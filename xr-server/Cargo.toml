@@ -1,0 +1,11 @@
+[package]
+name = "xr-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+xr-proto = { path = "../xr-proto" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }

@@ -1,0 +1,15 @@
+[workspace]
+members = ["xr-proto", "xr-client", "xr-server"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+opt-level = "s"          # optimize for size
+lto = true               # link-time optimization
+codegen-units = 1        # single codegen unit for best optimization
+panic = "abort"          # smaller binary, no unwinding
+strip = true             # strip debug symbols

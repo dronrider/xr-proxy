@@ -1,0 +1,83 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug executable 'xr-server'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=xr-server",
+                    "--package=xr-server"
+                ]
+            },
+            "args": []
+        },
+    
+        {
+            "name": "Debug unit tests in library 'xr_proto'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=xr-proto"
+                ]
+            }
+        },
+        {
+            "name": "Debug executable 'xr-client'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=xr-client",
+                    "--package=xr-client"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in executable 'xr-client'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=xr-client",
+                    "--package=xr-client"
+                ]
+            }
+        },
+        {
+            "name": "Debug executable 'xr-server'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=xr-server",
+                    "--package=xr-server"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in executable 'xr-server'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=xr-server",
+                    "--package=xr-server"
+                ]
+            }
+        }
+    ]
+}

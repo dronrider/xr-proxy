@@ -1,0 +1,30 @@
+# XR Proxy — Server Configuration
+# Place this file at /etc/xr-proxy/server.toml on your VPS
+
+# ─── Server listener ─────────────────────────────────────────────────
+[server]
+listen = "0.0.0.0"                    # Listen on all interfaces
+port = 8443                           # Must match client config
+
+# ─── Obfuscation (must match client exactly!) ─────────────────────────
+[obfuscation]
+key = "GENERATE_WITH_generate-key.sh" # Same key as client!
+modifier = "positional_xor_rotate"    # Must match client
+salt = 0xDEADBEEF                     # Must match client
+
+# ─── Limits ───────────────────────────────────────────────────────────
+[limits]
+max_connections = 256                 # Max simultaneous connections
+connection_timeout_sec = 300          # Idle connection timeout (seconds)
+
+# ─── Fallback ─────────────────────────────────────────────────────────
+# When someone connects with a browser or DPI probe sends a request,
+# respond with a fake web page instead of revealing we're a proxy.
+[fallback]
+enabled = true
+# response_file = "/etc/xr-proxy/fallback.html"  # Optional custom page
+
+# ─── Logging ──────────────────────────────────────────────────────────
+[logging]
+level = "info"                        # error, warn, info, debug
+# file = "/var/log/xr-proxy.log"     # Optional log file

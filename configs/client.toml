@@ -1,0 +1,56 @@
+# XR Proxy — Client Configuration
+# Place this file at /etc/xr-proxy/config.toml on your OpenWRT router
+
+# ─── Server connection ────────────────────────────────────────────────
+[server]
+address = "YOUR_SERVER_IP"            # IP address of your VPS
+port = 8443                           # Must match server config
+
+# ─── Obfuscation (must match server exactly!) ─────────────────────────
+[obfuscation]
+key = "rml6EFwRfwJzlYHCl58Pmergx1zBCNwhymvivmRAsyJugGqQE2aNMLai8m9dFcdYtNhNr7sJ+S0SFBID/sqVtw==" # Run: ./scripts/generate-key.sh
+modifier = "positional_xor_rotate"    # Options: positional_xor_rotate, rotating_salt, substitution_table
+salt = 0xDEADBEEF                     # Any 32-bit hex number, must match server
+padding_min = 16                      # Min random padding per packet (bytes)
+padding_max = 128                     # Max random padding per packet (bytes)
+
+# ─── Routing rules ────────────────────────────────────────────────────
+# default_action: what to do when no rule matches
+#   "direct" = send directly (proxy only matched domains)
+#   "proxy"  = proxy everything (bypass only matched domains)
+[routing]
+default_action = "direct"
+
+# Rule 1: Proxy these domains through the server
+[[routing.rules]]
+action = "proxy"
+domains = [
+  # Google
+  "youtube.com", "*.youtube.com", "*.googlevideo.com", "*.ggpht.com",
+  "*.google.com", "*.gmail.com", "*.googleapis.com", "*.gstatic.com",
+  # Telegram
+  "telegram.org", "*.telegram.org", "*.t.me", "*.telegram.me",
+  # WhatsApp
+  "*.whatsapp.com", "*.whatsapp.net",
+  # GitHub
+  "github.com", "*.github.com", "*.githubusercontent.com", "*.githubassets.com",
+  # Other
+  "*.openai.com", "*.anthropic.com",
+]
+
+# Rule 2 (optional, requires --features geoip build):
+# Proxy traffic to specific countries
+# [[routing.rules]]
+# action = "proxy"
+# geoip = ["US", "NL", "DE"]
+
+# ─── Client settings ─────────────────────────────────────────────────
+[client]
+listen_port = 1080                    # Local port for transparent proxy
+auto_redirect = true                  # Auto-setup nftables/iptables rules
+on_server_down = "direct"             # "direct" = bypass if server is down, "block" = block traffic
+log_level = "info"                    # error, warn, info, debug
+
+# ─── GeoIP (only with --features geoip build) ────────────────────────
+# [geoip]
+# database = "/etc/xr-proxy/GeoLite2-Country.mmdb"
