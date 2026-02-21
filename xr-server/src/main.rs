@@ -15,7 +15,7 @@ use xr_proto::protocol::Codec;
 #[command(name = "xr-server", about = "XR Proxy Server — lightweight obfuscated proxy server")]
 struct Cli {
     /// Path to config file
-    #[arg(short, long, default_value = "/etc/xr-proxy/configs/server.toml")]
+    #[arg(short, long, default_value = "/etc/xr-proxy/server.toml")]
     config: PathBuf,
 
     /// Override log level
