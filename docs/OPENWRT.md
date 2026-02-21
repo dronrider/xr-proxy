@@ -21,12 +21,12 @@ uname -m
 
 Таблица соответствия:
 
-| `uname -m` | Rust target | Типичные устройства |
-|------------|-------------|---------------------|
-| `mipsel` | `mipsel-unknown-linux-musl` | GL-MT300N-V2, MT7621-based |
-| `mips` | `mips-unknown-linux-musl` | GL-AR750S, Atheros/QCA-based |
-| `aarch64` | `aarch64-unknown-linux-musl` | GL-MT3000 (Beryl AX), Raspberry Pi 3/4 |
-| `armv7l` | `armv7-unknown-linux-musleabihf` | GL-A1300, некоторые Linksys |
+| `uname -m` | Rust target                          | Типичные устройства                    |
+| ---------- | ------------------------------------ | -------------------------------------- |
+| `mipsel`   | `mipsel-unknown-linux-musl`          | GL-MT300N-V2, MT7621-based             |
+| `mips`     | `mips-unknown-linux-musl`            | GL-AR750S, Atheros/QCA-based           |
+| `aarch64`  | `aarch64-unknown-linux-musl`         | GL-MT3000 (Beryl AX), Raspberry Pi 3/4 |
+| `armv7l`   | `armv7-unknown-linux-musleabihf`     | GL-A1300, некоторые Linksys            |
 
 Проверьте ресурсы:
 
@@ -55,12 +55,20 @@ source ~/.cargo/env
 cargo install cross --git https://github.com/cross-rs/cross
 ```
 
+> ⚠️ `cross` использует **Docker** для кросс-компиляции. Docker должен быть
+> установлен и запущен. Проверка: `docker info` — если ошибка, запустите Docker.
+>
+> Установка Docker: [docs.docker.com/get-docker](https://docs.docker.com/get-docker/)
+
 ### Сборка
 
 Замените `<TARGET>` на значение из таблицы выше:
 
 ```bash
 cd xr-proxy
+
+# Убедиться, что Docker запущен
+docker info >/dev/null 2>&1 || echo "Docker не запущен! Запустите Docker и повторите."
 
 # Стандартная сборка (без GeoIP, рекомендуется)
 cross build --release --target <TARGET> -p xr-client
@@ -76,7 +84,7 @@ cross build --release --target aarch64-unknown-linux-musl -p xr-client
 > rustup target add mips-unknown-linux-musl
 > cargo build --release --target mips-unknown-linux-musl -p xr-client
 > ```
-
+>
 > Может потребоваться установить линкер: `apt install gcc-mips-linux-gnu`
 
 ### Проверка размера
@@ -97,14 +105,14 @@ ls -lh target/<TARGET>/release/xr-client
 ssh root@192.168.1.1 "mkdir -p /etc/xr-proxy"
 
 # Загрузить бинарь
-scp target/<TARGET>/release/xr-client root@192.168.1.1:/usr/bin/xr-client
+scp -O target/<TARGET>/release/xr-client root@192.168.1.1:/usr/bin/xr-client
 
 # Загрузить конфиг
-scp configs/client.toml root@192.168.1.1:/etc/xr-proxy/config.toml
+scp -O configs/client.toml root@192.168.1.1:/etc/xr-proxy/config.toml
 
 # Загрузить init-скрипт и watchdog
-scp deploy/xr-proxy.init root@192.168.1.1:/etc/init.d/xr-proxy
-scp deploy/xr-watchdog.sh root@192.168.1.1:/usr/bin/xr-watchdog.sh
+scp -O deploy/xr-proxy.init root@192.168.1.1:/etc/init.d/xr-proxy
+scp -O deploy/xr-watchdog.sh root@192.168.1.1:/usr/bin/xr-watchdog.sh
 
 # Сделать исполняемыми
 ssh root@192.168.1.1 "chmod +x /usr/bin/xr-client /etc/init.d/xr-proxy /usr/bin/xr-watchdog.sh"
@@ -214,13 +222,13 @@ rm /etc/init.d/xr-proxy
 При выходе новой версии:
 
 ```bash
-# На своём компьютере:
+# На своём компьютере (Docker должен быть запущен):
 cd xr-proxy
 git pull
 cross build --release --target <TARGET> -p xr-client
 
 # Загрузить на роутер:
-scp target/<TARGET>/release/xr-client root@192.168.1.1:/usr/bin/xr-client
+scp -O target/<TARGET>/release/xr-client root@192.168.1.1:/usr/bin/xr-client
 
 # Перезапустить:
 ssh root@192.168.1.1 "/etc/init.d/xr-proxy restart"
@@ -281,11 +289,27 @@ iptables -t nat -F XR_PROXY
 iptables -t nat -X XR_PROXY
 ```
 
+### cross: ошибка «Docker not running»
+
+```bash
+# Проверить Docker
+docker info
+
+# Если не установлен — установите: https://docs.docker.com/get-docker/
+# Если установлен, но не запущен:
+sudo systemctl start docker        # Linux
+# Или откройте Docker Desktop      # macOS / Windows
+
+# Если ваш пользователь не в группе docker:
+sudo usermod -aG docker $USER
+# Перелогиньтесь после этого
+```
+
 ---
 
 ## Структура файлов на роутере
 
-```bash
+```text
 /usr/bin/xr-client              # бинарь (~1.5 МБ)
 /usr/bin/xr-watchdog.sh         # watchdog (автоочистка правил если клиент упал)
 /etc/xr-proxy/config.toml       # конфигурация
@@ -294,7 +318,7 @@ iptables -t nat -X XR_PROXY
 
 При сборке с GeoIP (`--features geoip`) добавляется:
 
-```bash
+```text
 /etc/xr-proxy/GeoLite2-Country.mmdb  # GeoIP-база (~5 МБ)
 ```
 
@@ -304,11 +328,11 @@ iptables -t nat -X XR_PROXY
 
 Три уровня защиты от потери доступа к роутеру:
 
-| Уровень | Механизм | Что делает |
-|---------|----------|-----------|
-| **SSH всегда работает** | Redirect перехватывает только порты 80/443, приватные подсети исключены | Вы всегда можете зайти на роутер по SSH, даже если всё сломалось |
-| **Cleanup при остановке** | init-скрипт принудительно удаляет правила nftables/iptables при `stop` | Достаточно выполнить `/etc/init.d/xr-proxy stop` |
-| **Watchdog (cron)** | Каждую минуту проверяет, жив ли процесс xr-client. Если нет — удаляет правила | Интернет восстанавливается автоматически в течение 1 минуты |
+| Уровень                    | Механизм                                                                      | Что делает                                                                   |
+| -------------------------- | --------------------------------------------------------------------------    | ---------------------------------------------------------------------------- |
+| **SSH всегда работает**    | Redirect перехватывает только порты 80/443, приватные подсети исключены       | Вы всегда можете зайти на роутер по SSH, даже если всё сломалось             |
+| **Cleanup при остановке**  | init-скрипт принудительно удаляет правила nftables/iptables при `stop`        | Достаточно выполнить `/etc/init.d/xr-proxy stop`                             |
+| **Watchdog (cron)**        | Каждую минуту проверяет, жив ли процесс xr-client. Если нет — удаляет правила | Интернет восстанавливается автоматически в течение 1 минуты                  |
 
 **Если всё совсем плохо** — SSH на роутер и выполните:
 

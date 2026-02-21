@@ -7,7 +7,7 @@
 
 ## Как это работает
 
-```bash
+```text
 Телефон/Ноутбук → [OpenWRT роутер с xr-client] → Интернет
                          │                          (напрямую для разрешённых)
                          ▼
@@ -39,7 +39,7 @@
 
 - Linux или macOS
 - Установленный [Rust](https://rustup.rs/) (1.70+)
-- Для кросс-компиляции: [cross](https://github.com/cross-rs/cross) + Docker
+- Для кросс-компиляции: [cross](https://github.com/cross-rs/cross) + **Docker** (должен быть запущен)
 
 ---
 
@@ -74,7 +74,8 @@ sudo apt update && sudo apt install -y build-essential    # Ubuntu/Debian
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 
-# Собрать сервер
+# Клонировать и собрать сервер
+git clone https://github.com/dronrider/xr-proxy.git
 cd xr-proxy
 cargo build --release -p xr-server
 ```
@@ -138,18 +139,24 @@ opkg print-architecture
 
 Типичные значения:
 
-| Модель роутера | Архитектура | Target в Rust |
-| ---------------- | ------------- | --------------- |
-| GL.iNet GL-MT300N-V2 | mipsel | `mipsel-unknown-linux-musl` |
-| GL.iNet GL-AR750S | mips | `mips-unknown-linux-musl` |
-| GL.iNet Beryl (MT1300) | aarch64 | `aarch64-unknown-linux-musl` |
-| Raspberry Pi | arm/aarch64 | `armv7-unknown-linux-musleabihf` / `aarch64-unknown-linux-musl` |
+| Модель роутера              | Архитектура | Target в Rust                                                       |
+| --------------------------- | ----------- | ------------------------------------------------------------------- |
+| GL.iNet GL-MT300N-V2        | mipsel      | `mipsel-unknown-linux-musl`                                         |
+| GL.iNet GL-AR750S           | mips        | `mips-unknown-linux-musl`                                           |
+| GL.iNet Beryl (MT1300)      | aarch64     | `aarch64-unknown-linux-musl`                                        |
+| Raspberry Pi                | arm/aarch64 | `armv7-unknown-linux-musleabihf` / `aarch64-unknown-linux-musl`     |
 
 #### Сборка (на вашем компьютере)
+
+> ⚠️ Для `cross` необходим **запущенный Docker**. Убедитесь, что Docker запущен перед сборкой:
+> `docker info` — если команда выдаёт ошибку, запустите Docker.
 
 ```bash
 # Установить cross для кросс-компиляции
 cargo install cross --git https://github.com/cross-rs/cross
+
+# Убедиться, что Docker запущен
+docker info >/dev/null 2>&1 || echo "Docker не запущен! Запустите Docker и повторите."
 
 # Собрать для вашей архитектуры (пример: aarch64)
 cross build --release --target aarch64-unknown-linux-musl -p xr-client
@@ -171,10 +178,10 @@ strip target/aarch64-unknown-linux-musl/release/xr-client
 
 ```bash
 # С вашего компьютера
-scp target/aarch64-unknown-linux-musl/release/xr-client root@192.168.1.1:/usr/bin/
-scp configs/client.toml root@192.168.1.1:/etc/xr-proxy/config.toml
-scp deploy/xr-proxy.init root@192.168.1.1:/etc/init.d/xr-proxy
-scp deploy/xr-watchdog.sh root@192.168.1.1:/usr/bin/xr-watchdog.sh
+scp -O target/aarch64-unknown-linux-musl/release/xr-client root@192.168.1.1:/usr/bin/
+scp -O configs/client.toml root@192.168.1.1:/etc/xr-proxy/config.toml
+scp -O deploy/xr-proxy.init root@192.168.1.1:/etc/init.d/xr-proxy
+scp -O deploy/xr-watchdog.sh root@192.168.1.1:/usr/bin/xr-watchdog.sh
 ```
 
 #### Настройте конфиг на роутере
@@ -254,7 +261,7 @@ domains = [
 Требует сборки с `--features geoip` и скачивания базы GeoLite2:
 
 ```bash
-# Сборка с GeoIP
+# Сборка с GeoIP (Docker должен быть запущен)
 cross build --release --target aarch64-unknown-linux-musl -p xr-client --features geoip
 
 # Скачать базу (нужна бесплатная регистрация на maxmind.com)
@@ -279,12 +286,12 @@ database = "/etc/xr-proxy/GeoLite2-Country.mmdb"
 
 Каждый параметр обфускации делает ваш трафик уникальным:
 
-| Параметр | Описание | Влияние |
-| ---------- | ---------- | --------- |
-| `key` | Общий секретный ключ | Без правильного ключа данные невозможно расшифровать |
-| `modifier` | Алгоритм модификации | Меняет паттерн обфускации. Варианты: `positional_xor_rotate`, `rotating_salt`, `substitution_table` |
-| `salt` | Дополнительный параметр | Любое 32-bit число, меняет выходные данные при том же ключе |
-| `padding_min/max` | Случайный мусор в каждом пакете | Маскирует реальные размеры пакетов от статистического анализа |
+| Параметр          | Описание                        | Влияние                                                                                                    |
+| ---------------   | -----------------------------   | ---------------------------------------------------------------------------------------------------------- |
+| `key`             | Общий секретный ключ            | Без правильного ключа данные невозможно расшифровать                                                       |
+| `modifier`        | Алгоритм модификации            | Меняет паттерн обфускации. Варианты: `positional_xor_rotate`, `rotating_salt`, `substitution_table`        |
+| `salt`            | Дополнительный параметр         | Любое 32-bit число, меняет выходные данные при том же ключе                                                |
+| `padding_min/max` | Случайный мусор в каждом пакете | Маскирует реальные размеры пакетов от статистического анализа                                              |
 
 **Все параметры должны совпадать на клиенте и сервере!**
 
@@ -326,6 +333,14 @@ iptables -t nat -X XR_PROXY
 - Без GeoIP потребление: ~2 МБ, с GeoIP: ~5 МБ
 - Если всё равно много — уменьшите `max_connections` в серверном конфиге
 
+### cross: ошибка «Docker not running» или «docker: command not found»
+
+`cross` использует Docker для кросс-компиляции. Убедитесь, что:
+
+1. Docker установлен: [docs.docker.com/get-docker](https://docs.docker.com/get-docker/)
+2. Docker запущен: `docker info`
+3. Ваш пользователь в группе docker: `sudo usermod -aG docker $USER` (перелогиньтесь после)
+
 ---
 
 ## Безопасность
@@ -348,7 +363,7 @@ cargo build --release -p xr-client
 # Клиент с GeoIP
 cargo build --release -p xr-client --features geoip
 
-# Кросс-компиляция клиента
+# Кросс-компиляция клиента (требует Docker!)
 cross build --release --target mipsel-unknown-linux-musl -p xr-client
 cross build --release --target aarch64-unknown-linux-musl -p xr-client
 cross build --release --target armv7-unknown-linux-musleabihf -p xr-client
