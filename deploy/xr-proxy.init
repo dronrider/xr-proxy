@@ -7,6 +7,8 @@ USE_PROCD=1
 
 PROG=/usr/bin/xr-client
 CONFIG=/etc/xr-proxy/config.toml
+WATCHDOG=/usr/bin/xr-watchdog.sh
+CRON_LINE="* * * * * $WATCHDOG"
 
 start_service() {
     [ -f "$CONFIG" ] || {
@@ -14,6 +16,12 @@ start_service() {
         echo "Copy configs/client.toml to $CONFIG and edit it first."
         return 1
     }
+
+    # Install watchdog cron job (safety net: auto-removes redirect rules
+    # if xr-client dies, restoring internet within 1 minute)
+    if [ -x "$WATCHDOG" ]; then
+        (crontab -l 2>/dev/null | grep -v "$WATCHDOG"; echo "$CRON_LINE") | crontab -
+    fi
 
     procd_open_instance
     procd_set_param command "$PROG" -c "$CONFIG"
@@ -24,8 +32,15 @@ start_service() {
 }
 
 stop_service() {
-    # nftables/iptables cleanup is handled by the client on SIGTERM
-    :
+    # Remove watchdog cron job
+    crontab -l 2>/dev/null | grep -v "$WATCHDOG" | crontab -
+
+    # Force cleanup firewall rules (belt and suspenders —
+    # client also cleans on SIGTERM, but just in case)
+    nft delete table ip xr_proxy 2>/dev/null
+    iptables -t nat -D PREROUTING -j XR_PROXY 2>/dev/null
+    iptables -t nat -F XR_PROXY 2>/dev/null
+    iptables -t nat -X XR_PROXY 2>/dev/null
 }
 
 service_triggers() {
