@@ -7,7 +7,7 @@
 
 ## Как это работает
 
-txt```
+```bash
 Телефон/Ноутбук → [OpenWRT роутер с xr-client] → Интернет
                          │                          (напрямую для разрешённых)
                          ▼
@@ -16,7 +16,6 @@ txt```
                          ▼
                       Интернет
                    (для заблокированных)
-
 ```
 
 Трафик к заблокированным ресурсам автоматически проксируется через ваш VPS.
@@ -67,6 +66,10 @@ chmod +x scripts/generate-key.sh
 #### Сборка на VPS
 
 ```bash
+# Установить системные зависимости для сборки
+sudo apt update && sudo apt install -y build-essential    # Ubuntu/Debian
+# sudo yum groupinstall -y "Development Tools"            # CentOS/RHEL
+
 # Установить Rust (если ещё нет)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
@@ -171,6 +174,7 @@ strip target/aarch64-unknown-linux-musl/release/xr-client
 scp target/aarch64-unknown-linux-musl/release/xr-client root@192.168.1.1:/usr/bin/
 scp configs/client.toml root@192.168.1.1:/etc/xr-proxy/config.toml
 scp deploy/xr-proxy.init root@192.168.1.1:/etc/init.d/xr-proxy
+scp deploy/xr-watchdog.sh root@192.168.1.1:/usr/bin/xr-watchdog.sh
 ```
 
 #### Настройте конфиг на роутере
@@ -198,6 +202,7 @@ vi /etc/xr-proxy/config.toml
 # Сделать файлы исполняемыми
 chmod +x /usr/bin/xr-client
 chmod +x /etc/init.d/xr-proxy
+chmod +x /usr/bin/xr-watchdog.sh
 
 # Запустить и включить автозапуск
 /etc/init.d/xr-proxy enable
@@ -355,3 +360,7 @@ cargo test --workspace
 ## Лицензия
 
 MIT
+
+## Документация
+
+- [Развёртывание на OpenWRT](docs/OPENWRT.md) — подробная пошаговая инструкция для роутера
