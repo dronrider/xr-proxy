@@ -65,7 +65,8 @@ pub async fn run_proxy(
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(client_stream, client_addr, state).await {
-                tracing::debug!("Connection from {} error: {}", client_addr, e);
+                // Log connection errors at warn level so they're visible with default settings
+                tracing::warn!("Connection from {} failed: {}", client_addr, e);
             }
         });
     }
@@ -88,7 +89,7 @@ async fn handle_connection(
     let sni_display = sni.as_deref().unwrap_or("-");
     let action = state.router.resolve(sni.as_deref(), dest_ip);
 
-    tracing::debug!(
+    tracing::info!(
         "{} -> {} [SNI: {}] => {:?}",
         client_addr, orig_dst, sni_display, action
     );

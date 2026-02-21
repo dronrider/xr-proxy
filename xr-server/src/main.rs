@@ -89,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     if let Err(e) = handler::handle_client(stream, addr, codec, timeout, fallback).await {
-                        tracing::debug!("Client {} error: {}", addr, e);
+                        tracing::warn!("Client {} error: {}", addr, e);
                     }
                 });
             }

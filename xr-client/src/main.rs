@@ -84,7 +84,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(backend)
             }
             None => {
-                tracing::warn!("No firewall backend (nftables/iptables) found, skipping auto-redirect");
+                tracing::error!(
+                    "No firewall backend found! Checked: {:?} and {:?}. \
+                     Traffic will NOT be redirected to the proxy. \
+                     Install nftables or iptables, or set auto_redirect = false and configure manually.",
+                    ["/usr/sbin/nft", "/sbin/nft"],
+                    ["/usr/sbin/iptables", "/sbin/iptables"],
+                );
                 None
             }
         }

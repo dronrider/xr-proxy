@@ -2,10 +2,21 @@
 ///
 /// On start: set up rules to redirect TCP traffic to the proxy.
 /// On stop: clean up rules to restore normal traffic flow.
+///
+/// Uses full binary paths because procd/systemd may have minimal PATH.
 use std::process::Command;
 
 const NFT_TABLE: &str = "xr_proxy";
 const IPT_CHAIN: &str = "XR_PROXY";
+
+/// Common locations for nft on OpenWRT and regular Linux.
+const NFT_PATHS: &[&str] = &["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft"];
+/// Common locations for iptables.
+const IPT_PATHS: &[&str] = &[
+    "/usr/sbin/iptables",
+    "/sbin/iptables",
+    "/usr/bin/iptables",
+];
 
 /// Detect whether nftables or iptables is available.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -14,10 +25,40 @@ pub enum FirewallBackend {
     Iptables,
 }
 
+/// Find the full path to a binary by checking common locations.
+fn find_binary(candidates: &[&str]) -> Option<String> {
+    for path in candidates {
+        if std::path::Path::new(path).exists() {
+            return Some(path.to_string());
+        }
+    }
+    // Fallback: try bare name (works if PATH is set correctly)
+    if let Some(first) = candidates.first() {
+        if let Some(bare_name) = first.rsplit('/').next() {
+            if Command::new(bare_name)
+                .arg("--version")
+                .output()
+                .is_ok()
+            {
+                return Some(bare_name.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn find_nft() -> Option<String> {
+    find_binary(NFT_PATHS)
+}
+
+fn find_iptables() -> Option<String> {
+    find_binary(IPT_PATHS)
+}
+
 pub fn detect_backend() -> Option<FirewallBackend> {
-    if Command::new("nft").arg("--version").output().is_ok() {
+    if find_nft().is_some() {
         Some(FirewallBackend::Nftables)
-    } else if Command::new("iptables").arg("--version").output().is_ok() {
+    } else if find_iptables().is_some() {
         Some(FirewallBackend::Iptables)
     } else {
         None
@@ -50,6 +91,8 @@ fn setup_nftables(
     listen_port: u16,
     server_ip: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let nft = find_nft().ok_or("nft binary not found")?;
+
     // Clean up any existing rules first
     let _ = cleanup_nftables();
 
@@ -72,25 +115,31 @@ table ip {table} {{
         listen_port = listen_port,
     );
 
-    let _status = Command::new("nft").arg("-f").arg("-").arg(&ruleset)
-        .status();
-
-    // nft -f - doesn't work well, use echo | nft -f -
-    let status = Command::new("sh")
+    // Use sh -c with pipe to feed ruleset via stdin
+    let status = Command::new("/bin/sh")
         .arg("-c")
-        .arg(format!("echo '{}' | nft -f -", ruleset.replace('\'', "\\'")))
+        .arg(format!(
+            "echo '{}' | {} -f -",
+            ruleset.replace('\'', "'\\''"),
+            nft
+        ))
         .status()?;
 
     if !status.success() {
-        return Err("nft command failed".into());
+        return Err(format!("nft command failed (binary: {})", nft).into());
     }
 
-    tracing::info!("nftables redirect rules installed (table: {})", NFT_TABLE);
+    tracing::info!("nftables redirect rules installed (table: {}, nft: {})", NFT_TABLE, nft);
     Ok(())
 }
 
 fn cleanup_nftables() -> Result<(), Box<dyn std::error::Error>> {
-    let status = Command::new("nft")
+    let nft = match find_nft() {
+        Some(n) => n,
+        None => return Ok(()), // no nft binary — nothing to clean
+    };
+
+    let status = Command::new(&nft)
         .args(["delete", "table", "ip", NFT_TABLE])
         .status()?;
     if status.success() {
@@ -128,7 +177,8 @@ fn setup_iptables(
     // Hook into PREROUTING
     run_ipt(&["-t", "nat", "-A", "PREROUTING", "-j", IPT_CHAIN])?;
 
-    tracing::info!("iptables redirect rules installed (chain: {})", IPT_CHAIN);
+    let ipt = find_iptables().unwrap_or_else(|| "iptables".to_string());
+    tracing::info!("iptables redirect rules installed (chain: {}, binary: {})", IPT_CHAIN, ipt);
     Ok(())
 }
 
@@ -143,9 +193,10 @@ fn cleanup_iptables() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_ipt(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
-    let status = Command::new("iptables").args(args).status()?;
+    let ipt = find_iptables().ok_or("iptables binary not found")?;
+    let status = Command::new(&ipt).args(args).status()?;
     if !status.success() {
-        return Err(format!("iptables {:?} failed", args).into());
+        return Err(format!("{} {:?} failed", ipt, args).into());
     }
     Ok(())
 }
