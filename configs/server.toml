@@ -8,8 +8,7 @@ port = 8443                           # Must match client config
 
 # ─── Obfuscation (must match client exactly!) ─────────────────────────
 [obfuscation]
-# Same key as client! Generate with /scripts/generate-key.sh
-key = "rml6EFwRfwJzlYHCl58Pmergx1zBCNwhymvivmRAsyJugGqQE2aNMLai8m9dFcdYtNhNr7sJ+S0SFBID/sqVtw==" 
+key = "GENERATE_WITH_generate-key.sh" # Same key as client!
 modifier = "positional_xor_rotate"    # Must match client
 salt = 0xDEADBEEF                     # Must match client
 

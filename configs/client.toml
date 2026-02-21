@@ -8,7 +8,7 @@ port = 8443                           # Must match server config
 
 # ─── Obfuscation (must match server exactly!) ─────────────────────────
 [obfuscation]
-key = "rml6EFwRfwJzlYHCl58Pmergx1zBCNwhymvivmRAsyJugGqQE2aNMLai8m9dFcdYtNhNr7sJ+S0SFBID/sqVtw==" # Run: ./scripts/generate-key.sh
+key = "GENERATE_WITH_generate-key.sh" # Run: ./scripts/generate-key.sh
 modifier = "positional_xor_rotate"    # Options: positional_xor_rotate, rotating_salt, substitution_table
 salt = 0xDEADBEEF                     # Any 32-bit hex number, must match server
 padding_min = 16                      # Min random padding per packet (bytes)
