@@ -22,10 +22,10 @@ fn get_original_dst(stream: &TcpStream) -> io::Result<SocketAddr> {
         let mut addr: libc::sockaddr_in = std::mem::zeroed();
         let mut len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in>() as u32;
 
-        // SO_ORIGINAL_DST = 80
+        // SOL_IP = 0, SO_ORIGINAL_DST = 80
         let ret = libc::getsockopt(
             fd,
-            libc::IPPROTO_IP,
+            0,  // SOL_IP
             80, // SO_ORIGINAL_DST
             &mut addr as *mut _ as *mut libc::c_void,
             &mut len,
