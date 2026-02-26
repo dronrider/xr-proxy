@@ -5,7 +5,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
 use xr_proto::protocol::{Codec, Command, TargetAddr};
 
@@ -48,6 +48,7 @@ pub struct ProxyState {
     pub codec: Codec,
     pub server_addr: SocketAddr,
     pub on_server_down: Action,
+    pub listen_port: u16,
 }
 
 // ── Main proxy loop ──────────────────────────────────────────────────
@@ -56,7 +57,11 @@ pub async fn run_proxy(
     listen_port: u16,
     state: Arc<ProxyState>,
 ) -> io::Result<()> {
-    let listener = TcpListener::bind(("0.0.0.0", listen_port)).await?;
+    // Use SO_REUSEADDR so rapid restarts don't fail with "address already in use"
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, listen_port)))?;
+    let listener = socket.listen(1024)?;
     tracing::info!("Transparent proxy listening on 0.0.0.0:{}", listen_port);
 
     loop {
@@ -65,8 +70,16 @@ pub async fn run_proxy(
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(client_stream, client_addr, state).await {
-                // Log connection errors at warn level so they're visible with default settings
-                tracing::warn!("Connection from {} failed: {}", client_addr, e);
+                let msg = e.to_string();
+                // Connection resets are normal (client closed tab, app timeout, etc.)
+                if msg.contains("reset by peer")
+                    || msg.contains("Broken pipe")
+                    || msg.contains("Connection refused")
+                {
+                    tracing::debug!("Connection from {} closed: {}", client_addr, msg);
+                } else {
+                    tracing::warn!("Connection from {} failed: {}", client_addr, e);
+                }
             }
         });
     }
@@ -80,6 +93,14 @@ async fn handle_connection(
     // Get original destination
     let orig_dst = get_original_dst(&client)?;
     let dest_ip = orig_dst.ip();
+
+    // Loop detection: if the original destination is our own listen port,
+    // someone is connecting directly to the proxy (e.g. from WAN).
+    // Drop to prevent infinite loops.
+    if orig_dst.port() == state.listen_port {
+        tracing::debug!("Loop detected: {} -> {} (own listen port), dropping", client_addr, orig_dst);
+        return Ok(());
+    }
 
     // Peek at first bytes for SNI extraction (up to 4KB should cover ClientHello)
     let mut peek_buf = vec![0u8; 4096];

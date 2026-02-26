@@ -101,12 +101,30 @@ fn setup_nftables(
 table ip {table} {{
     chain prerouting {{
         type nat hook prerouting priority dstnat; policy accept;
+
+        # Only redirect traffic from LAN clients (private source IPs)
+        # This prevents WAN scanners from hitting the proxy port
+        ip saddr != 10.0.0.0/8 ip saddr != 172.16.0.0/12 ip saddr != 192.168.0.0/16 ip saddr != 127.0.0.0/8 return
+
+        # Skip destinations that should go direct
         ip daddr {server_ip} return
         ip daddr 10.0.0.0/8 return
         ip daddr 172.16.0.0/12 return
         ip daddr 192.168.0.0/16 return
         ip daddr 127.0.0.0/8 return
+
+        # Redirect HTTP/HTTPS to proxy
         tcp dport {{ 80, 443 }} redirect to :{listen_port}
+    }}
+
+    chain input {{
+        type filter hook input priority filter; policy accept;
+        # Block direct access to proxy port from non-LAN sources
+        tcp dport {listen_port} ip saddr 10.0.0.0/8 accept
+        tcp dport {listen_port} ip saddr 172.16.0.0/12 accept
+        tcp dport {listen_port} ip saddr 192.168.0.0/16 accept
+        tcp dport {listen_port} ip saddr 127.0.0.0/8 accept
+        tcp dport {listen_port} drop
     }}
 }}
 "#,
@@ -159,7 +177,22 @@ fn setup_iptables(
     // Create custom chain
     run_ipt(&["-t", "nat", "-N", IPT_CHAIN])?;
 
-    // Skip server IP, private ranges
+    // Only redirect traffic from LAN (private source IPs)
+    // Skip anything from WAN to prevent redirect loops
+    run_ipt(&["-t", "nat", "-A", IPT_CHAIN,
+        "-s", "10.0.0.0/8", "-j", "RETURN"])?;  // will be overridden below
+    // Actually: use positive match — only process private sources
+    let _ = run_ipt(&["-t", "nat", "-F", IPT_CHAIN]); // re-flush
+
+    // First: RETURN for non-LAN sources (prevents WAN redirect loops)
+    run_ipt(&["-t", "nat", "-A", IPT_CHAIN,
+        "!", "-s", "10.0.0.0/8",
+        "!", "-s", "172.16.0.0/12",
+        "!", "-s", "192.168.0.0/16",
+        "!", "-s", "127.0.0.0/8",
+        "-j", "RETURN"])?;
+
+    // Skip server IP, private destination ranges
     run_ipt(&["-t", "nat", "-A", IPT_CHAIN, "-d", server_ip, "-j", "RETURN"])?;
     run_ipt(&["-t", "nat", "-A", IPT_CHAIN, "-d", "10.0.0.0/8", "-j", "RETURN"])?;
     run_ipt(&["-t", "nat", "-A", IPT_CHAIN, "-d", "172.16.0.0/12", "-j", "RETURN"])?;

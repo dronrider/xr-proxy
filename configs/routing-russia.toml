@@ -1,0 +1,204 @@
+# ═══════════════════════════════════════════════════════════════
+# XR Proxy — Правила маршрутизации для России
+# Актуально на февраль 2026
+# ═══════════════════════════════════════════════════════════════
+#
+# Всё что не перечислено ниже — идёт напрямую без прокси.
+# Добавляйте/убирайте домены по необходимости.
+
+[routing]
+default_action = "direct"
+
+# ── YouTube (замедлён/фактически не работает) ─────────────────
+[[routing.rules]]
+action = "proxy"
+domains = [
+  "youtube.com", "*.youtube.com",
+  "youtu.be",
+  "*.googlevideo.com",
+  "*.ytimg.com",
+  "youtube-nocookie.com", "*.youtube-nocookie.com",
+  "*.youtube-ui.l.google.com",
+  "*.ggpht.com",
+]
+
+# ── Meta (Facebook, Instagram, WhatsApp) ──────────────────────
+# Признана экстремистской, заблокирована
+[[routing.rules]]
+action = "proxy"
+domains = [
+  "facebook.com", "*.facebook.com",
+  "fbcdn.net", "*.fbcdn.net",
+  "*.fbsbx.com",
+  "instagram.com", "*.instagram.com",
+  "*.cdninstagram.com",
+  "threads.net", "*.threads.net",
+  "whatsapp.com", "*.whatsapp.com",
+  "whatsapp.net", "*.whatsapp.net",
+  "wa.me", "*.wa.me",
+  "messenger.com", "*.messenger.com",
+  "meta.com", "*.meta.com",
+]
+
+# ── Twitter / X ───────────────────────────────────────────────
+[[routing.rules]]
+action = "proxy"
+domains = [
+  "twitter.com", "*.twitter.com",
+  "x.com", "*.x.com",
+  "t.co",
+  "twimg.com", "*.twimg.com",
+  "tweetdeck.com", "*.tweetdeck.com",
+]
+
+# ── Telegram (звонки заблокированы, ограничения каналов) ──────
+[[routing.rules]]
+action = "proxy"
+domains = [
+  "telegram.org", "*.telegram.org",
+  "t.me", "*.t.me",
+  "telegram.me", "*.telegram.me",
+  "telesco.pe",
+  "tdesktop.com", "*.tdesktop.com",
+  "*.tg.dev",
+]
+
+# ── LinkedIn (заблокирован с 2016) ────────────────────────────
+[[routing.rules]]
+action = "proxy"
+domains = [
+  "linkedin.com", "*.linkedin.com",
+  "licdn.com", "*.licdn.com",
+]
+
+# ── Snapchat (заблокирован с декабря 2025) ────────────────────
+[[routing.rules]]
+action = "proxy"
+domains = [
+  "snapchat.com", "*.snapchat.com",
+  "snap.com", "*.snap.com",
+  "snapkit.co", "*.snapkit.co",
+  "*.sc-cdn.net",
+]
+
+# ── Google (основные сервисы — могут быть частично недоступны) ─
+[[routing.rules]]
+action = "proxy"
+domains = [
+  "google.com", "*.google.com",
+  "google.ru", "*.google.ru",
+  "*.googleapis.com",
+  "*.gstatic.com",
+  "*.googleusercontent.com",
+  "*.google-analytics.com",
+  "*.googletagmanager.com",
+  "gmail.com", "*.gmail.com",
+  "*.gvt1.com",
+  "*.gvt2.com",
+]
+
+# ── Discord ───────────────────────────────────────────────────
+[[routing.rules]]
+action = "proxy"
+domains = [
+  "discord.com", "*.discord.com",
+  "discord.gg",
+  "discord.media", "*.discord.media",
+  "discordapp.com", "*.discordapp.com",
+  "discordapp.net", "*.discordapp.net",
+]
+
+# ── Медиа и стриминг ─────────────────────────────────────────
+[[routing.rules]]
+action = "proxy"
+domains = [
+  # Twitch
+  "twitch.tv", "*.twitch.tv",
+  "twitchcdn.net", "*.twitchcdn.net",
+  "jtvnw.net", "*.jtvnw.net",
+  # Spotify
+  "spotify.com", "*.spotify.com",
+  "scdn.co", "*.scdn.co",
+  "spotifycdn.com", "*.spotifycdn.com",
+  # SoundCloud
+  "soundcloud.com", "*.soundcloud.com",
+  "sndcdn.com", "*.sndcdn.com",
+  # Medium
+  "medium.com", "*.medium.com",
+  # Patreon (заблокирован с 2022)
+  "patreon.com", "*.patreon.com",
+  "patreonusercontent.com", "*.patreonusercontent.com",
+]
+
+# ── AI-сервисы ────────────────────────────────────────────────
+[[routing.rules]]
+action = "proxy"
+domains = [
+  "openai.com", "*.openai.com",
+  "chatgpt.com", "*.chatgpt.com",
+  "claude.ai", "*.claude.ai",
+  "anthropic.com", "*.anthropic.com",
+  "perplexity.ai", "*.perplexity.ai",
+  "gemini.google.com",
+  "bard.google.com",
+]
+
+# ── Разработка и IT ───────────────────────────────────────────
+[[routing.rules]]
+action = "proxy"
+domains = [
+  # GitHub (работает, но бывают проблемы)
+  "github.com", "*.github.com",
+  "github.io", "*.github.io",
+  "githubusercontent.com", "*.githubusercontent.com",
+  "githubassets.com", "*.githubassets.com",
+  # Docker Hub
+  "docker.io", "*.docker.io",
+  "docker.com", "*.docker.com",
+  # npm
+  "npmjs.com", "*.npmjs.com",
+  "npmjs.org", "*.npmjs.org",
+  # Stack Overflow
+  "stackoverflow.com", "*.stackoverflow.com",
+  "stackexchange.com", "*.stackexchange.com",
+  "sstatic.net", "*.sstatic.net",
+]
+
+# ── VPN/прокси-сайты и privacy ────────────────────────────────
+[[routing.rules]]
+action = "proxy"
+domains = [
+  "protonvpn.com", "*.protonvpn.com",
+  "protonmail.com", "*.protonmail.com",
+  "proton.me", "*.proton.me",
+  "mullvad.net", "*.mullvad.net",
+  "signal.org", "*.signal.org",
+  "whispersystems.org", "*.whispersystems.org",
+]
+
+# ── Новостные ресурсы (заблокированные независимые СМИ) ───────
+[[routing.rules]]
+action = "proxy"
+domains = [
+  "bbc.com", "*.bbc.com",
+  "bbc.co.uk", "*.bbc.co.uk",
+  "*.bbci.co.uk",
+  "dw.com", "*.dw.com",
+  "currenttime.tv", "*.currenttime.tv",
+  "svoboda.org", "*.svoboda.org",
+  "rferl.org", "*.rferl.org",
+]
+
+# ── Другое ────────────────────────────────────────────────────
+[[routing.rules]]
+action = "proxy"
+domains = [
+  # Cloudflare (частичные блокировки CDN)
+  "cloudflare.com", "*.cloudflare.com",
+  "*.cloudflareinsights.com",
+  # Notion
+  "notion.so", "*.notion.so",
+  "notion.com", "*.notion.com",
+  # Figma
+  "figma.com", "*.figma.com",
+]
