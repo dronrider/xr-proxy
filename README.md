@@ -330,7 +330,7 @@ iptables -t nat -X XR_PROXY
 ### Высокое потребление памяти
 
 - Убедитесь, что используете release-сборку (`--release`)
-- Без GeoIP потребление: ~2 МБ, с GeoIP: ~5 МБ
+- Без GeoIP потребление: ~4-8 МБ RAM (зависит от количества активных соединений), с GeoIP: ~10-15 МБ
 - Если всё равно много — уменьшите `max_connections` в серверном конфиге
 
 ### cross: ошибка «Docker not running» или «docker: command not found»

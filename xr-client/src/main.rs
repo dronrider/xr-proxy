@@ -11,6 +11,24 @@ use xr_proto::config::{decode_key, load_client_config};
 use xr_proto::obfuscation::{ModifierStrategy, Obfuscator};
 use xr_proto::protocol::Codec;
 
+const CRASH_LOG: &str = "/etc/xr-proxy/crash.log";
+
+/// Append a line to the persistent crash log file.
+fn log_to_file(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(CRASH_LOG)
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{}] {}", ts, msg);
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "xr-client", about = "XR Proxy Client — lightweight transparent proxy for OpenWRT")]
 struct Cli {
@@ -24,7 +42,23 @@ struct Cli {
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    // Install panic hook — write to file so we don't lose crash info
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("PANIC: {}", info);
+        eprintln!("{}", msg);
+        log_to_file(&msg);
+    }));
+
+    if let Err(e) = run().await {
+        let msg = format!("FATAL: {}", e);
+        eprintln!("{}", msg);
+        log_to_file(&msg);
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // Load config
@@ -42,6 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     tracing::info!("XR Proxy Client starting");
+    log_to_file("xr-client starting");
 
     // Build obfuscator
     let key = decode_key(&config.obfuscation.key)?;
@@ -70,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         codec,
         server_addr,
         on_server_down,
+        listen_port: config.client.listen_port,
     });
 
     // Setup firewall redirect
@@ -105,11 +141,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::select! {
         result = proxy_handle => {
             if let Err(e) = result {
-                tracing::error!("Proxy task failed: {}", e);
+                let msg = format!("Proxy task failed: {}", e);
+                tracing::error!("{}", msg);
+                log_to_file(&msg);
             }
         }
         _ = shutdown_signal() => {
             tracing::info!("Shutdown signal received");
+            log_to_file("shutdown signal received");
         }
     }
 
@@ -121,6 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     tracing::info!("XR Proxy Client stopped");
+    log_to_file("xr-client stopped");
     Ok(())
 }
 
