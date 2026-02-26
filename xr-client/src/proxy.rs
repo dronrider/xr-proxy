@@ -5,7 +5,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream};
 use tokio::time::{sleep, Duration};
 use xr_proto::protocol::{Codec, Command, TargetAddr};
 

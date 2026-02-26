@@ -48,6 +48,8 @@ pub struct RoutingRule {
     #[serde(default)]
     pub domains: Vec<String>,
     #[serde(default)]
+    pub ip_ranges: Vec<String>,
+    #[serde(default)]
     pub geoip: Vec<String>,
 }
 

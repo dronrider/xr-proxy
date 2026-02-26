@@ -1,5 +1,5 @@
-/// Routing engine: domain matching, GeoIP lookup, rule evaluation.
-use std::net::IpAddr;
+/// Routing engine: domain matching, IP range (CIDR) matching, GeoIP lookup.
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use xr_proto::config::{RoutingConfig, RoutingRule};
 
 /// Routing decision.
@@ -18,6 +18,54 @@ impl Action {
     }
 }
 
+/// Parsed CIDR range for fast matching.
+#[derive(Debug)]
+enum CidrRange {
+    V4 { addr: u32, mask: u32 },
+    V6 { addr: u128, mask: u128 },
+}
+
+impl CidrRange {
+    fn parse(s: &str) -> Option<Self> {
+        let (ip_str, prefix_str) = s.split_once('/')?;
+        let prefix_len: u32 = prefix_str.parse().ok()?;
+
+        if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+            if prefix_len > 32 {
+                return None;
+            }
+            let mask = if prefix_len == 0 { 0 } else { !0u32 << (32 - prefix_len) };
+            Some(CidrRange::V4 {
+                addr: u32::from(ip) & mask,
+                mask,
+            })
+        } else if let Ok(ip) = ip_str.parse::<Ipv6Addr>() {
+            if prefix_len > 128 {
+                return None;
+            }
+            let mask = if prefix_len == 0 { 0 } else { !0u128 << (128 - prefix_len) };
+            Some(CidrRange::V6 {
+                addr: u128::from(ip) & mask,
+                mask,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (self, ip) {
+            (CidrRange::V4 { addr, mask }, IpAddr::V4(v4)) => {
+                (u32::from(v4) & mask) == *addr
+            }
+            (CidrRange::V6 { addr, mask }, IpAddr::V6(v6)) => {
+                (u128::from(v6) & mask) == *addr
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Compiled routing rule for fast matching.
 #[derive(Debug)]
 struct CompiledRule {
@@ -26,6 +74,8 @@ struct CompiledRule {
     exact_domains: Vec<String>,
     /// Wildcard suffixes: "*.google.com" stored as ".google.com".
     wildcard_suffixes: Vec<String>,
+    /// IP/CIDR ranges.
+    ip_ranges: Vec<CidrRange>,
     /// GeoIP country codes (uppercase).
     geoip_codes: Vec<String>,
 }
@@ -102,6 +152,13 @@ impl Router {
             }
         }
 
+        // Check IP range rules (CIDR)
+        for cidr in &rule.ip_ranges {
+            if cidr.contains(dest_ip) {
+                return true;
+            }
+        }
+
         // Check GeoIP rules
         if !rule.geoip_codes.is_empty() {
             if let Some(country) = self.lookup_country(dest_ip) {
@@ -157,12 +214,21 @@ fn compile_rule(rule: &RoutingRule) -> CompiledRule {
         }
     }
 
+    let mut ip_ranges = Vec::new();
+    for cidr_str in &rule.ip_ranges {
+        match CidrRange::parse(cidr_str) {
+            Some(cidr) => ip_ranges.push(cidr),
+            None => tracing::warn!("Invalid CIDR range in config: {}", cidr_str),
+        }
+    }
+
     let geoip_codes: Vec<String> = rule.geoip.iter().map(|s| s.to_uppercase()).collect();
 
     CompiledRule {
         action,
         exact_domains,
         wildcard_suffixes,
+        ip_ranges,
         geoip_codes,
     }
 }
@@ -183,11 +249,13 @@ mod tests {
                         "*.youtube.com".into(),
                         "*.google.com".into(),
                     ],
+                    ip_ranges: vec![],
                     geoip: vec![],
                 },
                 RoutingRule {
                     action: "direct".into(),
                     domains: vec!["*.local".into()],
+                    ip_ranges: vec![],
                     geoip: vec![],
                 },
             ],
@@ -229,5 +297,70 @@ mod tests {
         let router = Router::new(&make_config(), None);
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         assert_eq!(router.resolve(None, ip), Action::Direct);
+    }
+
+    #[test]
+    fn test_cidr_v4_match() {
+        let config = RoutingConfig {
+            default_action: "direct".into(),
+            rules: vec![RoutingRule {
+                action: "proxy".into(),
+                domains: vec![],
+                ip_ranges: vec![
+                    "91.108.56.0/22".into(),
+                    "149.154.160.0/20".into(),
+                ],
+                geoip: vec![],
+            }],
+        };
+        let router = Router::new(&config, None);
+        // Inside 91.108.56.0/22 (91.108.56.0 - 91.108.59.255)
+        assert_eq!(router.resolve(None, "91.108.57.3".parse().unwrap()), Action::Proxy);
+        // Inside 149.154.160.0/20 (149.154.160.0 - 149.154.175.255)
+        assert_eq!(router.resolve(None, "149.154.167.50".parse().unwrap()), Action::Proxy);
+        // Outside
+        assert_eq!(router.resolve(None, "8.8.8.8".parse().unwrap()), Action::Direct);
+    }
+
+    #[test]
+    fn test_cidr_v6_match() {
+        let config = RoutingConfig {
+            default_action: "direct".into(),
+            rules: vec![RoutingRule {
+                action: "proxy".into(),
+                domains: vec![],
+                ip_ranges: vec!["2001:b28:f23d::/48".into()],
+                geoip: vec![],
+            }],
+        };
+        let router = Router::new(&config, None);
+        assert_eq!(
+            router.resolve(None, "2001:b28:f23d::1".parse().unwrap()),
+            Action::Proxy
+        );
+        assert_eq!(
+            router.resolve(None, "2001:b28:f23e::1".parse().unwrap()),
+            Action::Direct
+        );
+    }
+
+    #[test]
+    fn test_cidr_and_domain_combined() {
+        let config = RoutingConfig {
+            default_action: "direct".into(),
+            rules: vec![RoutingRule {
+                action: "proxy".into(),
+                domains: vec!["*.telegram.org".into()],
+                ip_ranges: vec!["91.108.56.0/22".into()],
+                geoip: vec![],
+            }],
+        };
+        let router = Router::new(&config, None);
+        // Match by domain
+        assert_eq!(router.resolve(Some("web.telegram.org"), "1.2.3.4".parse().unwrap()), Action::Proxy);
+        // Match by IP (no SNI — typical for Telegram)
+        assert_eq!(router.resolve(None, "91.108.56.1".parse().unwrap()), Action::Proxy);
+        // Neither
+        assert_eq!(router.resolve(Some("example.com"), "8.8.8.8".parse().unwrap()), Action::Direct);
     }
 }
