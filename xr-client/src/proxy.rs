@@ -51,6 +51,15 @@ pub struct ProxyState {
     pub listen_port: u16,
 }
 
+/// Enable TCP keepalive on a stream to detect dead connections.
+fn set_keepalive(stream: &TcpStream) {
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(15));
+    let sock_ref = socket2::SockRef::from(stream);
+    let _ = sock_ref.set_tcp_keepalive(&ka);
+}
+
 // ── Main proxy loop ──────────────────────────────────────────────────
 
 pub async fn run_proxy(
@@ -102,9 +111,18 @@ async fn handle_connection(
         return Ok(());
     }
 
-    // Peek at first bytes for SNI extraction (up to 4KB should cover ClientHello)
+    // Enable TCP keepalive to detect dead connections
+    set_keepalive(&client);
+
+    // Peek at first bytes for SNI extraction (with timeout — don't hang on dead connections)
     let mut peek_buf = vec![0u8; 4096];
-    let n = client.peek(&mut peek_buf).await?;
+    let n = match tokio::time::timeout(Duration::from_secs(10), client.peek(&mut peek_buf)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            tracing::debug!("Peek timeout from {}, dropping", client_addr);
+            return Ok(());
+        }
+    };
     let sni = sni::extract_sni(&peek_buf[..n]);
 
     let sni_display = sni.as_deref().unwrap_or("-");
@@ -119,6 +137,7 @@ async fn handle_connection(
         Action::Direct => {
             // Connect directly to the original destination
             let mut target = TcpStream::connect(orig_dst).await?;
+            set_keepalive(&target);
             relay_bidirectional(&mut client, &mut target).await
         }
         Action::Proxy => {
@@ -131,6 +150,7 @@ async fn handle_connection(
                     if state.on_server_down == Action::Direct {
                         // Fallback: try direct connection
                         let mut target = TcpStream::connect(orig_dst).await?;
+                        set_keepalive(&target);
                         relay_bidirectional(&mut client, &mut target).await
                     } else {
                         Err(e)
@@ -151,6 +171,7 @@ async fn tunnel_connection(
 ) -> io::Result<()> {
     // Connect to xr-proxy-server
     let mut server = connect_with_retry(&state.server_addr, 3).await?;
+    set_keepalive(&server);
 
     // Build connect payload with target address
     let target_addr = if let Some(domain) = sni {
@@ -221,6 +242,7 @@ async fn connect_with_retry(addr: &SocketAddr, max_retries: u32) -> io::Result<T
 // ── Data relay ───────────────────────────────────────────────────────
 
 /// Simple bidirectional relay for direct connections.
+/// Timeout if no data flows in either direction for 5 minutes.
 async fn relay_bidirectional(a: &mut TcpStream, b: &mut TcpStream) -> io::Result<()> {
     let (mut ar, mut aw) = a.split();
     let (mut br, mut bw) = b.split();
@@ -228,18 +250,33 @@ async fn relay_bidirectional(a: &mut TcpStream, b: &mut TcpStream) -> io::Result
     let r1 = tokio::io::copy(&mut ar, &mut bw);
     let r2 = tokio::io::copy(&mut br, &mut aw);
 
-    tokio::select! {
-        result = r1 => result.map(|_| ()),
-        result = r2 => result.map(|_| ()),
+    // Overall connection limit: 1 hour max
+    let timeout = tokio::time::timeout(Duration::from_secs(3600), async {
+        tokio::select! {
+            result = r1 => result.map(|_| ()),
+            result = r2 => result.map(|_| ()),
+        }
+    });
+
+    match timeout.await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::debug!("Direct relay timed out (1h)");
+            Ok(())
+        }
     }
 }
 
 /// Obfuscated relay: frames client data into protocol frames and vice versa.
+/// Each read times out after 5 minutes idle; total connection limited to 1 hour.
 async fn relay_obfuscated(
     client: &mut TcpStream,
     server: &mut TcpStream,
     codec: &Codec,
 ) -> io::Result<()> {
+    let idle_timeout = Duration::from_secs(300); // 5 min idle
+    let max_lifetime = Duration::from_secs(3600); // 1h total
+
     let (mut cr, mut cw) = client.split();
     let (mut sr, mut sw) = server.split();
 
@@ -250,7 +287,13 @@ async fn relay_obfuscated(
     let upload = async move {
         let mut buf = vec![0u8; 8192];
         loop {
-            let n = cr.read(&mut buf).await?;
+            let n = match tokio::time::timeout(idle_timeout, cr.read(&mut buf)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    tracing::debug!("Upload idle timeout (5m)");
+                    return Ok::<(), io::Error>(());
+                }
+            };
             if n == 0 {
                 let close = codec_up.encode_frame(Command::Close, &[])?;
                 sw.write_all(&close).await?;
@@ -267,7 +310,13 @@ async fn relay_obfuscated(
         let mut buf = vec![0u8; 65536 + 256]; // max frame size
         let mut filled = 0;
         loop {
-            let n = sr.read(&mut buf[filled..]).await?;
+            let n = match tokio::time::timeout(idle_timeout, sr.read(&mut buf[filled..])).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    tracing::debug!("Download idle timeout (5m)");
+                    return Ok::<(), io::Error>(());
+                }
+            };
             if n == 0 {
                 break;
             }
@@ -295,8 +344,18 @@ async fn relay_obfuscated(
         Ok::<(), io::Error>(())
     };
 
-    tokio::select! {
-        result = upload => result,
-        result = download => result,
+    let result = tokio::time::timeout(max_lifetime, async {
+        tokio::select! {
+            result = upload => result,
+            result = download => result,
+        }
+    });
+
+    match result.await {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::debug!("Tunnel relay timed out (1h)");
+            Ok(())
+        }
     }
 }
