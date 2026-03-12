@@ -50,7 +50,24 @@ listen_port = 1080                    # Local port for transparent proxy
 auto_redirect = true                  # Auto-setup nftables/iptables rules
 on_server_down = "direct"             # "direct" = bypass if server is down, "block" = block traffic
 log_level = "info"                    # error, warn, info, debug
+# bypass_ips: LAN devices whose traffic should NOT go through the proxy.
+# Useful for game consoles, smart TVs, etc. Use their static DHCP IP.
+# bypass_ips = ["192.168.1.50", "192.168.1.51"]
 
 # ─── GeoIP (only with --features geoip build) ────────────────────────
 # [geoip]
 # database = "/etc/xr-proxy/GeoLite2-Country.mmdb"
+
+# ─── UDP Relay ─────────────────
+# Relay UDP traffic through VPS for devices that need NAT traversal.
+# Requires nftables TPROXY setup (see docs/OPENWRT.md).
+# [udp_relay]
+# enabled = true
+# listen_port = 1081                  # Local TPROXY port
+# vps_port = 9999                     # UDP relay port on VPS (must match server config)
+# use_tproxy = true                   # Use TPROXY (recommended) vs REDIRECT
+# source_ips = []                     # Empty = relay all LAN devices (recommended)
+# # source_ips = ["192.168.1.187"]   # Or: only specific IPs
+# exclude_dst_ports = [53, 67, 68]    # Don't relay DNS, DHCP
+# flow_timeout_sec = 120              # UDP flow expiry
+# keepalive_interval_sec = 25         # Keepalive to VPS

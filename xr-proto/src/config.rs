@@ -13,6 +13,8 @@ pub struct ClientConfig {
     pub client: ClientSettings,
     #[serde(default)]
     pub geoip: Option<GeoIpConfig>,
+    #[serde(default)]
+    pub udp_relay: Option<UdpRelayClientConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +65,10 @@ pub struct ClientSettings {
     pub on_server_down: String,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Source IPs to bypass (not redirect through proxy).
+    /// Useful for game consoles, smart TVs, etc.
+    #[serde(default)]
+    pub bypass_ips: Vec<String>,
 }
 
 impl Default for ClientSettings {
@@ -72,6 +78,7 @@ impl Default for ClientSettings {
             auto_redirect: true,
             on_server_down: default_on_server_down(),
             log_level: default_log_level(),
+            bypass_ips: vec![],
         }
     }
 }
@@ -93,6 +100,49 @@ pub struct ServerConfig {
     pub fallback: FallbackConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub udp_relay: Option<UdpRelayServerConfig>,
+}
+
+// ── UDP Relay configs ───────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct UdpRelayClientConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_udp_listen_port")]
+    pub listen_port: u16,
+    /// VPS host for UDP relay (defaults to server.address)
+    pub vps_host: Option<String>,
+    #[serde(default = "default_udp_vps_port")]
+    pub vps_port: u16,
+    #[serde(default = "default_true")]
+    pub use_tproxy: bool,
+    /// Source IPs to relay (e.g. Switch IP)
+    #[serde(default)]
+    pub source_ips: Vec<String>,
+    /// Destination ports to exclude from relay
+    #[serde(default = "default_exclude_ports")]
+    pub exclude_dst_ports: Vec<u16>,
+    #[serde(default = "default_flow_timeout")]
+    pub flow_timeout_sec: u64,
+    #[serde(default = "default_keepalive_interval")]
+    pub keepalive_interval_sec: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UdpRelayServerConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_udp_vps_port")]
+    pub listen_port: u16,
+    /// Port range for incoming connections from other players
+    #[serde(default = "default_incoming_port_min")]
+    pub incoming_port_min: u16,
+    #[serde(default = "default_incoming_port_max")]
+    pub incoming_port_max: u16,
+    #[serde(default = "default_flow_timeout")]
+    pub flow_timeout_sec: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,6 +240,27 @@ fn default_max_connections() -> u32 {
 }
 fn default_timeout() -> u64 {
     300
+}
+fn default_udp_listen_port() -> u16 {
+    1081
+}
+fn default_udp_vps_port() -> u16 {
+    9999
+}
+fn default_exclude_ports() -> Vec<u16> {
+    vec![53, 67, 68]
+}
+fn default_flow_timeout() -> u64 {
+    120
+}
+fn default_keepalive_interval() -> u64 {
+    25
+}
+fn default_incoming_port_min() -> u16 {
+    45000
+}
+fn default_incoming_port_max() -> u16 {
+    65535
 }
 
 // ── Loaders ──────────────────────────────────────────────────────────

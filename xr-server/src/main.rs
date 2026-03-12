@@ -1,5 +1,6 @@
 mod fallback;
 mod handler;
+mod udp_relay;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -47,6 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let strategy = ModifierStrategy::from_str(&config.obfuscation.modifier)
         .ok_or("unknown modifier strategy")?;
     let obfuscator = Obfuscator::new(key, config.obfuscation.salt as u32, strategy);
+    let udp_obfuscator = obfuscator.clone();
     // Server doesn't need padding — it uses whatever the client sends
     let codec = Codec::new(obfuscator, 16, 128);
 
@@ -69,6 +71,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connection limiter
     let semaphore = Arc::new(Semaphore::new(max_conns));
+
+    // Start UDP relay if configured
+    if let Some(udp_config) = config.udp_relay {
+        if udp_config.enabled {
+            let udp_obfs = udp_obfuscator;
+            tokio::spawn(async move {
+                if let Err(e) = udp_relay::run_udp_relay_server(
+                    udp_config.listen_port,
+                    udp_obfs,
+                    udp_config.flow_timeout_sec,
+                    udp_config.incoming_port_min,
+                    udp_config.incoming_port_max,
+                ).await {
+                    tracing::error!("UDP relay server failed: {}", e);
+                }
+            });
+        }
+    }
 
     // Accept loop
     loop {

@@ -66,14 +66,16 @@ pub fn detect_backend() -> Option<FirewallBackend> {
 }
 
 /// Set up redirect rules. `server_ip` is excluded to avoid redirect loops.
+/// `bypass_ips` are source IPs that should not be redirected (game consoles, etc.)
 pub fn setup_redirect(
     backend: FirewallBackend,
     listen_port: u16,
     server_ip: &str,
+    bypass_ips: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     match backend {
-        FirewallBackend::Nftables => setup_nftables(listen_port, server_ip),
-        FirewallBackend::Iptables => setup_iptables(listen_port, server_ip),
+        FirewallBackend::Nftables => setup_nftables(listen_port, server_ip, bypass_ips),
+        FirewallBackend::Iptables => setup_iptables(listen_port, server_ip, bypass_ips),
     }
 }
 
@@ -90,36 +92,41 @@ pub fn cleanup_redirect(backend: FirewallBackend) -> Result<(), Box<dyn std::err
 fn setup_nftables(
     listen_port: u16,
     server_ip: &str,
+    bypass_ips: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let nft = find_nft().ok_or("nft binary not found")?;
 
     // Clean up any existing rules first
     let _ = cleanup_nftables();
 
+    // Build bypass rules for excluded source IPs
+    let bypass_rules: String = bypass_ips
+        .iter()
+        .map(|ip| format!("        ip saddr {} return", ip))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let bypass_section = if bypass_rules.is_empty() {
+        String::new()
+    } else {
+        format!("\n        # Bypass devices (game consoles, etc.)\n{}\n", bypass_rules)
+    };
+
     let ruleset = format!(
         r#"
 table ip {table} {{
     chain prerouting {{
         type nat hook prerouting priority dstnat; policy accept;
-
-        # Only redirect traffic from LAN clients (private source IPs)
-        # This prevents WAN scanners from hitting the proxy port
-        ip saddr != 10.0.0.0/8 ip saddr != 172.16.0.0/12 ip saddr != 192.168.0.0/16 ip saddr != 127.0.0.0/8 return
-
-        # Skip destinations that should go direct
+{bypass_section}
         ip daddr {server_ip} return
         ip daddr 10.0.0.0/8 return
         ip daddr 172.16.0.0/12 return
         ip daddr 192.168.0.0/16 return
         ip daddr 127.0.0.0/8 return
-
-        # Redirect HTTP/HTTPS to proxy
         tcp dport {{ 80, 443 }} redirect to :{listen_port}
     }}
-
     chain input {{
         type filter hook input priority filter; policy accept;
-        # Block direct access to proxy port from non-LAN sources
         tcp dport {listen_port} ip saddr 10.0.0.0/8 accept
         tcp dport {listen_port} ip saddr 172.16.0.0/12 accept
         tcp dport {listen_port} ip saddr 192.168.0.0/16 accept
@@ -131,6 +138,7 @@ table ip {table} {{
         table = NFT_TABLE,
         server_ip = server_ip,
         listen_port = listen_port,
+        bypass_section = bypass_section,
     );
 
     // Use sh -c with pipe to feed ruleset via stdin
@@ -171,26 +179,17 @@ fn cleanup_nftables() -> Result<(), Box<dyn std::error::Error>> {
 fn setup_iptables(
     listen_port: u16,
     server_ip: &str,
+    bypass_ips: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = cleanup_iptables();
 
     // Create custom chain
     run_ipt(&["-t", "nat", "-N", IPT_CHAIN])?;
 
-    // Only redirect traffic from LAN (private source IPs)
-    // Skip anything from WAN to prevent redirect loops
-    run_ipt(&["-t", "nat", "-A", IPT_CHAIN,
-        "-s", "10.0.0.0/8", "-j", "RETURN"])?;  // will be overridden below
-    // Actually: use positive match — only process private sources
-    let _ = run_ipt(&["-t", "nat", "-F", IPT_CHAIN]); // re-flush
-
-    // First: RETURN for non-LAN sources (prevents WAN redirect loops)
-    run_ipt(&["-t", "nat", "-A", IPT_CHAIN,
-        "!", "-s", "10.0.0.0/8",
-        "!", "-s", "172.16.0.0/12",
-        "!", "-s", "192.168.0.0/16",
-        "!", "-s", "127.0.0.0/8",
-        "-j", "RETURN"])?;
+    // Bypass devices (game consoles, etc.)
+    for ip in bypass_ips {
+        run_ipt(&["-t", "nat", "-A", IPT_CHAIN, "-s", ip, "-j", "RETURN"])?;
+    }
 
     // Skip server IP, private destination ranges
     run_ipt(&["-t", "nat", "-A", IPT_CHAIN, "-d", server_ip, "-j", "RETURN"])?;

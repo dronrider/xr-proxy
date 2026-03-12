@@ -2,6 +2,7 @@ mod proxy;
 mod redirect;
 mod routing;
 mod sni;
+mod udp_relay;
 
 use clap::Parser;
 use std::net::SocketAddr;
@@ -83,6 +84,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let strategy = ModifierStrategy::from_str(&config.obfuscation.modifier)
         .ok_or("unknown modifier strategy")?;
     let obfuscator = Obfuscator::new(key, config.obfuscation.salt as u32, strategy);
+    let udp_obfuscator = obfuscator.clone(); // for UDP relay
     let codec = Codec::new(
         obfuscator,
         config.obfuscation.padding_min,
@@ -116,6 +118,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     backend,
                     config.client.listen_port,
                     &config.server.address,
+                    &config.client.bypass_ips,
                 )?;
                 Some(backend)
             }
@@ -134,8 +137,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Run proxy (with graceful shutdown on SIGINT/SIGTERM)
+    // Run TCP proxy
     let proxy_handle = tokio::spawn(proxy::run_proxy(config.client.listen_port, state));
+
+    // Run UDP relay if configured
+    let server_address = config.server.address.clone();
+    let udp_handle = if let Some(udp_config) = config.udp_relay {
+        if udp_config.enabled {
+            tracing::info!("Starting UDP relay (port {})", udp_config.listen_port);
+            Some(tokio::spawn(async move {
+                if let Err(e) = udp_relay::run_udp_relay(&udp_config, udp_obfuscator, &server_address).await {
+                    tracing::error!("UDP relay failed: {}", e);
+                }
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Wait for shutdown signal
     tokio::select! {
@@ -145,6 +165,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::error!("{}", msg);
                 log_to_file(&msg);
             }
+        }
+        _ = async {
+            if let Some(h) = udp_handle { h.await.ok(); }
+            else { std::future::pending::<()>().await; }
+        } => {
+            tracing::warn!("UDP relay exited");
         }
         _ = shutdown_signal() => {
             tracing::info!("Shutdown signal received");

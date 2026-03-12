@@ -28,3 +28,12 @@ enabled = true
 [logging]
 level = "info"                        # error, warn, info, debug
 # file = "/var/log/xr-proxy.log"     # Optional log file
+
+# ─── UDP Relay ────────────────────────────────────────────────────────
+# Relay UDP traffic for game consoles. Must be enabled on both client and server.
+# [udp_relay]
+# enabled = true
+# listen_port = 9999                  # Must match client's vps_port
+# incoming_port_min = 45000           # Port range for incoming P2P connections
+# incoming_port_max = 65535
+# flow_timeout_sec = 120

@@ -8,240 +8,125 @@
 ## Как это работает
 
 ```text
-Телефон/Ноутбук → [OpenWRT роутер с xr-client] → Интернет
-                         │                          (напрямую для разрешённых)
-                         ▼
-                   [VPS с xr-server]
-                         │
-                         ▼
-                      Интернет
-                   (для заблокированных)
+                           TCP (HTTP/HTTPS)
+Телефон/Ноутбук ──┬──→ [OpenWRT роутер] ──→ Интернет (разрешённые сайты)
+                   │       xr-client
+Игровая приставка ─┤          │
+                   │          ▼ обфусцированный туннель
+Любое устройство ──┘    [VPS xr-server]
+                              │
+                              ▼
+                           Интернет (заблокированные сайты)
 ```
 
-Трафик к заблокированным ресурсам автоматически проксируется через ваш VPS.
+Трафик к заблокированным ресурсам автоматически проксируется через VPS.
 Протокол обфусцирован — фаервол не может определить, что это прокси.
+
+### Возможности
+
+- **TCP прокси** — прозрачное проксирование HTTP/HTTPS по доменам, IP-диапазонам (CIDR) и GeoIP
+- **UDP relay** — проксирование UDP-трафика для игровых консолей (например Nintendo Switch P2P мультиплеер)
+- **Обфускация** — уникальный протокол с XOR + позиционные модификаторы + случайный padding, не детектируется DPI
+- **Маршрутизация** — гибкие правила: домены, wildcard (`*.google.com`), CIDR (`91.108.56.0/22`), GeoIP
+- **Защита от сбоев** — автоматический перезапуск через procd + watchdog, crash-логи, fallback на direct при недоступности сервера
+- **Лёгкий** — 4-8 МБ RAM, 1-3% CPU на роутере (vs 100+ МБ у v2ray/xray)
+
+## Структура проекта
+
+```text
+xr-proxy/
+├── xr-proto/          # Общая библиотека: протокол, обфускация, конфиги
+├── xr-client/         # Клиент для OpenWRT роутера
+├── xr-server/         # Сервер для VPS
+├── configs/           # Примеры конфигурации
+│   ├── client.toml
+│   ├── server.toml
+│   └── routing-russia.toml
+├── deploy/            # Init-скрипты, systemd-юниты, watchdog
+├── scripts/           # Утилиты: генерация ключа, диагностика, TPROXY
+└── docs/              # Документация по развёртыванию
+```
 
 ## Требования
 
-**VPS (сервер):**
+**VPS (сервер):** любой Linux с публичным IP в стране без блокировок. Минимум: 1 vCPU, 64 МБ RAM.
 
-- Любой Linux VPS с публичным IP (Ubuntu, Debian, CentOS и т.д.)
-- В стране без блокировок (Нидерланды, Германия, США и т.д.)
-- Минимум: 1 vCPU, 64 МБ RAM
+**Роутер (клиент):** OpenWRT 21.02+, 32 МБ RAM, 8 МБ flash. Архитектуры: aarch64, arm, mips, mipsel.
 
-**Роутер (клиент):**
-
-- OpenWRT 21.02 или новее
-- Минимум: 32 МБ RAM, 8 МБ flash
-- Архитектура: mipsel, mips, arm, aarch64
-
-**Компьютер для сборки:**
-
-- Linux или macOS
-- Установленный [Rust](https://rustup.rs/) (1.70+)
-- Для кросс-компиляции: [cross](https://github.com/cross-rs/cross) + **Docker** (должен быть запущен)
-
----
+**Сборка:** Linux или macOS с [Rust](https://rustup.rs/) 1.70+ и [cross](https://github.com/cross-rs/cross) + Docker.
 
 ## Быстрый старт
 
-### Шаг 1. Клонируйте репозиторий
+### 1. Сгенерируйте ключ
 
 ```bash
 git clone https://github.com/dronrider/xr-proxy.git
 cd xr-proxy
-```
-
-### Шаг 2. Сгенерируйте ключ
-
-```bash
-chmod +x scripts/generate-key.sh
 ./scripts/generate-key.sh
 ```
 
-Запишите сгенерированный ключ — он понадобится и для сервера, и для клиента.
-
-### Шаг 3. Настройте и запустите сервер (на VPS)
-
-#### Сборка на VPS
+### 2. Сервер (на VPS)
 
 ```bash
-# Установить системные зависимости для сборки
-sudo apt update && sudo apt install -y build-essential    # Ubuntu/Debian
-# sudo yum groupinstall -y "Development Tools"            # CentOS/RHEL
-
-# Установить Rust (если ещё нет)
+# Установить Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 
-# Клонировать и собрать сервер
-git clone https://github.com/dronrider/xr-proxy.git
-cd xr-proxy
+# Собрать и установить
 cargo build --release -p xr-server
-```
-
-#### Настройка
-
-```bash
-# Создать директорию конфига
 sudo mkdir -p /etc/xr-proxy
-
-# Скопировать и отредактировать конфиг
-sudo cp configs/server.toml /etc/xr-proxy/server.toml
-sudo nano /etc/xr-proxy/server.toml
-```
-
-В файле `server.toml` замените:
-
-- `key = "..."` → ваш ключ из шага 2
-- `port = 8443` → при необходимости измените порт
-- `salt = 0xDEADBEEF` → при желании замените на своё значение
-
-#### Установка как сервис
-
-```bash
-# Скопировать бинарь и сервис
 sudo cp target/release/xr-server /usr/local/bin/
+sudo cp configs/server.toml /etc/xr-proxy/server.toml
 sudo cp deploy/xr-proxy-server.service /etc/systemd/system/
+```
 
-# Запустить
+Отредактируйте `/etc/xr-proxy/server.toml` — вставьте ключ из шага 1. Запустите:
+
+```bash
 sudo systemctl daemon-reload
-sudo systemctl enable xr-proxy-server
-sudo systemctl start xr-proxy-server
-
-# Проверить статус
-sudo systemctl status xr-proxy-server
+sudo systemctl enable --now xr-proxy-server
 ```
 
-#### Открыть порт в файрволе VPS
+Откройте порт 8443/tcp (и 9999/udp если нужен UDP relay) в файрволе VPS.
+
+### 3. Клиент (на роутере)
 
 ```bash
-# UFW (Ubuntu)
-sudo ufw allow 8443/tcp
-
-# Или firewalld (CentOS)
-sudo firewall-cmd --permanent --add-port=8443/tcp
-sudo firewall-cmd --reload
-```
-
-> ⚠️ Также откройте порт в панели управления VPS (AWS Security Group, DigitalOcean Firewall и т.д.)
-
-### Шаг 4. Настройте и запустите клиент (на роутере)
-
-#### Определите архитектуру роутера
-
-```bash
-# На роутере через SSH:
-uname -m
-# или
-opkg print-architecture
-```
-
-Типичные значения:
-
-| Модель роутера              | Архитектура | Target в Rust                                                       |
-| --------------------------- | ----------- | ------------------------------------------------------------------- |
-| GL.iNet GL-MT300N-V2       | mipsel      | `mipsel-unknown-linux-musl`                                         |
-| GL.iNet GL-AR750S          | mips        | `mips-unknown-linux-musl`                                           |
-| GL.iNet Beryl (MT1300)     | aarch64     | `aarch64-unknown-linux-musl`                                        |
-| Raspberry Pi               | arm/aarch64 | `armv7-unknown-linux-musleabihf` / `aarch64-unknown-linux-musl`     |
-
-#### Сборка (на вашем компьютере)
-
-> ⚠️ Для `cross` необходим **запущенный Docker**. Убедитесь, что Docker запущен перед сборкой:
-> `docker info` — если команда выдаёт ошибку, запустите Docker.
-
-```bash
-# Установить cross для кросс-компиляции
-cargo install cross --git https://github.com/cross-rs/cross
-
-# Убедиться, что Docker запущен
-docker info >/dev/null 2>&1 || echo "Docker не запущен! Запустите Docker и повторите."
-
-# Собрать для вашей архитектуры (пример: aarch64)
+# На вашем компьютере — кросс-компиляция (Docker должен быть запущен!)
 cross build --release --target aarch64-unknown-linux-musl -p xr-client
 
-# Бинарь будет здесь:
-ls -lh target/aarch64-unknown-linux-musl/release/xr-client
-```
-
-Для минимального размера (опционально):
-
-```bash
-# Установить strip для целевой архитектуры и сжать
-strip target/aarch64-unknown-linux-musl/release/xr-client
-# UPX может дополнительно уменьшить размер (необязательно):
-# upx --best target/aarch64-unknown-linux-musl/release/xr-client
-```
-
-#### Загрузите на роутер
-
-```bash
-# С вашего компьютера
+# Загрузить на роутер
 scp -O target/aarch64-unknown-linux-musl/release/xr-client root@192.168.1.1:/usr/bin/
 scp -O configs/client.toml root@192.168.1.1:/etc/xr-proxy/config.toml
 scp -O deploy/xr-proxy.init root@192.168.1.1:/etc/init.d/xr-proxy
 scp -O deploy/xr-watchdog.sh root@192.168.1.1:/usr/bin/xr-watchdog.sh
 ```
 
-#### Настройте конфиг на роутере
+На роутере: отредактируйте `/etc/xr-proxy/config.toml` (IP сервера, ключ, домены). Запустите:
 
 ```bash
-ssh root@192.168.1.1
-
-# Создать директорию (если не существует)
-mkdir -p /etc/xr-proxy
-
-# Отредактировать конфиг
-vi /etc/xr-proxy/config.toml
-```
-
-В файле `config.toml` замените:
-
-- `address = "YOUR_SERVER_IP"` → IP-адрес вашего VPS
-- `key = "..."` → тот же ключ из шага 2
-- `port`, `salt`, `modifier` → должны совпадать с сервером
-- `domains = [...]` → список доменов, которые нужно проксировать
-
-#### Запустите
-
-```bash
-# Сделать файлы исполняемыми
-chmod +x /usr/bin/xr-client
-chmod +x /etc/init.d/xr-proxy
-chmod +x /usr/bin/xr-watchdog.sh
-
-# Запустить и включить автозапуск
+chmod +x /usr/bin/xr-client /etc/init.d/xr-proxy /usr/bin/xr-watchdog.sh
 /etc/init.d/xr-proxy enable
 /etc/init.d/xr-proxy start
 ```
 
-### Шаг 5. Проверьте работу
+### 4. Проверьте
 
-Подключите телефон или ноутбук к WiFi роутера и откройте один из заблокированных сайтов.
-
-Для диагностики:
+Подключите устройство к WiFi роутера, откройте заблокированный сайт.
 
 ```bash
-# На роутере — смотреть логи в реальном времени
+# Логи на роутере
 logread -f | grep xr
 
-# На сервере — смотреть подключения
-sudo journalctl -u xr-proxy-server -f
+# Диагностика
+scp -O scripts/diagnose.sh root@192.168.1.1:/tmp/ && ssh root@192.168.1.1 sh /tmp/diagnose.sh
 ```
 
----
+## Маршрутизация
 
-## Примеры конфигурации маршрутизации
+Правила проверяются по порядку. Первое совпавшее — применяется. Если ничего не совпало — `default_action`.
 
-### Минимальный — проксировать всё
-
-```toml
-[routing]
-default_action = "proxy"
-```
-
-### Стандартный — проксировать только нужное
+### По доменам (SNI)
 
 ```toml
 [routing]
@@ -251,27 +136,33 @@ default_action = "direct"
 action = "proxy"
 domains = [
   "youtube.com", "*.youtube.com", "*.googlevideo.com",
-  "*.google.com", "*.gmail.com",
   "telegram.org", "*.telegram.org", "*.t.me",
 ]
 ```
 
-### С GeoIP — проксировать по стране
+### По IP-диапазонам (CIDR)
 
-Требует сборки с `--features geoip` и скачивания базы GeoLite2:
-
-```bash
-# Сборка с GeoIP (Docker должен быть запущен)
-cross build --release --target aarch64-unknown-linux-musl -p xr-client --features geoip
-
-# Скачать базу (нужна бесплатная регистрация на maxmind.com)
-# Скопировать GeoLite2-Country.mmdb на роутер в /etc/xr-proxy/
-```
+Для сервисов, которые подключаются напрямую по IP без SNI (например Telegram):
 
 ```toml
-[routing]
-default_action = "direct"
+[[routing.rules]]
+action = "proxy"
+domains = ["telegram.org", "*.telegram.org"]
+ip_ranges = [
+  "91.108.56.0/22",
+  "91.108.4.0/22",
+  "149.154.160.0/20",
+  "2001:b28:f23d::/48",
+]
+```
 
+Домены и IP-диапазоны в одном правиле работают через ИЛИ.
+
+### По GeoIP
+
+Требует сборки с `--features geoip` и базы [MaxMind GeoLite2-Country](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data):
+
+```toml
 [[routing.rules]]
 action = "proxy"
 geoip = ["US", "NL", "DE"]
@@ -280,102 +171,157 @@ geoip = ["US", "NL", "DE"]
 database = "/etc/xr-proxy/GeoLite2-Country.mmdb"
 ```
 
----
+### Готовый конфиг для России
 
-## Настройка обфускации
+В `configs/routing-russia.toml` — правила для YouTube, Meta, Twitter/X, Telegram (включая IP-диапазоны), LinkedIn, Discord, AI-сервисов, GitHub и других ресурсов.
 
-Каждый параметр обфускации делает ваш трафик уникальным:
+## Исключение устройств из прокси
 
-| Параметр        | Описание                      | Влияние                                                                                                    |
-| --------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `key`           | Общий секретный ключ          | Без правильного ключа данные невозможно расшифровать                                                       |
-| `modifier`      | Алгоритм модификации          | Меняет паттерн обфускации. Варианты: `positional_xor_rotate`, `rotating_salt`, `substitution_table`        |
-| `salt`          | Дополнительный параметр       | Любое 32-bit число, меняет выходные данные при том же ключе                                                |
-| `padding_min/max` | Случайный мусор в каждом пакете | Маскирует реальные размеры пакетов от статистического анализа                                            |
+Если прокси мешает работе какого-то устройства, его можно исключить на уровне файрвола — трафик с этого IP вообще не будет заворачиваться в прокси:
 
-**Все параметры должны совпадать на клиенте и сервере!**
+```toml
+[client]
+bypass_ips = ["192.168.1.50"]
+```
 
----
+Рекомендуется закрепить статический IP за устройством через DHCP.
+
+## UDP Relay (игровые консоли)
+
+Nintendo Switch и другие консоли используют P2P UDP для онлайн-мультиплеера. Если провайдер блокирует входящие UDP-пакеты, онлайн-игры не работают. UDP relay решает эту проблему — весь UDP-трафик проходит через VPS.
+
+### Настройка
+
+**Сервер** (`server.toml`):
+
+```toml
+[udp_relay]
+enabled = true
+listen_port = 9999
+```
+
+**Клиент** (`config.toml`):
+
+```toml
+[udp_relay]
+enabled = true
+listen_port = 1081
+vps_port = 9999
+source_ips = []                  # Все LAN-устройства
+exclude_dst_ports = [53, 67, 68]
+```
+
+**Роутер** — настроить nftables TPROXY:
+
+```bash
+scp -O scripts/udp-tproxy-setup.sh root@192.168.1.1:/usr/bin/
+ssh root@192.168.1.1 "chmod +x /usr/bin/udp-tproxy-setup.sh && udp-tproxy-setup.sh"
+```
+
+Скрипт без аргументов настраивает relay для всех LAN-устройств. Для конкретного IP: `udp-tproxy-setup.sh 192.168.1.187`.
+
+Откройте порт 9999/udp на файрволе VPS.
+
+### Как это работает
+
+```text
+Switch ──UDP──→ [роутер: TPROXY → xr-client] ══обфусцированный UDP══→ [VPS: xr-server]
+                                                                            │
+                                                                     bind(src_port)
+                                                                            │
+                                                                     UDP → Другой игрок
+```
+
+VPS сохраняет source port Switch при отправке в интернет — критично для NAT traversal.
+
+## Обфускация
+
+Каждый параметр делает трафик уникальным и неузнаваемым для DPI:
+
+| Параметр | Описание |
+|---|---|
+| `key` | Общий секретный ключ (base64). Без него данные нерасшифруемы |
+| `modifier` | Алгоритм: `positional_xor_rotate`, `rotating_salt`, `substitution_table` |
+| `salt` | 32-bit число, меняет выходные данные при том же ключе |
+| `padding_min/max` | Случайный padding в каждом пакете, маскирует размеры |
+
+Все параметры должны совпадать на клиенте и сервере.
+
+## Надёжность
+
+**procd** — init-скрипт с `respawn 3600 15 0` (бесконечные перезапуски с паузой 15 сек).
+
+**Watchdog** — cron каждую минуту проверяет процесс. Если мёртв: записывает диагностику в `/etc/xr-proxy/crash.log`, чистит firewall-правила, перезапускает. Также ставит OOM-защиту (`oom_score_adj=-900`).
+
+**Crash log** — персистентный (`/etc/xr-proxy/crash.log`), переживает ребут. Содержит: dmesg (OOM-killer), последние логи, состояние памяти.
+
+**Защита от петель** — nftables input chain блокирует доступ к порту прокси с WAN + детекция петель в коде.
+
+**Таймауты** — idle 5 мин, max lifetime 1 час, TCP keepalive 60 сек на всех сокетах. Зомби-соединения невозможны.
+
+**`SO_REUSEADDR`** — быстрый рестарт без "address already in use".
 
 ## Устранение неполадок
 
-### Клиент не запускается
-
 ```bash
-# Проверить, что бинарь запускается
+# Диагностика (на роутере)
+sh /tmp/diagnose.sh
+
+# Логи
+logread -f | grep xr
+
+# Причины крашей
+cat /etc/xr-proxy/crash.log
+
+# Ручной запуск с debug-логами
 /usr/bin/xr-client -c /etc/xr-proxy/config.toml -l debug
+
+# Проверить firewall-правила
+nft list table ip xr_proxy
+
+# Ручная очистка правил
+nft delete table ip xr_proxy
 ```
 
-### Сайты не открываются через прокси
-
-1. Проверьте, что сервер запущен: `curl http://YOUR_SERVER_IP:8443` (должен ответить HTML-заглушкой)
-2. Проверьте, что порт открыт: `nc -zv YOUR_SERVER_IP 8443`
-3. Проверьте, что ключи совпадают в обоих конфигах
-4. Посмотрите логи: `logread -f` на роутере, `journalctl -u xr-proxy-server -f` на сервере
-
-### nftables/iptables ошибки
+## Сборка
 
 ```bash
-# Проверить, что redirect правила созданы:
-nft list ruleset   # для nftables
-iptables -t nat -L  # для iptables
+# Сервер (на VPS)
+cargo build --release -p xr-server
 
-# Ручная очистка (если клиент завершился аварийно):
-nft delete table ip xr_proxy        # nftables
-iptables -t nat -F XR_PROXY         # iptables
-iptables -t nat -D PREROUTING -j XR_PROXY
-iptables -t nat -X XR_PROXY
+# Клиент — кросс-компиляция (требует Docker!)
+cross build --release --target aarch64-unknown-linux-musl -p xr-client
+cross build --release --target mipsel-unknown-linux-musl -p xr-client
+cross build --release --target armv7-unknown-linux-musleabihf -p xr-client
+
+# Клиент с GeoIP
+cross build --release --target aarch64-unknown-linux-musl -p xr-client --features geoip
+
+# Тесты
+cargo test --workspace
 ```
 
-### Высокое потребление памяти
+## Файлы на роутере
 
-- Убедитесь, что используете release-сборку (`--release`)
-- Без GeoIP потребление: ~4-8 МБ RAM (зависит от количества активных соединений), с GeoIP: ~10-15 МБ
-- Если всё равно много — уменьшите `max_connections` в серверном конфиге
-
-### cross: ошибка «Docker not running» или «docker: command not found»
-
-`cross` использует Docker для кросс-компиляции. Убедитесь, что:
-
-1. Docker установлен: [docs.docker.com/get-docker](https://docs.docker.com/get-docker/)
-2. Docker запущен: `docker info`
-3. Ваш пользователь в группе docker: `sudo usermod -aG docker $USER` (перелогиньтесь после)
-
----
+```text
+/usr/bin/xr-client              # Бинарь (~1.5 МБ)
+/usr/bin/xr-watchdog.sh         # Watchdog (перезапуск + crash-лог)
+/etc/xr-proxy/config.toml       # Конфигурация
+/etc/xr-proxy/crash.log         # Лог падений (создаётся автоматически)
+/etc/init.d/xr-proxy            # Init-скрипт (procd)
+```
 
 ## Безопасность
 
 - **Ключ** — храните в секрете. Любой, кто знает ключ, может расшифровать трафик.
-- **Это НЕ полноценное шифрование** — протокол обфусцирует трафик, чтобы он не распознавался DPI. Для конфиденциальности используйте HTTPS (который и так используется большинством сайтов).
-- **Сервер доступен из интернета** — используйте файрвол, ограничьте доступ к SSH, обновляйте систему.
+- **Это НЕ полноценное шифрование** — протокол обфусцирует трафик, чтобы он не распознавался DPI. Для конфиденциальности используйте HTTPS.
+- **Сервер доступен из интернета** — используйте файрвол, ограничьте SSH, обновляйте систему.
 
----
+## Документация
 
-## Сборка из исходников
-
-```bash
-# Только сервер (для VPS)
-cargo build --release -p xr-server
-
-# Только клиент (нативная сборка, для тестов)
-cargo build --release -p xr-client
-
-# Клиент с GeoIP
-cargo build --release -p xr-client --features geoip
-
-# Кросс-компиляция клиента (требует Docker!)
-cross build --release --target mipsel-unknown-linux-musl -p xr-client
-cross build --release --target aarch64-unknown-linux-musl -p xr-client
-cross build --release --target armv7-unknown-linux-musleabihf -p xr-client
-
-# Запуск тестов
-cargo test --workspace
-```
+- [Развёртывание на OpenWRT](docs/OPENWRT.md) — подробная пошаговая инструкция
+- [Правила маршрутизации для России](configs/routing-russia.toml) — готовый конфиг
 
 ## Лицензия
 
 MIT
-
-## Документация
-
-- [Развёртывание на OpenWRT](docs/OPENWRT.md) — подробная пошаговая инструкция для роутера
