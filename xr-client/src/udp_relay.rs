@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::UdpSocket;
@@ -26,12 +26,16 @@ const IP_ORIGDSTADDR: libc::c_int = 20;
 
 struct UdpFlow {
     src_addr: SocketAddr,
+    orig_dst: SocketAddr,
     last_activity: Instant,
 }
 
 struct RelayState {
     /// Map: flow_key(src_port, dst) → flow info
     flows: Mutex<HashMap<u64, UdpFlow>>,
+    /// Cache of spoofed sockets: orig_dst → socket bound to that address.
+    /// Used to send responses back to Switch with correct source address.
+    spoof_sockets: Mutex<HashMap<SocketAddr, Arc<std::net::UdpSocket>>>,
     obfuscator: Obfuscator,
     vps_addr: SocketAddr,
     flow_timeout: Duration,
@@ -73,6 +77,7 @@ pub async fn run_udp_relay(
 
     let state = Arc::new(RelayState {
         flows: Mutex::new(HashMap::new()),
+        spoof_sockets: Mutex::new(HashMap::new()),
         obfuscator,
         vps_addr,
         flow_timeout: Duration::from_secs(config.flow_timeout_sec),
@@ -80,21 +85,22 @@ pub async fn run_udp_relay(
         exclude_ports: config.exclude_dst_ports.clone(),
     });
 
-    // Bind local TPROXY listener
+    // Bind local TPROXY listener — use AsyncFd directly (not tokio UdpSocket)
+    // because we need recvmsg for IP_ORIGDSTADDR, and tokio's UdpSocket
+    // would double-register the fd with the reactor.
     let listen_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, config.listen_port));
-    let local_socket = bind_tproxy_socket(config.listen_port, config.use_tproxy)?;
-    let local_socket = UdpSocket::from_std(local_socket)?;
+    let local_std = bind_tproxy_socket(config.listen_port, config.use_tproxy)?;
+    let local_async = Arc::new(tokio::io::unix::AsyncFd::new(local_std)?);
     tracing::info!(
         "UDP relay listening on {} ({} mode)",
         listen_addr,
         if config.use_tproxy { "TPROXY" } else { "REDIRECT" }
     );
 
-    // Tunnel socket to VPS
+    // Tunnel socket to VPS (normal tokio socket, no recvmsg needed)
     let tunnel_socket = UdpSocket::bind("0.0.0.0:0").await?;
     tracing::info!("UDP relay tunnel to {}", vps_addr);
 
-    let local = Arc::new(local_socket);
     let tunnel = Arc::new(tunnel_socket);
 
     // Keepalive sender
@@ -117,37 +123,47 @@ pub async fn run_udp_relay(
         let mut timer = interval(Duration::from_secs(30));
         loop {
             timer.tick().await;
-            let mut flows = clean_state.flows.lock().await;
             let timeout = clean_state.flow_timeout;
+
+            let mut flows = clean_state.flows.lock().await;
             let before = flows.len();
             flows.retain(|_, f| f.last_activity.elapsed() < timeout);
             let removed = before - flows.len();
             if removed > 0 {
                 tracing::debug!("UDP relay: cleaned {} expired flows ({} active)", removed, flows.len());
             }
+
+            // Collect active orig_dst addresses
+            let active_dsts: std::collections::HashSet<SocketAddr> =
+                flows.values().map(|f| f.orig_dst).collect();
+            drop(flows);
+
+            // Clean spoof sockets for dead flows
+            let mut spoof = clean_state.spoof_sockets.lock().await;
+            let spoof_before = spoof.len();
+            spoof.retain(|addr, _| active_dsts.contains(addr));
+            let spoof_removed = spoof_before - spoof.len();
+            if spoof_removed > 0 {
+                tracing::debug!("UDP relay: cleaned {} spoof sockets", spoof_removed);
+            }
         }
     });
 
     // Upstream: LAN → VPS
     let up_state = state.clone();
-    let up_local = local.clone();
+    let up_local = local_async.clone();
     let up_tunnel = tunnel.clone();
     let use_tproxy = config.use_tproxy;
     let upstream = async move {
         let mut buf = vec![0u8; 65536];
-        let fd = up_local.as_raw_fd();
 
         loop {
             // Use recvmsg to get both src and original dst
             let (n, src_addr, orig_dst) = if use_tproxy {
-                recvmsg_origdst(fd, &mut buf).await?
+                recvmsg_origdst(&up_local, &mut buf).await?
             } else {
-                // REDIRECT fallback: just recv_from, dst is unknown
-                let (_n, _src) = up_local.recv_from(&mut buf).await?;
-                // In REDIRECT mode we can't easily get original dst.
-                // Require TPROXY for proper operation.
-                tracing::warn!("UDP relay REDIRECT mode: original dst unknown, skipping");
-                continue;
+                tracing::warn!("UDP relay REDIRECT mode not supported, use TPROXY");
+                return Err(io::Error::new(io::ErrorKind::Unsupported, "REDIRECT mode not supported"));
             };
 
             if n == 0 {
@@ -170,6 +186,18 @@ pub async fn run_udp_relay(
                 continue;
             }
 
+            // Filter broadcast, multicast, and LAN destinations
+            if let SocketAddr::V4(v4) = orig_dst {
+                let ip = v4.ip();
+                if ip.is_broadcast() || ip.is_multicast()
+                    || *ip == Ipv4Addr::new(255, 255, 255, 255)
+                    || ip.is_loopback()
+                    || is_private_ip(ip)
+                {
+                    continue;
+                }
+            }
+
             let src_port = src_addr.port();
 
             // Track flow for reverse path
@@ -178,6 +206,7 @@ pub async fn run_udp_relay(
                 let mut flows = up_state.flows.lock().await;
                 flows.insert(fkey, UdpFlow {
                     src_addr,
+                    orig_dst,
                     last_activity: Instant::now(),
                 });
             }
@@ -200,7 +229,6 @@ pub async fn run_udp_relay(
 
     // Downstream: VPS → LAN
     let down_state = state.clone();
-    let down_local = local.clone();
     let down_tunnel = tunnel.clone();
     let downstream = async move {
         let mut buf = vec![0u8; 65536];
@@ -221,27 +249,42 @@ pub async fn run_udp_relay(
             match packet.relay_type {
                 RelayType::Keepalive => {}
                 RelayType::Data => {
-                    // Find where to deliver this response
+                    // packet.dst = the remote server that responded (e.g. 3.71.152.160:33334)
+                    // packet.src_port = Switch's source port
+                    // We need to deliver payload to Switch with src = packet.dst (the server)
+
+                    // Find Switch address from flow table
                     let fkey = flow_key(packet.src_port, &packet.dst);
-                    let target = {
+                    let target_info = {
                         let mut flows = down_state.flows.lock().await;
                         if let Some(flow) = flows.get_mut(&fkey) {
                             flow.last_activity = Instant::now();
-                            Some(flow.src_addr)
+                            Some((flow.src_addr, flow.orig_dst))
                         } else {
-                            // Incoming connection: find any flow with matching src_port
+                            // Incoming P2P: find any flow with matching src_port
                             flows.values_mut()
                                 .find(|f| f.src_addr.port() == packet.src_port)
                                 .map(|f| {
                                     f.last_activity = Instant::now();
-                                    f.src_addr
+                                    (f.src_addr, packet.dst)
                                 })
                         }
                     };
 
-                    if let Some(switch_addr) = target {
-                        if let Err(e) = down_local.send_to(&packet.payload, switch_addr).await {
-                            tracing::warn!("UDP relay: deliver to {} failed: {}", switch_addr, e);
+                    if let Some((switch_addr, orig_dst)) = target_info {
+                        // Send from a socket bound to orig_dst (spoofed source)
+                        // so Switch sees the response coming from the real server
+                        let spoof = get_or_create_spoof_socket(&down_state, orig_dst).await;
+                        match spoof {
+                            Ok(sock) => {
+                                let fd = sock.as_raw_fd();
+                                if let Err(e) = do_sendto(fd, &packet.payload, switch_addr) {
+                                    tracing::warn!("UDP relay: spoof send to {} failed: {}", switch_addr, e);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("UDP relay: spoof socket for {} failed: {}", orig_dst, e);
+                            }
                         }
                     } else {
                         tracing::debug!(
@@ -264,6 +307,102 @@ pub async fn run_udp_relay(
 }
 
 // ── Socket setup ───────────────────────────────────────────────────
+
+/// Get or create a UDP socket bound to `spoof_addr` with IP_TRANSPARENT.
+/// This allows sending packets that appear to come from `spoof_addr`.
+async fn get_or_create_spoof_socket(
+    state: &RelayState,
+    spoof_addr: SocketAddr,
+) -> io::Result<Arc<std::net::UdpSocket>> {
+    // Check cache first
+    {
+        let cache = state.spoof_sockets.lock().await;
+        if let Some(sock) = cache.get(&spoof_addr) {
+            return Ok(sock.clone());
+        }
+    }
+
+    // Create new spoofed socket
+    let sock = create_spoof_socket(spoof_addr)?;
+    let sock = Arc::new(sock);
+
+    let mut cache = state.spoof_sockets.lock().await;
+    cache.insert(spoof_addr, sock.clone());
+
+    tracing::debug!("UDP relay: created spoof socket for {}", spoof_addr);
+    Ok(sock)
+}
+
+/// Create a non-blocking UDP socket bound to a non-local address via IP_TRANSPARENT.
+fn create_spoof_socket(bind_addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    use std::net::UdpSocket as StdSocket;
+
+    // Create socket
+    let sock = StdSocket::bind("0.0.0.0:0")
+        .map_err(|e| io::Error::new(e.kind(), format!("spoof socket create: {}", e)))?;
+
+    let fd = sock.as_raw_fd();
+
+    unsafe {
+        let val: libc::c_int = 1;
+
+        // IP_TRANSPARENT: allow binding to non-local addresses
+        let ret = libc::setsockopt(
+            fd, SOL_IP, IP_TRANSPARENT,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    // Now re-bind to the spoofed address
+    drop(sock);
+
+    let sock = unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let val: libc::c_int = 1;
+        libc::setsockopt(
+            fd, SOL_IP, IP_TRANSPARENT,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+
+        // SO_REUSEADDR so multiple spoof sockets can coexist
+        libc::setsockopt(
+            fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+
+        if let SocketAddr::V4(v4) = bind_addr {
+            let mut addr: libc::sockaddr_in = std::mem::zeroed();
+            addr.sin_family = libc::AF_INET as _;
+            addr.sin_port = v4.port().to_be();
+            addr.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+
+            let ret = libc::bind(
+                fd,
+                &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            if ret != 0 {
+                let err = io::Error::last_os_error();
+                libc::close(fd);
+                return Err(err);
+            }
+        }
+
+        StdSocket::from_raw_fd(fd)
+    };
+
+    Ok(sock)
+}
 
 fn bind_tproxy_socket(port: u16, use_tproxy: bool) -> io::Result<std::net::UdpSocket> {
     use std::net::UdpSocket as StdSocket;
@@ -306,17 +445,14 @@ fn bind_tproxy_socket(port: u16, use_tproxy: bool) -> io::Result<std::net::UdpSo
 /// Receive a UDP packet via recvmsg, extracting the original destination
 /// address from IP_ORIGDSTADDR ancillary data (set by TPROXY).
 async fn recvmsg_origdst(
-    fd: i32,
+    async_fd: &tokio::io::unix::AsyncFd<std::net::UdpSocket>,
     buf: &mut [u8],
 ) -> io::Result<(usize, SocketAddr, SocketAddr)> {
-    let async_fd = tokio::io::unix::AsyncFd::new(FdWrapper(fd))?;
-
     loop {
         let mut guard = async_fd.readable().await?;
+        let fd = async_fd.as_raw_fd();
 
-        // Perform the recvmsg in a non-blocking manner
-        let result = do_recvmsg(fd, buf);
-        match result {
+        match do_recvmsg(fd, buf) {
             Ok(r) => {
                 guard.retain_ready();
                 return Ok(r);
@@ -326,6 +462,35 @@ async fn recvmsg_origdst(
                 continue;
             }
             Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Raw sendto syscall.
+fn do_sendto(fd: i32, data: &[u8], target: SocketAddr) -> io::Result<usize> {
+    unsafe {
+        match target {
+            SocketAddr::V4(v4) => {
+                let mut addr: libc::sockaddr_in = std::mem::zeroed();
+                addr.sin_family = libc::AF_INET as _;
+                addr.sin_port = v4.port().to_be();
+                addr.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+
+                let n = libc::sendto(
+                    fd,
+                    data.as_ptr() as *const libc::c_void,
+                    data.len(),
+                    0,
+                    &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                );
+                if n < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }
+            _ => Err(io::Error::new(io::ErrorKind::Unsupported, "IPv6 sendto not implemented")),
         }
     }
 }
@@ -388,11 +553,10 @@ fn do_recvmsg(
     }
 }
 
-/// Wrapper to use raw fd with tokio AsyncFd.
-struct FdWrapper(i32);
-
-impl std::os::unix::io::AsRawFd for FdWrapper {
-    fn as_raw_fd(&self) -> i32 {
-        self.0
-    }
+/// Check if an IPv4 address is in a private range (10/8, 172.16/12, 192.168/16).
+fn is_private_ip(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 10
+        || (octets[0] == 172 && (octets[1] & 0xf0) == 16)
+        || (octets[0] == 192 && octets[1] == 168)
 }

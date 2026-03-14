@@ -46,44 +46,31 @@ ROUTER_IP=$(ip -4 addr show br-lan 2>/dev/null | grep -o 'inet [0-9.]*' | awk '{
 
 # Build source filter rule
 if [ -n "$SOURCE_FILTER" ]; then
-    SRC_RULE="ip saddr != $SOURCE_FILTER return"
     echo "Setting up UDP TPROXY for $SOURCE_FILTER -> port $TPROXY_PORT"
 else
-    SRC_RULE="# All LAN devices"
     echo "Setting up UDP TPROXY for all LAN devices -> port $TPROXY_PORT"
 fi
 
 # Clean up existing rules
 "$NFT" delete table inet "$TABLE" 2>/dev/null || true
 
+# Build source filter
+SRC_RULES=""
+if [ -n "$SOURCE_FILTER" ]; then
+    SRC_RULES="add rule inet $TABLE prerouting ip saddr != $SOURCE_FILTER return"
+fi
+
 "$NFT" -f - <<EOF
-table inet $TABLE {
-    chain prerouting {
-        type filter hook prerouting priority mangle; policy accept;
-
-        # Only process UDP
-        meta l4proto != udp return
-
-        # Only process traffic from LAN (private IPs)
-        ip saddr != { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return
-
-        # Exclude router's own traffic (avoid loops)
-        ip saddr ${ROUTER_IP:-127.0.0.1} return
-
-        # Per-device filter (empty = all LAN)
-        $SRC_RULE
-
-        # Skip DNS and DHCP
-        udp dport { 53, 67, 68 } return
-
-        # Skip traffic to LAN (local devices, router itself)
-        ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8 } return
-
-        # Mark and TPROXY
-        meta mark set $FWMARK
-        tproxy to :$TPROXY_PORT
-    }
-}
+add table inet $TABLE
+add chain inet $TABLE prerouting { type filter hook prerouting priority mangle; policy accept; }
+add rule inet $TABLE prerouting meta l4proto != udp return
+add rule inet $TABLE prerouting ip saddr != { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return
+add rule inet $TABLE prerouting ip saddr ${ROUTER_IP:-127.0.0.1} return
+$SRC_RULES
+add rule inet $TABLE prerouting udp dport { 53, 67, 68 } return
+add rule inet $TABLE prerouting ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8 } return
+add rule inet $TABLE prerouting meta l4proto udp meta mark set $FWMARK
+add rule inet $TABLE prerouting meta l4proto udp tproxy to :$TPROXY_PORT
 EOF
 
 # Policy routing: marked packets go to local loopback
