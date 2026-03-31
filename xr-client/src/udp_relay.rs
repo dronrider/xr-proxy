@@ -361,9 +361,9 @@ fn create_spoof_socket(bind_addr: SocketAddr) -> io::Result<std::net::UdpSocket>
     drop(sock);
 
     let sock = unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0);
         if fd < 0 {
-            return Err(std::io::Error::last_os_error());
+            return Err(io::Error::last_os_error());
         }
 
         let val: libc::c_int = 1;

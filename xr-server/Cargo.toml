@@ -9,3 +9,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macro
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
+socket2 = { version = "0.5", features = ["all"] }

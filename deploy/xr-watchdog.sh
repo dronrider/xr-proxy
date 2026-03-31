@@ -32,10 +32,20 @@ cleanup_nftables() {
     done
     [ -z "$nft" ] && return
 
+    # TCP proxy rules
     "$nft" list table ip xr_proxy >/dev/null 2>&1 && {
         "$nft" delete table ip xr_proxy
-        logger -t xr-watchdog "nftables rules removed"
+        logger -t xr-watchdog "nftables TCP rules removed"
     }
+
+    # UDP TPROXY rules
+    "$nft" list table ip xr_udp_relay >/dev/null 2>&1 && {
+        "$nft" delete table ip xr_udp_relay
+        ip rule del fwmark 0x200 table 201 2>/dev/null
+        logger -t xr-watchdog "nftables UDP TPROXY rules removed"
+    }
+    # Legacy inet table cleanup
+    "$nft" delete table inet xr_udp_relay 2>/dev/null
 }
 
 cleanup_iptables() {

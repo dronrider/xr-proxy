@@ -7,6 +7,18 @@ use tokio::net::TcpStream;
 use tokio::time::Duration;
 use xr_proto::protocol::{Codec, Command, TargetAddr};
 
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);   // 5 min idle
+const MAX_LIFETIME: Duration = Duration::from_secs(3600);  // 1 hour max
+
+/// Enable TCP keepalive on a stream.
+fn set_keepalive(stream: &TcpStream) {
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(15));
+    let sock_ref = socket2::SockRef::from(stream);
+    let _ = sock_ref.set_tcp_keepalive(&ka);
+}
+
 /// Handle a single client connection end-to-end.
 pub async fn handle_client(
     mut client: TcpStream,
@@ -15,6 +27,8 @@ pub async fn handle_client(
     timeout: Duration,
     fallback_response: Option<Vec<u8>>,
 ) -> io::Result<()> {
+    set_keepalive(&client);
+
     // Read first frame (Connect command) with timeout
     let mut buf = vec![0u8; 4096];
     let mut filled = 0;
@@ -31,20 +45,17 @@ pub async fn handle_client(
 
         match codec.decode_frame(&buf[..filled]) {
             Ok(Some((frame, consumed))) => {
-                // Shift buffer for any remaining data
                 buf.copy_within(consumed..filled, 0);
                 filled -= consumed;
                 break frame;
             }
             Ok(None) => {
                 if filled > 4096 {
-                    // Too much data without a valid frame — probably not our protocol
                     return send_fallback_and_close(&mut client, &buf[..filled], fallback_response).await;
                 }
                 continue;
             }
             Err(_) => {
-                // Decode error (wrong key / not our protocol)
                 tracing::debug!("Invalid frame from {}, sending fallback", client_addr);
                 return send_fallback_and_close(&mut client, &buf[..filled], fallback_response).await;
             }
@@ -56,13 +67,11 @@ pub async fn handle_client(
         return Err(io::Error::new(io::ErrorKind::InvalidData, "expected Connect"));
     }
 
-    // Parse target address from payload
     let (target_addr, _) = TargetAddr::decode(&connect_frame.payload)?;
     let target_sockaddr = resolve_target(&target_addr).await?;
 
     tracing::info!("{} -> {} ({})", client_addr, target_sockaddr, addr_display(&target_addr));
 
-    // Connect to target
     let mut target = tokio::time::timeout(
         Duration::from_secs(10),
         TcpStream::connect(target_sockaddr),
@@ -70,14 +79,11 @@ pub async fn handle_client(
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "target connect timeout"))??;
 
-    // Send ConnectAck (status=0 for success)
+    set_keepalive(&target);
+
     let ack = codec.encode_frame(Command::ConnectAck, &[0])?;
     client.write_all(&ack).await?;
 
-    // If there was leftover data after the Connect frame, it's the first Data frame
-    // We need to handle it properly in the relay loop
-
-    // Relay data bidirectionally with obfuscation
     relay_obfuscated(&mut client, &mut target, &codec, &buf[..filled]).await
 }
 
@@ -117,6 +123,8 @@ async fn send_fallback_and_close(
 }
 
 /// Relay data between client (obfuscated) and target (plaintext).
+/// Idle timeout: 5 min without data in either direction.
+/// Max lifetime: 1 hour absolute limit.
 async fn relay_obfuscated(
     client: &mut TcpStream,
     target: &mut TcpStream,
@@ -136,7 +144,6 @@ async fn relay_obfuscated(
         let mut buf = vec![0u8; 65536 + 256];
         let mut filled = 0;
 
-        // Process any initial data leftover from handshake
         if !initial.is_empty() {
             buf[..initial.len()].copy_from_slice(&initial);
             filled = initial.len();
@@ -164,8 +171,14 @@ async fn relay_obfuscated(
                 }
             }
 
-            // Read more data from client
-            let n = cr.read(&mut buf[filled..]).await?;
+            // Read more data from client with idle timeout
+            let n = match tokio::time::timeout(IDLE_TIMEOUT, cr.read(&mut buf[filled..])).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    tracing::debug!("Server upstream idle timeout (5m)");
+                    return Ok(());
+                }
+            };
             if n == 0 {
                 break;
             }
@@ -178,7 +191,13 @@ async fn relay_obfuscated(
     let downstream = async move {
         let mut buf = vec![0u8; 8192];
         loop {
-            let n = tr.read(&mut buf).await?;
+            let n = match tokio::time::timeout(IDLE_TIMEOUT, tr.read(&mut buf)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    tracing::debug!("Server downstream idle timeout (5m)");
+                    return Ok::<(), io::Error>(());
+                }
+            };
             if n == 0 {
                 let close = codec_encode.encode_frame(Command::Close, &[])?;
                 cw.write_all(&close).await?;
@@ -190,8 +209,18 @@ async fn relay_obfuscated(
         Ok::<(), io::Error>(())
     };
 
-    tokio::select! {
-        result = upstream => result,
-        result = downstream => result,
+    let result = tokio::time::timeout(MAX_LIFETIME, async {
+        tokio::select! {
+            result = upstream => result,
+            result = downstream => result,
+        }
+    });
+
+    match result.await {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::debug!("Server relay timed out (1h max)");
+            Ok(())
+        }
     }
 }

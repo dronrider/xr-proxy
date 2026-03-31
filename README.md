@@ -207,7 +207,7 @@ listen_port = 9999
 enabled = true
 listen_port = 1081
 vps_port = 9999
-source_ips = []                  # Все LAN-устройства
+source_ips = ["192.168.1.188"]   # IP устройств для relay (обязательно!)
 exclude_dst_ports = [53, 67, 68]
 ```
 
@@ -218,7 +218,7 @@ scp -O scripts/udp-tproxy-setup.sh root@192.168.1.1:/usr/bin/
 ssh root@192.168.1.1 "chmod +x /usr/bin/udp-tproxy-setup.sh && udp-tproxy-setup.sh"
 ```
 
-Скрипт без аргументов настраивает relay для всех LAN-устройств. Для конкретного IP: `udp-tproxy-setup.sh 192.168.1.187`.
+Скрипт автоматически читает `source_ips` из конфига и перехватывает UDP только от этих устройств. Остальной трафик (игры, VoIP, видеозвонки) не затрагивается.
 
 Откройте порт 9999/udp на файрволе VPS.
 

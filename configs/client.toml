@@ -58,7 +58,7 @@ log_level = "info"                    # error, warn, info, debug
 # [geoip]
 # database = "/etc/xr-proxy/GeoLite2-Country.mmdb"
 
-# ─── UDP Relay ─────────────────
+# ─── UDP Relay (for Nintendo Switch, game consoles) ─────────────────
 # Relay UDP traffic through VPS for devices that need NAT traversal.
 # Requires nftables TPROXY setup (see docs/OPENWRT.md).
 # [udp_relay]
@@ -66,8 +66,8 @@ log_level = "info"                    # error, warn, info, debug
 # listen_port = 1081                  # Local TPROXY port
 # vps_port = 9999                     # UDP relay port on VPS (must match server config)
 # use_tproxy = true                   # Use TPROXY (recommended) vs REDIRECT
-# source_ips = []                     # Empty = relay all LAN devices (recommended)
-# # source_ips = ["192.168.1.187"]   # Or: only specific IPs
+# source_ips = ["192.168.1.188"]       # REQUIRED: devices to relay (e.g. Switch IPs)
+# # Assign static IPs via DHCP so these don't change!
 # exclude_dst_ports = [53, 67, 68]    # Don't relay DNS, DHCP
 # flow_timeout_sec = 120              # UDP flow expiry
 # keepalive_interval_sec = 25         # Keepalive to VPS
