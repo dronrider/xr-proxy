@@ -1,12 +1,12 @@
 package com.xrproxy.app.ui
 
 import android.app.Activity
-import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.animation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -16,6 +16,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
@@ -63,11 +64,10 @@ fun MainScreen(viewModel: VpnViewModel, onConnect: () -> Unit) {
             TopAppBar(
                 title = { Text("XR Proxy") },
                 actions = {
-                    IconButton(onClick = { showSettings = !showSettings }) {
-                        Icon(
-                            if (showSettings) Icons.Default.Close else Icons.Default.Settings,
-                            contentDescription = "Settings"
-                        )
+                    if (!showSettings) {
+                        IconButton(onClick = { showSettings = true }) {
+                            Icon(Icons.Default.Settings, contentDescription = "Settings")
+                        }
                     }
                 }
             )
@@ -82,13 +82,15 @@ fun MainScreen(viewModel: VpnViewModel, onConnect: () -> Unit) {
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             if (showSettings) {
-                SettingsSection(state, viewModel)
+                SettingsSection(state, viewModel, onDone = { showSettings = false })
             } else {
                 ConnectionSection(state, onConnect, viewModel::disconnect)
             }
         }
     }
 }
+
+// ── Connection screen ───────────────────────────────────────────────
 
 @Composable
 fun ConnectionSection(
@@ -105,15 +107,36 @@ fun ConnectionSection(
         else -> MaterialTheme.colorScheme.outline to "Disconnected"
     }
 
-    Icon(
-        imageVector = if (state.connected) Icons.Default.Lock else Icons.Default.LockOpen,
-        contentDescription = null,
-        tint = statusColor,
-        modifier = Modifier.size(64.dp)
-    )
+    Box(contentAlignment = Alignment.Center) {
+        if (state.connecting) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(80.dp),
+                color = statusColor,
+                strokeWidth = 3.dp,
+            )
+        }
+        Icon(
+            imageVector = if (state.connected) Icons.Default.Lock else Icons.Default.LockOpen,
+            contentDescription = null,
+            tint = statusColor,
+            modifier = Modifier.size(if (state.connecting) 40.dp else 64.dp)
+        )
+    }
 
     Spacer(Modifier.height(8.dp))
     Text(statusText, style = MaterialTheme.typography.headlineSmall, color = statusColor)
+
+    // Show current preset.
+    if (!state.connected && !state.connecting) {
+        Spacer(Modifier.height(4.dp))
+        val presetLabel = when (state.routingPreset) {
+            "russia" -> "Preset: Russia"
+            "proxy_all" -> "Proxy all traffic"
+            "custom" -> "Custom rules"
+            else -> ""
+        }
+        Text(presetLabel, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
 
     Spacer(Modifier.height(32.dp))
 
@@ -122,15 +145,24 @@ fun ConnectionSection(
         onClick = { if (state.connected || state.connecting) onDisconnect() else onConnect() },
         modifier = Modifier.fillMaxWidth(0.6f),
         colors = ButtonDefaults.buttonColors(
-            containerColor = if (state.connected) MaterialTheme.colorScheme.error
+            containerColor = if (state.connected || state.connecting) MaterialTheme.colorScheme.error
             else MaterialTheme.colorScheme.primary
         ),
-        enabled = !state.connecting || state.connected,
     ) {
-        Text(
-            if (state.connected) "Disconnect" else if (state.connecting) "Connecting..." else "Connect",
-            style = MaterialTheme.typography.titleMedium,
-        )
+        if (state.connecting) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(18.dp),
+                color = MaterialTheme.colorScheme.onError,
+                strokeWidth = 2.dp,
+            )
+            Spacer(Modifier.width(8.dp))
+            Text("Cancel", style = MaterialTheme.typography.titleMedium)
+        } else {
+            Text(
+                if (state.connected) "Disconnect" else "Connect",
+                style = MaterialTheme.typography.titleMedium,
+            )
+        }
     }
 
     // Stats.
@@ -149,25 +181,32 @@ fun ConnectionSection(
     }
 
     // Warning if not configured.
-    if (!state.connected && state.serverAddress.isBlank()) {
+    if (!state.connected && !state.connecting && state.serverAddress.isBlank()) {
         Spacer(Modifier.height(32.dp))
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
         ) {
-            Text(
-                "Configure server address and key in Settings",
-                modifier = Modifier.padding(16.dp),
-                color = MaterialTheme.colorScheme.onErrorContainer,
-            )
+            Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error)
+                Spacer(Modifier.width(12.dp))
+                Text(
+                    "Configure server address and key in Settings",
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                )
+            }
         }
     }
 }
 
-@Composable
-fun SettingsSection(state: VpnUiState, viewModel: VpnViewModel) {
-    var showKey by remember { mutableStateOf(false) }
+// ── Settings screen ─────────────────────────────────────────────────
 
+@Composable
+fun SettingsSection(state: VpnUiState, viewModel: VpnViewModel, onDone: () -> Unit) {
+    var showKey by remember { mutableStateOf(false) }
+    val clipboardManager = LocalClipboardManager.current
+
+    // ── Server ──────────────────────────────────────────────────
     Text("Server", style = MaterialTheme.typography.titleMedium)
     Spacer(Modifier.height(8.dp))
 
@@ -190,6 +229,7 @@ fun SettingsSection(state: VpnUiState, viewModel: VpnViewModel) {
     )
     Spacer(Modifier.height(16.dp))
 
+    // ── Obfuscation ─────────────────────────────────────────────
     Text("Obfuscation", style = MaterialTheme.typography.titleMedium)
     Spacer(Modifier.height(8.dp))
 
@@ -220,47 +260,105 @@ fun SettingsSection(state: VpnUiState, viewModel: VpnViewModel) {
     )
     Spacer(Modifier.height(16.dp))
 
+    // ── Routing ─────────────────────────────────────────────────
     Text("Routing", style = MaterialTheme.typography.titleMedium)
     Spacer(Modifier.height(8.dp))
 
-    // Default action toggle.
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("Default action: ")
+    // Preset selector.
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
         FilterChip(
-            selected = state.defaultAction == "proxy",
-            onClick = { viewModel.updateDefaultAction("proxy") },
-            label = { Text("Proxy all") },
+            selected = state.routingPreset == "russia",
+            onClick = { viewModel.updateRoutingPreset("russia") },
+            label = { Text("Russia") },
+            leadingIcon = if (state.routingPreset == "russia") {{ Icon(Icons.Default.Check, null, Modifier.size(16.dp)) }} else null,
         )
-        Spacer(Modifier.width(8.dp))
         FilterChip(
-            selected = state.defaultAction == "direct",
-            onClick = { viewModel.updateDefaultAction("direct") },
-            label = { Text("Direct all") },
+            selected = state.routingPreset == "proxy_all",
+            onClick = { viewModel.updateRoutingPreset("proxy_all") },
+            label = { Text("Proxy all") },
+            leadingIcon = if (state.routingPreset == "proxy_all") {{ Icon(Icons.Default.Check, null, Modifier.size(16.dp)) }} else null,
+        )
+        FilterChip(
+            selected = state.routingPreset == "custom",
+            onClick = { viewModel.updateRoutingPreset("custom") },
+            label = { Text("Custom") },
+            leadingIcon = if (state.routingPreset == "custom") {{ Icon(Icons.Default.Check, null, Modifier.size(16.dp)) }} else null,
         )
     }
-    Spacer(Modifier.height(8.dp))
 
-    val rulesLabel = if (state.defaultAction == "direct") "Domains to proxy" else "Domains to bypass"
-    OutlinedTextField(
-        value = state.customDomains,
-        onValueChange = viewModel::updateCustomDomains,
-        label = { Text(rulesLabel) },
-        placeholder = { Text("youtube.com\n*.google.com") },
-        modifier = Modifier.fillMaxWidth().height(120.dp),
-        maxLines = 8,
-    )
-    Spacer(Modifier.height(8.dp))
+    // Custom rules editor (only shown for "custom" preset).
+    if (state.routingPreset == "custom") {
+        Spacer(Modifier.height(8.dp))
 
-    val ipLabel = if (state.defaultAction == "direct") "IP ranges to proxy" else "IP ranges to bypass"
-    OutlinedTextField(
-        value = state.customIpRanges,
-        onValueChange = viewModel::updateCustomIpRanges,
-        label = { Text(ipLabel) },
-        placeholder = { Text("91.108.56.0/22\n149.154.160.0/20") },
-        modifier = Modifier.fillMaxWidth().height(100.dp),
-        maxLines = 6,
-    )
+        // Import from clipboard button.
+        OutlinedButton(
+            onClick = {
+                val text = clipboardManager.getText()?.text ?: ""
+                if (text.isNotBlank()) viewModel.importToml(text)
+            },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Icon(Icons.Default.ContentPaste, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Import TOML from clipboard")
+        }
+        Spacer(Modifier.height(8.dp))
+
+        OutlinedTextField(
+            value = state.customDomains,
+            onValueChange = viewModel::updateCustomDomains,
+            label = { Text("Domains to proxy") },
+            placeholder = { Text("youtube.com\n*.google.com") },
+            modifier = Modifier.fillMaxWidth().height(120.dp),
+            maxLines = 8,
+        )
+        Spacer(Modifier.height(8.dp))
+
+        OutlinedTextField(
+            value = state.customIpRanges,
+            onValueChange = viewModel::updateCustomIpRanges,
+            label = { Text("IP ranges to proxy") },
+            placeholder = { Text("91.108.56.0/22") },
+            modifier = Modifier.fillMaxWidth().height(100.dp),
+            maxLines = 6,
+        )
+    }
+
+    if (state.routingPreset == "russia") {
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "YouTube, Meta, Twitter/X, Telegram, Discord, Google, LinkedIn, AI, Dev tools, etc.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+
+    Spacer(Modifier.height(24.dp))
+
+    // ── Save button ─────────────────────────────────────────────
+    Button(
+        onClick = {
+            viewModel.saveSettings()
+            onDone()
+        },
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(8.dp))
+        Text("Save & Back")
+    }
+
+    // Saved confirmation.
+    AnimatedVisibility(visible = state.settingsSaved) {
+        Spacer(Modifier.height(8.dp))
+        Text("Settings saved", color = MaterialTheme.colorScheme.primary)
+    }
 }
+
+// ── Helpers ──────────────────────────────────────────────────────────
 
 @Composable
 fun StatRow(label: String, value: String) {
@@ -276,7 +374,7 @@ fun StatRow(label: String, value: String) {
 fun formatBytes(bytes: Long): String = when {
     bytes < 1024 -> "$bytes B"
     bytes < 1024 * 1024 -> "${bytes / 1024} KB"
-    bytes < 1024 * 1024 * 1024 -> "${"%.1f".format(bytes / 1024.0 / 1024.0)} MB"
+    bytes < 1024L * 1024 * 1024 -> "${"%.1f".format(bytes / 1024.0 / 1024.0)} MB"
     else -> "${"%.2f".format(bytes / 1024.0 / 1024.0 / 1024.0)} GB"
 }
 
