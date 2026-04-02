@@ -1,7 +1,7 @@
 //! JNI bridge: Kotlin ↔ xr-core VPN engine.
 
-use jni::objects::{JClass, JString, GlobalRef, JValue};
-use jni::sys::{jint, jstring};
+use jni::objects::{JClass, JString, GlobalRef};
+use jni::sys::{jint, jmethodID, jstring};
 use jni::{JNIEnv, JavaVM};
 
 use std::sync::{Arc, Mutex, OnceLock};
@@ -14,11 +14,22 @@ use xr_proto::config::RoutingConfig;
 /// Global engine instance.
 static ENGINE: OnceLock<Mutex<Option<EngineHandle>>> = OnceLock::new();
 
-/// Global JavaVM reference (for callbacks from any thread).
+/// Global JVM reference.
 static JVM: OnceLock<JavaVM> = OnceLock::new();
 
-/// Global reference to the NativeBridge class (for protectSocket callback).
-static BRIDGE_CLASS: OnceLock<GlobalRef> = OnceLock::new();
+/// Cached class reference and method ID — resolved on main thread, safe to use from any thread.
+static PROTECT_METHOD: OnceLock<ProtectMethodCache> = OnceLock::new();
+
+struct ProtectMethodCache {
+    class: GlobalRef,
+    method_id: jmethodID,
+}
+
+// Safety: jmethodID is a raw pointer to a JVM internal structure.
+// Once resolved, it is immutable and valid for the lifetime of the JVM.
+// GlobalRef is Send+Sync by design.
+unsafe impl Send for ProtectMethodCache {}
+unsafe impl Sync for ProtectMethodCache {}
 
 struct EngineHandle {
     engine: VpnEngine,
@@ -31,56 +42,45 @@ fn get_engine() -> &'static Mutex<Option<EngineHandle>> {
     ENGINE.get_or_init(|| Mutex::new(None))
 }
 
-/// Create a ProtectSocketFn that calls back into Java.
+/// Create a ProtectSocketFn that calls VpnService.protect(fd) via cached JNI references.
 fn make_protect_fn() -> ProtectSocketFn {
     Arc::new(|fd: i32| -> bool {
-        // Catch any panic to prevent crash.
-        let result = std::panic::catch_unwind(|| {
-            let jvm = match JVM.get() {
-                Some(jvm) => jvm,
-                None => { tracing::warn!("protect: no JVM"); return false; }
-            };
-            let bridge_class = match BRIDGE_CLASS.get() {
-                Some(c) => c,
-                None => { tracing::warn!("protect: no class ref"); return false; }
-            };
+        let jvm = match JVM.get() {
+            Some(jvm) => jvm,
+            None => return false,
+        };
+        let cache = match PROTECT_METHOD.get() {
+            Some(c) => c,
+            None => return false,
+        };
 
-            let mut env = match jvm.attach_current_thread() {
-                Ok(env) => env,
-                Err(e) => { tracing::warn!("protect: attach failed: {}", e); return false; }
-            };
+        // Attach current thread to JVM.
+        let mut env = match jvm.attach_current_thread_as_daemon() {
+            Ok(env) => env,
+            Err(_) => return false,
+        };
 
-            // Use the class name to find the class — this works from any thread.
-            let class = match env.find_class("com/xrproxy/app/jni/NativeBridge") {
-                Ok(c) => c,
+        // Call the cached static method directly via raw JNI.
+        // This avoids FindClass which doesn't work from native threads.
+        unsafe {
+            let result = env.call_static_method_unchecked(
+                &cache.class,
+                jni::objects::JStaticMethodID::from_raw(cache.method_id),
+                jni::signature::ReturnType::Primitive(jni::signature::Primitive::Boolean),
+                &[jni::sys::jvalue { i: fd }],
+            );
+
+            match result {
+                Ok(val) => val.z().unwrap_or(false),
                 Err(_) => {
-                    // Fallback: try using the stored GlobalRef.
-                    let obj = bridge_class.as_obj();
-                    // Safety: GlobalRef to a Class object is valid as JClass.
-                    unsafe { JClass::from_raw(obj.as_raw()) }
-                }
-            };
-            match env.call_static_method(
-                &class,
-                "protectSocket",
-                "(I)Z",
-                &[JValue::Int(fd)],
-            ) {
-                Ok(result) => result.z().unwrap_or(false),
-                Err(e) => {
-                    tracing::warn!("protectSocket JNI call failed: {}", e);
-                    // Clear any Java exception.
                     let _ = env.exception_clear();
                     false
                 }
             }
-        });
-
-        result.unwrap_or(false)
+        }
     })
 }
 
-/// Parse a JSON config string into VpnConfig.
 fn parse_config(json: &str) -> Result<VpnConfig, String> {
     let get_str = |key: &str| -> Result<String, String> {
         let pattern = format!("\"{}\"", key);
@@ -121,24 +121,13 @@ fn parse_config(json: &str) -> Result<VpnConfig, String> {
     };
 
     Ok(VpnConfig {
-        server_address,
-        server_port,
-        obfuscation_key,
-        modifier,
-        salt,
-        padding_min,
-        padding_max,
-        routing,
-        geoip_path: None,
-        on_server_down,
+        server_address, server_port, obfuscation_key, modifier, salt,
+        padding_min, padding_max, routing, geoip_path: None, on_server_down,
     })
 }
 
 fn default_routing() -> RoutingConfig {
-    RoutingConfig {
-        default_action: "proxy".into(),
-        rules: vec![],
-    }
+    RoutingConfig { default_action: "proxy".into(), rules: vec![] }
 }
 
 // ── JNI exports ─────────────────────────────────────────────────────
@@ -150,21 +139,40 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
     _tun_fd: jint,
     config_json: JString,
 ) -> jint {
-    // Initialize logging (once).
     let _ = tracing_subscriber::fmt()
         .with_env_filter("xr_core=debug,xr_proto=info")
         .with_target(false)
         .try_init();
 
-    // Store JVM and class references for protect callback.
+    // Cache JVM reference (once).
     if JVM.get().is_none() {
         if let Ok(jvm) = env.get_java_vm() {
             let _ = JVM.set(jvm);
         }
     }
-    if BRIDGE_CLASS.get().is_none() {
-        if let Ok(global) = env.new_global_ref(&class) {
-            let _ = BRIDGE_CLASS.set(global);
+
+    // Cache class + method ID on the MAIN thread where ClassLoader works.
+    // This is the critical fix — FindClass/GetStaticMethodID only works
+    // from threads that have the app's ClassLoader (main thread, service threads).
+    if PROTECT_METHOD.get().is_none() {
+        if let Ok(global_class) = env.new_global_ref(&class) {
+            let method_id = env.get_static_method_id(
+                &class,
+                "protectSocket",
+                "(I)Z",
+            );
+            match method_id {
+                Ok(mid) => {
+                    let _ = PROTECT_METHOD.set(ProtectMethodCache {
+                        class: global_class,
+                        method_id: mid.into_raw(),
+                    });
+                    tracing::info!("Cached protectSocket method ID");
+                }
+                Err(e) => {
+                    tracing::error!("Failed to cache protectSocket: {:?}", e);
+                }
+            }
         }
     }
 
@@ -197,8 +205,6 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
         }
     };
 
-    // Enter the runtime context so engine.start() can spawn tasks,
-    // but don't block the Android thread.
     let _guard = runtime.enter();
     match engine.start(queue.clone(), protect) {
         Ok(()) => {
@@ -216,8 +222,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
 
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStop(
-    _env: JNIEnv,
-    _class: JClass,
+    _env: JNIEnv, _class: JClass,
 ) {
     let mut lock = get_engine().lock().unwrap();
     if let Some(mut handle) = lock.take() {
@@ -228,45 +233,37 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStop(
 
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetState(
-    env: JNIEnv,
-    _class: JClass,
+    env: JNIEnv, _class: JClass,
 ) -> jstring {
     let lock = get_engine().lock().unwrap();
-    let state_str = if let Some(ref handle) = *lock {
-        handle.engine.state().get().to_string()
-    } else {
-        "Disconnected".to_string()
+    let state_str = match *lock {
+        Some(ref h) => h.engine.state().get().to_string(),
+        None => "Disconnected".to_string(),
     };
-    env.new_string(&state_str)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    env.new_string(&state_str).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetStats(
-    env: JNIEnv,
-    _class: JClass,
+    env: JNIEnv, _class: JClass,
 ) -> jstring {
     let lock = get_engine().lock().unwrap();
-    let stats_json = if let Some(ref handle) = *lock {
-        let s = handle.engine.stats().snapshot();
-        format!(
-            "{{\"bytes_up\":{},\"bytes_down\":{},\"active\":{},\"total\":{},\"uptime\":{}}}",
-            s.bytes_up, s.bytes_down, s.active_connections, s.total_connections, s.uptime_seconds
-        )
-    } else {
-        "{\"bytes_up\":0,\"bytes_down\":0,\"active\":0,\"total\":0,\"uptime\":0}".to_string()
+    let json = match *lock {
+        Some(ref h) => {
+            let s = h.engine.stats().snapshot();
+            format!(
+                "{{\"bytes_up\":{},\"bytes_down\":{},\"active\":{},\"total\":{},\"uptime\":{}}}",
+                s.bytes_up, s.bytes_down, s.active_connections, s.total_connections, s.uptime_seconds
+            )
+        }
+        None => "{\"bytes_up\":0,\"bytes_down\":0,\"active\":0,\"total\":0,\"uptime\":0}".into(),
     };
-    env.new_string(&stats_json)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    env.new_string(&json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePushPacket(
-    env: JNIEnv,
-    _class: JClass,
-    packet: jni::objects::JByteArray,
+    env: JNIEnv, _class: JClass, packet: jni::objects::JByteArray,
 ) {
     let lock = get_engine().lock().unwrap();
     if let Some(ref handle) = *lock {
@@ -278,8 +275,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePushPacket(
 
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePopPacket(
-    env: JNIEnv,
-    _class: JClass,
+    env: JNIEnv, _class: JClass,
 ) -> jni::sys::jbyteArray {
     let lock = get_engine().lock().unwrap();
     if let Some(ref handle) = *lock {
