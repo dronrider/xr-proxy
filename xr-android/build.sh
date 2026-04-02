@@ -32,7 +32,11 @@ cargo ndk \
 echo ""
 echo "=== Building Android APK ==="
 cd "$SCRIPT_DIR"
-GRADLE_OPTS="-Xmx768m" sh ./gradlew assembleDebug --no-daemon
+
+# Generate local.properties with correct SDK path for this machine.
+echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+sh ./gradlew assembleDebug --no-daemon
 
 echo ""
 echo "=== Done ==="
