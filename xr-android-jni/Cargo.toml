@@ -1,0 +1,17 @@
+[package]
+name = "xr-android-jni"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+name = "xr_proxy"
+
+[dependencies]
+xr-core = { path = "../xr-core" }
+xr-proto = { path = "../xr-proto" }
+jni = "0.21"
+toml = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
