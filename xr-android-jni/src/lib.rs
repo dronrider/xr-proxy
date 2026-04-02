@@ -1,28 +1,29 @@
 //! JNI bridge: Kotlin ↔ xr-core VPN engine.
-//!
-//! Exposes native methods called from XrVpnService.kt:
-//! - nativeStart(tunFd, configJson) → starts the VPN engine
-//! - nativeStop() → stops the engine
-//! - nativeGetStats() → returns JSON stats
-//! - nativeGetState() → returns state string
 
-use jni::objects::{JClass, JString};
+use jni::objects::{JClass, JString, GlobalRef, JValue};
 use jni::sys::{jint, jstring};
-use jni::JNIEnv;
+use jni::{JNIEnv, JavaVM};
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use xr_core::engine::{VpnConfig, VpnEngine};
 use xr_core::ip_stack::PacketQueue;
+use xr_core::session::ProtectSocketFn;
 use xr_proto::config::RoutingConfig;
 
 /// Global engine instance.
 static ENGINE: OnceLock<Mutex<Option<EngineHandle>>> = OnceLock::new();
 
+/// Global JavaVM reference (for callbacks from any thread).
+static JVM: OnceLock<JavaVM> = OnceLock::new();
+
+/// Global reference to the NativeBridge class (for protectSocket callback).
+static BRIDGE_CLASS: OnceLock<GlobalRef> = OnceLock::new();
+
 struct EngineHandle {
     engine: VpnEngine,
     queue: PacketQueue,
-    #[allow(dead_code)] // held to keep the runtime alive
+    #[allow(dead_code)]
     runtime: tokio::runtime::Runtime,
 }
 
@@ -30,34 +31,47 @@ fn get_engine() -> &'static Mutex<Option<EngineHandle>> {
     ENGINE.get_or_init(|| Mutex::new(None))
 }
 
+/// Create a ProtectSocketFn that calls back into Java.
+fn make_protect_fn() -> ProtectSocketFn {
+    Arc::new(|fd: i32| -> bool {
+        let jvm = match JVM.get() {
+            Some(jvm) => jvm,
+            None => return false,
+        };
+        let bridge_class = match BRIDGE_CLASS.get() {
+            Some(c) => c,
+            None => return false,
+        };
+
+        // Attach current thread to JVM (needed for callback from Rust threads).
+        let mut env = match jvm.attach_current_thread() {
+            Ok(env) => env,
+            Err(_) => return false,
+        };
+
+        // Call NativeBridge.protectSocket(fd) — static Java method.
+        match env.call_static_method(
+            &*bridge_class,
+            "protectSocket",
+            "(I)Z",
+            &[JValue::Int(fd)],
+        ) {
+            Ok(result) => result.z().unwrap_or(false),
+            Err(e) => {
+                tracing::warn!("protectSocket JNI call failed: {}", e);
+                false
+            }
+        }
+    })
+}
+
 /// Parse a JSON config string into VpnConfig.
 fn parse_config(json: &str) -> Result<VpnConfig, String> {
-    // Simple JSON parsing without serde_json dependency.
-    // Expected format:
-    // {
-    //   "server_address": "1.2.3.4",
-    //   "server_port": 8443,
-    //   "obfuscation_key": "base64...",
-    //   "modifier": "positional_xor_rotate",
-    //   "salt": 3735928559,
-    //   "padding_min": 16,
-    //   "padding_max": 128,
-    //   "routing_toml": "default_action = \"proxy\"\n...",
-    //   "on_server_down": "direct"
-    // }
-    //
-    // For MVP, we'll parse key fields manually.
-    // TODO: add serde_json for proper parsing.
-
     let get_str = |key: &str| -> Result<String, String> {
         let pattern = format!("\"{}\"", key);
         let pos = json.find(&pattern).ok_or(format!("missing {}", key))?;
         let after = &json[pos + pattern.len()..];
-        // Skip : and whitespace, find opening quote.
-        let start = after
-            .find('"')
-            .ok_or(format!("bad value for {}", key))?
-            + 1;
+        let start = after.find('"').ok_or(format!("bad value for {}", key))? + 1;
         let rest = &after[start..];
         let end = rest.find('"').ok_or(format!("unterminated {}", key))?;
         Ok(rest[..end].replace("\\n", "\n").replace("\\\"", "\""))
@@ -82,10 +96,11 @@ fn parse_config(json: &str) -> Result<VpnConfig, String> {
     let padding_max = get_num("padding_max").unwrap_or(128) as u8;
     let on_server_down = get_str("on_server_down").unwrap_or_else(|_| "direct".into());
 
-    // Parse routing from embedded TOML string or use default.
     let routing = if let Ok(toml_str) = get_str("routing_toml") {
-        toml::from_str::<RoutingConfig>(&toml_str)
-            .unwrap_or_else(|_| default_routing())
+        toml::from_str::<RoutingConfig>(&toml_str).unwrap_or_else(|e| {
+            tracing::warn!("Failed to parse routing TOML: {}", e);
+            default_routing()
+        })
     } else {
         default_routing()
     };
@@ -116,15 +131,27 @@ fn default_routing() -> RoutingConfig {
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
     mut env: JNIEnv,
-    _class: JClass,
-    tun_fd: jint,
+    class: JClass,
+    _tun_fd: jint,
     config_json: JString,
 ) -> jint {
     // Initialize logging (once).
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("xr_core=info,xr_proto=info")
+        .with_env_filter("xr_core=debug,xr_proto=info")
         .with_target(false)
         .try_init();
+
+    // Store JVM and class references for protect callback.
+    if JVM.get().is_none() {
+        if let Ok(jvm) = env.get_java_vm() {
+            let _ = JVM.set(jvm);
+        }
+    }
+    if BRIDGE_CLASS.get().is_none() {
+        if let Ok(global) = env.new_global_ref(&class) {
+            let _ = BRIDGE_CLASS.set(global);
+        }
+    }
 
     let config_str: String = match env.get_string(&config_json) {
         Ok(s) => s.into(),
@@ -141,8 +168,8 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
 
     let mut engine = VpnEngine::new(config);
     let queue = PacketQueue::new();
+    let protect = make_protect_fn();
 
-    // Build tokio runtime for async operations.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -155,16 +182,15 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
         }
     };
 
-    // Start the engine.
     let result = runtime.block_on(async {
-        engine.start(queue.clone())
+        engine.start(queue.clone(), protect)
     });
 
     match result {
         Ok(()) => {
             let mut lock = get_engine().lock().unwrap();
             *lock = Some(EngineHandle { engine, queue, runtime });
-            tracing::info!("VPN engine started (tun_fd={})", tun_fd);
+            tracing::info!("VPN engine started");
             0
         }
         Err(e) => {
@@ -197,7 +223,6 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetState(
     } else {
         "Disconnected".to_string()
     };
-
     env.new_string(&state_str)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
@@ -218,13 +243,11 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetStats(
     } else {
         "{\"bytes_up\":0,\"bytes_down\":0,\"active\":0,\"total\":0,\"uptime\":0}".to_string()
     };
-
     env.new_string(&stats_json)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
 }
 
-/// Push a raw IP packet from TUN into the engine.
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePushPacket(
     env: JNIEnv,
@@ -239,8 +262,6 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePushPacket(
     }
 }
 
-/// Pop outbound packets from the engine to write to TUN.
-/// Returns a byte array of the next packet, or null (represented as empty array).
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePopPacket(
     env: JNIEnv,

@@ -12,6 +12,7 @@ uniffi = ["dep:uniffi"]
 xr-proto = { path = "../xr-proto" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
 tracing = "0.1"
+socket2 = { version = "0.5", features = ["all"] }
 smoltcp = { version = "0.12", default-features = false, features = [
     "std", "log", "medium-ip", "proto-ipv4", "proto-ipv6",
     "socket-tcp", "socket-udp", "socket-dns",

@@ -22,7 +22,7 @@ use xr_proto::routing::{Action, Router};
 
 use crate::dns::FakeDns;
 use crate::ip_stack::{IpStack, PacketQueue};
-use crate::session::{relay_session, SessionContext, TcpSessionKey};
+use crate::session::{relay_session, ProtectSocketFn, SessionContext, TcpSessionKey};
 use crate::state::{StateHandle, VpnState};
 use crate::stats::Stats;
 
@@ -66,7 +66,11 @@ impl VpnEngine {
         &self.stats
     }
 
-    pub fn start(&mut self, queue: PacketQueue) -> io::Result<()> {
+    /// Start the VPN engine.
+    ///
+    /// `protect_socket` is called with socket fd before connecting — on Android
+    /// this calls VpnService.protect() so the socket bypasses the TUN.
+    pub fn start(&mut self, queue: PacketQueue, protect_socket: ProtectSocketFn) -> io::Result<()> {
         if self.shutdown_tx.is_some() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "already running"));
         }
@@ -96,6 +100,7 @@ impl VpnEngine {
             fake_dns: fake_dns.clone(),
             stats: self.stats.clone(),
             on_server_down,
+            protect_socket,
         });
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

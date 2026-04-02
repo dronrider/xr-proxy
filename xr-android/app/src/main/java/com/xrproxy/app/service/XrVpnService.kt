@@ -43,6 +43,9 @@ class XrVpnService : VpnService() {
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("Connecting..."))
 
+        // Set VpnService reference for socket protection (prevents routing loops).
+        NativeBridge.vpnService = this
+
         // Create TUN interface.
         val builder = Builder()
             .setSession("XR Proxy")
@@ -130,6 +133,7 @@ class XrVpnService : VpnService() {
 
         vpnInterface?.close()
         vpnInterface = null
+        NativeBridge.vpnService = null
 
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()

@@ -1735,6 +1735,7 @@ name = "xr-core"
 version = "0.1.0"
 dependencies = [
  "smoltcp",
+ "socket2 0.5.10",
  "tokio",
  "tracing",
  "tracing-subscriber",
