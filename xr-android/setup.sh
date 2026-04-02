@@ -87,9 +87,26 @@ else
     TMP_JDK="$TOOLS_DIR/jdk17-download.tar.gz"
 
     curl -L -o "$TMP_JDK" "$JDK_URL"
-    mkdir -p "$JDK_DIR"
-    tar xzf "$TMP_JDK" --strip-components=1 -C "$JDK_DIR"
-    rm -f "$TMP_JDK"
+
+    # Extract to temp dir first, then find the actual JDK root.
+    # On Linux: jdk-17.x.x+y/bin/java (strip 1)
+    # On macOS: jdk-17.x.x+y/Contents/Home/bin/java (strip 3)
+    TMP_JDK_EXTRACT="$TOOLS_DIR/jdk17-extract"
+    rm -rf "$TMP_JDK_EXTRACT"
+    mkdir -p "$TMP_JDK_EXTRACT"
+    tar xzf "$TMP_JDK" -C "$TMP_JDK_EXTRACT"
+
+    # Find the directory containing bin/java
+    JDK_ROOT=$(find "$TMP_JDK_EXTRACT" -name "java" -path "*/bin/java" -type f | head -1 | sed 's|/bin/java$||')
+    if [ -z "$JDK_ROOT" ]; then
+        echo "ERROR: Could not find java binary in downloaded archive"
+        rm -rf "$TMP_JDK_EXTRACT" "$TMP_JDK"
+        exit 1
+    fi
+
+    rm -rf "$JDK_DIR"
+    mv "$JDK_ROOT" "$JDK_DIR"
+    rm -rf "$TMP_JDK_EXTRACT" "$TMP_JDK"
 
     echo "Installed: $($JDK_DIR/bin/java -version 2>&1 | head -1)"
 fi
@@ -151,7 +168,9 @@ for pkg in "${PACKAGES[@]}"; do
         echo "  Already installed: $pkg"
     else
         echo "  Installing: $pkg ..."
-        sdkmanager --install "$pkg" 2>&1 | grep -E "^(Downloading|Installing|done)" || true
+        if ! sdkmanager --install "$pkg" 2>&1 | tail -5; then
+            echo "  WARNING: Failed to install $pkg"
+        fi
     fi
 done
 echo ""
