@@ -202,6 +202,11 @@ impl IpStack {
                 .ok();
         });
 
+        // Accept packets for ANY destination IP, not just 10.0.0.2.
+        // This is critical: TUN packets arrive for fake IPs (198.18.x.x)
+        // and real IPs. Without this, smoltcp drops them all.
+        iface.set_any_ip(true);
+
         // Default route through gateway.
         iface.routes_mut().add_default_ipv4_route(TUN_GATEWAY).ok();
 

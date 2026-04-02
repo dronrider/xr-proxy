@@ -186,9 +186,25 @@ async fn run_event_loop(
             if let Some(key) = detect_tcp_syn(&pkt) {
                 if !sessions.contains_key(&key) {
                     // Create smoltcp socket to handle this connection.
-                    let handle = stack.add_tcp_socket(65535, 65535);
+                    // Buffer sizes: 32KB each — reasonable for mobile.
+                    let handle = stack.add_tcp_socket(32768, 32768);
                     let socket = stack.tcp_socket_mut(handle);
-                    if socket.listen(key.dst_addr).is_ok() {
+                    // Listen on dst IP:port. Convert std Ipv4Addr → smoltcp Ipv4Address.
+                    let listen_ep = match key.dst_addr {
+                        SocketAddr::V4(v4) => smoltcp::wire::IpListenEndpoint {
+                            addr: Some(smoltcp::wire::Ipv4Address::new(
+                                v4.ip().octets()[0], v4.ip().octets()[1],
+                                v4.ip().octets()[2], v4.ip().octets()[3],
+                            ).into()),
+                            port: v4.port(),
+                        },
+                        SocketAddr::V6(_) => {
+                            stack.remove_socket(handle);
+                            queue.push_inbound(pkt);
+                            continue;
+                        }
+                    };
+                    if socket.listen(listen_ep).is_ok() {
                         // Create channels for relay.
                         let (to_relay_tx, to_relay_rx) = mpsc::channel(256);
                         let (from_relay_tx, from_relay_rx) = mpsc::channel(256);
