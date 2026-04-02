@@ -1,0 +1,23 @@
+[package]
+name = "xr-core"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+geoip = ["xr-proto/geoip"]
+uniffi = ["dep:uniffi"]
+
+[dependencies]
+xr-proto = { path = "../xr-proto" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
+tracing = "0.1"
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std", "log", "medium-ip", "proto-ipv4", "proto-ipv6",
+    "socket-tcp", "socket-udp", "socket-dns",
+] }
+uniffi = { version = "0.29", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
