@@ -70,6 +70,20 @@ impl PacketQueue {
         inner.outbound.drain(..).collect()
     }
 
+    /// Pop a packet from the inbound queue (public, for DNS interception).
+    pub fn pop_inbound_public(&self) -> Option<Vec<u8>> {
+        self.inner.lock().unwrap().inbound.pop_front()
+    }
+
+    /// Push a packet to the outbound queue (public, for DNS responses).
+    pub fn push_outbound_public(&self, packet: Vec<u8>) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.outbound.len() >= 4096 {
+            inner.outbound.pop_front();
+        }
+        inner.outbound.push_back(packet);
+    }
+
     fn pop_inbound(&self) -> Option<Vec<u8>> {
         self.inner.lock().unwrap().inbound.pop_front()
     }
