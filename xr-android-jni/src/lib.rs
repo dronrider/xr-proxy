@@ -135,7 +135,7 @@ fn default_routing() -> RoutingConfig {
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
     mut env: JNIEnv,
-    class: JClass,
+    _class: JClass,
     _tun_fd: jint,
     config_json: JString,
 ) -> jint {
@@ -152,26 +152,28 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
     }
 
     // Cache class + method ID on the MAIN thread where ClassLoader works.
-    // This is the critical fix — FindClass/GetStaticMethodID only works
-    // from threads that have the app's ClassLoader (main thread, service threads).
+    // NativeBridge is a Kotlin `object`, so `class` parameter may be the instance,
+    // not the JClass. Use FindClass explicitly to get the correct JClass.
     if PROTECT_METHOD.get().is_none() {
-        if let Ok(global_class) = env.new_global_ref(&class) {
-            let method_id = env.get_static_method_id(
-                &class,
-                "protectSocket",
-                "(I)Z",
-            );
-            match method_id {
-                Ok(mid) => {
-                    let _ = PROTECT_METHOD.set(ProtectMethodCache {
-                        class: global_class,
-                        method_id: mid.into_raw(),
-                    });
-                    tracing::info!("Cached protectSocket method ID");
+        match env.find_class("com/xrproxy/app/jni/NativeBridge") {
+            Ok(found_class) => {
+                match env.get_static_method_id(&found_class, "protectSocket", "(I)Z") {
+                    Ok(mid) => {
+                        if let Ok(global_class) = env.new_global_ref(&found_class) {
+                            let _ = PROTECT_METHOD.set(ProtectMethodCache {
+                                class: global_class,
+                                method_id: mid.into_raw(),
+                            });
+                            tracing::info!("Cached protectSocket method ID");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to get protectSocket method: {:?}", e);
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("Failed to cache protectSocket: {:?}", e);
-                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to find NativeBridge class: {:?}", e);
             }
         }
     }
