@@ -7,10 +7,10 @@
 //! - nativeGetState() → returns state string
 
 use jni::objects::{JClass, JString};
-use jni::sys::{jint, jlong, jstring};
+use jni::sys::{jint, jstring};
 use jni::JNIEnv;
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use xr_core::engine::{VpnConfig, VpnEngine};
 use xr_core::ip_stack::PacketQueue;
@@ -22,6 +22,7 @@ static ENGINE: OnceLock<Mutex<Option<EngineHandle>>> = OnceLock::new();
 struct EngineHandle {
     engine: VpnEngine,
     queue: PacketQueue,
+    #[allow(dead_code)] // held to keep the runtime alive
     runtime: tokio::runtime::Runtime,
 }
 
