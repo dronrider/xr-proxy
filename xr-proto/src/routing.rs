@@ -1,6 +1,6 @@
 /// Routing engine: domain matching, IP range (CIDR) matching, GeoIP lookup.
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use xr_proto::config::{RoutingConfig, RoutingRule};
+use crate::config::{RoutingConfig, RoutingRule};
 
 /// Routing decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,7 +123,7 @@ impl Router {
     /// Decide routing for a connection.
     ///
     /// `sni` is extracted from TLS ClientHello (may be None for non-TLS).
-    /// `dest_ip` is the original destination IP from SO_ORIGINAL_DST.
+    /// `dest_ip` is the original destination IP.
     pub fn resolve(&self, sni: Option<&str>, dest_ip: IpAddr) -> Action {
         for rule in &self.rules {
             if self.matches_rule(rule, sni, dest_ip) {
@@ -236,7 +236,7 @@ fn compile_rule(rule: &RoutingRule) -> CompiledRule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xr_proto::config::{RoutingConfig, RoutingRule};
+    use crate::config::{RoutingConfig, RoutingRule};
 
     fn make_config() -> RoutingConfig {
         RoutingConfig {

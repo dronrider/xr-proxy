@@ -1,7 +1,5 @@
 mod proxy;
 mod redirect;
-mod routing;
-mod sni;
 mod udp_relay;
 
 use clap::Parser;
@@ -11,6 +9,7 @@ use std::sync::Arc;
 use xr_proto::config::{decode_key, load_client_config};
 use xr_proto::obfuscation::{ModifierStrategy, Obfuscator};
 use xr_proto::protocol::Codec;
+use xr_proto::routing;
 
 const CRASH_LOG: &str = "/etc/xr-proxy/crash.log";
 

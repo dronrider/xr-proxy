@@ -3,12 +3,18 @@ name = "xr-proto"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+geoip = ["maxminddb"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 base64 = "0.22"
 rand = "0.8"
 tracing = "0.1"
+maxminddb = { version = "0.24", optional = true }
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

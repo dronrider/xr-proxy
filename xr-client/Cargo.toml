@@ -5,7 +5,7 @@ edition.workspace = true
 
 [features]
 default = []
-geoip = ["maxminddb"]
+geoip = ["xr-proto/geoip"]
 
 [dependencies]
 xr-proto = { path = "../xr-proto" }
@@ -13,6 +13,5 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "signal",
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
-maxminddb = { version = "0.24", optional = true }
 libc = "0.2"
 socket2 = { version = "0.5", features = ["all"] }
