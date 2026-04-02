@@ -34,34 +34,49 @@ fn get_engine() -> &'static Mutex<Option<EngineHandle>> {
 /// Create a ProtectSocketFn that calls back into Java.
 fn make_protect_fn() -> ProtectSocketFn {
     Arc::new(|fd: i32| -> bool {
-        let jvm = match JVM.get() {
-            Some(jvm) => jvm,
-            None => return false,
-        };
-        let bridge_class = match BRIDGE_CLASS.get() {
-            Some(c) => c,
-            None => return false,
-        };
+        // Catch any panic to prevent crash.
+        let result = std::panic::catch_unwind(|| {
+            let jvm = match JVM.get() {
+                Some(jvm) => jvm,
+                None => { tracing::warn!("protect: no JVM"); return false; }
+            };
+            let bridge_class = match BRIDGE_CLASS.get() {
+                Some(c) => c,
+                None => { tracing::warn!("protect: no class ref"); return false; }
+            };
 
-        // Attach current thread to JVM (needed for callback from Rust threads).
-        let mut env = match jvm.attach_current_thread() {
-            Ok(env) => env,
-            Err(_) => return false,
-        };
+            let mut env = match jvm.attach_current_thread() {
+                Ok(env) => env,
+                Err(e) => { tracing::warn!("protect: attach failed: {}", e); return false; }
+            };
 
-        // Call NativeBridge.protectSocket(fd) — static Java method.
-        match env.call_static_method(
-            &*bridge_class,
-            "protectSocket",
-            "(I)Z",
-            &[JValue::Int(fd)],
-        ) {
-            Ok(result) => result.z().unwrap_or(false),
-            Err(e) => {
-                tracing::warn!("protectSocket JNI call failed: {}", e);
-                false
+            // Use the class name to find the class — this works from any thread.
+            let class = match env.find_class("com/xrproxy/app/jni/NativeBridge") {
+                Ok(c) => c,
+                Err(_) => {
+                    // Fallback: try using the stored GlobalRef.
+                    let obj = bridge_class.as_obj();
+                    // Safety: GlobalRef to a Class object is valid as JClass.
+                    unsafe { JClass::from_raw(obj.as_raw()) }
+                }
+            };
+            match env.call_static_method(
+                &class,
+                "protectSocket",
+                "(I)Z",
+                &[JValue::Int(fd)],
+            ) {
+                Ok(result) => result.z().unwrap_or(false),
+                Err(e) => {
+                    tracing::warn!("protectSocket JNI call failed: {}", e);
+                    // Clear any Java exception.
+                    let _ = env.exception_clear();
+                    false
+                }
             }
-        }
+        });
+
+        result.unwrap_or(false)
     })
 }
 
@@ -182,11 +197,10 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
         }
     };
 
-    let result = runtime.block_on(async {
-        engine.start(queue.clone(), protect)
-    });
-
-    match result {
+    // Enter the runtime context so engine.start() can spawn tasks,
+    // but don't block the Android thread.
+    let _guard = runtime.enter();
+    match engine.start(queue.clone(), protect) {
         Ok(()) => {
             let mut lock = get_engine().lock().unwrap();
             *lock = Some(EngineHandle { engine, queue, runtime });
