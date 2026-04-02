@@ -172,7 +172,7 @@ async fn run_event_loop(
         let mut non_dns_packets = Vec::new();
         while let Some(packet) = queue.pop_inbound_public() {
             if let Some(dns_response) = try_handle_dns(&packet, &fake_dns) {
-                // DNS intercepted — push response to outbound (→ TUN).
+                ctx.stats.add_dns_query();
                 queue.push_outbound_public(dns_response);
             } else {
                 // Not DNS — will be processed by smoltcp.
@@ -219,13 +219,20 @@ async fn run_event_loop(
                         let ctx_clone = ctx.clone();
                         let key_clone = key;
                         tokio::spawn(async move {
-                            if let Err(e) = relay_session(ctx_clone, key_clone, to_relay_rx, from_relay_tx).await {
-                                tracing::debug!("Relay {} -> {} ended: {}", key_clone.src_addr, key_clone.dst_addr, e);
+                            match relay_session(ctx_clone.clone(), key_clone, to_relay_rx, from_relay_tx).await {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    ctx_clone.stats.add_relay_error();
+                                    ctx_clone.stats.set_debug(format!(
+                                        "relay err: {} -> {}: {}",
+                                        key_clone.src_addr, key_clone.dst_addr, e
+                                    ));
+                                }
                             }
                         });
 
                         ctx.stats.connection_opened();
-                        tracing::info!("New TCP session: {} -> {}", key.src_addr, key.dst_addr);
+                        ctx.stats.add_tcp_syn();
                     } else {
                         stack.remove_socket(handle);
                     }
@@ -250,6 +257,7 @@ async fn run_event_loop(
                 match socket.recv_slice(&mut buf) {
                     Ok(n) if n > 0 => {
                         buf.truncate(n);
+                        ctx.stats.add_smol_recv(n as u64);
                         let _ = session.to_relay.try_send(buf);
                     }
                     _ => {}
@@ -260,6 +268,7 @@ async fn run_event_loop(
             while socket.can_send() {
                 match session.from_relay.try_recv() {
                     Ok(data) => {
+                        ctx.stats.add_smol_send(data.len() as u64);
                         let _ = socket.send_slice(&data);
                     }
                     Err(_) => break,

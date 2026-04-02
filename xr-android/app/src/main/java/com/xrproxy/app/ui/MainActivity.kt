@@ -176,6 +176,23 @@ fun ConnectionSection(
                 StatRow("Download", formatBytes(state.bytesDown))
                 StatRow("Connections", "${state.activeConnections}")
                 StatRow("Uptime", formatUptime(state.uptime))
+
+                Spacer(Modifier.height(12.dp))
+                Text("Debug", style = MaterialTheme.typography.titleSmall)
+                Spacer(Modifier.height(4.dp))
+                StatRow("DNS queries", "${state.dnsQueries}")
+                StatRow("TCP SYNs", "${state.tcpSyns}")
+                StatRow("smoltcp recv", formatBytes(state.smolRecv))
+                StatRow("smoltcp send", formatBytes(state.smolSend))
+                StatRow("Relay errors", "${state.relayErrors}")
+                if (state.debugMsg.isNotBlank()) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        state.debugMsg,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
             }
         }
     }

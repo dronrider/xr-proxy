@@ -253,12 +253,14 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetStats(
     let json = match *lock {
         Some(ref h) => {
             let s = h.engine.stats().snapshot();
+            let debug_escaped = s.debug_msg.replace('\\', "\\\\").replace('"', "\\\"");
             format!(
-                "{{\"bytes_up\":{},\"bytes_down\":{},\"active\":{},\"total\":{},\"uptime\":{}}}",
-                s.bytes_up, s.bytes_down, s.active_connections, s.total_connections, s.uptime_seconds
+                "{{\"bytes_up\":{},\"bytes_down\":{},\"active\":{},\"total\":{},\"uptime\":{},\"dns\":{},\"syns\":{},\"smol_recv\":{},\"smol_send\":{},\"relay_err\":{},\"debug\":\"{}\"}}",
+                s.bytes_up, s.bytes_down, s.active_connections, s.total_connections, s.uptime_seconds,
+                s.dns_queries, s.tcp_syns, s.smol_recv, s.smol_send, s.relay_errors, debug_escaped
             )
         }
-        None => "{\"bytes_up\":0,\"bytes_down\":0,\"active\":0,\"total\":0,\"uptime\":0}".into(),
+        None => "{\"bytes_up\":0,\"bytes_down\":0,\"active\":0,\"total\":0,\"uptime\":0,\"dns\":0,\"syns\":0,\"smol_recv\":0,\"smol_send\":0,\"relay_err\":0,\"debug\":\"\"}".into(),
     };
     env.new_string(&json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }

@@ -22,6 +22,13 @@ data class VpnUiState(
     val bytesDown: Long = 0,
     val activeConnections: Int = 0,
     val uptime: Long = 0,
+    // Debug
+    val dnsQueries: Long = 0,
+    val tcpSyns: Long = 0,
+    val smolRecv: Long = 0,
+    val smolSend: Long = 0,
+    val relayErrors: Long = 0,
+    val debugMsg: String = "",
     // Settings
     val serverAddress: String = "",
     val serverPort: String = "8443",
@@ -193,11 +200,20 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 val bytesDown = extractLong(statsJson, "bytes_down")
                 val active = extractLong(statsJson, "active").toInt()
                 val uptime = extractLong(statsJson, "uptime")
+                val dns = extractLong(statsJson, "dns")
+                val syns = extractLong(statsJson, "syns")
+                val smolRecv = extractLong(statsJson, "smol_recv")
+                val smolSend = extractLong(statsJson, "smol_send")
+                val relayErr = extractLong(statsJson, "relay_err")
+                val debug = extractString(statsJson, "debug")
 
                 _uiState.value = _uiState.value.copy(
                     connected = connected, connecting = connecting, state = stateStr,
                     bytesUp = bytesUp, bytesDown = bytesDown,
                     activeConnections = active, uptime = uptime,
+                    dnsQueries = dns, tcpSyns = syns,
+                    smolRecv = smolRecv, smolSend = smolSend,
+                    relayErrors = relayErr, debugMsg = debug,
                 )
 
                 if (!connected && !connecting) { statsPolling = false; break }
@@ -256,6 +272,15 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         return sb.toString()
+    }
+
+    private fun extractString(json: String, key: String): String {
+        val pattern = "\"$key\":\""
+        val idx = json.indexOf(pattern)
+        if (idx < 0) return ""
+        val rest = json.substring(idx + pattern.length)
+        val end = rest.indexOf('"')
+        return if (end >= 0) rest.substring(0, end) else ""
     }
 
     private fun extractLong(json: String, key: String): Long {
