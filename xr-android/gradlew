@@ -1,21 +1,41 @@
 #!/bin/sh
-# Gradle wrapper bootstrap script
+# Gradle wrapper bootstrap script.
+# Downloads Gradle if not cached, then runs it.
+
+set -e
+
 export JAVA_HOME="${JAVA_HOME:-$HOME/android-tools/jdk17}"
 export ANDROID_HOME="${ANDROID_HOME:-$HOME/android-tools/sdk}"
 export PATH="$JAVA_HOME/bin:$PATH"
 
 APP_HOME=$(cd "$(dirname "$0")" && pwd)
-GRADLE_DIST="$APP_HOME/gradle/wrapper/gradle-wrapper.properties"
-GRADLE_HOME="$HOME/.gradle/wrapper/dists/gradle-8.7-bin"
 
-if [ ! -d "$GRADLE_HOME" ]; then
-    echo "Downloading Gradle 8.7..."
-    mkdir -p "$HOME/.gradle/wrapper/dists"
-    wget -q "https://services.gradle.org/distributions/gradle-8.7-bin.zip" -O /tmp/gradle-8.7.zip
-    mkdir -p "$GRADLE_HOME"
-    unzip -q /tmp/gradle-8.7.zip -d "$GRADLE_HOME"
-    rm /tmp/gradle-8.7.zip
+GRADLE_VERSION="8.7"
+GRADLE_DIST_URL="https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
+GRADLE_CACHE="$HOME/.gradle/wrapper/dists/gradle-${GRADLE_VERSION}-bin"
+GRADLE_BIN=""
+
+# Find existing Gradle binary in cache.
+if [ -d "$GRADLE_CACHE" ]; then
+    GRADLE_BIN=$(find "$GRADLE_CACHE" -name "gradle" -type f -path "*/bin/gradle" 2>/dev/null | head -1)
 fi
 
-GRADLE_BIN=$(find "$GRADLE_HOME" -name "gradle" -type f -path "*/bin/gradle" | head -1)
+# Download if not found.
+if [ -z "$GRADLE_BIN" ] || [ ! -x "$GRADLE_BIN" ]; then
+    echo "Downloading Gradle ${GRADLE_VERSION}..."
+    TMP_ZIP="/tmp/gradle-${GRADLE_VERSION}-$$.zip"
+    mkdir -p "$GRADLE_CACHE"
+
+    curl -fsSL -o "$TMP_ZIP" "$GRADLE_DIST_URL"
+    unzip -q -o "$TMP_ZIP" -d "$GRADLE_CACHE"
+    rm -f "$TMP_ZIP"
+
+    GRADLE_BIN=$(find "$GRADLE_CACHE" -name "gradle" -type f -path "*/bin/gradle" | head -1)
+fi
+
+if [ -z "$GRADLE_BIN" ] || [ ! -x "$GRADLE_BIN" ]; then
+    echo "ERROR: Could not find Gradle binary after download" >&2
+    exit 1
+fi
+
 exec "$GRADLE_BIN" "$@"
