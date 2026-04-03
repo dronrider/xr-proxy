@@ -54,12 +54,19 @@ async fn connect_protected(addr: SocketAddr, protect: &ProtectSocketFn) -> io::R
     };
 
     // Protect BEFORE connecting — critical on Android.
-    // This tells the OS to route this socket outside the VPN tunnel.
     let fd = socket.as_raw_fd();
     let protected = protect(fd);
-    tracing::debug!("protect fd={} addr={} => {}", fd, addr, protected);
+    if !protected {
+        return Err(io::Error::new(io::ErrorKind::Other,
+            format!("protect(fd={}) failed for {}", fd, addr)));
+    }
 
-    socket.connect(addr).await
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        socket.connect(addr),
+    ).await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut,
+        format!("connect timeout to {}", addr)))?
 }
 
 /// Connect to server with retry, using protected sockets.
@@ -129,10 +136,22 @@ async fn relay_via_proxy(
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) -> io::Result<()> {
     // Connect to xr-server with PROTECTED socket.
-    let mut server = connect_server_protected(&ctx.server_addr, &ctx.protect_socket, 3).await?;
+    let mut server = connect_server_protected(&ctx.server_addr, &ctx.protect_socket, 3).await
+        .map_err(|e| {
+            ctx.stats.add_log(&format!("srv connect fail: {}", e));
+            e
+        })?;
+
+    ctx.stats.add_log(&format!("srv connected, handshaking for {:?}", target_addr));
 
     // Handshake.
-    tunnel::handshake(&mut server, &target_addr, &ctx.codec).await?;
+    tunnel::handshake(&mut server, &target_addr, &ctx.codec).await
+        .map_err(|e| {
+            ctx.stats.add_log(&format!("handshake fail: {}", e));
+            e
+        })?;
+
+    ctx.stats.add_log(&format!("relay started for {:?}", target_addr));
 
     let codec_up = ctx.codec.clone();
     let codec_down = ctx.codec.clone();
