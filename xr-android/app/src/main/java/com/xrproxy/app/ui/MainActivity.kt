@@ -200,8 +200,20 @@ fun ConnectionSection(
                     Text(
                         state.debugMsg,
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+                if (state.recentErrors.isNotEmpty()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text("Recent errors:", style = MaterialTheme.typography.labelSmall)
+                    for (err in state.recentErrors.takeLast(5)) {
+                        Text(
+                            err,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                            maxLines = 2,
+                        )
+                    }
                 }
             }
         }

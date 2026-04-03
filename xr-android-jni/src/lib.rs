@@ -254,10 +254,15 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetStats(
         Some(ref h) => {
             let s = h.engine.stats().snapshot();
             let debug_escaped = s.debug_msg.replace('\\', "\\\\").replace('"', "\\\"");
+            let errors = h.engine.stats().recent_errors();
+            let errors_json: Vec<String> = errors.iter()
+                .map(|e| format!("\"{}\"", e.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ")))
+                .collect();
             format!(
-                "{{\"bytes_up\":{},\"bytes_down\":{},\"active\":{},\"total\":{},\"uptime\":{},\"dns\":{},\"syns\":{},\"smol_recv\":{},\"smol_send\":{},\"relay_err\":{},\"debug\":\"{}\"}}",
+                "{{\"bytes_up\":{},\"bytes_down\":{},\"active\":{},\"total\":{},\"uptime\":{},\"dns\":{},\"syns\":{},\"smol_recv\":{},\"smol_send\":{},\"relay_err\":{},\"debug\":\"{}\",\"errors\":[{}]}}",
                 s.bytes_up, s.bytes_down, s.active_connections, s.total_connections, s.uptime_seconds,
-                s.dns_queries, s.tcp_syns, s.smol_recv, s.smol_send, s.relay_errors, debug_escaped
+                s.dns_queries, s.tcp_syns, s.smol_recv, s.smol_send, s.relay_errors, debug_escaped,
+                errors_json.join(",")
             )
         }
         None => "{\"bytes_up\":0,\"bytes_down\":0,\"active\":0,\"total\":0,\"uptime\":0,\"dns\":0,\"syns\":0,\"smol_recv\":0,\"smol_send\":0,\"relay_err\":0,\"debug\":\"\"}".into(),

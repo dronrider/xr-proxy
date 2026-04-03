@@ -23,6 +23,7 @@ struct StatsInner {
     smol_send: AtomicU64,
     relay_errors: AtomicU64,
     debug_msg: std::sync::Mutex<String>,
+    recent_errors: std::sync::Mutex<Vec<String>>,
 }
 
 /// Snapshot of current statistics.
@@ -56,6 +57,7 @@ impl Stats {
                 smol_send: AtomicU64::new(0),
                 relay_errors: AtomicU64::new(0),
                 debug_msg: std::sync::Mutex::new(String::new()),
+                recent_errors: std::sync::Mutex::new(Vec::new()),
             }),
         }
     }
@@ -97,8 +99,17 @@ impl Stats {
         self.inner.smol_send.fetch_add(n, Ordering::Relaxed);
     }
 
-    pub fn add_relay_error(&self) {
+    pub fn add_relay_error(&self, msg: &str) {
         self.inner.relay_errors.fetch_add(1, Ordering::Relaxed);
+        let mut errors = self.inner.recent_errors.lock().unwrap();
+        if errors.len() >= 10 {
+            errors.remove(0);
+        }
+        errors.push(msg.to_string());
+    }
+
+    pub fn recent_errors(&self) -> Vec<String> {
+        self.inner.recent_errors.lock().unwrap().clone()
     }
 
     pub fn set_debug(&self, msg: String) {

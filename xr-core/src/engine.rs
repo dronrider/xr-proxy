@@ -321,8 +321,8 @@ async fn run_event_loop(
                     match relay_session(ctx_clone.clone(), relay_key, to_relay_rx, from_relay_tx).await {
                         Ok(()) => {}
                         Err(e) => {
-                            ctx_clone.stats.add_relay_error();
-                            ctx_clone.stats.set_debug(format!("relay err: {}: {}", real_dst, e));
+                            let msg = format!("{}: {}", real_dst, e);
+                            ctx_clone.stats.add_relay_error(&msg);
                         }
                     }
                 });

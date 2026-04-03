@@ -29,6 +29,7 @@ data class VpnUiState(
     val smolSend: Long = 0,
     val relayErrors: Long = 0,
     val debugMsg: String = "",
+    val recentErrors: List<String> = emptyList(),
     // Settings
     val serverAddress: String = "",
     val serverPort: String = "8443",
@@ -206,6 +207,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 val smolSend = extractLong(statsJson, "smol_send")
                 val relayErr = extractLong(statsJson, "relay_err")
                 val debug = extractString(statsJson, "debug")
+                val errors = extractStringArray(statsJson, "errors")
 
                 _uiState.value = _uiState.value.copy(
                     connected = connected, connecting = connecting, state = stateStr,
@@ -214,6 +216,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                     dnsQueries = dns, tcpSyns = syns,
                     smolRecv = smolRecv, smolSend = smolSend,
                     relayErrors = relayErr, debugMsg = debug,
+                    recentErrors = errors,
                 )
 
                 if (!connected && !connecting) { statsPolling = false; break }
@@ -272,6 +275,18 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         return sb.toString()
+    }
+
+    private fun extractStringArray(json: String, key: String): List<String> {
+        val pattern = "\"$key\":["
+        val idx = json.indexOf(pattern)
+        if (idx < 0) return emptyList()
+        val rest = json.substring(idx + pattern.length)
+        val end = rest.indexOf(']')
+        if (end < 0) return emptyList()
+        val inner = rest.substring(0, end)
+        if (inner.isBlank()) return emptyList()
+        return Regex("\"([^\"]+)\"").findAll(inner).map { it.groupValues[1] }.toList()
     }
 
     private fun extractString(json: String, key: String): String {
