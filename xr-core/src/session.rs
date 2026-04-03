@@ -8,6 +8,7 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -45,60 +46,20 @@ pub struct SessionContext {
 
 /// Create a TCP connection that bypasses the VPN tunnel.
 ///
-/// 1. Create raw socket via socket2
-/// 2. Call protect_socket(fd) so Android VPN doesn't capture it
-/// 3. Connect to target
-/// 4. Convert to tokio TcpStream
+/// Uses tokio::net::TcpSocket with protect(fd) before connect.
 async fn connect_protected(addr: SocketAddr, protect: &ProtectSocketFn) -> io::Result<TcpStream> {
-    let domain = match addr {
-        SocketAddr::V4(_) => socket2::Domain::IPV4,
-        SocketAddr::V6(_) => socket2::Domain::IPV6,
+    let socket = match addr {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
     };
 
-    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    socket.set_nonblocking(true)?;
-
-    // Protect BEFORE connecting — this is critical on Android.
+    // Protect BEFORE connecting — critical on Android.
+    // This tells the OS to route this socket outside the VPN tunnel.
     let fd = socket.as_raw_fd();
-    if !protect(fd) {
-        tracing::warn!("Failed to protect socket fd={}", fd);
-    }
+    let protected = protect(fd);
+    tracing::debug!("protect fd={} addr={} => {}", fd, addr, protected);
 
-    let std_stream: std::net::TcpStream = socket.into();
-    let tokio_stream = TcpStream::from_std(std_stream)?;
-
-    // Connect asynchronously.
-    // Since socket is non-blocking, we need to use tokio's connect.
-    // But we already have a TcpStream... we need to do the connect.
-    // Actually, from_std on an unconnected socket won't work for connect.
-    // Let's use a different approach.
-    drop(tokio_stream);
-
-    // Better approach: create socket, protect, then connect synchronously
-    // in a blocking task.
-    let protect_clone = protect.clone();
-    tokio::task::spawn_blocking(move || -> io::Result<std::net::TcpStream> {
-        let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-
-        let raw_fd = {
-            use std::os::fd::AsRawFd;
-            socket.as_raw_fd()
-        };
-        if !protect_clone(raw_fd) {
-            tracing::warn!("Failed to protect socket fd={}", raw_fd);
-        }
-
-        // Set connect timeout.
-        socket.set_nonblocking(false)?;
-        let sock_addr: socket2::SockAddr = addr.into();
-        socket.connect_timeout(&sock_addr, std::time::Duration::from_secs(10))?;
-        socket.set_nonblocking(true)?;
-
-        Ok(socket.into())
-    })
-    .await
-    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-    .and_then(|std_stream| TcpStream::from_std(std_stream))
+    socket.connect(addr).await
 }
 
 /// Connect to server with retry, using protected sockets.
@@ -145,15 +106,21 @@ pub async fn relay_session(
         TargetAddr::Ip(key.dst_addr)
     };
 
-    tracing::info!(
-        "Relay: {} -> {} [{}] => {:?}",
-        key.src_addr, key.dst_addr,
-        domain.as_deref().unwrap_or("-"), action,
-    );
-
     match action {
-        Action::Proxy => relay_via_proxy(ctx, target_addr, data_rx, data_tx).await,
-        Action::Direct => relay_direct(ctx, key.dst_addr, domain.as_deref(), data_rx, data_tx).await,
+        Action::Proxy => {
+            ctx.stats.set_debug(format!(
+                "proxy: {} [{}] -> srv {}",
+                key.dst_addr, domain.as_deref().unwrap_or("-"), ctx.server_addr,
+            ));
+            relay_via_proxy(ctx, target_addr, data_rx, data_tx).await
+        }
+        Action::Direct => {
+            ctx.stats.set_debug(format!(
+                "direct: {} [{}]",
+                key.dst_addr, domain.as_deref().unwrap_or("-"),
+            ));
+            relay_direct(ctx, key.dst_addr, domain.as_deref(), data_rx, data_tx).await
+        }
     }
 }
 
@@ -297,6 +264,3 @@ async fn relay_direct(
         Err(_) => Ok(()),
     }
 }
-
-// Re-export AsRawFd for use in connect_protected.
-use std::os::fd::AsRawFd;
