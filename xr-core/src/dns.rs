@@ -17,7 +17,7 @@ const FAKE_IP_BASE: u32 = 0xC6120000; // 198.18.0.0
 const FAKE_IP_MASK: u32 = 0xFFFE0000; // /15 → 131072 addresses
 
 /// TTL for cached entries.
-const DEFAULT_TTL: Duration = Duration::from_secs(600); // 10 minutes
+const DEFAULT_TTL: Duration = Duration::from_secs(3600); // 1 hour
 
 struct Entry {
     domain: String,

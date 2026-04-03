@@ -24,7 +24,7 @@ use xr_proto::routing::{Action, Router};
 
 use crate::dns::FakeDns;
 use crate::ip_stack::{IpStack, PacketQueue};
-use crate::session::{relay_session, ProtectSocketFn, SessionContext, TcpSessionKey};
+use crate::session::{relay_session_with_domain, ProtectSocketFn, SessionContext, TcpSessionKey};
 use crate::state::{StateHandle, VpnState};
 use crate::stats::Stats;
 
@@ -125,6 +125,8 @@ struct ActiveSession {
     smol_handle: SocketHandle,
     /// The real destination (from the SYN packet).
     real_dst: SocketAddr,
+    /// Domain from Fake DNS (cached at SYN time, not at relay time).
+    domain: Option<String>,
     /// Ephemeral port assigned to this session for smoltcp.
     eph_port: u16,
     /// Set when TCP reaches Established.
@@ -199,9 +201,15 @@ async fn run_event_loop(
                     let socket = stack.tcp_socket_mut(handle);
 
                     if socket.listen(eph_port).is_ok() {
+                        // Cache domain NOW — FakeDns TTL might expire before Established.
+                        let domain = if let IpAddr::V4(v4) = dst_ip.into() {
+                            fake_dns.lookup(v4)
+                        } else { None };
+
                         sessions.insert(orig_key, ActiveSession {
                             smol_handle: handle,
                             real_dst: orig_key.dst_addr,
+                            domain,
                             eph_port,
                             relay: None,
                         });
@@ -311,14 +319,14 @@ async fn run_event_loop(
 
                 let ctx_clone = ctx.clone();
                 let real_dst = session.real_dst;
+                let cached_domain = session.domain.clone();
                 let key_clone = *key;
                 tokio::spawn(async move {
-                    // Use real_dst (not rewritten) for relay.
                     let relay_key = TcpSessionKey {
                         src_addr: key_clone.src_addr,
                         dst_addr: real_dst,
                     };
-                    match relay_session(ctx_clone.clone(), relay_key, to_relay_rx, from_relay_tx).await {
+                    match relay_session_with_domain(ctx_clone.clone(), relay_key, cached_domain, to_relay_rx, from_relay_tx).await {
                         Ok(()) => {}
                         Err(e) => {
                             let msg = format!("{}: {}", real_dst, e);

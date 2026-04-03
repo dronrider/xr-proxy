@@ -86,17 +86,14 @@ async fn connect_server_protected(
     unreachable!()
 }
 
-/// Spawn a relay task for a single session.
-pub async fn relay_session(
+/// Spawn a relay task with a pre-resolved domain.
+pub async fn relay_session_with_domain(
     ctx: Arc<SessionContext>,
     key: TcpSessionKey,
+    domain: Option<String>,
     data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) -> io::Result<()> {
-    let domain = ctx.fake_dns.lookup(match key.dst_addr.ip() {
-        IpAddr::V4(v4) => v4,
-        _ => return Err(io::Error::new(io::ErrorKind::Other, "IPv6 not supported yet")),
-    });
 
     let action = ctx.router.resolve(domain.as_deref(), key.dst_addr.ip());
 
