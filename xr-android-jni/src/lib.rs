@@ -196,7 +196,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
     let protect = make_protect_fn();
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(4)
         .enable_all()
         .build()
     {

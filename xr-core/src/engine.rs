@@ -403,8 +403,15 @@ async fn run_event_loop(
             }
         }
 
-        // ── 9. Sleep ────────────────────────────────────────────────
-        let delay = stack.poll_delay().unwrap_or(Duration::from_millis(1)).min(Duration::from_millis(1));
+        // ── 9. Yield to relay tasks, then sleep ────────────────────
+        tokio::task::yield_now().await;
+
+        let has_data = queue.has_inbound() || queue.has_outbound();
+        let delay = if has_data {
+            Duration::from_micros(200)
+        } else {
+            stack.poll_delay().unwrap_or(Duration::from_millis(5)).min(Duration::from_millis(5))
+        };
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             _ = shutdown_rx.changed() => {}
