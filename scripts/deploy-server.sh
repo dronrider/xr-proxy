@@ -1,5 +1,5 @@
 #!/bin/bash
-# Сборка и обновление xr-server на VPS.
+# Сборка и обновление xr-server на VPS (сборка локально на сервере).
 # Использование: ./scripts/deploy-server.sh user@host [-p port]
 set -euo pipefail
 
@@ -19,17 +19,16 @@ if [[ -z "$VPS" ]]; then
     exit 1
 fi
 
+PROJECT_DIR="~/projects/xr-proxy"
 REMOTE_BIN="/usr/local/bin/xr-server"
-LOCAL_BIN="target/release/xr-server"
 
-echo "=== Сборка xr-server ==="
-cargo build --release -p xr-server
-
-echo "=== Загрузка на $VPS (порт $SSH_PORT) ==="
-scp -P "$SSH_PORT" "$LOCAL_BIN" "$VPS":"${REMOTE_BIN}.new"
-
-echo "=== Замена и перезапуск ==="
+echo "=== Сборка и перезапуск на $VPS (порт $SSH_PORT) ==="
 ssh -p "$SSH_PORT" "$VPS" "
+    set -e
+    cd $PROJECT_DIR &&
+    git pull &&
+    cargo build --release -p xr-server &&
+    cp target/release/xr-server ${REMOTE_BIN}.new &&
     mv ${REMOTE_BIN}.new ${REMOTE_BIN} &&
     chmod +x ${REMOTE_BIN} &&
     systemctl restart xr-proxy-server &&
