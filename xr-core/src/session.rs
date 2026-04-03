@@ -69,28 +69,12 @@ async fn connect_protected(addr: SocketAddr, protect: &ProtectSocketFn) -> io::R
         format!("connect timeout to {}", addr)))?
 }
 
-/// Connect to server with retry, using protected sockets.
+/// Connect to server, using protected socket. Single attempt (no retry).
 async fn connect_server_protected(
     addr: &SocketAddr,
     protect: &ProtectSocketFn,
-    max_retries: u32,
 ) -> io::Result<TcpStream> {
-    let mut delay = Duration::from_secs(1);
-
-    for attempt in 0..=max_retries {
-        match connect_protected(*addr, protect).await {
-            Ok(stream) => return Ok(stream),
-            Err(e) => {
-                if attempt == max_retries {
-                    return Err(e);
-                }
-                tracing::warn!("Connect to server failed (attempt {}): {}", attempt + 1, e);
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_secs(10));
-            }
-        }
-    }
-    unreachable!()
+    connect_protected(*addr, protect).await
 }
 
 /// Spawn a relay task with a pre-resolved domain.
@@ -135,8 +119,8 @@ async fn relay_via_proxy(
     mut data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) -> io::Result<()> {
-    // Connect to xr-server with PROTECTED socket.
-    let mut server = connect_server_protected(&ctx.server_addr, &ctx.protect_socket, 3).await
+    // Connect to xr-server with PROTECTED socket (single attempt).
+    let mut server = connect_server_protected(&ctx.server_addr, &ctx.protect_socket).await
         .map_err(|e| {
             ctx.stats.add_log(&format!("srv connect fail: {}", e));
             e
