@@ -149,6 +149,10 @@ impl Device for QueueDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = TUN_MTU;
+        // Disable checksum verification/generation — we rewrite packets
+        // (NAT with ephemeral ports) so checksums are invalid.
+        // The TUN device and the real network stack handle checksums.
+        caps.checksum = smoltcp::phy::ChecksumCapabilities::ignored();
         caps
     }
 }
