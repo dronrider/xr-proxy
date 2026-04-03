@@ -259,7 +259,7 @@ async fn run_event_loop(
         // We need to rewrite them to src=original_dst_ip:original_dst_port
         // so the TUN client sees the response from the expected address.
         let mut outbound = Vec::new();
-        while let Some(mut pkt) = queue.pop_outbound() {
+        while let Some(mut pkt) = queue.pop_smol_outbound() {
             if pkt.len() >= 40 && pkt[0] >> 4 == 4 && pkt[9] == 6 {
                 let ihl = (pkt[0] & 0x0F) as usize * 4;
                 if pkt.len() >= ihl + 4 {

@@ -126,6 +126,16 @@ fun ConnectionSection(
     Spacer(Modifier.height(8.dp))
     Text(statusText, style = MaterialTheme.typography.headlineSmall, color = statusColor)
 
+    // Version.
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val versionName = remember {
+        try { context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "" }
+        catch (_: Exception) { "" }
+    }
+    if (versionName.isNotBlank()) {
+        Text("v$versionName", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
+    }
+
     // Show current preset.
     if (!state.connected && !state.connecting) {
         Spacer(Modifier.height(4.dp))

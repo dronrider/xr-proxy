@@ -37,7 +37,10 @@ pub struct PacketQueue {
 
 struct PacketQueueInner {
     inbound: VecDeque<Vec<u8>>,
-    outbound: VecDeque<Vec<u8>>,
+    /// Packets from smoltcp device → engine (for NAT rewrite).
+    smol_outbound: VecDeque<Vec<u8>>,
+    /// Packets after NAT rewrite → TUN fd.
+    tun_outbound: VecDeque<Vec<u8>>,
 }
 
 impl PacketQueue {
@@ -45,7 +48,8 @@ impl PacketQueue {
         Self {
             inner: Arc::new(Mutex::new(PacketQueueInner {
                 inbound: VecDeque::with_capacity(256),
-                outbound: VecDeque::with_capacity(256),
+                smol_outbound: VecDeque::with_capacity(256),
+                tun_outbound: VecDeque::with_capacity(256),
             })),
         }
     }
@@ -60,15 +64,15 @@ impl PacketQueue {
         inner.inbound.push_back(packet);
     }
 
-    /// Pop a packet that smoltcp wants to send out via TUN.
+    /// Pop a packet for TUN fd (after NAT rewrite).
     pub fn pop_outbound(&self) -> Option<Vec<u8>> {
-        self.inner.lock().unwrap().outbound.pop_front()
+        self.inner.lock().unwrap().tun_outbound.pop_front()
     }
 
-    /// Drain all outbound packets.
-    pub fn drain_outbound(&self) -> Vec<Vec<u8>> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.outbound.drain(..).collect()
+    /// Pop a packet from smoltcp device (before NAT rewrite).
+    /// Called by engine event loop.
+    pub fn pop_smol_outbound(&self) -> Option<Vec<u8>> {
+        self.inner.lock().unwrap().smol_outbound.pop_front()
     }
 
     /// Pop a packet from the inbound queue (public, for DNS interception).
@@ -76,13 +80,13 @@ impl PacketQueue {
         self.inner.lock().unwrap().inbound.pop_front()
     }
 
-    /// Push a packet to the outbound queue (public, for DNS responses).
+    /// Push a packet to the TUN outbound queue (for DNS responses and NAT-rewritten packets).
     pub fn push_outbound_public(&self, packet: Vec<u8>) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.outbound.len() >= 4096 {
-            inner.outbound.pop_front();
+        if inner.tun_outbound.len() >= 4096 {
+            inner.tun_outbound.pop_front();
         }
-        inner.outbound.push_back(packet);
+        inner.tun_outbound.push_back(packet);
     }
 
     fn pop_inbound(&self) -> Option<Vec<u8>> {
@@ -91,10 +95,10 @@ impl PacketQueue {
 
     fn push_outbound(&self, packet: Vec<u8>) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.outbound.len() >= 4096 {
-            inner.outbound.pop_front();
+        if inner.smol_outbound.len() >= 4096 {
+            inner.smol_outbound.pop_front();
         }
-        inner.outbound.push_back(packet);
+        inner.smol_outbound.push_back(packet);
     }
 
     /// Check if there's pending inbound data.
@@ -102,9 +106,9 @@ impl PacketQueue {
         !self.inner.lock().unwrap().inbound.is_empty()
     }
 
-    /// Check if there's pending outbound data.
+    /// Check if there's pending outbound data (for TUN).
     pub fn has_outbound(&self) -> bool {
-        !self.inner.lock().unwrap().outbound.is_empty()
+        !self.inner.lock().unwrap().tun_outbound.is_empty()
     }
 }
 
