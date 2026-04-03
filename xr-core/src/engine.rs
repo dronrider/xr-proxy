@@ -439,20 +439,6 @@ fn try_handle_dns(packet: &[u8], fake_dns: &FakeDns) -> Option<Vec<u8>> {
     Some(build_udp_response(dst_ip, src_ip, dst_port, src_port, &dns_response))
 }
 
-fn detect_tcp_syn(packet: &[u8]) -> Option<TcpSessionKey> {
-    let (src_ip, dst_ip, protocol, ihl) = parse_ipv4_header(packet)?;
-    if protocol != 6 { return None; }
-    let tcp = &packet[ihl..];
-    if tcp.len() < 14 { return None; }
-    let flags = tcp[13];
-    if flags & 0x02 != 0 && flags & 0x10 == 0 {
-        Some(TcpSessionKey {
-            src_addr: SocketAddr::new(IpAddr::V4(src_ip), u16::from_be_bytes([tcp[0], tcp[1]])),
-            dst_addr: SocketAddr::new(IpAddr::V4(dst_ip), u16::from_be_bytes([tcp[2], tcp[3]])),
-        })
-    } else { None }
-}
-
 pub fn parse_ipv4_header(p: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, u8, usize)> {
     if p.len() < 20 || p[0] >> 4 != 4 { return None; }
     let ihl = (p[0] & 0x0F) as usize * 4;
@@ -508,15 +494,4 @@ mod tests {
         assert_eq!(proto, 6); assert_eq!(ihl, 20);
     }
 
-    #[test]
-    fn test_detect_tcp_syn() {
-        let mut pkt = vec![0u8; 40];
-        pkt[0] = 0x45; pkt[9] = 6;
-        pkt[12..16].copy_from_slice(&[10, 0, 0, 2]);
-        pkt[16..20].copy_from_slice(&[198, 18, 0, 1]);
-        pkt[20..22].copy_from_slice(&12345u16.to_be_bytes());
-        pkt[22..24].copy_from_slice(&443u16.to_be_bytes());
-        pkt[32] = 0x50; pkt[33] = 0x02;
-        assert!(detect_tcp_syn(&pkt).is_some());
-    }
 }
