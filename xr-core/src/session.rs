@@ -100,6 +100,16 @@ pub async fn relay_session_with_domain(
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     waker: Arc<Notify>,
 ) -> io::Result<()> {
+    // Block DNS-over-TLS (port 853). Android Private DNS bypasses FakeDNS
+    // (sends queries over TLS instead of UDP:53). Blocking DoT forces Android
+    // to fall back to plain UDP DNS which FakeDNS intercepts properly.
+    if key.dst_addr.port() == 853 {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("DoT blocked ({}), forcing UDP DNS", key.dst_addr),
+        ));
+    }
+
     // Never proxy fake IPs without a domain — server can't connect to 198.18.x.x.
     if domain.is_none() {
         if let IpAddr::V4(v4) = key.dst_addr.ip() {
