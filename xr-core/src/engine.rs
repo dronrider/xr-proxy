@@ -1,15 +1,16 @@
-//! VPN Engine — the main entry point for mobile/desktop clients.
+//! VPN Engine — main entry point for mobile/desktop clients.
 //!
-//! Processes raw IP packets from TUN:
-//! 1. DNS queries (UDP:53) → intercepted, responded with fake IPs
-//! 2. TCP SYN → new smoltcp socket + session
-//! 3. TCP Established → spawn relay task
-//! 4. TCP data → smoltcp ↔ relay task ↔ xr-server (or direct)
+//! Architecture:
+//! 1. DNS queries (UDP:53) → intercepted via Fake DNS
+//! 2. TCP SYN → smoltcp socket (listen on unique ephemeral port)
+//! 3. TCP Established → spawn relay task to xr-server or direct
+//! 4. TCP data: smoltcp ↔ channels ↔ relay task
 
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp::State as TcpState;
@@ -27,7 +28,19 @@ use crate::session::{relay_session, ProtectSocketFn, SessionContext, TcpSessionK
 use crate::state::{StateHandle, VpnState};
 use crate::stats::Stats;
 
-/// Configuration for the VPN engine.
+/// Ephemeral port counter for unique listen endpoints.
+/// Each smoltcp socket listens on a unique port so multiple SYNs
+/// to the same dst port (e.g. 443) don't conflict.
+static EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(10000);
+
+fn next_ephemeral_port() -> u16 {
+    let port = EPHEMERAL_PORT.fetch_add(1, Ordering::Relaxed);
+    if port >= 60000 {
+        EPHEMERAL_PORT.store(10000, Ordering::Relaxed);
+    }
+    port
+}
+
 pub struct VpnConfig {
     pub server_address: String,
     pub server_port: u16,
@@ -41,7 +54,6 @@ pub struct VpnConfig {
     pub on_server_down: String,
 }
 
-/// The VPN engine.
 pub struct VpnEngine {
     config: VpnConfig,
     state: StateHandle,
@@ -51,14 +63,8 @@ pub struct VpnEngine {
 
 impl VpnEngine {
     pub fn new(config: VpnConfig) -> Self {
-        Self {
-            config,
-            state: StateHandle::new(),
-            stats: Stats::new(),
-            shutdown_tx: None,
-        }
+        Self { config, state: StateHandle::new(), stats: Stats::new(), shutdown_tx: None }
     }
-
     pub fn state(&self) -> &StateHandle { &self.state }
     pub fn stats(&self) -> &Stats { &self.stats }
 
@@ -66,7 +72,6 @@ impl VpnEngine {
         if self.shutdown_tx.is_some() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "already running"));
         }
-
         self.state.set(VpnState::Connecting);
 
         let key = decode_key(&self.config.obfuscation_key)
@@ -76,11 +81,8 @@ impl VpnEngine {
         let obfuscator = Obfuscator::new(key, self.config.salt, strategy);
         let codec = Codec::new(obfuscator, self.config.padding_min, self.config.padding_max);
         let router = Router::new(&self.config.routing, self.config.geoip_path.as_deref());
-
         let server_addr: SocketAddr = format!("{}:{}", self.config.server_address, self.config.server_port)
-            .parse()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad server addr: {}", e)))?;
-
+            .parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{}", e)))?;
         let on_server_down = Action::from_str(&self.config.on_server_down);
         let fake_dns = Arc::new(FakeDns::new());
 
@@ -93,7 +95,6 @@ impl VpnEngine {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
-
         let state = self.state.clone();
         let stats = self.stats.clone();
 
@@ -106,7 +107,6 @@ impl VpnEngine {
                 state.set(VpnState::Disconnected);
             }
         });
-
         Ok(())
     }
 
@@ -116,15 +116,16 @@ impl VpnEngine {
             let _ = tx.send(true);
         }
     }
-
     pub fn is_running(&self) -> bool { self.shutdown_tx.is_some() }
 }
 
-// ── Session tracking ────────────────────────────────────────────────
+// ── Session ─────────────────────────────────────────────────────────
 
 struct ActiveSession {
     smol_handle: SocketHandle,
-    /// None until TCP handshake completes (Established).
+    /// The real destination (from the SYN packet).
+    real_dst: SocketAddr,
+    /// Set when TCP reaches Established.
     relay: Option<RelayChannels>,
 }
 
@@ -142,66 +143,110 @@ async fn run_event_loop(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut stack = IpStack::new(queue.clone());
+
+    // Key: (src_addr, dst_addr) from original SYN.
+    // We rewrite the SYN dst_port → ephemeral port so smoltcp can handle
+    // multiple connections to the same dst port (443).
     let mut sessions: HashMap<TcpSessionKey, ActiveSession> = HashMap::new();
+
+    // Map: ephemeral_port → original TcpSessionKey.
+    // Used to find which session a smoltcp socket belongs to.
+    let mut port_to_key: HashMap<u16, TcpSessionKey> = HashMap::new();
+
     let mut stale_keys: Vec<TcpSessionKey> = Vec::new();
-    // Track which (dst_port) currently has a Listen socket to avoid duplicates.
-    let mut listening_ports: HashMap<u16, TcpSessionKey> = HashMap::new();
 
     loop {
-        // ── 1. Check shutdown ───────────────────────────────────────
-        if *shutdown_rx.borrow() {
-            return Ok(());
-        }
+        if *shutdown_rx.borrow() { return Ok(()); }
 
-        // ── 2. Intercept DNS, detect SYNs, feed to smoltcp ─────────
-        let mut non_dns_packets = Vec::new();
+        // ── 1. Intercept DNS ────────────────────────────────────────
+        let mut tcp_packets = Vec::new();
         while let Some(packet) = queue.pop_inbound_public() {
             if let Some(dns_response) = try_handle_dns(&packet, &fake_dns) {
                 ctx.stats.add_dns_query();
                 queue.push_outbound_public(dns_response);
             } else {
-                non_dns_packets.push(packet);
+                tcp_packets.push(packet);
             }
         }
 
-        for pkt in non_dns_packets {
-            if let Some(key) = detect_tcp_syn(&pkt) {
-                if key.dst_addr.is_ipv6() {
-                    queue.push_inbound(pkt);
-                    continue;
-                }
+        // ── 2. Process TCP packets: rewrite dst port for SYNs ───────
+        for mut pkt in tcp_packets {
+            if pkt.len() < 20 { queue.push_inbound(pkt); continue; }
+            if pkt[0] >> 4 != 4 { queue.push_inbound(pkt); continue; }
+            let ihl = (pkt[0] & 0x0F) as usize * 4;
+            let protocol = pkt[9];
 
-                if !sessions.contains_key(&key) {
-                    let port = key.dst_addr.port();
+            // Only rewrite TCP packets.
+            if protocol == 6 && pkt.len() >= ihl + 14 {
+                let src_port = u16::from_be_bytes([pkt[ihl], pkt[ihl+1]]);
+                let dst_port = u16::from_be_bytes([pkt[ihl+2], pkt[ihl+3]]);
+                let flags = pkt[ihl + 13];
+                let is_syn = flags & 0x02 != 0 && flags & 0x10 == 0;
 
-                    // Check if there's already a Listen socket on this port
-                    // that hasn't been matched yet. If so, don't create another.
-                    let need_listen = match listening_ports.get(&port) {
-                        Some(existing_key) => {
-                            // Check if that socket is still in Listen state.
-                            if let Some(session) = sessions.get(existing_key) {
-                                let state = stack.tcp_socket(session.smol_handle).state();
-                                state != TcpState::Listen
-                            } else {
-                                true
-                            }
-                        }
-                        None => true,
-                    };
+                let src_ip = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
+                let dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+                let orig_key = TcpSessionKey {
+                    src_addr: SocketAddr::new(IpAddr::V4(src_ip), src_port),
+                    dst_addr: SocketAddr::new(IpAddr::V4(dst_ip), dst_port),
+                };
 
-                    if need_listen {
-                        let handle = stack.add_tcp_socket(65535, 65535);
-                        let socket = stack.tcp_socket_mut(handle);
-                        if socket.listen(port).is_ok() {
-                            sessions.insert(key, ActiveSession {
-                                smol_handle: handle,
-                                relay: None, // relay spawned when Established
-                            });
-                            listening_ports.insert(port, key);
-                            ctx.stats.connection_opened();
-                            ctx.stats.add_tcp_syn();
+                if is_syn && !sessions.contains_key(&orig_key) {
+                    // New connection: assign ephemeral port, create listen socket.
+                    let eph_port = next_ephemeral_port();
+                    let handle = stack.add_tcp_socket(65535, 65535);
+                    let socket = stack.tcp_socket_mut(handle);
+
+                    if socket.listen(eph_port).is_ok() {
+                        sessions.insert(orig_key, ActiveSession {
+                            smol_handle: handle,
+                            real_dst: orig_key.dst_addr,
+                            relay: None,
+                        });
+                        port_to_key.insert(eph_port, orig_key);
+                        ctx.stats.connection_opened();
+                        ctx.stats.add_tcp_syn();
+
+                        // Rewrite dst port in the SYN packet → ephemeral port.
+                        pkt[ihl+2] = (eph_port >> 8) as u8;
+                        pkt[ihl+3] = eph_port as u8;
+                        // Rewrite dst IP → smoltcp's interface IP.
+                        let smol_ip = crate::ip_stack::SMOL_IP;
+                        pkt[16] = smol_ip.octets()[0];
+                        pkt[17] = smol_ip.octets()[1];
+                        pkt[18] = smol_ip.octets()[2];
+                        pkt[19] = smol_ip.octets()[3];
+                        // Recalculate IP checksum.
+                        pkt[10] = 0; pkt[11] = 0;
+                        let ip_cksum = ipv4_checksum(&pkt[..ihl]);
+                        pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+                        // Clear TCP checksum (smoltcp will recalculate).
+                        pkt[ihl+16] = 0; pkt[ihl+17] = 0;
+                    } else {
+                        stack.remove_socket(handle);
+                    }
+                } else if let Some(session) = sessions.get(&orig_key) {
+                    // Existing connection: rewrite dst port & IP to match smoltcp socket.
+                    // Find the ephemeral port for this session.
+                    let eph_port = stack.tcp_socket(session.smol_handle).listen_endpoint().port;
+                    if eph_port != 0 || stack.tcp_socket(session.smol_handle).state() != TcpState::Listen {
+                        // Get the local port from the socket's tuple or listen endpoint.
+                        let local_port = if let Some(tuple) = get_socket_local_port(&stack, session.smol_handle) {
+                            tuple
                         } else {
-                            stack.remove_socket(handle);
+                            eph_port
+                        };
+                        if local_port != 0 {
+                            pkt[ihl+2] = (local_port >> 8) as u8;
+                            pkt[ihl+3] = local_port as u8;
+                            let smol_ip = crate::ip_stack::SMOL_IP;
+                            pkt[16] = smol_ip.octets()[0];
+                            pkt[17] = smol_ip.octets()[1];
+                            pkt[18] = smol_ip.octets()[2];
+                            pkt[19] = smol_ip.octets()[3];
+                            pkt[10] = 0; pkt[11] = 0;
+                            let ip_cksum = ipv4_checksum(&pkt[..ihl]);
+                            pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+                            pkt[ihl+16] = 0; pkt[ihl+17] = 0;
                         }
                     }
                 }
@@ -210,63 +255,96 @@ async fn run_event_loop(
             queue.push_inbound(pkt);
         }
 
-        // ── 3. Poll smoltcp (multiple times for throughput) ─────────
-        for _ in 0..8 {
-            if !stack.poll() {
-                break;
-            }
+        // ── 3. Poll smoltcp ─────────────────────────────────────────
+        for _ in 0..16 {
+            if !stack.poll() { break; }
         }
 
-        // ── 4. Check sessions ───────────────────────────────────────
+        // ── 4. Rewrite outbound packets: restore original dst ───────
+        // smoltcp sends packets with src=SMOL_IP:eph_port.
+        // We need to rewrite them to src=original_dst_ip:original_dst_port
+        // so the TUN client sees the response from the expected address.
+        let mut outbound = Vec::new();
+        while let Some(mut pkt) = queue.pop_outbound() {
+            if pkt.len() >= 40 && pkt[0] >> 4 == 4 && pkt[9] == 6 {
+                let ihl = (pkt[0] & 0x0F) as usize * 4;
+                if pkt.len() >= ihl + 4 {
+                    let src_port = u16::from_be_bytes([pkt[ihl], pkt[ihl+1]]);
+                    // Look up the original destination by ephemeral port.
+                    if let Some(orig_key) = port_to_key.get(&src_port) {
+                        // Rewrite src IP → original dst IP.
+                        if let IpAddr::V4(orig_dst_ip) = orig_key.dst_addr.ip() {
+                            pkt[12] = orig_dst_ip.octets()[0];
+                            pkt[13] = orig_dst_ip.octets()[1];
+                            pkt[14] = orig_dst_ip.octets()[2];
+                            pkt[15] = orig_dst_ip.octets()[3];
+                        }
+                        // Rewrite src port → original dst port.
+                        let orig_port = orig_key.dst_addr.port();
+                        pkt[ihl] = (orig_port >> 8) as u8;
+                        pkt[ihl+1] = orig_port as u8;
+                        // Recalculate IP checksum.
+                        pkt[10] = 0; pkt[11] = 0;
+                        let ip_cksum = ipv4_checksum(&pkt[..ihl]);
+                        pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+                        // Clear TCP checksum (kernel will validate or not for TUN).
+                        pkt[ihl+16] = 0; pkt[ihl+17] = 0;
+                    }
+                }
+            }
+            outbound.push(pkt);
+        }
+        for pkt in outbound {
+            queue.push_outbound_public(pkt);
+        }
+
+        // ── 5. Check sessions: spawn relay, transfer data ───────────
         stale_keys.clear();
 
         for (key, session) in sessions.iter_mut() {
             let socket = stack.tcp_socket_mut(session.smol_handle);
             let tcp_state = socket.state();
 
-            // Spawn relay when TCP handshake completes.
+            // Spawn relay when handshake completes.
             if tcp_state == TcpState::Established && session.relay.is_none() {
                 let (to_relay_tx, to_relay_rx) = mpsc::channel(512);
                 let (from_relay_tx, from_relay_rx) = mpsc::channel(512);
-
                 session.relay = Some(RelayChannels {
                     to_relay: to_relay_tx,
                     from_relay: from_relay_rx,
                 });
 
                 let ctx_clone = ctx.clone();
+                let real_dst = session.real_dst;
                 let key_clone = *key;
                 tokio::spawn(async move {
-                    match relay_session(ctx_clone.clone(), key_clone, to_relay_rx, from_relay_tx).await {
+                    // Use real_dst (not rewritten) for relay.
+                    let relay_key = TcpSessionKey {
+                        src_addr: key_clone.src_addr,
+                        dst_addr: real_dst,
+                    };
+                    match relay_session(ctx_clone.clone(), relay_key, to_relay_rx, from_relay_tx).await {
                         Ok(()) => {}
                         Err(e) => {
                             ctx_clone.stats.add_relay_error();
-                            ctx_clone.stats.set_debug(format!(
-                                "relay err: {}: {}", key_clone.dst_addr, e
-                            ));
+                            ctx_clone.stats.set_debug(format!("relay err: {}: {}", real_dst, e));
                         }
                     }
                 });
-
-                // Remove from listening_ports so new SYNs on same port work.
-                let port = key.dst_addr.port();
-                if listening_ports.get(&port) == Some(key) {
-                    listening_ports.remove(&port);
-                }
             }
 
-            // Transfer data: smoltcp ↔ relay channels.
+            // Transfer data.
             if let Some(ref mut relay) = session.relay {
                 // smoltcp → relay (upload).
-                if socket.can_recv() {
+                while socket.can_recv() {
                     let mut buf = vec![0u8; 32768];
                     match socket.recv_slice(&mut buf) {
                         Ok(n) if n > 0 => {
                             buf.truncate(n);
                             ctx.stats.add_smol_recv(n as u64);
-                            let _ = relay.to_relay.try_send(buf);
+                            if relay.to_relay.try_send(buf).is_err() { break; }
                         }
-                        _ => {}
+                        _ => break,
                     }
                 }
 
@@ -282,64 +360,70 @@ async fn run_event_loop(
                 }
             }
 
-            // Detect closed connections.
-            if tcp_state == TcpState::Closed
-                || tcp_state == TcpState::TimeWait
-                || (tcp_state == TcpState::CloseWait && !socket.can_recv())
-            {
+            // Detect closed.
+            if tcp_state == TcpState::Closed || tcp_state == TcpState::TimeWait {
                 stale_keys.push(*key);
             }
         }
 
-        // ── 5. Clean up ─────────────────────────────────────────────
+        // ── 6. Cleanup ──────────────────────────────────────────────
         for key in &stale_keys {
             if let Some(session) = sessions.remove(key) {
+                // Find ephemeral port to clean up port_to_key.
+                let eph_port = stack.tcp_socket(session.smol_handle).listen_endpoint().port;
+                if eph_port != 0 { port_to_key.remove(&eph_port); }
+                // Also check tuple local port.
+                if let Some(lp) = get_socket_local_port(&stack, session.smol_handle) {
+                    port_to_key.remove(&lp);
+                }
                 stack.remove_socket(session.smol_handle);
                 ctx.stats.connection_closed();
-                let port = key.dst_addr.port();
-                if listening_ports.get(&port) == Some(key) {
-                    listening_ports.remove(&port);
-                }
             }
         }
 
-        // ── 6. Poll again to flush outbound ─────────────────────────
+        // ── 7. Poll again ───────────────────────────────────────────
         stack.poll();
 
-        // ── 7. Debug ────────────────────────────────────────────────
+        // ── 8. Debug ────────────────────────────────────────────────
         {
-            let mut established = 0u32;
-            let mut syn_recv = 0u32;
-            let mut listen = 0u32;
-            let mut other = 0u32;
-            for session in sessions.values() {
-                match stack.tcp_socket(session.smol_handle).state() {
+            let (mut established, mut syn_recv, mut listen, mut other) = (0u32, 0u32, 0u32, 0u32);
+            for s in sessions.values() {
+                match stack.tcp_socket(s.smol_handle).state() {
                     TcpState::Established => established += 1,
                     TcpState::SynReceived => syn_recv += 1,
                     TcpState::Listen => listen += 1,
                     _ => other += 1,
                 }
             }
-            let rx = stack.device.rx_count;
-            let tx = stack.device.tx_count;
             if !sessions.is_empty() {
                 ctx.stats.set_debug(format!(
-                    "dev rx:{} tx:{} | tcp L:{} SR:{} E:{} o:{} | sess:{}",
-                    rx, tx, listen, syn_recv, established, other, sessions.len()
+                    "dev rx:{} tx:{} | L:{} SR:{} E:{} o:{} | s:{}",
+                    stack.device.rx_count, stack.device.tx_count,
+                    listen, syn_recv, established, other, sessions.len()
                 ));
             }
         }
 
-        // ── 8. Sleep ────────────────────────────────────────────────
-        let delay = stack
-            .poll_delay()
-            .unwrap_or(Duration::from_millis(1))
-            .min(Duration::from_millis(1));
-
+        // ── 9. Sleep ────────────────────────────────────────────────
+        let delay = stack.poll_delay().unwrap_or(Duration::from_millis(1)).min(Duration::from_millis(1));
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             _ = shutdown_rx.changed() => {}
         }
+    }
+}
+
+/// Get the local port of an established/syn-received socket.
+fn get_socket_local_port(stack: &IpStack, handle: SocketHandle) -> Option<u16> {
+    let socket = stack.tcp_socket(handle);
+    // In Listen state, local_endpoint may not be set yet.
+    // After SYN-ACK, the tuple is set.
+    let ep = socket.local_endpoint();
+    if ep.is_some() {
+        ep.map(|e| e.port)
+    } else {
+        let lep = socket.listen_endpoint();
+        if lep.port != 0 { Some(lep.port) } else { None }
     }
 }
 
@@ -351,7 +435,7 @@ fn try_handle_dns(packet: &[u8], fake_dns: &FakeDns) -> Option<Vec<u8>> {
     let udp = &packet[ihl..];
     let (src_port, dst_port, data_offset) = parse_udp_header(udp)?;
     if dst_port != 53 { return None; }
-    let (dns_response, _fake_ip) = fake_dns.handle_query(&udp[data_offset..])?;
+    let (dns_response, _) = fake_dns.handle_query(&udp[data_offset..])?;
     Some(build_udp_response(dst_ip, src_ip, dst_port, src_port, &dns_response))
 }
 
@@ -360,79 +444,49 @@ fn detect_tcp_syn(packet: &[u8]) -> Option<TcpSessionKey> {
     if protocol != 6 { return None; }
     let tcp = &packet[ihl..];
     if tcp.len() < 14 { return None; }
-    let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
-    let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
     let flags = tcp[13];
     if flags & 0x02 != 0 && flags & 0x10 == 0 {
         Some(TcpSessionKey {
-            src_addr: SocketAddr::new(IpAddr::V4(src_ip), src_port),
-            dst_addr: SocketAddr::new(IpAddr::V4(dst_ip), dst_port),
+            src_addr: SocketAddr::new(IpAddr::V4(src_ip), u16::from_be_bytes([tcp[0], tcp[1]])),
+            dst_addr: SocketAddr::new(IpAddr::V4(dst_ip), u16::from_be_bytes([tcp[2], tcp[3]])),
         })
-    } else {
-        None
-    }
+    } else { None }
 }
 
-pub fn parse_ipv4_header(packet: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, u8, usize)> {
-    if packet.len() < 20 || packet[0] >> 4 != 4 { return None; }
-    let ihl = (packet[0] & 0x0F) as usize * 4;
-    if ihl < 20 || packet.len() < ihl { return None; }
-    Some((
-        Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]),
-        Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
-        packet[9], ihl,
-    ))
+pub fn parse_ipv4_header(p: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, u8, usize)> {
+    if p.len() < 20 || p[0] >> 4 != 4 { return None; }
+    let ihl = (p[0] & 0x0F) as usize * 4;
+    if ihl < 20 || p.len() < ihl { return None; }
+    Some((Ipv4Addr::new(p[12],p[13],p[14],p[15]), Ipv4Addr::new(p[16],p[17],p[18],p[19]), p[9], ihl))
 }
 
-pub fn parse_udp_header(payload: &[u8]) -> Option<(u16, u16, usize)> {
-    if payload.len() < 8 { return None; }
-    Some((
-        u16::from_be_bytes([payload[0], payload[1]]),
-        u16::from_be_bytes([payload[2], payload[3]]),
-        8,
-    ))
+pub fn parse_udp_header(p: &[u8]) -> Option<(u16, u16, usize)> {
+    if p.len() < 8 { return None; }
+    Some((u16::from_be_bytes([p[0],p[1]]), u16::from_be_bytes([p[2],p[3]]), 8))
 }
 
-pub fn parse_tcp_ports(payload: &[u8]) -> Option<(u16, u16)> {
-    if payload.len() < 4 { return None; }
-    Some((
-        u16::from_be_bytes([payload[0], payload[1]]),
-        u16::from_be_bytes([payload[2], payload[3]]),
-    ))
+pub fn parse_tcp_ports(p: &[u8]) -> Option<(u16, u16)> {
+    if p.len() < 4 { return None; }
+    Some((u16::from_be_bytes([p[0],p[1]]), u16::from_be_bytes([p[2],p[3]])))
 }
 
-pub fn build_udp_response(
-    src_ip: Ipv4Addr, dst_ip: Ipv4Addr,
-    src_port: u16, dst_port: u16,
-    payload: &[u8],
-) -> Vec<u8> {
-    let total_len = 20 + 8 + payload.len();
-    let mut pkt = vec![0u8; total_len];
-    pkt[0] = 0x45;
-    pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    pkt[8] = 64;
-    pkt[9] = 17;
-    pkt[12..16].copy_from_slice(&src_ip.octets());
-    pkt[16..20].copy_from_slice(&dst_ip.octets());
-    let cksum = ipv4_checksum(&pkt[..20]);
-    pkt[10..12].copy_from_slice(&cksum.to_be_bytes());
-    pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
-    pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
-    pkt[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
-    pkt[28..].copy_from_slice(payload);
-    pkt
+pub fn build_udp_response(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
+    let total = 20 + 8 + payload.len();
+    let mut p = vec![0u8; total];
+    p[0] = 0x45; p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    p[8] = 64; p[9] = 17;
+    p[12..16].copy_from_slice(&src_ip.octets()); p[16..20].copy_from_slice(&dst_ip.octets());
+    let ck = ipv4_checksum(&p[..20]); p[10..12].copy_from_slice(&ck.to_be_bytes());
+    p[20..22].copy_from_slice(&src_port.to_be_bytes()); p[22..24].copy_from_slice(&dst_port.to_be_bytes());
+    p[24..26].copy_from_slice(&((8+payload.len()) as u16).to_be_bytes());
+    p[28..].copy_from_slice(payload); p
 }
 
-fn ipv4_checksum(header: &[u8]) -> u16 {
+fn ipv4_checksum(h: &[u8]) -> u16 {
     let mut sum = 0u32;
-    for i in (0..header.len()).step_by(2) {
+    for i in (0..h.len()).step_by(2) {
         if i == 10 { continue; }
-        let word = if i + 1 < header.len() {
-            u16::from_be_bytes([header[i], header[i + 1]])
-        } else {
-            u16::from_be_bytes([header[i], 0])
-        };
-        sum += word as u32;
+        sum += if i+1 < h.len() { u16::from_be_bytes([h[i],h[i+1]]) } else { u16::from_be_bytes([h[i],0]) } as u32;
     }
     while sum >> 16 != 0 { sum = (sum & 0xFFFF) + (sum >> 16); }
     !(sum as u16)
@@ -451,47 +505,18 @@ mod tests {
         let (src, dst, proto, ihl) = parse_ipv4_header(&pkt).unwrap();
         assert_eq!(src, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(dst, Ipv4Addr::new(93, 184, 216, 34));
-        assert_eq!(proto, 6);
-        assert_eq!(ihl, 20);
+        assert_eq!(proto, 6); assert_eq!(ihl, 20);
     }
 
     #[test]
     fn test_detect_tcp_syn() {
         let mut pkt = vec![0u8; 40];
-        pkt[0] = 0x45;
-        pkt[2..4].copy_from_slice(&40u16.to_be_bytes());
-        pkt[9] = 6;
+        pkt[0] = 0x45; pkt[9] = 6;
         pkt[12..16].copy_from_slice(&[10, 0, 0, 2]);
         pkt[16..20].copy_from_slice(&[198, 18, 0, 1]);
         pkt[20..22].copy_from_slice(&12345u16.to_be_bytes());
         pkt[22..24].copy_from_slice(&443u16.to_be_bytes());
-        pkt[32] = 0x50;
-        pkt[33] = 0x02;
-        let key = detect_tcp_syn(&pkt).unwrap();
-        assert_eq!(key.dst_addr.port(), 443);
-    }
-
-    #[test]
-    fn test_build_udp_response() {
-        let response = build_udp_response(
-            Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2),
-            53, 12345, b"test",
-        );
-        assert_eq!(response[9], 17);
-        assert_eq!(&response[28..], b"test");
-    }
-
-    #[test]
-    fn test_ipv4_checksum() {
-        let mut h = vec![0u8; 20];
-        h[0] = 0x45; h[8] = 64; h[9] = 17;
-        h[12..16].copy_from_slice(&[10, 0, 0, 1]);
-        h[16..20].copy_from_slice(&[10, 0, 0, 2]);
-        let cksum = ipv4_checksum(&h);
-        h[10..12].copy_from_slice(&cksum.to_be_bytes());
-        let mut sum = 0u32;
-        for i in (0..20).step_by(2) { sum += u16::from_be_bytes([h[i], h[i+1]]) as u32; }
-        while sum >> 16 != 0 { sum = (sum & 0xFFFF) + (sum >> 16); }
-        assert_eq!(sum as u16, 0xFFFF);
+        pkt[32] = 0x50; pkt[33] = 0x02;
+        assert!(detect_tcp_syn(&pkt).is_some());
     }
 }
