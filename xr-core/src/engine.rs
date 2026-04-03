@@ -321,6 +321,7 @@ async fn run_event_loop(
                 let real_dst = session.real_dst;
                 let cached_domain = session.domain.clone();
                 let key_clone = *key;
+                let domain_tag = cached_domain.as_deref().unwrap_or("NO_DOMAIN").to_string();
                 tokio::spawn(async move {
                     let relay_key = TcpSessionKey {
                         src_addr: key_clone.src_addr,
@@ -329,8 +330,9 @@ async fn run_event_loop(
                     match relay_session_with_domain(ctx_clone.clone(), relay_key, cached_domain, to_relay_rx, from_relay_tx).await {
                         Ok(()) => {}
                         Err(e) => {
-                            let msg = format!("{}: {}", real_dst, e);
-                            ctx_clone.stats.add_relay_error(&msg);
+                            ctx_clone.stats.add_relay_error(
+                                &format!("[{}] {}: {}", domain_tag, real_dst, e)
+                            );
                         }
                     }
                 });
