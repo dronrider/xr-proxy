@@ -72,6 +72,12 @@ pub async fn handle_client(
 
     tracing::info!("{} -> {} ({})", client_addr, target_sockaddr, addr_display(&target_addr));
 
+    // Send ConnectAck EARLY — before target connect completes.
+    // This reduces handshake latency on the client side.
+    // If target connect fails, the relay will end with an error/close.
+    let ack = codec.encode_frame(Command::ConnectAck, &[0])?;
+    client.write_all(&ack).await?;
+
     let mut target = tokio::time::timeout(
         Duration::from_secs(10),
         TcpStream::connect(target_sockaddr),
@@ -80,9 +86,6 @@ pub async fn handle_client(
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "target connect timeout"))??;
 
     set_keepalive(&target);
-
-    let ack = codec.encode_frame(Command::ConnectAck, &[0])?;
-    client.write_all(&ack).await?;
 
     relay_obfuscated(&mut client, &mut target, &codec, &buf[..filled]).await
 }
