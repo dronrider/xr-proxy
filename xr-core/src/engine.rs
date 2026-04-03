@@ -125,6 +125,8 @@ struct ActiveSession {
     smol_handle: SocketHandle,
     /// The real destination (from the SYN packet).
     real_dst: SocketAddr,
+    /// Ephemeral port assigned to this session for smoltcp.
+    eph_port: u16,
     /// Set when TCP reaches Established.
     relay: Option<RelayChannels>,
 }
@@ -200,6 +202,7 @@ async fn run_event_loop(
                         sessions.insert(orig_key, ActiveSession {
                             smol_handle: handle,
                             real_dst: orig_key.dst_addr,
+                            eph_port,
                             relay: None,
                         });
                         port_to_key.insert(eph_port, orig_key);
@@ -225,30 +228,21 @@ async fn run_event_loop(
                         stack.remove_socket(handle);
                     }
                 } else if let Some(session) = sessions.get(&orig_key) {
-                    // Existing connection: rewrite dst port & IP to match smoltcp socket.
-                    // Find the ephemeral port for this session.
-                    let eph_port = stack.tcp_socket(session.smol_handle).listen_endpoint().port;
-                    if eph_port != 0 || stack.tcp_socket(session.smol_handle).state() != TcpState::Listen {
-                        // Get the local port from the socket's tuple or listen endpoint.
-                        let local_port = if let Some(tuple) = get_socket_local_port(&stack, session.smol_handle) {
-                            tuple
-                        } else {
-                            eph_port
-                        };
-                        if local_port != 0 {
-                            pkt[ihl+2] = (local_port >> 8) as u8;
-                            pkt[ihl+3] = local_port as u8;
-                            let smol_ip = crate::ip_stack::SMOL_IP;
-                            pkt[16] = smol_ip.octets()[0];
-                            pkt[17] = smol_ip.octets()[1];
-                            pkt[18] = smol_ip.octets()[2];
-                            pkt[19] = smol_ip.octets()[3];
-                            pkt[10] = 0; pkt[11] = 0;
-                            let ip_cksum = ipv4_checksum(&pkt[..ihl]);
-                            pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
-                            pkt[ihl+16] = 0; pkt[ihl+17] = 0;
-                        }
-                    }
+                    // Existing connection (ACK, data, FIN, etc.):
+                    // Rewrite dst → smoltcp's IP:eph_port.
+                    let ep = session.eph_port;
+                    pkt[ihl+2] = (ep >> 8) as u8;
+                    pkt[ihl+3] = ep as u8;
+                    let smol_ip = crate::ip_stack::SMOL_IP;
+                    pkt[16] = smol_ip.octets()[0];
+                    pkt[17] = smol_ip.octets()[1];
+                    pkt[18] = smol_ip.octets()[2];
+                    pkt[19] = smol_ip.octets()[3];
+                    // Recalc IP checksum (TCP checksum ignored by smoltcp).
+                    pkt[10] = 0; pkt[11] = 0;
+                    let ip_cksum = ipv4_checksum(&pkt[..ihl]);
+                    pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+                    pkt[ihl+16] = 0; pkt[ihl+17] = 0;
                 }
             }
 
@@ -369,13 +363,7 @@ async fn run_event_loop(
         // ── 6. Cleanup ──────────────────────────────────────────────
         for key in &stale_keys {
             if let Some(session) = sessions.remove(key) {
-                // Find ephemeral port to clean up port_to_key.
-                let eph_port = stack.tcp_socket(session.smol_handle).listen_endpoint().port;
-                if eph_port != 0 { port_to_key.remove(&eph_port); }
-                // Also check tuple local port.
-                if let Some(lp) = get_socket_local_port(&stack, session.smol_handle) {
-                    port_to_key.remove(&lp);
-                }
+                port_to_key.remove(&session.eph_port);
                 stack.remove_socket(session.smol_handle);
                 ctx.stats.connection_closed();
             }
@@ -410,20 +398,6 @@ async fn run_event_loop(
             _ = tokio::time::sleep(delay) => {}
             _ = shutdown_rx.changed() => {}
         }
-    }
-}
-
-/// Get the local port of an established/syn-received socket.
-fn get_socket_local_port(stack: &IpStack, handle: SocketHandle) -> Option<u16> {
-    let socket = stack.tcp_socket(handle);
-    // In Listen state, local_endpoint may not be set yet.
-    // After SYN-ACK, the tuple is set.
-    let ep = socket.local_endpoint();
-    if ep.is_some() {
-        ep.map(|e| e.port)
-    } else {
-        let lep = socket.listen_endpoint();
-        if lep.port != 0 { Some(lep.port) } else { None }
     }
 }
 
