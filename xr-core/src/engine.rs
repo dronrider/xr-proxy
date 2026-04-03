@@ -189,22 +189,27 @@ async fn run_event_loop(
                     // Buffer sizes: 32KB each — reasonable for mobile.
                     let handle = stack.add_tcp_socket(32768, 32768);
                     let socket = stack.tcp_socket_mut(handle);
-                    // Listen on dst IP:port. Convert std Ipv4Addr → smoltcp Ipv4Address.
-                    let listen_ep = match key.dst_addr {
-                        SocketAddr::V4(v4) => smoltcp::wire::IpListenEndpoint {
-                            addr: Some(smoltcp::wire::Ipv4Address::new(
-                                v4.ip().octets()[0], v4.ip().octets()[1],
-                                v4.ip().octets()[2], v4.ip().octets()[3],
-                            ).into()),
-                            port: v4.port(),
-                        },
-                        SocketAddr::V6(_) => {
-                            stack.remove_socket(handle);
-                            queue.push_inbound(pkt);
-                            continue;
-                        }
-                    };
-                    if socket.listen(listen_ep).is_ok() {
+                    if key.dst_addr.is_ipv6() {
+                        stack.remove_socket(handle);
+                        queue.push_inbound(pkt);
+                        continue;
+                    }
+                    // Listen with specific dst IP and port.
+                    // The dst IP in the SYN packet is always the smoltcp
+                    // interface IP when any_ip=true is working correctly,
+                    // BUT the actual wire packet has the real dst IP.
+                    // smoltcp's accepts() checks: ip_repr.dst_addr() == listen addr
+                    // So we must NOT specify addr — use port only.
+                    // To handle multiple connections to same port (e.g. 443),
+                    // after a socket transitions from Listen to SynReceived,
+                    // it sets a 4-tuple and no longer matches new SYNs.
+                    // We need a new listen socket for the NEXT SYN on same port.
+                    //
+                    // Strategy: listen on port only. After SYN is matched,
+                    // smoltcp sets the 4-tuple. Next SYN on same port will
+                    // need another listen socket — we create it on the next
+                    // event loop iteration when we detect a new SYN.
+                    if socket.listen(key.dst_addr.port()).is_ok() {
                         // Create channels for relay.
                         let (to_relay_tx, to_relay_rx) = mpsc::channel(256);
                         let (from_relay_tx, from_relay_rx) = mpsc::channel(256);

@@ -19,11 +19,10 @@ use std::sync::{Arc, Mutex};
 pub const TUN_MTU: usize = 1500;
 
 /// smoltcp interface IP — intentionally DIFFERENT from TUN IP (10.0.0.2).
-/// If they match, smoltcp treats incoming packets as loopback and SYN-ACK
-/// never leaves the stack.
 pub const SMOL_IP: Ipv4Address = Ipv4Address::new(172, 16, 0, 1);
-/// Gateway IP for smoltcp routing.
-pub const SMOL_GATEWAY: Ipv4Address = Ipv4Address::new(172, 16, 0, 254);
+/// Gateway IP. MUST be smoltcp's own IP for any_ip routing check:
+/// smoltcp requires routes.lookup(dst).gateway == one of ip_addrs.
+pub const SMOL_GATEWAY: Ipv4Address = Ipv4Address::new(172, 16, 0, 1);
 
 // ── Packet queue (TUN ↔ smoltcp bridge) ─────────────────────────────
 
