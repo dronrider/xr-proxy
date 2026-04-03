@@ -28,6 +28,12 @@ object NativeBridge {
     external fun nativeStop()
     external fun nativeGetState(): String
     external fun nativeGetStats(): String
+    /** Get full error log (newline-separated). */
+    external fun nativeGetErrorLog(): String
+
+    /** Clear error log. */
+    external fun nativeClearErrorLog()
+
     external fun nativePushPacket(packet: ByteArray)
     external fun nativePopPacket(): ByteArray?
 }

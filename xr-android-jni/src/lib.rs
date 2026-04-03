@@ -270,6 +270,30 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetStats(
     env.new_string(&json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
+/// Get full error log as newline-separated string.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetErrorLog(
+    env: JNIEnv, _class: JClass,
+) -> jstring {
+    let lock = get_engine().lock().unwrap();
+    let log = match *lock {
+        Some(ref h) => h.engine.stats().recent_errors().join("\n"),
+        None => String::new(),
+    };
+    env.new_string(&log).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Clear error log.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeClearErrorLog(
+    _env: JNIEnv, _class: JClass,
+) {
+    let lock = get_engine().lock().unwrap();
+    if let Some(ref h) = *lock {
+        h.engine.stats().clear_errors();
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePushPacket(
     env: JNIEnv, _class: JClass, packet: jni::objects::JByteArray,

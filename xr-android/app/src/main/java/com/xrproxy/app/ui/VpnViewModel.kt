@@ -30,6 +30,7 @@ data class VpnUiState(
     val relayErrors: Long = 0,
     val debugMsg: String = "",
     val recentErrors: List<String> = emptyList(),
+    val errorLog: String = "",
     // Settings
     val serverAddress: String = "",
     val serverPort: String = "8443",
@@ -102,6 +103,15 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun updateRoutingPreset(value: String) { _uiState.value = _uiState.value.copy(routingPreset = value) }
     fun updateCustomDomains(value: String) { _uiState.value = _uiState.value.copy(customDomains = value) }
     fun updateCustomIpRanges(value: String) { _uiState.value = _uiState.value.copy(customIpRanges = value) }
+
+    fun refreshLog() {
+        _uiState.value = _uiState.value.copy(errorLog = NativeBridge.nativeGetErrorLog())
+    }
+
+    fun clearLog() {
+        NativeBridge.nativeClearErrorLog()
+        _uiState.value = _uiState.value.copy(errorLog = "", relayErrors = 0)
+    }
 
     /// Import TOML config from clipboard text.
     fun importToml(toml: String) {

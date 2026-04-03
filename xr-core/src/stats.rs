@@ -99,17 +99,35 @@ impl Stats {
         self.inner.smol_send.fetch_add(n, Ordering::Relaxed);
     }
 
+    pub fn add_log(&self, msg: &str) {
+        let mut errors = self.inner.recent_errors.lock().unwrap();
+        if errors.len() >= 200 { errors.drain(0..50); }
+        let ts = self.inner.started_at.lock().unwrap()
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        errors.push(format!("[+{}s] {}", ts, msg));
+    }
+
     pub fn add_relay_error(&self, msg: &str) {
         self.inner.relay_errors.fetch_add(1, Ordering::Relaxed);
         let mut errors = self.inner.recent_errors.lock().unwrap();
-        if errors.len() >= 10 {
-            errors.remove(0);
+        // Keep last 200 errors.
+        if errors.len() >= 200 {
+            errors.drain(0..50);
         }
-        errors.push(msg.to_string());
+        let ts = self.inner.started_at.lock().unwrap()
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        errors.push(format!("[+{}s] {}", ts, msg));
     }
 
     pub fn recent_errors(&self) -> Vec<String> {
         self.inner.recent_errors.lock().unwrap().clone()
+    }
+
+    pub fn clear_errors(&self) {
+        self.inner.recent_errors.lock().unwrap().clear();
+        self.inner.relay_errors.store(0, Ordering::Relaxed);
     }
 
     pub fn set_debug(&self, msg: String) {
