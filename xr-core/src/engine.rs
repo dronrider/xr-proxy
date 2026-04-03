@@ -209,21 +209,20 @@ async fn run_event_loop(
                         ctx.stats.connection_opened();
                         ctx.stats.add_tcp_syn();
 
-                        // Rewrite dst port in the SYN packet → ephemeral port.
+                        // Rewrite dst → smoltcp's IP:eph_port.
                         pkt[ihl+2] = (eph_port >> 8) as u8;
                         pkt[ihl+3] = eph_port as u8;
-                        // Rewrite dst IP → smoltcp's interface IP.
                         let smol_ip = crate::ip_stack::SMOL_IP;
+                        let src_ip_inb = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
                         pkt[16] = smol_ip.octets()[0];
                         pkt[17] = smol_ip.octets()[1];
                         pkt[18] = smol_ip.octets()[2];
                         pkt[19] = smol_ip.octets()[3];
-                        // Recalculate IP checksum.
                         pkt[10] = 0; pkt[11] = 0;
                         let ip_cksum = ipv4_checksum(&pkt[..ihl]);
                         pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
-                        // Clear TCP checksum (smoltcp will recalculate).
-                        pkt[ihl+16] = 0; pkt[ihl+17] = 0;
+                        let smol_addr = Ipv4Addr::new(smol_ip.octets()[0], smol_ip.octets()[1], smol_ip.octets()[2], smol_ip.octets()[3]);
+                        tcp_checksum_update(&mut pkt, ihl, &src_ip_inb, &smol_addr);
                     } else {
                         stack.remove_socket(handle);
                     }
@@ -233,16 +232,17 @@ async fn run_event_loop(
                     let ep = session.eph_port;
                     pkt[ihl+2] = (ep >> 8) as u8;
                     pkt[ihl+3] = ep as u8;
+                    let src_ip_inb = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
                     let smol_ip = crate::ip_stack::SMOL_IP;
                     pkt[16] = smol_ip.octets()[0];
                     pkt[17] = smol_ip.octets()[1];
                     pkt[18] = smol_ip.octets()[2];
                     pkt[19] = smol_ip.octets()[3];
-                    // Recalc IP checksum (TCP checksum ignored by smoltcp).
                     pkt[10] = 0; pkt[11] = 0;
                     let ip_cksum = ipv4_checksum(&pkt[..ihl]);
                     pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
-                    pkt[ihl+16] = 0; pkt[ihl+17] = 0;
+                    let smol_addr = Ipv4Addr::new(smol_ip.octets()[0], smol_ip.octets()[1], smol_ip.octets()[2], smol_ip.octets()[3]);
+                    tcp_checksum_update(&mut pkt, ihl, &src_ip_inb, &smol_addr);
                 }
             }
 
@@ -266,23 +266,24 @@ async fn run_event_loop(
                     let src_port = u16::from_be_bytes([pkt[ihl], pkt[ihl+1]]);
                     // Look up the original destination by ephemeral port.
                     if let Some(orig_key) = port_to_key.get(&src_port) {
-                        // Rewrite src IP → original dst IP.
                         if let IpAddr::V4(orig_dst_ip) = orig_key.dst_addr.ip() {
+                            // Rewrite src IP → original dst IP.
                             pkt[12] = orig_dst_ip.octets()[0];
                             pkt[13] = orig_dst_ip.octets()[1];
                             pkt[14] = orig_dst_ip.octets()[2];
                             pkt[15] = orig_dst_ip.octets()[3];
+                            // Rewrite src port → original dst port.
+                            let orig_port = orig_key.dst_addr.port();
+                            pkt[ihl] = (orig_port >> 8) as u8;
+                            pkt[ihl+1] = orig_port as u8;
+                            // Recalculate IP checksum.
+                            pkt[10] = 0; pkt[11] = 0;
+                            let ip_cksum = ipv4_checksum(&pkt[..ihl]);
+                            pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+                            // Recalculate TCP checksum (Android TUN validates it).
+                            let dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+                            tcp_checksum_update(&mut pkt, ihl, &orig_dst_ip, &dst_ip);
                         }
-                        // Rewrite src port → original dst port.
-                        let orig_port = orig_key.dst_addr.port();
-                        pkt[ihl] = (orig_port >> 8) as u8;
-                        pkt[ihl+1] = orig_port as u8;
-                        // Recalculate IP checksum.
-                        pkt[10] = 0; pkt[11] = 0;
-                        let ip_cksum = ipv4_checksum(&pkt[..ihl]);
-                        pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
-                        // Clear TCP checksum (kernel will validate or not for TUN).
-                        pkt[ihl+16] = 0; pkt[ihl+17] = 0;
                     }
                 }
             }
@@ -440,6 +441,43 @@ pub fn build_udp_response(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, src_port: u16, dst
     p[20..22].copy_from_slice(&src_port.to_be_bytes()); p[22..24].copy_from_slice(&dst_port.to_be_bytes());
     p[24..26].copy_from_slice(&((8+payload.len()) as u16).to_be_bytes());
     p[28..].copy_from_slice(payload); p
+}
+
+/// Recalculate TCP checksum after NAT rewrite.
+fn tcp_checksum_update(pkt: &mut [u8], ihl: usize, src_ip: &Ipv4Addr, dst_ip: &Ipv4Addr) {
+    let tcp_len = pkt.len() - ihl;
+    // Clear existing checksum.
+    pkt[ihl + 16] = 0;
+    pkt[ihl + 17] = 0;
+
+    let mut sum = 0u32;
+    // Pseudo-header: src IP, dst IP, zero, protocol(6), TCP length.
+    for pair in src_ip.octets().chunks(2) {
+        sum += u16::from_be_bytes([pair[0], pair[1]]) as u32;
+    }
+    for pair in dst_ip.octets().chunks(2) {
+        sum += u16::from_be_bytes([pair[0], pair[1]]) as u32;
+    }
+    sum += 6u32; // protocol TCP
+    sum += tcp_len as u32;
+
+    // TCP segment.
+    let tcp = &pkt[ihl..];
+    for i in (0..tcp.len()).step_by(2) {
+        let word = if i + 1 < tcp.len() {
+            u16::from_be_bytes([tcp[i], tcp[i + 1]])
+        } else {
+            u16::from_be_bytes([tcp[i], 0])
+        };
+        sum += word as u32;
+    }
+
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let cksum = !(sum as u16);
+    pkt[ihl + 16] = (cksum >> 8) as u8;
+    pkt[ihl + 17] = cksum as u8;
 }
 
 fn ipv4_checksum(h: &[u8]) -> u16 {
