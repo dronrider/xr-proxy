@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Notify;
 use tokio::time::Duration;
 
 use xr_proto::protocol::{Codec, Command, TargetAddr};
@@ -69,12 +70,25 @@ async fn connect_protected(addr: SocketAddr, protect: &ProtectSocketFn) -> io::R
         format!("connect timeout to {}", addr)))?
 }
 
-/// Connect to server, using protected socket. Single attempt (no retry).
+/// Connect to server, using protected socket. Single attempt — retries
+/// amplify load on overloaded server and make things worse.
 async fn connect_server_protected(
     addr: &SocketAddr,
     protect: &ProtectSocketFn,
 ) -> io::Result<TcpStream> {
     connect_protected(*addr, protect).await
+}
+
+/// Check if an IP is a private/non-routable address that should never be proxied.
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()          // 10.x, 172.16-31.x, 192.168.x
+            || v4.is_loopback()      // 127.x
+            || v4.is_link_local()    // 169.254.x
+        }
+        IpAddr::V6(v6) => v6.is_loopback(),
+    }
 }
 
 /// Spawn a relay task with a pre-resolved domain.
@@ -84,7 +98,27 @@ pub async fn relay_session_with_domain(
     domain: Option<String>,
     data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    waker: Arc<Notify>,
 ) -> io::Result<()> {
+    // Never proxy fake IPs without a domain — server can't connect to 198.18.x.x.
+    if domain.is_none() {
+        if let IpAddr::V4(v4) = key.dst_addr.ip() {
+            if FakeDns::is_fake_ip(v4) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("fake IP {} without domain, dropping", v4),
+                ));
+            }
+        }
+    }
+
+    // Never proxy private/local IPs — they're not reachable from server.
+    if is_private_ip(key.dst_addr.ip()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("private IP {}, dropping", key.dst_addr.ip()),
+        ));
+    }
 
     let action = ctx.router.resolve(domain.as_deref(), key.dst_addr.ip());
 
@@ -100,14 +134,14 @@ pub async fn relay_session_with_domain(
                 "proxy: {} [{}] -> srv {}",
                 key.dst_addr, domain.as_deref().unwrap_or("-"), ctx.server_addr,
             ));
-            relay_via_proxy(ctx, target_addr, data_rx, data_tx).await
+            relay_via_proxy(ctx, target_addr, data_rx, data_tx, waker).await
         }
         Action::Direct => {
             ctx.stats.set_debug(format!(
                 "direct: {} [{}]",
                 key.dst_addr, domain.as_deref().unwrap_or("-"),
             ));
-            relay_direct(ctx, key.dst_addr, domain.as_deref(), data_rx, data_tx).await
+            relay_direct(ctx, key.dst_addr, domain.as_deref(), data_rx, data_tx, waker).await
         }
     }
 }
@@ -118,6 +152,7 @@ async fn relay_via_proxy(
     target_addr: TargetAddr,
     mut data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    waker: Arc<Notify>,
 ) -> io::Result<()> {
     // Connect to xr-server with PROTECTED socket (single attempt).
     let mut server = connect_server_protected(&ctx.server_addr, &ctx.protect_socket).await
@@ -175,6 +210,8 @@ async fn relay_via_proxy(
                                 if data_tx.send(frame.payload).await.is_err() {
                                     return Ok(());
                                 }
+                                // Wake event loop to deliver data to smoltcp immediately.
+                                waker.notify_one();
                             }
                             Command::Close => return Ok(()),
                             _ => {}
@@ -209,6 +246,7 @@ async fn relay_direct(
     domain: Option<&str>,
     mut data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    waker: Arc<Notify>,
 ) -> io::Result<()> {
     // Resolve real destination for fake IPs.
     let real_dst = if let IpAddr::V4(v4) = dst.ip() {
@@ -248,6 +286,8 @@ async fn relay_direct(
             let n = tr.read(&mut buf).await?;
             if n == 0 { break; }
             if data_tx.send(buf[..n].to_vec()).await.is_err() { break; }
+            // Wake event loop to deliver data to smoltcp immediately.
+            waker.notify_one();
         }
         Ok::<(), io::Error>(())
     };

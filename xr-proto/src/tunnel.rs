@@ -49,7 +49,7 @@ pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
 
     loop {
         let n = tokio::time::timeout(
-            Duration::from_secs(15),
+            Duration::from_secs(5),
             server.read(&mut ack_buf[ack_filled..]),
         )
         .await

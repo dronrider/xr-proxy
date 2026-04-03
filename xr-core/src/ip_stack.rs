@@ -14,6 +14,7 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 /// MTU for the virtual TUN device.
 pub const TUN_MTU: usize = 1500;
@@ -33,6 +34,8 @@ pub const SMOL_GATEWAY: Ipv4Address = Ipv4Address::new(172, 16, 0, 1);
 #[derive(Clone)]
 pub struct PacketQueue {
     inner: Arc<Mutex<PacketQueueInner>>,
+    /// Notify the event loop when new data arrives.
+    notify: Arc<Notify>,
 }
 
 struct PacketQueueInner {
@@ -51,17 +54,27 @@ impl PacketQueue {
                 smol_outbound: VecDeque::with_capacity(256),
                 tun_outbound: VecDeque::with_capacity(256),
             })),
+            notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Get the notifier for waking the event loop.
+    pub fn notifier(&self) -> Arc<Notify> {
+        self.notify.clone()
     }
 
     /// Push a packet from TUN into the stack (for smoltcp to process).
     pub fn push_inbound(&self, packet: Vec<u8>) {
-        let mut inner = self.inner.lock().unwrap();
-        // Drop oldest if queue is too large (backpressure).
-        if inner.inbound.len() >= 4096 {
-            inner.inbound.pop_front();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            // Drop oldest if queue is too large (backpressure).
+            if inner.inbound.len() >= 4096 {
+                inner.inbound.pop_front();
+            }
+            inner.inbound.push_back(packet);
         }
-        inner.inbound.push_back(packet);
+        // Wake event loop immediately.
+        self.notify.notify_one();
     }
 
     /// Pop a packet for TUN fd (after NAT rewrite).
@@ -108,7 +121,8 @@ impl PacketQueue {
 
     /// Check if there's pending outbound data (for TUN).
     pub fn has_outbound(&self) -> bool {
-        !self.inner.lock().unwrap().tun_outbound.is_empty()
+        let inner = self.inner.lock().unwrap();
+        !inner.tun_outbound.is_empty() || !inner.smol_outbound.is_empty()
     }
 }
 

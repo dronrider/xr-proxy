@@ -147,6 +147,7 @@ async fn run_event_loop(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut stack = IpStack::new(queue.clone());
+    let waker = queue.notifier();
 
     // Key: (src_addr, dst_addr) from original SYN.
     // We rewrite the SYN dst_port → ephemeral port so smoltcp can handle
@@ -262,46 +263,7 @@ async fn run_event_loop(
             if !stack.poll() { break; }
         }
 
-        // ── 4. Rewrite outbound packets: restore original dst ───────
-        // smoltcp sends packets with src=SMOL_IP:eph_port.
-        // We need to rewrite them to src=original_dst_ip:original_dst_port
-        // so the TUN client sees the response from the expected address.
-        let mut outbound = Vec::new();
-        while let Some(mut pkt) = queue.pop_smol_outbound() {
-            if pkt.len() >= 40 && pkt[0] >> 4 == 4 && pkt[9] == 6 {
-                let ihl = (pkt[0] & 0x0F) as usize * 4;
-                if pkt.len() >= ihl + 4 {
-                    let src_port = u16::from_be_bytes([pkt[ihl], pkt[ihl+1]]);
-                    // Look up the original destination by ephemeral port.
-                    if let Some(orig_key) = port_to_key.get(&src_port) {
-                        if let IpAddr::V4(orig_dst_ip) = orig_key.dst_addr.ip() {
-                            // Rewrite src IP → original dst IP.
-                            pkt[12] = orig_dst_ip.octets()[0];
-                            pkt[13] = orig_dst_ip.octets()[1];
-                            pkt[14] = orig_dst_ip.octets()[2];
-                            pkt[15] = orig_dst_ip.octets()[3];
-                            // Rewrite src port → original dst port.
-                            let orig_port = orig_key.dst_addr.port();
-                            pkt[ihl] = (orig_port >> 8) as u8;
-                            pkt[ihl+1] = orig_port as u8;
-                            // Recalculate IP checksum.
-                            pkt[10] = 0; pkt[11] = 0;
-                            let ip_cksum = ipv4_checksum(&pkt[..ihl]);
-                            pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
-                            // Recalculate TCP checksum (Android TUN validates it).
-                            let dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-                            tcp_checksum_update(&mut pkt, ihl, &orig_dst_ip, &dst_ip);
-                        }
-                    }
-                }
-            }
-            outbound.push(pkt);
-        }
-        for pkt in outbound {
-            queue.push_outbound_public(pkt);
-        }
-
-        // ── 5. Check sessions: spawn relay, transfer data ───────────
+        // ── 4. Check sessions: spawn relay, transfer data ───────────
         stale_keys.clear();
 
         for (key, session) in sessions.iter_mut() {
@@ -322,12 +284,13 @@ async fn run_event_loop(
                 let cached_domain = session.domain.clone();
                 let key_clone = *key;
                 let domain_tag = cached_domain.as_deref().unwrap_or("NO_DOMAIN").to_string();
+                let relay_waker = waker.clone();
                 tokio::spawn(async move {
                     let relay_key = TcpSessionKey {
                         src_addr: key_clone.src_addr,
                         dst_addr: real_dst,
                     };
-                    match relay_session_with_domain(ctx_clone.clone(), relay_key, cached_domain, to_relay_rx, from_relay_tx).await {
+                    match relay_session_with_domain(ctx_clone.clone(), relay_key, cached_domain, to_relay_rx, from_relay_tx, relay_waker).await {
                         Ok(()) => {}
                         Err(e) => {
                             ctx_clone.stats.add_relay_error(
@@ -340,6 +303,14 @@ async fn run_event_loop(
 
             // Transfer data.
             if let Some(ref mut relay) = session.relay {
+                // Detect dead relay: if receiver dropped, relay task died.
+                // Abort socket so the app gets RST and retries with fresh DNS.
+                if relay.to_relay.is_closed() {
+                    socket.abort();
+                    stale_keys.push(*key);
+                    continue;
+                }
+
                 // smoltcp → relay (upload).
                 while socket.can_recv() {
                     let mut buf = vec![0u8; 32768];
@@ -360,7 +331,13 @@ async fn run_event_loop(
                             ctx.stats.add_smol_send(data.len() as u64);
                             let _ = socket.send_slice(&data);
                         }
-                        Err(_) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            // Relay sender dropped — relay task finished.
+                            socket.abort();
+                            stale_keys.push(*key);
+                            break;
+                        }
                     }
                 }
             }
@@ -371,7 +348,7 @@ async fn run_event_loop(
             }
         }
 
-        // ── 6. Cleanup ──────────────────────────────────────────────
+        // ── 5. Cleanup ──────────────────────────────────────────────
         for key in &stale_keys {
             if let Some(session) = sessions.remove(key) {
                 port_to_key.remove(&session.eph_port);
@@ -380,8 +357,40 @@ async fn run_event_loop(
             }
         }
 
-        // ── 7. Poll again ───────────────────────────────────────────
-        stack.poll();
+        // ── 6. Poll again (process data written by relay → smoltcp) ─
+        for _ in 0..16 {
+            if !stack.poll() { break; }
+        }
+
+        // ── 7. Rewrite outbound packets: restore original dst ───────
+        // smoltcp sends packets with src=SMOL_IP:eph_port.
+        // We need to rewrite them to src=original_dst_ip:original_dst_port
+        // so the TUN client sees the response from the expected address.
+        while let Some(mut pkt) = queue.pop_smol_outbound() {
+            if pkt.len() >= 40 && pkt[0] >> 4 == 4 && pkt[9] == 6 {
+                let ihl = (pkt[0] & 0x0F) as usize * 4;
+                if pkt.len() >= ihl + 4 {
+                    let src_port = u16::from_be_bytes([pkt[ihl], pkt[ihl+1]]);
+                    if let Some(orig_key) = port_to_key.get(&src_port) {
+                        if let IpAddr::V4(orig_dst_ip) = orig_key.dst_addr.ip() {
+                            pkt[12] = orig_dst_ip.octets()[0];
+                            pkt[13] = orig_dst_ip.octets()[1];
+                            pkt[14] = orig_dst_ip.octets()[2];
+                            pkt[15] = orig_dst_ip.octets()[3];
+                            let orig_port = orig_key.dst_addr.port();
+                            pkt[ihl] = (orig_port >> 8) as u8;
+                            pkt[ihl+1] = orig_port as u8;
+                            pkt[10] = 0; pkt[11] = 0;
+                            let ip_cksum = ipv4_checksum(&pkt[..ihl]);
+                            pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+                            let dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+                            tcp_checksum_update(&mut pkt, ihl, &orig_dst_ip, &dst_ip);
+                        }
+                    }
+                }
+            }
+            queue.push_outbound_public(pkt);
+        }
 
         // ── 8. Debug ────────────────────────────────────────────────
         {
@@ -403,17 +412,20 @@ async fn run_event_loop(
             }
         }
 
-        // ── 9. Yield to relay tasks, then sleep ────────────────────
-        tokio::task::yield_now().await;
+        // ── 9. Wait for new data or smoltcp timer ────────────────
+        // If there's still pending data, loop immediately without waiting.
+        if queue.has_inbound() || queue.has_outbound() {
+            tokio::task::yield_now().await;
+            continue;
+        }
 
-        let has_data = queue.has_inbound() || queue.has_outbound();
-        let delay = if has_data {
-            Duration::from_micros(200)
-        } else {
-            stack.poll_delay().unwrap_or(Duration::from_millis(5)).min(Duration::from_millis(5))
-        };
+        // Sleep until woken by: TUN packet, relay data, smoltcp timer, or shutdown.
+        let poll_delay = stack.poll_delay()
+            .unwrap_or(Duration::from_millis(50))
+            .min(Duration::from_millis(50));
         tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
+            _ = waker.notified() => {}
+            _ = tokio::time::sleep(poll_delay) => {}
             _ = shutdown_rx.changed() => {}
         }
     }
