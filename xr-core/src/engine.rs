@@ -297,7 +297,33 @@ async fn run_event_loop(
         // ── 6. Poll smoltcp again (to send any data we queued) ──────
         stack.poll();
 
-        // ── 7. Sleep ────────────────────────────────────────────────
+        // ── 7. Debug: report TCP states and device counters ─────────
+        // Update debug message periodically.
+        {
+            let mut established = 0u32;
+            let mut syn_recv = 0u32;
+            let mut listen = 0u32;
+            let mut other = 0u32;
+            for (_key, session) in sessions.iter() {
+                let state = stack.tcp_socket(session.smol_handle).state();
+                match state {
+                    TcpState::Established => established += 1,
+                    TcpState::SynReceived => syn_recv += 1,
+                    TcpState::Listen => listen += 1,
+                    _ => other += 1,
+                }
+            }
+            let rx = stack.device.rx_count;
+            let tx = stack.device.tx_count;
+            if sessions.len() > 0 {
+                ctx.stats.set_debug(format!(
+                    "dev rx:{} tx:{} | tcp L:{} SR:{} E:{} o:{} | sess:{}",
+                    rx, tx, listen, syn_recv, established, other, sessions.len()
+                ));
+            }
+        }
+
+        // ── 8. Sleep ────────────────────────────────────────────────
         let delay = stack
             .poll_delay()
             .unwrap_or(Duration::from_millis(5))

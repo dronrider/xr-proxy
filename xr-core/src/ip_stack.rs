@@ -18,10 +18,12 @@ use std::sync::{Arc, Mutex};
 /// MTU for the virtual TUN device.
 pub const TUN_MTU: usize = 1500;
 
-/// Virtual IP of the TUN interface (device-side).
-pub const TUN_IP: Ipv4Address = Ipv4Address::new(10, 0, 0, 2);
-/// Gateway IP.
-pub const TUN_GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 0, 1);
+/// smoltcp interface IP — intentionally DIFFERENT from TUN IP (10.0.0.2).
+/// If they match, smoltcp treats incoming packets as loopback and SYN-ACK
+/// never leaves the stack.
+pub const SMOL_IP: Ipv4Address = Ipv4Address::new(172, 16, 0, 1);
+/// Gateway IP for smoltcp routing.
+pub const SMOL_GATEWAY: Ipv4Address = Ipv4Address::new(172, 16, 0, 254);
 
 // ── Packet queue (TUN ↔ smoltcp bridge) ─────────────────────────────
 
@@ -112,11 +114,13 @@ impl PacketQueue {
 /// Virtual device backed by PacketQueue. Implements smoltcp's Device trait.
 pub struct QueueDevice {
     queue: PacketQueue,
+    pub rx_count: u64,
+    pub tx_count: u64,
 }
 
 impl QueueDevice {
     pub fn new(queue: PacketQueue) -> Self {
-        Self { queue }
+        Self { queue, rx_count: 0, tx_count: 0 }
     }
 }
 
@@ -126,6 +130,7 @@ impl Device for QueueDevice {
 
     fn receive(&mut self, _timestamp: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let packet = self.queue.pop_inbound()?;
+        self.rx_count += 1;
         Some((
             QueueRxToken { packet },
             QueueTxToken {
@@ -135,6 +140,7 @@ impl Device for QueueDevice {
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+        self.tx_count += 1;
         Some(QueueTxToken {
             queue: self.queue.clone(),
         })
@@ -195,20 +201,21 @@ impl IpStack {
         let config = Config::new(HardwareAddress::Ip);
         let mut iface = Interface::new(config, &mut device, SmolInstant::now());
 
-        // Configure the interface with TUN IP.
+        // Configure interface with a DIFFERENT IP than the TUN (10.0.0.2).
+        // With any_ip=true, smoltcp considers ALL IPs as local.
+        // If the smoltcp IP == TUN IP, smoltcp treats SYN-ACK as loopback
+        // and never sends it through the device → TCP handshake never completes.
         iface.update_ip_addrs(|addrs| {
             addrs
-                .push(IpCidr::new(TUN_IP.into(), 24))
+                .push(IpCidr::new(SMOL_IP.into(), 16))
                 .ok();
         });
 
-        // Accept packets for ANY destination IP, not just 10.0.0.2.
-        // This is critical: TUN packets arrive for fake IPs (198.18.x.x)
-        // and real IPs. Without this, smoltcp drops them all.
+        // Accept packets for ANY destination IP.
         iface.set_any_ip(true);
 
-        // Default route through gateway.
-        iface.routes_mut().add_default_ipv4_route(TUN_GATEWAY).ok();
+        // Default route.
+        iface.routes_mut().add_default_ipv4_route(SMOL_GATEWAY).ok();
 
         let sockets = SocketSet::new(Vec::new());
 
