@@ -63,7 +63,7 @@ async fn connect_protected(addr: SocketAddr, protect: &ProtectSocketFn) -> io::R
     }
 
     tokio::time::timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(2),
         socket.connect(addr),
     ).await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut,

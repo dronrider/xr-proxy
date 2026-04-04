@@ -12,10 +12,10 @@ use crate::protocol::{Codec, Command, TargetAddr};
 
 /// Connect to the xr-server. Single attempt with fast timeout.
 /// Server sends ConnectAck instantly, so if connection doesn't work
-/// in 3 seconds — it won't work at all, fall back to Direct.
+/// in 2 seconds — it won't work at all, retry or fall back.
 pub async fn connect_to_server(addr: &SocketAddr) -> io::Result<TcpStream> {
     tokio::time::timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(2),
         TcpStream::connect(addr),
     )
     .await
@@ -46,7 +46,7 @@ pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
 
     loop {
         let n = tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(2),
             server.read(&mut ack_buf[ack_filled..]),
         )
         .await
