@@ -45,7 +45,7 @@ echo "=== Остановка службы ==="
 $SSH_CMD "/etc/init.d/xr-proxy stop" 2>/dev/null || true
 
 echo "=== Загрузка на ${ROUTER} ==="
-scp -P "$SSH_PORT" "$LOCAL_BIN" "${ROUTER}:${REMOTE_BIN}.new"
+scp -O -P "$SSH_PORT" "$LOCAL_BIN" "${ROUTER}:${REMOTE_BIN}.new"
 
 echo "=== Замена и запуск ==="
 $SSH_CMD "
