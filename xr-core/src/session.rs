@@ -165,7 +165,7 @@ async fn relay_via_proxy(
     waker: Arc<Notify>,
 ) -> io::Result<()> {
     // Fast retry: connect(3s) + handshake(3s) = 6s per attempt, 3 attempts.
-    let mut server = {
+    let server = {
         let mut last_err = None;
         let mut connected = None;
         for attempt in 0..3u8 {

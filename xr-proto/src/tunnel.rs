@@ -6,7 +6,7 @@ use std::io;
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
 
 use crate::protocol::{Codec, Command, TargetAddr};
 
