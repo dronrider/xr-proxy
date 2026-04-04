@@ -10,8 +10,9 @@ use xr_proto::protocol::{Codec, Command, TargetAddr};
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);   // 5 min idle
 const MAX_LIFETIME: Duration = Duration::from_secs(3600);  // 1 hour max
 
-/// Enable TCP keepalive on a stream.
-fn set_keepalive(stream: &TcpStream) {
+/// Configure TCP socket: keepalive + nodelay.
+fn configure_socket(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
     let ka = socket2::TcpKeepalive::new()
         .with_time(std::time::Duration::from_secs(60))
         .with_interval(std::time::Duration::from_secs(15));
@@ -27,7 +28,7 @@ pub async fn handle_client(
     timeout: Duration,
     fallback_response: Option<Vec<u8>>,
 ) -> io::Result<()> {
-    set_keepalive(&client);
+    configure_socket(&client);
 
     // Read first frame (Connect command) with timeout
     let mut buf = vec![0u8; 4096];
@@ -79,13 +80,13 @@ pub async fn handle_client(
     tracing::info!("{} -> {} ({})", client_addr, target_sockaddr, addr_display(&target_addr));
 
     let mut target = tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(5),
         TcpStream::connect(target_sockaddr),
     )
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "target connect timeout"))??;
 
-    set_keepalive(&target);
+    configure_socket(&target);
 
     relay_obfuscated(&mut client, &mut target, &codec, &buf[..filled]).await
 }
