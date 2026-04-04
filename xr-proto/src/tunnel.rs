@@ -10,25 +10,22 @@ use tokio::time::{sleep, Duration};
 
 use crate::protocol::{Codec, Command, TargetAddr};
 
-/// Connect to the xr-server with retry logic.
-pub async fn connect_with_retry(addr: &SocketAddr, max_retries: u32) -> io::Result<TcpStream> {
-    let mut delay = Duration::from_secs(1);
+/// Connect to the xr-server. Single attempt with fast timeout.
+/// Server sends ConnectAck instantly, so if connection doesn't work
+/// in 3 seconds — it won't work at all, fall back to Direct.
+pub async fn connect_to_server(addr: &SocketAddr) -> io::Result<TcpStream> {
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        TcpStream::connect(addr),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut,
+        format!("server connect timeout ({})", addr)))?
+}
 
-    for attempt in 0..=max_retries {
-        match TcpStream::connect(addr).await {
-            Ok(stream) => return Ok(stream),
-            Err(e) => {
-                if attempt == max_retries {
-                    return Err(e);
-                }
-                tracing::warn!("Connect to server failed (attempt {}): {}", attempt + 1, e);
-                sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_secs(60));
-            }
-        }
-    }
-
-    unreachable!()
+/// Connect to the xr-server with retry logic (legacy, used by older configs).
+pub async fn connect_with_retry(addr: &SocketAddr, _max_retries: u32) -> io::Result<TcpStream> {
+    connect_to_server(addr).await
 }
 
 /// Perform the tunnel handshake: send Connect, wait for ConnectAck.
@@ -49,7 +46,7 @@ pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
 
     loop {
         let n = tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(3),
             server.read(&mut ack_buf[ack_filled..]),
         )
         .await
