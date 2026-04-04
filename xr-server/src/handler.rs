@@ -71,10 +71,9 @@ pub async fn handle_client(
     let (target_addr, _) = TargetAddr::decode(&connect_frame.payload)?;
 
     // Send ConnectAck IMMEDIATELY — before DNS resolution and target connect.
-    // DNS for domains like basket-25.wbbasket.ru can take seconds,
-    // causing "connect ack timeout" on clients with 5-10s handshake timeout.
     let ack = codec.encode_frame(Command::ConnectAck, &[0])?;
     client.write_all(&ack).await?;
+    tracing::debug!("{} ack sent for {}", client_addr, addr_display(&target_addr));
 
     let target_sockaddr = resolve_target(&target_addr).await?;
     tracing::info!("{} -> {} ({})", client_addr, target_sockaddr, addr_display(&target_addr));
