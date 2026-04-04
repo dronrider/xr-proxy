@@ -164,21 +164,32 @@ async fn relay_via_proxy(
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     waker: Arc<Notify>,
 ) -> io::Result<()> {
-    // Connect to xr-server with PROTECTED socket (single attempt).
-    let mut server = connect_server_protected(&ctx.server_addr, &ctx.protect_socket).await
-        .map_err(|e| {
-            ctx.stats.add_log(&format!("srv connect fail: {}", e));
-            e
-        })?;
-
-    ctx.stats.add_log(&format!("srv connected, handshaking for {:?}", target_addr));
-
-    // Handshake.
-    tunnel::handshake(&mut server, &target_addr, &ctx.codec).await
-        .map_err(|e| {
-            ctx.stats.add_log(&format!("handshake fail: {}", e));
-            e
-        })?;
+    // Fast retry: connect(3s) + handshake(3s) = 6s per attempt, 3 attempts.
+    let mut server = {
+        let mut last_err = None;
+        let mut connected = None;
+        for attempt in 0..3u8 {
+            match connect_server_protected(&ctx.server_addr, &ctx.protect_socket).await {
+                Ok(mut s) => {
+                    if attempt > 0 {
+                        ctx.stats.add_log(&format!("srv retry {} for {:?}", attempt, target_addr));
+                    }
+                    match tunnel::handshake(&mut s, &target_addr, &ctx.codec).await {
+                        Ok(()) => { connected = Some(s); break; }
+                        Err(e) => {
+                            ctx.stats.add_log(&format!("handshake fail: {}", e));
+                            last_err = Some(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    ctx.stats.add_log(&format!("srv connect fail: {}", e));
+                    last_err = Some(e);
+                }
+            }
+        }
+        connected.ok_or_else(|| last_err.unwrap())?
+    };
 
     ctx.stats.add_log(&format!("relay started for {:?}", target_addr));
 

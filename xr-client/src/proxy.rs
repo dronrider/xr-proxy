@@ -174,19 +174,31 @@ async fn tunnel_connection(
     idle_timeout: Duration,
     max_lifetime: Duration,
 ) -> io::Result<()> {
-    // Connect to xr-proxy-server
-    let mut server = tunnel::connect_with_retry(&state.server_addr, 3).await?;
-    set_keepalive(&server);
-
-    // Build connect payload with target address
     let target_addr = if let Some(domain) = sni_name {
         TargetAddr::Domain(domain.to_string(), orig_dst.port())
     } else {
         TargetAddr::Ip(orig_dst)
     };
 
-    // Handshake: Connect → ConnectAck
-    tunnel::handshake(&mut server, &target_addr, &state.codec).await?;
+    // Fast retry: connect(3s) + handshake(3s) = 6s per attempt.
+    // With ~14% packet loss, 3 attempts give 99.7% success rate.
+    let mut server = {
+        let mut last_err = None;
+        let mut connected = None;
+        for _ in 0..3 {
+            match tunnel::connect_to_server(&state.server_addr).await {
+                Ok(mut s) => {
+                    set_keepalive(&s);
+                    match tunnel::handshake(&mut s, &target_addr, &state.codec).await {
+                        Ok(()) => { connected = Some(s); break; }
+                        Err(e) => { last_err = Some(e); }
+                    }
+                }
+                Err(e) => { last_err = Some(e); }
+            }
+        }
+        connected.ok_or_else(|| last_err.unwrap())?
+    };
 
     // Relay data: client <-> obfuscated tunnel <-> server
     tunnel::relay_obfuscated(client, &mut server, &state.codec, idle_timeout, max_lifetime).await
