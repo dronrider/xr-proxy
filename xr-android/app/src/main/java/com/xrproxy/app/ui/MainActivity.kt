@@ -1,6 +1,7 @@
 package com.xrproxy.app.ui
 
 import android.app.Activity
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -16,8 +17,14 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.withStyle
+import java.io.File
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -208,18 +215,40 @@ fun ConnectionSection(state: VpnUiState, onConnect: () -> Unit, onDisconnect: ()
 @Composable
 fun LogSection(state: VpnUiState, viewModel: VpnViewModel) {
     val clipboardManager = LocalClipboardManager.current
+    val context = LocalContext.current
 
     Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
         horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-        Text("Error Log (${state.relayErrors})", style = MaterialTheme.typography.titleMedium)
+        Text("Log (${state.relayErrors} errors)", style = MaterialTheme.typography.titleMedium)
         Row {
             IconButton(onClick = {
                 clipboardManager.setText(AnnotatedString(state.errorLog))
             }) {
-                Icon(Icons.Default.ContentCopy, "Copy log")
+                Icon(Icons.Default.ContentCopy, "Copy")
+            }
+            IconButton(onClick = {
+                // Save log to cache and share via Intent.
+                try {
+                    val file = File(context.cacheDir, "xr-proxy.log")
+                    file.writeText(state.errorLog)
+                    val uri = androidx.core.content.FileProvider.getUriForFile(
+                        context, "${context.packageName}.fileprovider", file
+                    )
+                    val intent = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_STREAM, uri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    context.startActivity(Intent.createChooser(intent, "Share log"))
+                } catch (_: Exception) {
+                    // Fallback: copy to clipboard.
+                    clipboardManager.setText(AnnotatedString(state.errorLog))
+                }
+            }) {
+                Icon(Icons.Default.Share, "Share")
             }
             IconButton(onClick = { viewModel.clearLog() }) {
-                Icon(Icons.Default.Delete, "Clear log")
+                Icon(Icons.Default.Delete, "Clear")
             }
             IconButton(onClick = { viewModel.refreshLog() }) {
                 Icon(Icons.Default.Refresh, "Refresh")
@@ -229,12 +258,12 @@ fun LogSection(state: VpnUiState, viewModel: VpnViewModel) {
 
     if (state.errorLog.isBlank()) {
         Spacer(Modifier.height(32.dp))
-        Text("No errors", style = MaterialTheme.typography.bodyLarge,
+        Text("No entries", style = MaterialTheme.typography.bodyLarge,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
     } else {
         Card(modifier = Modifier.fillMaxWidth()) {
             Text(
-                text = state.errorLog,
+                text = colorizeLog(state.errorLog),
                 modifier = Modifier.padding(12.dp),
                 style = MaterialTheme.typography.bodySmall,
                 fontSize = 11.sp,
@@ -243,6 +272,22 @@ fun LogSection(state: VpnUiState, viewModel: VpnViewModel) {
         }
     }
     Spacer(Modifier.height(16.dp))
+}
+
+/** Highlight ERROR lines in red. */
+@Composable
+fun colorizeLog(log: String): AnnotatedString {
+    val errorColor = MaterialTheme.colorScheme.error
+    return buildAnnotatedString {
+        for (line in log.lines()) {
+            if (line.contains("ERROR")) {
+                withStyle(SpanStyle(color = errorColor)) { append(line) }
+            } else {
+                append(line)
+            }
+            append("\n")
+        }
+    }
 }
 
 // ── Settings tab ────────────────────────────────────────────────────

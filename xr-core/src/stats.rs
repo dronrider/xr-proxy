@@ -2,7 +2,19 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
+
+/// Format current wall-clock time as HH:MM:SS.
+fn wall_time() -> String {
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let h = (secs / 3600) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    format!("{:02}:{:02}:{:02}", h, m, s)
+}
 
 /// Thread-safe traffic counters.
 #[derive(Clone)]
@@ -100,25 +112,16 @@ impl Stats {
     }
 
     pub fn add_log(&self, msg: &str) {
-        let mut errors = self.inner.recent_errors.lock().unwrap();
-        if errors.len() >= 200 { errors.drain(0..50); }
-        let ts = self.inner.started_at.lock().unwrap()
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0);
-        errors.push(format!("[+{}s] {}", ts, msg));
+        let mut entries = self.inner.recent_errors.lock().unwrap();
+        if entries.len() >= 200 { entries.drain(0..50); }
+        entries.push(format!("[{}] {}", wall_time(), msg));
     }
 
     pub fn add_relay_error(&self, msg: &str) {
         self.inner.relay_errors.fetch_add(1, Ordering::Relaxed);
-        let mut errors = self.inner.recent_errors.lock().unwrap();
-        // Keep last 200 errors.
-        if errors.len() >= 200 {
-            errors.drain(0..50);
-        }
-        let ts = self.inner.started_at.lock().unwrap()
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0);
-        errors.push(format!("[+{}s] {}", ts, msg));
+        let mut entries = self.inner.recent_errors.lock().unwrap();
+        if entries.len() >= 200 { entries.drain(0..50); }
+        entries.push(format!("[{}] ERROR {}", wall_time(), msg));
     }
 
     pub fn recent_errors(&self) -> Vec<String> {
