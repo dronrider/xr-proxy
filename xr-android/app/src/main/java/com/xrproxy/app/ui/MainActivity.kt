@@ -274,14 +274,14 @@ fun LogSection(state: VpnUiState, viewModel: VpnViewModel) {
     Spacer(Modifier.height(16.dp))
 }
 
-/** Highlight ERROR lines in red. */
+/** Highlight WARN lines in red. */
 @Composable
 fun colorizeLog(log: String): AnnotatedString {
-    val errorColor = MaterialTheme.colorScheme.error
+    val warnColor = MaterialTheme.colorScheme.error
     return buildAnnotatedString {
         for (line in log.lines()) {
-            if (line.contains("ERROR")) {
-                withStyle(SpanStyle(color = errorColor)) { append(line) }
+            if (line.contains(" WARN ")) {
+                withStyle(SpanStyle(color = warnColor)) { append(line) }
             } else {
                 append(line)
             }

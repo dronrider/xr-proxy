@@ -4,16 +4,33 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
-/// Format current wall-clock time as HH:MM:SS.
-fn wall_time() -> String {
+/// Format current wall-clock time as YYYY-MM-DD HH:MM:SS UTC.
+fn timestamp() -> String {
     let secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let h = (secs / 3600) % 24;
-    let m = (secs / 60) % 60;
-    let s = secs % 60;
-    format!("{:02}:{:02}:{:02}", h, m, s)
+
+    // Days since epoch → date (simplified, no leap second handling).
+    let days = (secs / 86400) as i64;
+    let time = secs % 86400;
+    let h = time / 3600;
+    let m = (time % 3600) / 60;
+    let s = time % 60;
+
+    // Civil date from days since 1970-01-01 (Rata Die algorithm).
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, m, s)
 }
 
 /// Thread-safe traffic counters.
@@ -112,16 +129,18 @@ impl Stats {
     }
 
     pub fn add_log(&self, msg: &str) {
-        let mut entries = self.inner.recent_errors.lock().unwrap();
-        if entries.len() >= 200 { entries.drain(0..50); }
-        entries.push(format!("[{}] {}", wall_time(), msg));
+        self.append_entry("INFO", msg);
     }
 
     pub fn add_relay_error(&self, msg: &str) {
         self.inner.relay_errors.fetch_add(1, Ordering::Relaxed);
+        self.append_entry("WARN", msg);
+    }
+
+    fn append_entry(&self, level: &str, msg: &str) {
         let mut entries = self.inner.recent_errors.lock().unwrap();
         if entries.len() >= 200 { entries.drain(0..50); }
-        entries.push(format!("[{}] ERROR {}", wall_time(), msg));
+        entries.push(format!("{} {:>4} {}", timestamp(), level, msg));
     }
 
     pub fn recent_errors(&self) -> Vec<String> {
