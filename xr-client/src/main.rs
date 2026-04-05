@@ -101,12 +101,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let on_server_down = routing::Action::from_str(&config.client.on_server_down);
 
+    // Build mux pool: persistent multiplexed connection to server.
+    let mux_pool = {
+        let addr = server_addr;
+        xr_proto::mux_pool::MuxPool::new(
+            Arc::new(move || {
+                Box::pin(async move {
+                    xr_proto::tunnel::connect_to_server(&addr).await
+                })
+            }),
+            codec.clone(),
+        )
+    };
+
     let state = Arc::new(proxy::ProxyState {
         router,
         codec,
         server_addr,
         on_server_down,
         listen_port: config.client.listen_port,
+        mux_pool,
     });
 
     // Setup firewall redirect

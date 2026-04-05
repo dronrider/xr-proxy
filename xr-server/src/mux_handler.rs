@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Duration;
 
-use xr_proto::mux::{mux_handshake_server, Multiplexer, NewStream};
+use xr_proto::mux::{mux_handshake_server, Multiplexer};
 use xr_proto::protocol::{Codec, Command, Frame, TargetAddr};
 
 const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);

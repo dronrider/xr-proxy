@@ -1,10 +1,12 @@
 /// Transparent proxy core: accept connections, extract SNI, route, tunnel.
+use xr_proto::mux_pool::MuxPool;
 use xr_proto::routing::{Action, Router};
 use xr_proto::sni;
 use xr_proto::tunnel;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Duration;
 use xr_proto::protocol::{Codec, TargetAddr};
@@ -49,6 +51,7 @@ pub struct ProxyState {
     pub server_addr: SocketAddr,
     pub on_server_down: Action,
     pub listen_port: u16,
+    pub mux_pool: Arc<MuxPool>,
 }
 
 /// Enable TCP keepalive on a stream to detect dead connections.
@@ -180,8 +183,22 @@ async fn tunnel_connection(
         TargetAddr::Ip(orig_dst)
     };
 
-    // Fast retry: connect(3s) + handshake(3s) = 6s per attempt.
-    // With ~14% packet loss, 3 attempts give 99.7% success rate.
+    // Try multiplexed connection first (single persistent TCP, no new handshake).
+    if !state.mux_pool.is_legacy() {
+        match state.mux_pool.open_stream(&target_addr).await {
+            Ok(mux_stream) => {
+                return relay_mux(client, mux_stream, idle_timeout, max_lifetime).await;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+                tracing::info!("Server doesn't support mux, using legacy");
+            }
+            Err(e) => {
+                tracing::debug!("Mux open_stream failed: {}, trying legacy", e);
+            }
+        }
+    }
+
+    // Legacy: per-request TCP with retry.
     let mut server = {
         let mut last_err = None;
         let mut connected = None;
@@ -200,6 +217,43 @@ async fn tunnel_connection(
         connected.ok_or_else(|| last_err.unwrap())?
     };
 
-    // Relay data: client <-> obfuscated tunnel <-> server
     tunnel::relay_obfuscated(client, &mut server, &state.codec, idle_timeout, max_lifetime).await
+}
+
+/// Relay data between a local client and a MuxStream.
+async fn relay_mux(
+    client: &mut TcpStream,
+    mut mux_stream: xr_proto::mux::MuxStream,
+    idle_timeout: Duration,
+    max_lifetime: Duration,
+) -> io::Result<()> {
+    let (mut cr, mut cw) = client.split();
+
+    let upload = async {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            tokio::select! {
+                result = tokio::time::timeout(idle_timeout, cr.read(&mut buf)) => {
+                    match result {
+                        Ok(Ok(0)) | Err(_) => break,
+                        Ok(Ok(n)) => mux_stream.send(&buf[..n]).await?,
+                        Ok(Err(e)) => return Err(e),
+                    }
+                }
+                data = mux_stream.recv() => {
+                    match data {
+                        Some(d) if !d.is_empty() => cw.write_all(&d).await?,
+                        _ => break,
+                    }
+                }
+            }
+        }
+        mux_stream.close().await?;
+        Ok::<(), io::Error>(())
+    };
+
+    match tokio::time::timeout(max_lifetime, upload).await {
+        Ok(r) => r,
+        Err(_) => Ok(()),
+    }
 }

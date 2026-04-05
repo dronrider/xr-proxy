@@ -86,11 +86,28 @@ impl VpnEngine {
         let on_server_down = Action::from_str(&self.config.on_server_down);
         let fake_dns = Arc::new(FakeDns::new());
 
+        // Build mux pool with protected socket factory.
+        let mux_pool = {
+            let addr = server_addr;
+            let protect = protect_socket.clone();
+            xr_proto::mux_pool::MuxPool::new(
+                Arc::new(move || {
+                    let protect = protect.clone();
+                    let addr = addr;
+                    Box::pin(async move {
+                        crate::session::connect_protected_pub(addr, &protect).await
+                    })
+                }),
+                codec.clone(),
+            )
+        };
+
         let ctx = Arc::new(SessionContext {
             router, codec, server_addr,
             fake_dns: fake_dns.clone(),
             stats: self.stats.clone(),
             on_server_down, protect_socket,
+            mux_pool,
         });
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

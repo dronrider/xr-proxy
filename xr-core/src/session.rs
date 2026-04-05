@@ -43,11 +43,16 @@ pub struct SessionContext {
     pub stats: Stats,
     pub on_server_down: Action,
     pub protect_socket: ProtectSocketFn,
+    pub mux_pool: Arc<xr_proto::mux_pool::MuxPool>,
 }
 
 /// Create a TCP connection that bypasses the VPN tunnel.
 ///
 /// Uses tokio::net::TcpSocket with protect(fd) before connect.
+pub(crate) async fn connect_protected_pub(addr: SocketAddr, protect: &ProtectSocketFn) -> io::Result<TcpStream> {
+    connect_protected(addr, protect).await
+}
+
 async fn connect_protected(addr: SocketAddr, protect: &ProtectSocketFn) -> io::Result<TcpStream> {
     let socket = match addr {
         SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
@@ -164,7 +169,23 @@ async fn relay_via_proxy(
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     waker: Arc<Notify>,
 ) -> io::Result<()> {
-    // Fast retry: connect(3s) + handshake(3s) = 6s per attempt, 3 attempts.
+    // Try multiplexed connection first.
+    if !ctx.mux_pool.is_legacy() {
+        match ctx.mux_pool.open_stream(&target_addr).await {
+            Ok(mux_stream) => {
+                ctx.stats.add_log(&format!("mux relay for {:?}", target_addr));
+                return relay_via_mux_stream(mux_stream, data_rx, data_tx, waker, &ctx.stats).await;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+                ctx.stats.add_log("server doesn't support mux, legacy mode");
+            }
+            Err(e) => {
+                ctx.stats.add_log(&format!("mux open fail: {}, trying legacy", e));
+            }
+        }
+    }
+
+    // Legacy: per-request TCP with retry.
     let server = {
         let mut last_err = None;
         let mut connected = None;
@@ -321,6 +342,48 @@ async fn relay_direct(
     });
 
     match result.await {
+        Ok(r) => r,
+        Err(_) => Ok(()),
+    }
+}
+
+/// Relay data between smoltcp channels and a MuxStream.
+async fn relay_via_mux_stream(
+    mut mux_stream: xr_proto::mux::MuxStream,
+    mut data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    waker: Arc<Notify>,
+    stats: &Stats,
+) -> io::Result<()> {
+    let upload = async {
+        loop {
+            tokio::select! {
+                data = data_rx.recv() => {
+                    match data {
+                        Some(d) if !d.is_empty() => {
+                            stats.add_bytes_up(d.len() as u64);
+                            mux_stream.send(&d).await?;
+                        }
+                        _ => break,
+                    }
+                }
+                data = mux_stream.recv() => {
+                    match data {
+                        Some(d) if !d.is_empty() => {
+                            stats.add_bytes_down(d.len() as u64);
+                            if data_tx.send(d).await.is_err() { break; }
+                            waker.notify_one();
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+        mux_stream.close().await?;
+        Ok::<(), io::Error>(())
+    };
+
+    match tokio::time::timeout(Duration::from_secs(3600), upload).await {
         Ok(r) => r,
         Err(_) => Ok(()),
     }
