@@ -12,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
+use xr_proto::mux::{mux_handshake_client, mux_handshake_server, mux_open_stream, Multiplexer};
 use xr_proto::obfuscation::{ModifierStrategy, Obfuscator};
 use xr_proto::protocol::{Codec, Command, TargetAddr};
 
@@ -333,4 +334,155 @@ async fn test_wrong_key_rejected() {
             println!("✅ Wrong key correctly rejected (error: {})", e);
         }
     }
+}
+
+/// Simplified mux-aware test server: accepts MuxInit, serves streams.
+async fn run_mux_test_server(listener: TcpListener, codec: Codec) {
+    let (mut client, _addr) = listener.accept().await.unwrap();
+
+    // Read first frame (MuxInit).
+    let mut buf = vec![0u8; 4096];
+    let mut filled = 0;
+    let init_frame = loop {
+        let n = client.read(&mut buf[filled..]).await.unwrap();
+        filled += n;
+        if let Some((frame, _)) = codec.decode_frame(&buf[..filled]).unwrap() {
+            break frame;
+        }
+    };
+
+    assert_eq!(init_frame.command, Command::MuxInit);
+    mux_handshake_server(&mut client, &codec, &init_frame).await.unwrap();
+
+    // Create server-side multiplexer.
+    let mux = Multiplexer::new_server(client, codec.clone());
+    let mut new_stream_rx = mux.take_new_stream_rx().await.unwrap();
+
+    // Handle incoming streams — connect to targets and relay.
+    while let Some(new_stream) = new_stream_rx.recv().await {
+        let sid = new_stream.stream_id;
+        let (target_addr, _) = TargetAddr::decode(&new_stream.payload).unwrap();
+
+        // Send ConnectAck.
+        mux.send_frame(sid, Command::ConnectAck, vec![0]).await.unwrap();
+
+        // Connect to target.
+        let target_sockaddr = match &target_addr {
+            TargetAddr::Ip(a) => *a,
+            TargetAddr::Domain(h, p) => format!("{}:{}", h, p).parse().unwrap(),
+        };
+
+        let mut mux_stream = mux.register_stream(sid).await;
+        let mux_for_close = mux.clone();
+
+        tokio::spawn(async move {
+            let mut target = TcpStream::connect(target_sockaddr).await.unwrap();
+            let (mut tr, mut tw) = target.split();
+
+            let (dl_tx, mut dl_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+            let relay = async {
+                loop {
+                    tokio::select! {
+                        data = mux_stream.recv() => {
+                            match data {
+                                Some(d) if !d.is_empty() => tw.write_all(&d).await.unwrap(),
+                                _ => break,
+                            }
+                        }
+                        data = dl_rx.recv() => {
+                            match data {
+                                Some(d) => mux_stream.send(&d).await.unwrap(),
+                                None => break,
+                            }
+                        }
+                    }
+                }
+            };
+
+            let download = async {
+                let mut buf = vec![0u8; 8192];
+                loop {
+                    let n = tr.read(&mut buf).await.unwrap();
+                    if n == 0 { break; }
+                    if dl_tx.send(buf[..n].to_vec()).await.is_err() { break; }
+                }
+            };
+
+            tokio::select! {
+                _ = relay => {}
+                _ = download => {}
+            }
+
+            let _ = mux_for_close.send_frame(sid, Command::Close, Vec::new()).await;
+        });
+    }
+}
+
+#[tokio::test]
+async fn test_mux_two_concurrent_streams() {
+    // 1. Start two echo servers on random ports.
+    let echo1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo1_addr = echo1.local_addr().unwrap();
+    tokio::spawn(run_echo_server(echo1));
+
+    let echo2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo2_addr = echo2.local_addr().unwrap();
+    tokio::spawn(run_echo_server(echo2));
+
+    // 2. Start mux-aware test server.
+    let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_listener.local_addr().unwrap();
+    tokio::spawn(run_mux_test_server(server_listener, make_codec()));
+
+    // 3. Client: connect, mux handshake, open two streams.
+    let codec = make_codec();
+    let mut conn = timeout(TIMEOUT, TcpStream::connect(server_addr))
+        .await.unwrap().unwrap();
+
+    assert!(mux_handshake_client(&mut conn, &codec).await.unwrap());
+
+    let client_mux = Multiplexer::new_client(conn, codec.clone());
+
+    // Open stream 1 → echo1
+    let mut stream1 = timeout(
+        TIMEOUT,
+        mux_open_stream(&client_mux, &TargetAddr::Ip(echo1_addr)),
+    ).await.unwrap().unwrap();
+
+    // Open stream 2 → echo2
+    let mut stream2 = timeout(
+        TIMEOUT,
+        mux_open_stream(&client_mux, &TargetAddr::Ip(echo2_addr)),
+    ).await.unwrap().unwrap();
+
+    // 4. Send data on both streams concurrently.
+    let msg1 = b"hello from stream 1";
+    let msg2 = b"hello from stream 2";
+
+    stream1.send(msg1).await.unwrap();
+    stream2.send(msg2).await.unwrap();
+
+    // 5. Receive echoed responses.
+    let resp1 = timeout(TIMEOUT, stream1.recv()).await.unwrap().unwrap();
+    let resp2 = timeout(TIMEOUT, stream2.recv()).await.unwrap().unwrap();
+
+    assert_eq!(resp1, msg1);
+    assert_eq!(resp2, msg2);
+
+    // 6. Close streams independently.
+    stream1.close().await.unwrap();
+
+    // Stream 2 should still work after stream 1 closed.
+    let msg3 = b"stream 2 still alive";
+    stream2.send(msg3).await.unwrap();
+    let resp3 = timeout(TIMEOUT, stream2.recv()).await.unwrap().unwrap();
+    assert_eq!(resp3, msg3);
+
+    stream2.close().await.unwrap();
+
+    println!("✅ Mux two concurrent streams test passed!");
+    println!("   - Stream 1 → echo {}", echo1_addr);
+    println!("   - Stream 2 → echo {}", echo2_addr);
+    println!("   - Both through single TCP to mux server {}", server_addr);
 }
