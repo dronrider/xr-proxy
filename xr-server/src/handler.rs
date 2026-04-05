@@ -63,6 +63,13 @@ pub async fn handle_client(
         }
     };
 
+    // Multiplexed or legacy single-stream?
+    if connect_frame.command == Command::MuxInit {
+        return crate::mux_handler::handle_mux_client(
+            client, client_addr, codec, &connect_frame,
+        ).await;
+    }
+
     if connect_frame.command != Command::Connect {
         tracing::debug!("Expected Connect from {}, got {:?}", client_addr, connect_frame.command);
         return Err(io::Error::new(io::ErrorKind::InvalidData, "expected Connect"));

@@ -46,6 +46,7 @@ struct OutFrame {
 
 /// A single logical stream within a multiplexed connection.
 /// Drop sends Close automatically.
+#[derive(Debug)]
 pub struct MuxStream {
     stream_id: u32,
     rx: mpsc::Receiver<Vec<u8>>,
@@ -121,6 +122,13 @@ impl Drop for MuxStream {
 
 // ── Multiplexer ─────────────────────────────────────────────────────
 
+/// Notification about a new incoming stream (Connect from remote).
+#[derive(Debug)]
+pub struct NewStream {
+    pub stream_id: u32,
+    pub payload: Vec<u8>,
+}
+
 /// Manages a multiplexed TCP connection with multiple logical streams.
 pub struct Multiplexer {
     writer_tx: mpsc::Sender<OutFrame>,
@@ -128,6 +136,9 @@ pub struct Multiplexer {
     next_stream_id: AtomicU32,
     alive: Arc<AtomicBool>,
     _close_notify: Arc<Notify>,
+    /// Channel for incoming Connect frames for unregistered stream_ids.
+    /// Server reads from this to create target connections.
+    new_stream_rx: Mutex<Option<mpsc::Receiver<NewStream>>>,
 }
 
 impl Multiplexer {
@@ -157,6 +168,7 @@ impl Multiplexer {
             Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let close_notify = Arc::new(Notify::new());
+        let (new_stream_tx, new_stream_rx) = mpsc::channel::<NewStream>(64);
 
         let (read_half, write_half) = tokio::io::split(stream);
 
@@ -168,7 +180,7 @@ impl Multiplexer {
             let codec = codec.clone();
             let writer_tx = writer_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = reader_task(read_half, codec, streams.clone(), writer_tx).await {
+                if let Err(e) = reader_task(read_half, codec, streams.clone(), writer_tx, new_stream_tx).await {
                     tracing::debug!("mux reader ended: {}", e);
                 }
                 alive.store(false, Ordering::Relaxed);
@@ -196,6 +208,7 @@ impl Multiplexer {
             next_stream_id: AtomicU32::new(first_stream_id),
             alive,
             _close_notify: close_notify,
+            new_stream_rx: Mutex::new(Some(new_stream_rx)),
         })
     }
 
@@ -224,6 +237,12 @@ impl Multiplexer {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "mux writer closed"))
     }
 
+    /// Take the new-stream notification receiver (server-side use).
+    /// Can only be called once — returns None on subsequent calls.
+    pub async fn take_new_stream_rx(&self) -> Option<mpsc::Receiver<NewStream>> {
+        self.new_stream_rx.lock().await.take()
+    }
+
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
@@ -236,6 +255,7 @@ async fn reader_task<R: AsyncReadExt + Unpin>(
     codec: Codec,
     streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
     writer_tx: mpsc::Sender<OutFrame>,
+    new_stream_tx: mpsc::Sender<NewStream>,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; 65536 + 256];
     let mut filled = 0;
@@ -262,7 +282,7 @@ async fn reader_task<R: AsyncReadExt + Unpin>(
         loop {
             match codec.decode_frame(&buf[..filled])? {
                 Some((frame, consumed)) => {
-                    dispatch_frame(&frame, &streams, &writer_tx).await;
+                    dispatch_frame(&frame, &streams, &writer_tx, &new_stream_tx).await;
                     buf.copy_within(consumed..filled, 0);
                     filled -= consumed;
                 }
@@ -291,10 +311,10 @@ async fn dispatch_frame(
     frame: &Frame,
     streams: &Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
     writer_tx: &mpsc::Sender<OutFrame>,
+    new_stream_tx: &mpsc::Sender<NewStream>,
 ) {
     match frame.command {
         Command::Ping => {
-            // Respond with Pong.
             let _ = writer_tx
                 .send(OutFrame {
                     stream_id: 0,
@@ -303,36 +323,39 @@ async fn dispatch_frame(
                 })
                 .await;
         }
-        Command::Pong => {
-            // Keepalive acknowledged — nothing to do.
-        }
-        Command::Data | Command::ConnectAck | Command::Close => {
-            // Extract stream_id from payload prefix.
+        Command::Pong => {}
+        Command::Data | Command::ConnectAck => {
             if let Ok((stream_id, data)) = decode_mux_payload(&frame.payload) {
                 let streams_guard = streams.lock().await;
                 if let Some(tx) = streams_guard.get(&stream_id) {
-                    if frame.command == Command::Close {
-                        // Remove stream on close (after sending notification).
-                        drop(streams_guard);
-                        streams.lock().await.remove(&stream_id);
-                    } else {
-                        let _ = tx.try_send(data.to_vec());
-                    }
+                    let _ = tx.try_send(data.to_vec());
                 }
+            }
+        }
+        Command::Close => {
+            if let Ok((stream_id, _)) = decode_mux_payload(&frame.payload) {
+                // Remove stream and drop sender — receiver gets None.
+                streams.lock().await.remove(&stream_id);
             }
         }
         Command::Connect => {
-            // Server-side: this is handled by the mux_handler, not here.
-            // For client-side multiplexers, Connect from server is unexpected.
-            // We pass it through the stream_id=0 channel if registered.
-            if let Ok((stream_id, _data)) = decode_mux_payload(&frame.payload) {
+            // New stream from remote side (server receives these from clients).
+            if let Ok((stream_id, data)) = decode_mux_payload(&frame.payload) {
+                // If stream is already registered, deliver to it.
                 let streams_guard = streams.lock().await;
                 if let Some(tx) = streams_guard.get(&stream_id) {
-                    let _ = tx.try_send(frame.payload.clone());
+                    let _ = tx.try_send(data.to_vec());
+                } else {
+                    // New unregistered stream — notify via new_stream channel.
+                    drop(streams_guard);
+                    let _ = new_stream_tx.try_send(NewStream {
+                        stream_id,
+                        payload: data.to_vec(),
+                    });
                 }
             }
         }
-        _ => {} // MuxInit/MuxInitAck handled at connection setup, not here.
+        _ => {}
     }
 }
 

@@ -1,5 +1,6 @@
 mod fallback;
 mod handler;
+mod mux_handler;
 mod udp_relay;
 
 use clap::Parser;
