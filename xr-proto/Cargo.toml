@@ -14,7 +14,7 @@ base64 = "0.22"
 rand = "0.8"
 tracing = "0.1"
 maxminddb = { version = "0.24", optional = true }
-tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros", "sync"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

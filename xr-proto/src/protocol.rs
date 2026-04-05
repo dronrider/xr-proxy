@@ -36,6 +36,14 @@ pub enum Command {
     Close = 3,
     /// Server → Client: connection established.
     ConnectAck = 4,
+    /// Client → Server: initialize multiplexed connection.
+    MuxInit = 5,
+    /// Server → Client: multiplexing acknowledged.
+    MuxInitAck = 6,
+    /// Bidirectional: keepalive ping.
+    Ping = 7,
+    /// Bidirectional: keepalive pong.
+    Pong = 8,
 }
 
 impl Command {
@@ -49,6 +57,10 @@ impl Command {
             2 => Some(Self::Data),
             3 => Some(Self::Close),
             4 => Some(Self::ConnectAck),
+            5 => Some(Self::MuxInit),
+            6 => Some(Self::MuxInitAck),
+            7 => Some(Self::Ping),
+            8 => Some(Self::Pong),
             _ => None,
         }
     }
@@ -56,6 +68,28 @@ impl Command {
     fn to_byte(self) -> u8 {
         HEADER_MAGIC | (self as u8)
     }
+}
+
+// ── Mux helpers ─────────────────────────────────────────────────────
+
+/// Encode a multiplexed payload: [stream_id:4B BE][data...].
+pub fn encode_mux_payload(stream_id: u32, data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + data.len());
+    buf.extend_from_slice(&stream_id.to_be_bytes());
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Decode a multiplexed payload: returns (stream_id, data_slice).
+pub fn decode_mux_payload(payload: &[u8]) -> io::Result<(u32, &[u8])> {
+    if payload.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mux payload too short for stream_id",
+        ));
+    }
+    let stream_id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    Ok((stream_id, &payload[4..]))
 }
 
 // ── Address types ────────────────────────────────────────────────────
@@ -324,6 +358,47 @@ mod tests {
         }
         // With random magic collisions (~1.5%), at least 90% should fail
         assert!(errors > 90, "wrong key should fail for most frames, got {} errors out of 100", errors);
+    }
+
+    #[test]
+    fn test_mux_commands_roundtrip() {
+        let codec = test_codec();
+
+        // MuxInit
+        let wire = codec.encode_frame(Command::MuxInit, &[1]).unwrap();
+        let (frame, _) = codec.decode_frame(&wire).unwrap().unwrap();
+        assert_eq!(frame.command, Command::MuxInit);
+        assert_eq!(frame.payload, &[1]);
+
+        // MuxInitAck
+        let wire = codec.encode_frame(Command::MuxInitAck, &[1, 0]).unwrap();
+        let (frame, _) = codec.decode_frame(&wire).unwrap().unwrap();
+        assert_eq!(frame.command, Command::MuxInitAck);
+        assert_eq!(frame.payload, &[1, 0]);
+
+        // Ping/Pong
+        let ts = 1234567890u64.to_be_bytes();
+        let wire = codec.encode_frame(Command::Ping, &ts).unwrap();
+        let (frame, _) = codec.decode_frame(&wire).unwrap().unwrap();
+        assert_eq!(frame.command, Command::Ping);
+        assert_eq!(frame.payload, ts);
+    }
+
+    #[test]
+    fn test_mux_payload_roundtrip() {
+        let data = b"hello mux stream";
+        let encoded = encode_mux_payload(42, data);
+        let (sid, decoded) = decode_mux_payload(&encoded).unwrap();
+        assert_eq!(sid, 42);
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_mux_payload_empty_data() {
+        let encoded = encode_mux_payload(1, &[]);
+        let (sid, decoded) = decode_mux_payload(&encoded).unwrap();
+        assert_eq!(sid, 1);
+        assert!(decoded.is_empty());
     }
 
     #[test]
