@@ -403,7 +403,7 @@ pub async fn mux_handshake_client<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     let mut filled = 0;
 
     loop {
-        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf[filled..]))
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf[filled..]))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "mux init ack timeout"))??;
 

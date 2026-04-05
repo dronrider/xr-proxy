@@ -93,17 +93,16 @@ impl MuxPool {
                 tracing::info!("mux connection established");
                 Ok(mux)
             }
-            Ok(false) => {
+            Ok(false) | Err(_) => {
+                // Any failure (explicit rejection, timeout, decode error)
+                // means the server doesn't support mux. Switch to legacy
+                // permanently so we don't waste time retrying.
                 self.legacy_mode.store(true, Ordering::Relaxed);
-                tracing::warn!("server does not support mux, falling back to legacy");
+                tracing::warn!("mux handshake failed, falling back to legacy permanently");
                 Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "server does not support mux",
                 ))
-            }
-            Err(e) => {
-                tracing::warn!("mux handshake failed: {}", e);
-                Err(e)
             }
         }
     }
