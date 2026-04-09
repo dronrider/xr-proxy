@@ -27,10 +27,12 @@ use crate::protocol::{
 
 // ── Constants ───────────────────────────────────────────────────────
 
-const STREAM_CHANNEL_SIZE: usize = 64;
-const WRITER_CHANNEL_SIZE: usize = 256;
+const STREAM_CHANNEL_SIZE: usize = 256;
+const WRITER_CHANNEL_SIZE: usize = 512;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Force mux reconnection every 4 hours to prevent TCP degradation.
+const MUX_MAX_LIFETIME: Duration = Duration::from_secs(4 * 3600);
 const MUX_PROTOCOL_VERSION: u8 = 1;
 
 // ── Outgoing frame ──────────────────────────────────────────────────
@@ -259,50 +261,48 @@ async fn reader_task<R: AsyncReadExt + Unpin>(
 ) -> io::Result<()> {
     let mut buf = vec![0u8; 65536 + 256];
     let mut filled = 0;
-    let mut last_activity = Instant::now();
+    let started = Instant::now();
+    let mut keepalive_interval = tokio::time::interval(KEEPALIVE_INTERVAL);
+    keepalive_interval.tick().await; // skip first immediate tick
 
     loop {
-        // Read with keepalive timeout.
-        let read_timeout = KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT;
-        let n = match tokio::time::timeout(read_timeout, reader.read(&mut buf[filled..])).await {
-            Ok(result) => result?,
-            Err(_) => {
-                // No data for too long — connection dead.
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "mux keepalive timeout"));
-            }
-        };
-        if n == 0 {
-            return Ok(()); // clean close
+        // Max lifetime — force reconnection to prevent TCP degradation.
+        if started.elapsed() >= MUX_MAX_LIFETIME {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "mux max lifetime reached"));
         }
-        filled += n;
-        let _ = last_activity; // suppress unused warning, will be used for keepalive send
-        last_activity = Instant::now();
 
-        // Decode all complete frames.
-        loop {
-            match codec.decode_frame(&buf[..filled])? {
-                Some((frame, consumed)) => {
-                    dispatch_frame(&frame, &streams, &writer_tx, &new_stream_tx).await;
-                    buf.copy_within(consumed..filled, 0);
-                    filled -= consumed;
+        tokio::select! {
+            result = reader.read(&mut buf[filled..]) => {
+                let n = result?;
+                if n == 0 { return Ok(()); }
+                filled += n;
+
+                // Decode all complete frames.
+                loop {
+                    match codec.decode_frame(&buf[..filled])? {
+                        Some((frame, consumed)) => {
+                            dispatch_frame(&frame, &streams, &writer_tx, &new_stream_tx).await;
+                            buf.copy_within(consumed..filled, 0);
+                            filled -= consumed;
+                        }
+                        None => break,
+                    }
                 }
-                None => break,
             }
-        }
-
-        // Send keepalive if idle.
-        if last_activity.elapsed() >= KEEPALIVE_INTERVAL {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let _ = writer_tx
-                .send(OutFrame {
+            _ = keepalive_interval.tick() => {
+                // Send Ping to keep the connection alive and detect dead links.
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                if writer_tx.send(OutFrame {
                     stream_id: 0,
                     command: Command::Ping,
                     payload: ts.to_be_bytes().to_vec(),
-                })
-                .await;
+                }).await.is_err() {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "writer closed"));
+                }
+            }
         }
     }
 }
@@ -328,30 +328,32 @@ async fn dispatch_frame(
             if let Ok((stream_id, data)) = decode_mux_payload(&frame.payload) {
                 let streams_guard = streams.lock().await;
                 if let Some(tx) = streams_guard.get(&stream_id) {
-                    let _ = tx.try_send(data.to_vec());
+                    // Use send().await for backpressure instead of try_send which
+                    // silently drops data and causes streams to hang.
+                    if tx.send(data.to_vec()).await.is_err() {
+                        // Receiver dropped — stream closed locally.
+                        drop(streams_guard);
+                        streams.lock().await.remove(&stream_id);
+                    }
                 }
             }
         }
         Command::Close => {
             if let Ok((stream_id, _)) = decode_mux_payload(&frame.payload) {
-                // Remove stream and drop sender — receiver gets None.
                 streams.lock().await.remove(&stream_id);
             }
         }
         Command::Connect => {
-            // New stream from remote side (server receives these from clients).
             if let Ok((stream_id, data)) = decode_mux_payload(&frame.payload) {
-                // If stream is already registered, deliver to it.
                 let streams_guard = streams.lock().await;
                 if let Some(tx) = streams_guard.get(&stream_id) {
-                    let _ = tx.try_send(data.to_vec());
+                    let _ = tx.send(data.to_vec()).await;
                 } else {
-                    // New unregistered stream — notify via new_stream channel.
                     drop(streams_guard);
-                    let _ = new_stream_tx.try_send(NewStream {
+                    let _ = new_stream_tx.send(NewStream {
                         stream_id,
                         payload: data.to_vec(),
-                    });
+                    }).await;
                 }
             }
         }
