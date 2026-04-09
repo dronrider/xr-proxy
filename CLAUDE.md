@@ -32,6 +32,8 @@ Three crates in a Cargo workspace:
 
 ## Build & Test
 
+**IMPORTANT**: Before every commit, run `cargo test --workspace` AND verify zero warnings with `cargo test --workspace 2>&1 | grep "warning:" | grep -v "generated"`. Do NOT commit code with warnings.
+
 ```bash
 # Run all tests
 cargo test --workspace
