@@ -30,7 +30,6 @@ use crate::protocol::{
 const STREAM_CHANNEL_SIZE: usize = 256;
 const WRITER_CHANNEL_SIZE: usize = 512;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
-const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Force mux reconnection every 4 hours to prevent TCP degradation.
 const MUX_MAX_LIFETIME: Duration = Duration::from_secs(4 * 3600);
 const MUX_PROTOCOL_VERSION: u8 = 1;
