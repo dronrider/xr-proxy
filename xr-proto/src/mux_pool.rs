@@ -60,9 +60,10 @@ impl MuxPool {
         let mux = self.get_or_connect().await?;
         match mux_open_stream(&mux, target).await {
             Ok(stream) => Ok(stream),
-            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-                // Connection died — reconnect and retry once.
-                tracing::debug!("mux connection dead, reconnecting");
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe
+                    || e.kind() == io::ErrorKind::TimedOut => {
+                // Connection died or stale — reconnect and retry once.
+                tracing::debug!("mux stream failed ({}), reconnecting", e);
                 self.invalidate().await;
                 let mux = self.get_or_connect().await?;
                 mux_open_stream(&mux, target).await
@@ -93,16 +94,20 @@ impl MuxPool {
                 tracing::info!("mux connection established");
                 Ok(mux)
             }
-            Ok(false) | Err(_) => {
-                // Any failure (explicit rejection, timeout, decode error)
-                // means the server doesn't support mux. Switch to legacy
-                // permanently so we don't waste time retrying.
+            Ok(false) => {
+                // Server explicitly rejected mux — old server, permanent fallback.
                 self.legacy_mode.store(true, Ordering::Relaxed);
-                tracing::warn!("mux handshake failed, falling back to legacy permanently");
+                tracing::warn!("server rejected mux, legacy mode permanent");
                 Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "server does not support mux",
                 ))
+            }
+            Err(e) => {
+                // Transient error (timeout, network). Don't set legacy_mode —
+                // next connection will try mux again.
+                tracing::debug!("mux handshake error (transient): {}", e);
+                Err(e)
             }
         }
     }
