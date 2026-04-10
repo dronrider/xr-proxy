@@ -116,8 +116,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Arc::new(proxy::ProxyState {
         router,
-        codec,
-        server_addr,
         on_server_down,
         listen_port: config.client.listen_port,
         mux_pool,

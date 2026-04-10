@@ -325,15 +325,27 @@ async fn dispatch_frame(
         Command::Pong => {}
         Command::Data | Command::ConnectAck => {
             if let Ok((stream_id, data)) = decode_mux_payload(&frame.payload) {
-                let streams_guard = streams.lock().await;
-                if let Some(tx) = streams_guard.get(&stream_id) {
-                    // Use send().await for backpressure instead of try_send which
-                    // silently drops data and causes streams to hang.
-                    if tx.send(data.to_vec()).await.is_err() {
-                        // Receiver dropped — stream closed locally.
-                        drop(streams_guard);
-                        streams.lock().await.remove(&stream_id);
+                let mut remove = false;
+                {
+                    let streams_guard = streams.lock().await;
+                    if let Some(tx) = streams_guard.get(&stream_id) {
+                        // NEVER use send().await here — it blocks the reader task
+                        // and deadlocks ALL other streams. Use try_send; if the
+                        // channel is full, the stream consumer is stuck — kill it.
+                        match tx.try_send(data.to_vec()) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                tracing::warn!("mux stream {} channel full, closing", stream_id);
+                                remove = true;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                remove = true;
+                            }
+                        }
                     }
+                }
+                if remove {
+                    streams.lock().await.remove(&stream_id);
                 }
             }
         }
@@ -346,13 +358,13 @@ async fn dispatch_frame(
             if let Ok((stream_id, data)) = decode_mux_payload(&frame.payload) {
                 let streams_guard = streams.lock().await;
                 if let Some(tx) = streams_guard.get(&stream_id) {
-                    let _ = tx.send(data.to_vec()).await;
+                    let _ = tx.try_send(data.to_vec());
                 } else {
                     drop(streams_guard);
-                    let _ = new_stream_tx.send(NewStream {
+                    let _ = new_stream_tx.try_send(NewStream {
                         stream_id,
                         payload: data.to_vec(),
-                    }).await;
+                    });
                 }
             }
         }

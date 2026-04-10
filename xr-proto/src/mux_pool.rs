@@ -1,7 +1,7 @@
 //! Client-side multiplexed connection pool.
 //!
 //! Manages a single persistent TCP connection to the server with
-//! automatic reconnection and legacy fallback for old servers.
+//! automatic reconnection.
 //!
 //! ```text
 //! open_stream(target) ─→ [MuxPool] ─→ get/create Multiplexer ─→ MuxStream
@@ -9,7 +9,6 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::future::Future;
 
@@ -30,8 +29,6 @@ pub struct MuxPool {
     connect_fn: ConnectFn,
     codec: Codec,
     current: Mutex<Option<Arc<Multiplexer>>>,
-    /// Set to true if the server rejected MuxInit (old server).
-    legacy_mode: AtomicBool,
 }
 
 impl MuxPool {
@@ -40,7 +37,6 @@ impl MuxPool {
             connect_fn,
             codec,
             current: Mutex::new(None),
-            legacy_mode: AtomicBool::new(false),
         })
     }
 
@@ -48,15 +44,7 @@ impl MuxPool {
     ///
     /// - If no connection exists, establishes one (TCP + MuxInit handshake).
     /// - If the connection is dead, reconnects automatically.
-    /// - If the server doesn't support mux, returns Err with ErrorKind::Unsupported.
     pub async fn open_stream(&self, target: &TargetAddr) -> io::Result<MuxStream> {
-        if self.legacy_mode.load(Ordering::Relaxed) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "server does not support mux",
-            ));
-        }
-
         let mux = self.get_or_connect().await?;
         match mux_open_stream(&mux, target).await {
             Ok(stream) => Ok(stream),
@@ -95,20 +83,12 @@ impl MuxPool {
                 Ok(mux)
             }
             Ok(false) => {
-                // Server explicitly rejected mux — old server, permanent fallback.
-                self.legacy_mode.store(true, Ordering::Relaxed);
-                tracing::warn!("server rejected mux, legacy mode permanent");
                 Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "server does not support mux",
+                    io::ErrorKind::ConnectionRefused,
+                    "server rejected mux handshake",
                 ))
             }
-            Err(e) => {
-                // Transient error (timeout, network). Don't set legacy_mode —
-                // next connection will try mux again.
-                tracing::debug!("mux handshake error (transient): {}", e);
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 
@@ -116,16 +96,6 @@ impl MuxPool {
     async fn invalidate(&self) {
         let mut guard = self.current.lock().await;
         *guard = None;
-    }
-
-    /// Check if the pool is in legacy mode (server doesn't support mux).
-    pub fn is_legacy(&self) -> bool {
-        self.legacy_mode.load(Ordering::Relaxed)
-    }
-
-    /// Reset legacy mode flag (e.g., after server upgrade).
-    pub fn reset_legacy(&self) {
-        self.legacy_mode.store(false, Ordering::Relaxed);
     }
 }
 
@@ -153,28 +123,5 @@ mod tests {
         let pool = MuxPool::new(connect_fn, codec);
         let err = pool.open_stream(&TargetAddr::Domain("test.com".to_string(), 443)).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
-    }
-
-    #[tokio::test]
-    async fn test_pool_legacy_mode() {
-        let codec = test_codec();
-
-        let connect_fn: ConnectFn = Arc::new(move || {
-            Box::pin(async move {
-                Err(io::Error::new(io::ErrorKind::Other, "not connected"))
-            })
-        });
-
-        let pool = MuxPool::new(connect_fn, codec);
-        assert!(!pool.is_legacy());
-
-        // Simulate legacy mode.
-        pool.legacy_mode.store(true, Ordering::Relaxed);
-        let err = pool.open_stream(&TargetAddr::Domain("test.com".to_string(), 443)).await.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-
-        // Reset.
-        pool.reset_legacy();
-        assert!(!pool.is_legacy());
     }
 }

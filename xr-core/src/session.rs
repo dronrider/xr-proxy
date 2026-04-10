@@ -16,9 +16,8 @@ use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tokio::time::Duration;
 
-use xr_proto::protocol::{Codec, Command, TargetAddr};
+use xr_proto::protocol::{Codec, TargetAddr};
 use xr_proto::routing::{Action, Router};
-use xr_proto::tunnel;
 
 use crate::dns::FakeDns;
 use crate::stats::Stats;
@@ -73,15 +72,6 @@ async fn connect_protected(addr: SocketAddr, protect: &ProtectSocketFn) -> io::R
     ).await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut,
         format!("connect timeout to {}", addr)))?
-}
-
-/// Connect to server, using protected socket. Single attempt — retries
-/// amplify load on overloaded server and make things worse.
-async fn connect_server_protected(
-    addr: &SocketAddr,
-    protect: &ProtectSocketFn,
-) -> io::Result<TcpStream> {
-    connect_protected(*addr, protect).await
 }
 
 /// Check if an IP is a private/non-routable address that should never be proxied.
@@ -165,120 +155,18 @@ pub async fn relay_session_with_domain(
 async fn relay_via_proxy(
     ctx: Arc<SessionContext>,
     target_addr: TargetAddr,
-    mut data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     waker: Arc<Notify>,
 ) -> io::Result<()> {
-    // Try multiplexed connection first.
-    if !ctx.mux_pool.is_legacy() {
-        match ctx.mux_pool.open_stream(&target_addr).await {
-            Ok(mux_stream) => {
-                ctx.stats.add_log(&format!("mux relay for {:?}", target_addr));
-                return relay_via_mux_stream(mux_stream, data_rx, data_tx, waker, &ctx.stats).await;
-            }
-            Err(e) if e.kind() == io::ErrorKind::Unsupported => {
-                ctx.stats.add_log("server doesn't support mux, legacy mode");
-            }
-            Err(e) => {
-                ctx.stats.add_log(&format!("mux open fail: {}, trying legacy", e));
-            }
-        }
-    }
+    let mux_stream = ctx.mux_pool.open_stream(&target_addr).await
+        .map_err(|e| {
+            ctx.stats.add_log(&format!("mux open fail: {}", e));
+            e
+        })?;
 
-    // Legacy: per-request TCP with retry.
-    let server = {
-        let mut last_err = None;
-        let mut connected = None;
-        for attempt in 0..3u8 {
-            match connect_server_protected(&ctx.server_addr, &ctx.protect_socket).await {
-                Ok(mut s) => {
-                    if attempt > 0 {
-                        ctx.stats.add_log(&format!("srv retry {} for {:?}", attempt, target_addr));
-                    }
-                    match tunnel::handshake(&mut s, &target_addr, &ctx.codec).await {
-                        Ok(()) => { connected = Some(s); break; }
-                        Err(e) => {
-                            ctx.stats.add_log(&format!("handshake fail: {}", e));
-                            last_err = Some(e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    ctx.stats.add_log(&format!("srv connect fail: {}", e));
-                    last_err = Some(e);
-                }
-            }
-        }
-        connected.ok_or_else(|| last_err.unwrap())?
-    };
-
-    ctx.stats.add_log(&format!("relay started for {:?}", target_addr));
-
-    let codec_up = ctx.codec.clone();
-    let codec_down = ctx.codec.clone();
-    let stats_up = ctx.stats.clone();
-    let stats_down = ctx.stats.clone();
-
-    let (mut sr, mut sw) = server.into_split();
-
-    let upload = async move {
-        while let Some(data) = data_rx.recv().await {
-            if data.is_empty() {
-                let close = codec_up.encode_frame(Command::Close, &[])?;
-                sw.write_all(&close).await?;
-                break;
-            }
-            stats_up.add_bytes_up(data.len() as u64);
-            let frame = codec_up.encode_frame(Command::Data, &data)?;
-            sw.write_all(&frame).await?;
-        }
-        Ok::<(), io::Error>(())
-    };
-
-    let download = async move {
-        let mut buf = vec![0u8; 65536 + 256];
-        let mut filled = 0;
-        loop {
-            let n = sr.read(&mut buf[filled..]).await?;
-            if n == 0 { break; }
-            filled += n;
-
-            loop {
-                match codec_down.decode_frame(&buf[..filled])? {
-                    Some((frame, consumed)) => {
-                        match frame.command {
-                            Command::Data => {
-                                stats_down.add_bytes_down(frame.payload.len() as u64);
-                                if data_tx.send(frame.payload).await.is_err() {
-                                    return Ok(());
-                                }
-                                // Wake event loop to deliver data to smoltcp immediately.
-                                waker.notify_one();
-                            }
-                            Command::Close => return Ok(()),
-                            _ => {}
-                        }
-                        buf.copy_within(consumed..filled, 0);
-                        filled -= consumed;
-                    }
-                    None => break,
-                }
-            }
-        }
-        Ok::<(), io::Error>(())
-    };
-
-    let result = tokio::time::timeout(Duration::from_secs(3600), async {
-        tokio::select! {
-            r = upload => r,
-            r = download => r,
-        }
-    });
-
-    match result.await {
-        Ok(r) => r,
-        Err(_) => Ok(()),
-    }
+    ctx.stats.add_log(&format!("mux relay for {:?}", target_addr));
+    relay_via_mux_stream(mux_stream, data_rx, data_tx, waker, &ctx.stats).await
 }
 
 /// Relay directly to the target.

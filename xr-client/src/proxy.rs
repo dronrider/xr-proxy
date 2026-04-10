@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Duration;
-use xr_proto::protocol::{Codec, TargetAddr};
+use xr_proto::protocol::TargetAddr;
 
 // ── SO_ORIGINAL_DST ──────────────────────────────────────────────────
 
@@ -47,8 +47,6 @@ fn get_original_dst(stream: &TcpStream) -> io::Result<SocketAddr> {
 
 pub struct ProxyState {
     pub router: Router,
-    pub codec: Codec,
-    pub server_addr: SocketAddr,
     pub on_server_down: Action,
     pub listen_port: u16,
     pub mux_pool: Arc<MuxPool>,
@@ -183,41 +181,8 @@ async fn tunnel_connection(
         TargetAddr::Ip(orig_dst)
     };
 
-    // Try multiplexed connection first (single persistent TCP, no new handshake).
-    if !state.mux_pool.is_legacy() {
-        match state.mux_pool.open_stream(&target_addr).await {
-            Ok(mux_stream) => {
-                return relay_mux(client, mux_stream, idle_timeout, max_lifetime).await;
-            }
-            Err(e) if e.kind() == io::ErrorKind::Unsupported => {
-                tracing::info!("Server doesn't support mux, using legacy");
-            }
-            Err(e) => {
-                tracing::debug!("Mux open_stream failed: {}, trying legacy", e);
-            }
-        }
-    }
-
-    // Legacy: per-request TCP with retry.
-    let mut server = {
-        let mut last_err = None;
-        let mut connected = None;
-        for _ in 0..3 {
-            match tunnel::connect_to_server(&state.server_addr).await {
-                Ok(mut s) => {
-                    set_keepalive(&s);
-                    match tunnel::handshake(&mut s, &target_addr, &state.codec).await {
-                        Ok(()) => { connected = Some(s); break; }
-                        Err(e) => { last_err = Some(e); }
-                    }
-                }
-                Err(e) => { last_err = Some(e); }
-            }
-        }
-        connected.ok_or_else(|| last_err.unwrap())?
-    };
-
-    tunnel::relay_obfuscated(client, &mut server, &state.codec, idle_timeout, max_lifetime).await
+    let mux_stream = state.mux_pool.open_stream(&target_addr).await?;
+    relay_mux(client, mux_stream, idle_timeout, max_lifetime).await
 }
 
 /// Relay data between a local client and a MuxStream.
