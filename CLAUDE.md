@@ -2,33 +2,13 @@
 
 ## Project Overview
 
-xr-proxy — lightweight obfuscated proxy for bypassing regional internet blocks. Deployed on OpenWRT routers (client) connected to a VPS (server). All LAN devices get transparent access to blocked resources without per-device configuration.
+xr-proxy — lightweight obfuscated proxy for bypassing regional internet blocks. Deployed on OpenWRT routers (`xr-client`) connected to a VPS (`xr-server`). All LAN devices get transparent access to blocked resources without per-device configuration. There is also an Android client (`xr-android`) that uses the same tunnel via the shared `xr-core` engine (via JNI in `xr-android-jni`).
 
-Language: Rust. All communication in this project is in Russian.
+Language: Rust (core / server / OpenWRT client) + Kotlin (Android). All communication in this project is in Russian.
 
-## Architecture
+**Полная архитектура — в [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).** Читай этот файл, когда нужна карта компонентов, модулей, протоколов, модели конфигурации или жизненного цикла соединения. Не импортируй его сюда автоматически — он большой. Планы крупных доработок лежат в [docs/lld/](docs/lld/); после реализации факты из LLD переносятся в `ARCHITECTURE.md`.
 
-Three crates in a Cargo workspace:
-
-### xr-proto (shared library)
-- `config.rs` — TOML config parsing for client and server (serde)
-- `obfuscation.rs` — XOR-based obfuscation with positional modifiers, substitution tables
-- `protocol.rs` — TCP wire protocol: `[Nonce:4B][Header:4B obfuscated][Padding][Payload obfuscated]`
-- `udp_relay.rs` — UDP relay protocol: `[Nonce:4B][Obfuscated: type+dst+src_port+payload]`
-
-### xr-client (OpenWRT router)
-- `main.rs` — entry point, config loading, TCP proxy + UDP relay startup, signal handling
-- `proxy.rs` — transparent TCP proxy: accept → SO_ORIGINAL_DST → SNI extraction → route → relay/tunnel
-- `routing.rs` — rule engine: domain matching (exact, wildcard), CIDR (IPv4/IPv6), GeoIP
-- `redirect.rs` — nftables/iptables redirect rule management (auto-setup/cleanup)
-- `sni.rs` — TLS ClientHello SNI extraction
-- `udp_relay.rs` — UDP TPROXY interception via recvmsg/IP_ORIGDSTADDR, relay to VPS, spoofed responses via IP_TRANSPARENT
-
-### xr-server (VPS)
-- `main.rs` — TCP listener + optional UDP relay server
-- `handler.rs` — TCP connection handler: deobfuscate → connect to target → relay with timeouts
-- `udp_relay.rs` — UDP relay: flow table, bind(src_port) for NAT traversal, per-port receiver tasks
-- `fallback.rs` — fake HTTP response for DPI probes
+Остальные разделы этого файла — рабочие правила (build, кросс-компиляция, дизайн-решения по nftables/TPROXY, деплой), которые нужны под рукой в каждом сеансе.
 
 ## Build & Test
 
@@ -71,18 +51,6 @@ Integer types differ across targets (`msg_controllen`, `iov_len`). Use `as _` fo
 - **procd respawn** — `respawn 3600 15 0` (threshold=3600s, interval=15s, retry=0=unlimited)
 - **Timeouts everywhere** — idle 5min, max lifetime 1h, TCP keepalive 60s. Prevents zombie connection memory leaks.
 - **SO_REUSEADDR** on TCP listener — prevents "address already in use" on rapid restart.
-
-## Deployment Topology
-
-```
-LAN devices → [OpenWRT router, xr-client:1080 TCP, :1081 UDP TPROXY]
-                    │ obfuscated tunnel
-                    ▼
-              [VPS, xr-server:8443 TCP, :9999 UDP]
-                    │
-                    ▼
-              Internet (blocked resources)
-```
 
 ## File Locations on Router
 
