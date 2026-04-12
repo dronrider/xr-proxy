@@ -7,7 +7,7 @@
 //! 4. Relay data between smoltcp socket and outbound connection
 
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
@@ -67,7 +67,7 @@ async fn connect_protected(addr: SocketAddr, protect: &ProtectSocketFn) -> io::R
     }
 
     tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(5),
         socket.connect(addr),
     ).await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut,
@@ -98,6 +98,17 @@ pub async fn relay_session_with_domain(
     // Block DNS-over-TLS (port 853). Android Private DNS bypasses FakeDNS
     // (sends queries over TLS instead of UDP:53). Blocking DoT forces Android
     // to fall back to plain UDP DNS which FakeDNS intercepts properly.
+    //
+    // **Kind must stay `ConnectionRefused`.** Android Private DNS interprets
+    // this specific error as "port closed, try something else" and falls
+    // back to UDP/53. Any other kind (InvalidInput, Other, ...) breaks the
+    // fallback — DNS queries silently die, apps get "no network", and the
+    // user sees "Connected but no traffic". Regression verified the hard
+    // way during LLD-02 rollout.
+    //
+    // The engine-level classifier in `engine.rs` filters this specific
+    // message out of the log entirely (it's normal per-query behaviour,
+    // not a failure to report).
     if key.dst_addr.port() == 853 {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionRefused,
@@ -159,13 +170,19 @@ async fn relay_via_proxy(
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     waker: Arc<Notify>,
 ) -> io::Result<()> {
+    // Оборачиваем ошибку в новую io::Error с тем же kind — контекст "mux open fail"
+    // сохраняется в тексте, а классификация уровня (WARN vs ERROR) происходит
+    // в одном месте — `engine.rs:313` по `io::ErrorKind`. Тут никакого add_*,
+    // чтобы не дублировать запись в журнале.
     let mux_stream = ctx.mux_pool.open_stream(&target_addr).await
-        .map_err(|e| {
-            ctx.stats.add_log(&format!("mux open fail: {}", e));
-            e
-        })?;
+        .map_err(|e| io::Error::new(e.kind(), format!("mux open fail: {}", e)))?;
 
+    // INFO: успешное открытие стрима — это часть нормального feed'а вкладки
+    // Log, пользователь смотрит на журнал как на индикатор "приложение что-то
+    // делает". Smart drain в stats.rs защищает ERROR и WARN от вытеснения
+    // INFO-потоком, так что писать сюда безопасно.
     ctx.stats.add_log(&format!("mux relay for {:?}", target_addr));
+    tracing::debug!("mux relay for {:?}", target_addr);
     relay_via_mux_stream(mux_stream, data_rx, data_tx, waker, &ctx.stats).await
 }
 
@@ -179,17 +196,17 @@ async fn relay_direct(
     waker: Arc<Notify>,
 ) -> io::Result<()> {
     // Resolve real destination for fake IPs.
+    // On Android, tokio::net::lookup_host goes through the system resolver
+    // which uses the VPN's DNS (FakeDNS) — returning another fake IP and
+    // creating an infinite loop. We resolve via a protected UDP socket to
+    // an external DNS server, bypassing the VPN tunnel entirely.
     let real_dst = if let IpAddr::V4(v4) = dst.ip() {
         if FakeDns::is_fake_ip(v4) {
             if let Some(domain) = domain {
-                let addr_str = format!("{}:{}", domain, dst.port());
-                let resolved = tokio::net::lookup_host(&addr_str)
-                    .await?
-                    .next()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "DNS resolution failed"))?;
-                resolved
+                let ip = resolve_via_protected_dns(domain, &ctx.protect_socket).await?;
+                SocketAddr::new(IpAddr::V4(ip), dst.port())
             } else {
-                return Err(io::Error::new(io::ErrorKind::Other, "fake IP without domain"));
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "fake IP without domain"));
             }
         } else {
             dst
@@ -274,5 +291,155 @@ async fn relay_via_mux_stream(
     match tokio::time::timeout(Duration::from_secs(3600), upload).await {
         Ok(r) => r,
         Err(_) => Ok(()),
+    }
+}
+
+// ── Protected DNS resolver ─────────────────────────────────────────
+
+/// External DNS server used for direct-connection resolution.
+/// Protected socket bypasses VPN, so this query goes to the real internet.
+const DNS_RESOLVER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
+
+/// Resolve a domain to an IPv4 address via a protected UDP socket.
+///
+/// On Android, the system DNS resolver routes through the VPN's FakeDNS,
+/// returning fake IPs and creating a loop. This function sends a raw DNS
+/// query through a protected (VPN-bypassing) UDP socket to 8.8.8.8.
+async fn resolve_via_protected_dns(
+    domain: &str,
+    protect: &ProtectSocketFn,
+) -> io::Result<Ipv4Addr> {
+    let std_sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    std_sock.set_nonblocking(true)?;
+    if !protect(std_sock.as_raw_fd()) {
+        return Err(io::Error::new(io::ErrorKind::Other, "protect(dns socket) failed"));
+    }
+    let sock = tokio::net::UdpSocket::from_std(std_sock)?;
+
+    let query = build_dns_query(domain);
+    sock.send_to(&query, DNS_RESOLVER).await?;
+
+    let mut buf = [0u8; 512];
+    let n = tokio::time::timeout(Duration::from_secs(5), sock.recv(&mut buf))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("DNS resolve timeout for {}", domain)))??;
+
+    parse_dns_a_record(&buf[..n], domain)
+}
+
+/// Build a minimal DNS A-record query for the given domain.
+fn build_dns_query(domain: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    // Header: ID=0xABCD, Flags=0x0100 (RD=1), QDCOUNT=1.
+    buf.extend_from_slice(&[0xAB, 0xCD, 0x01, 0x00]);
+    buf.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    // Question: encoded domain name.
+    for label in domain.split('.') {
+        buf.push(label.len() as u8);
+        buf.extend_from_slice(label.as_bytes());
+    }
+    buf.push(0); // Root terminator.
+    buf.extend_from_slice(&[0x00, 0x01]); // QTYPE = A
+    buf.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
+    buf
+}
+
+/// Parse the first A record (IPv4) from a DNS response.
+fn parse_dns_a_record(data: &[u8], domain: &str) -> io::Result<Ipv4Addr> {
+    if data.len() < 12 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "DNS response too short"));
+    }
+    let ancount = u16::from_be_bytes([data[6], data[7]]);
+    if ancount == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("DNS: no answers for {}", domain),
+        ));
+    }
+
+    // Skip header (12 bytes) + question section.
+    let mut pos = 12;
+    pos = skip_dns_name(data, pos);
+    pos += 4; // QTYPE + QCLASS
+
+    // Scan answer records for the first A record.
+    for _ in 0..ancount {
+        if pos >= data.len() { break; }
+        pos = skip_dns_name(data, pos);
+        if pos + 10 > data.len() { break; }
+        let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
+        pos += 10;
+        if rtype == 1 && rdlength == 4 && pos + 4 <= data.len() {
+            return Ok(Ipv4Addr::new(data[pos], data[pos + 1], data[pos + 2], data[pos + 3]));
+        }
+        pos += rdlength;
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::Other,
+        format!("DNS: no A record for {}", domain),
+    ))
+}
+
+/// Skip a DNS name (handles both labels and compression pointers).
+fn skip_dns_name(data: &[u8], mut pos: usize) -> usize {
+    while pos < data.len() {
+        let b = data[pos];
+        if b == 0 { return pos + 1; }
+        if b & 0xC0 == 0xC0 { return pos + 2; } // Compression pointer.
+        pos += (b as usize) + 1;
+    }
+    pos
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dns_query_format() {
+        let q = build_dns_query("example.com");
+        // Header: 12 bytes.
+        assert_eq!(&q[..2], &[0xAB, 0xCD]); // ID
+        assert_eq!(&q[2..4], &[0x01, 0x00]); // Flags: RD=1
+        assert_eq!(&q[4..6], &[0x00, 0x01]); // QDCOUNT=1
+        // Question: 7(example) + 3(com) + 1(root) + 4(type+class) = 17
+        assert_eq!(q[12], 7); // "example" label length
+        assert_eq!(&q[13..20], b"example");
+        assert_eq!(q[20], 3); // "com" label length
+        assert_eq!(&q[21..24], b"com");
+        assert_eq!(q[24], 0); // Root
+        assert_eq!(&q[25..27], &[0x00, 0x01]); // QTYPE=A
+        assert_eq!(&q[27..29], &[0x00, 0x01]); // QCLASS=IN
+    }
+
+    #[test]
+    fn dns_response_parse_a_record() {
+        // Minimal DNS response: header + question + 1 A record answer.
+        let mut resp = build_dns_query("t.co");
+        // Patch header: QR=1, AA=1, ANCOUNT=1.
+        resp[2] = 0x85; resp[3] = 0x00;
+        resp[6] = 0x00; resp[7] = 0x01;
+        // Answer: compression pointer to name at offset 12, TYPE=A,
+        // CLASS=IN, TTL=300, RDLENGTH=4, RDATA=93.184.216.34.
+        resp.extend_from_slice(&[0xC0, 12]); // Name pointer
+        resp.extend_from_slice(&[0x00, 0x01]); // TYPE=A
+        resp.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
+        resp.extend_from_slice(&[0x00, 0x00, 0x01, 0x2C]); // TTL=300
+        resp.extend_from_slice(&[0x00, 0x04]); // RDLENGTH=4
+        resp.extend_from_slice(&[93, 184, 216, 34]); // IP
+
+        let ip = parse_dns_a_record(&resp, "t.co").unwrap();
+        assert_eq!(ip, Ipv4Addr::new(93, 184, 216, 34));
+    }
+
+    #[test]
+    fn dns_response_no_answers() {
+        let mut resp = build_dns_query("nxdomain.test");
+        resp[2] = 0x81; resp[3] = 0x03; // QR=1, RCODE=NXDOMAIN
+        // ANCOUNT stays 0.
+        let err = parse_dns_a_record(&resp, "nxdomain.test").unwrap_err();
+        assert!(err.to_string().contains("no answers"));
     }
 }

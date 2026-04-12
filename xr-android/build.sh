@@ -21,8 +21,23 @@ export PATH="$JAVA_HOME/bin:$HOME/.cargo/bin:$PATH"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-echo "=== Building Rust native libraries ==="
+echo "=== Cleaning workspace crates (keeps dep cache) ==="
 cd "$PROJECT_ROOT"
+# Чистим только наши крейты, чтобы гарантированно пересобрать native .so
+# даже после rsync/checkout с чужими mtime. Тяжёлые deps (tokio, serde, ...)
+# остаются кэшированными, поэтому пересборка занимает ~30-40 секунд.
+#
+# ВАЖНО: нужны --target *-linux-android И --release. Без --target
+# cargo clean трогает только host (target/debug, target/release), не
+# трогая target/<triple>/release/, где лежат наши JNI .so. Без
+# --release чистится только debug-профиль того же target'а.
+cargo clean -p xr-proto -p xr-core -p xr-android-jni \
+    --target aarch64-linux-android --release
+cargo clean -p xr-proto -p xr-core -p xr-android-jni \
+    --target x86_64-linux-android --release
+
+echo ""
+echo "=== Building Rust native libraries ==="
 cargo ndk \
     -t aarch64-linux-android \
     -t x86_64-linux-android \

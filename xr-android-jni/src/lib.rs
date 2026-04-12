@@ -81,16 +81,48 @@ fn make_protect_fn() -> ProtectSocketFn {
     })
 }
 
+/// Proper JSON string value extractor. Walks char-by-char from the
+/// opening quote and honors `\"`, `\\`, `\n`, `\t`, `\r` escape sequences,
+/// so embedded TOML (routing_toml) with quoted strings doesn't truncate
+/// at the first `\"`. The original `find('"')` approach cut off
+/// `routing_toml` at the very first escaped quote, and `toml::from_str`
+/// silently fell back to the default "proxy everything" routing.
+fn json_get_str(json: &str, key: &str) -> Result<String, String> {
+    let pattern = format!("\"{}\"", key);
+    let pos = json.find(&pattern).ok_or(format!("missing {}", key))?;
+    let after = &json[pos + pattern.len()..];
+    let start = after.find('"').ok_or(format!("bad value for {}", key))? + 1;
+    let rest = &after[start..];
+
+    let mut result = String::new();
+    let mut iter = rest.chars();
+    while let Some(c) = iter.next() {
+        if c == '\\' {
+            match iter.next() {
+                Some('n') => result.push('\n'),
+                Some('"') => result.push('"'),
+                Some('\\') => result.push('\\'),
+                Some('t') => result.push('\t'),
+                Some('r') => result.push('\r'),
+                Some(other) => {
+                    // Unknown escape — keep literally, don't break parsing.
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => return Err(format!("unterminated escape in {}", key)),
+            }
+        } else if c == '"' {
+            // End of string value (unescaped quote).
+            return Ok(result);
+        } else {
+            result.push(c);
+        }
+    }
+    Err(format!("unterminated {}", key))
+}
+
 fn parse_config(json: &str) -> Result<VpnConfig, String> {
-    let get_str = |key: &str| -> Result<String, String> {
-        let pattern = format!("\"{}\"", key);
-        let pos = json.find(&pattern).ok_or(format!("missing {}", key))?;
-        let after = &json[pos + pattern.len()..];
-        let start = after.find('"').ok_or(format!("bad value for {}", key))? + 1;
-        let rest = &after[start..];
-        let end = rest.find('"').ok_or(format!("unterminated {}", key))?;
-        Ok(rest[..end].replace("\\n", "\n").replace("\\\"", "\""))
-    };
+    let get_str = |key: &str| json_get_str(json, key);
 
     let get_num = |key: &str| -> Result<u64, String> {
         let pattern = format!("\"{}\"", key);
@@ -130,15 +162,33 @@ fn default_routing() -> RoutingConfig {
     RoutingConfig { default_action: "proxy".into(), rules: vec![] }
 }
 
+/// Translate engine InvalidInput errors into user-friendly messages.
+fn humanize_config_error(e: &std::io::Error) -> String {
+    let raw = e.to_string();
+    if raw.contains("invalid symbol") || raw.contains("Invalid padding") ||
+       raw.contains("Invalid byte") {
+        "Неверный ключ шифрования — проверьте, что вставлена только base64-строка без лишних символов".to_string()
+    } else if raw.contains("key must not be empty") {
+        "Ключ шифрования не указан".to_string()
+    } else if raw.contains("unknown modifier") {
+        "Неизвестный модификатор обфускации".to_string()
+    } else if raw.contains("invalid socket address") || raw.contains("invalid IP address") {
+        "Неверный адрес сервера — проверьте IP и порт".to_string()
+    } else {
+        format!("Ошибка настроек: {}", raw)
+    }
+}
+
 // ── JNI exports ─────────────────────────────────────────────────────
 
+/// Start the VPN engine. Returns null on success, or an error message string on failure.
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
     mut env: JNIEnv,
     _class: JClass,
     _tun_fd: jint,
     config_json: JString,
-) -> jint {
+) -> jstring {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("xr_core=debug,xr_proto=info")
         .with_target(false)
@@ -178,17 +228,20 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
         }
     }
 
+    // Helper: return an error string to Kotlin.
+    let err = |env: &mut JNIEnv, msg: &str| -> jstring {
+        tracing::error!("{}", msg);
+        env.new_string(msg).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    };
+
     let config_str: String = match env.get_string(&config_json) {
         Ok(s) => s.into(),
-        Err(_) => return -1,
+        Err(_) => return err(&mut env, "Failed to read config string"),
     };
 
     let config = match parse_config(&config_str) {
         Ok(c) => c,
-        Err(e) => {
-            tracing::error!("Config parse error: {}", e);
-            return -2;
-        }
+        Err(e) => return err(&mut env, &format!("Ошибка конфигурации: {}", e)),
     };
 
     let mut engine = VpnEngine::new(config);
@@ -201,10 +254,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
         .build()
     {
         Ok(rt) => rt,
-        Err(e) => {
-            tracing::error!("Failed to create runtime: {}", e);
-            return -3;
-        }
+        Err(e) => return err(&mut env, &format!("Tokio runtime error: {}", e)),
     };
 
     let _guard = runtime.enter();
@@ -213,11 +263,15 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
             let mut lock = get_engine().lock().unwrap();
             *lock = Some(EngineHandle { engine, queue, runtime });
             tracing::info!("VPN engine started");
-            0
+            std::ptr::null_mut() // null = success
         }
         Err(e) => {
-            tracing::error!("Engine start failed: {}", e);
-            -4
+            let user_msg = match e.kind() {
+                std::io::ErrorKind::InvalidInput => humanize_config_error(&e),
+                std::io::ErrorKind::AlreadyExists => "Туннель уже запущен".to_string(),
+                _ => format!("Ошибка запуска: {}", e),
+            };
+            err(&mut env, &user_msg)
         }
     }
 }
@@ -259,13 +313,13 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetStats(
                 .map(|e| format!("\"{}\"", e.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ")))
                 .collect();
             format!(
-                "{{\"bytes_up\":{},\"bytes_down\":{},\"active\":{},\"total\":{},\"uptime\":{},\"dns\":{},\"syns\":{},\"smol_recv\":{},\"smol_send\":{},\"relay_err\":{},\"debug\":\"{}\",\"errors\":[{}]}}",
+                "{{\"bytes_up\":{},\"bytes_down\":{},\"active\":{},\"total\":{},\"uptime\":{},\"dns\":{},\"syns\":{},\"smol_recv\":{},\"smol_send\":{},\"relay_warn\":{},\"relay_err\":{},\"debug\":\"{}\",\"errors\":[{}]}}",
                 s.bytes_up, s.bytes_down, s.active_connections, s.total_connections, s.uptime_seconds,
-                s.dns_queries, s.tcp_syns, s.smol_recv, s.smol_send, s.relay_errors, debug_escaped,
+                s.dns_queries, s.tcp_syns, s.smol_recv, s.smol_send, s.relay_warns, s.relay_errors, debug_escaped,
                 errors_json.join(",")
             )
         }
-        None => "{\"bytes_up\":0,\"bytes_down\":0,\"active\":0,\"total\":0,\"uptime\":0,\"dns\":0,\"syns\":0,\"smol_recv\":0,\"smol_send\":0,\"relay_err\":0,\"debug\":\"\"}".into(),
+        None => "{\"bytes_up\":0,\"bytes_down\":0,\"active\":0,\"total\":0,\"uptime\":0,\"dns\":0,\"syns\":0,\"smol_recv\":0,\"smol_send\":0,\"relay_warn\":0,\"relay_err\":0,\"debug\":\"\"}".into(),
     };
     env.new_string(&json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
@@ -319,4 +373,67 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePopPacket(
         }
     }
     std::ptr::null_mut()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_str_simple_value() {
+        let json = r#"{"foo":"bar","baz":"qux"}"#;
+        assert_eq!(json_get_str(json, "foo").unwrap(), "bar");
+        assert_eq!(json_get_str(json, "baz").unwrap(), "qux");
+    }
+
+    #[test]
+    fn get_str_escaped_quote_inside_value() {
+        // Regression: the previous naive parser truncated here at the
+        // first `\"`, returning only `he said `. Now the escape is honored.
+        let json = r#"{"msg":"he said \"hi\" and left","other":"x"}"#;
+        assert_eq!(json_get_str(json, "msg").unwrap(), r#"he said "hi" and left"#);
+        assert_eq!(json_get_str(json, "other").unwrap(), "x");
+    }
+
+    #[test]
+    fn get_str_routing_toml_with_quoted_rules() {
+        // The actual case that broke user routing — routing_toml contains
+        // many escaped quotes. Without the fix, this returned only
+        // `default_action = \`, `toml::from_str` failed, and the engine
+        // fell back to proxy-everything default.
+        let routing_toml = r#"default_action = "direct"
+[[rules]]
+action = "proxy"
+domains = ["youtube.com", "*.youtube.com"]"#;
+        let escaped = routing_toml.replace('"', "\\\"").replace('\n', "\\n");
+        let json = format!(
+            r#"{{"server_address":"1.2.3.4","routing_toml":"{}","on_server_down":"direct"}}"#,
+            escaped
+        );
+
+        let result = json_get_str(&json, "routing_toml").unwrap();
+        assert_eq!(result, routing_toml, "routing_toml must round-trip through escape/unescape");
+
+        // Sanity: other fields still parse after the multi-line value.
+        assert_eq!(json_get_str(&json, "server_address").unwrap(), "1.2.3.4");
+        assert_eq!(json_get_str(&json, "on_server_down").unwrap(), "direct");
+    }
+
+    #[test]
+    fn get_str_newline_escape() {
+        let json = r#"{"multi":"line1\nline2\nline3"}"#;
+        assert_eq!(json_get_str(json, "multi").unwrap(), "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn get_str_missing_key() {
+        let json = r#"{"foo":"bar"}"#;
+        assert!(json_get_str(json, "nope").is_err());
+    }
+
+    #[test]
+    fn get_str_unterminated() {
+        let json = r#"{"foo":"bar"#;
+        assert!(json_get_str(json, "foo").is_err());
+    }
 }

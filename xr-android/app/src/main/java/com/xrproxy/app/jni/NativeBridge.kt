@@ -1,6 +1,6 @@
 package com.xrproxy.app.jni
 
-import android.net.VpnService
+import com.xrproxy.app.service.XrVpnService
 
 /**
  * JNI bridge to the Rust xr-core VPN engine.
@@ -10,9 +10,14 @@ object NativeBridge {
         System.loadLibrary("xr_proxy")
     }
 
-    /** Reference to the active VpnService (set before nativeStart). */
+    /**
+     * Live reference to the running XrVpnService, updated in the service
+     * lifecycle (onCreate/onDestroy). Used only by the Rust-side callback
+     * below, so `protectSocket` always goes through whichever service is
+     * currently alive — avoids stale references after Activity recreation.
+     */
     @Volatile
-    var vpnService: VpnService? = null
+    var current: XrVpnService? = null
 
     /**
      * Called FROM Rust (via JNI callback) to protect a socket fd.
@@ -20,11 +25,11 @@ object NativeBridge {
      */
     @JvmStatic
     fun protectSocket(fd: Int): Boolean {
-        return vpnService?.protect(fd) ?: false
+        return current?.protect(fd) ?: false
     }
 
-    /** Start the VPN engine. Returns 0 on success, negative on error. */
-    external fun nativeStart(tunFd: Int, configJson: String): Int
+    /** Start the VPN engine. Returns null on success, or an error message on failure. */
+    external fun nativeStart(tunFd: Int, configJson: String): String?
     external fun nativeStop()
     external fun nativeGetState(): String
     external fun nativeGetStats(): String

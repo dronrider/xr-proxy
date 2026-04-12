@@ -153,6 +153,9 @@ icon.
 
 1. **Центральная иконка `ShieldArrowIcon`** — 128dp, см. §3.5, анимируется
    по фазам.
+1a. **Health HUD** — 32dp (§3.5a), только в фазе Connected. По умолчанию
+    под `ShieldArrowIcon`, по центру; альтернативное размещение — внутри
+    самой иконки, если отдельный HUD перегружает экран.
 2. **Строка статуса** — одна крупная строка (headlineMedium, 28sp):
    - Idle → «Disconnected»
    - Preparing → «Подготовка…»
@@ -221,6 +224,109 @@ fun ShieldArrowIcon(phase: ConnectPhase, modifier: Modifier = Modifier)
 
 Всё через Compose `animate*AsState` / `rememberInfiniteTransition`. Никакой
 `Lottie`, никаких сторонних зависимостей.
+
+### 3.5a Индикатор здоровья сессии (Health HUD)
+
+Счётчики `warn/error` в бадже и в Debug-секции отвечают на вопрос «сколько
+раз оно сломалось?», но не на «как дела прямо сейчас». Пользователь хочет
+периферийно видеть состояние: если туннель работает гладко — успокоительный
+зелёный, если сыплются ошибки — тревожный красный, и сразу понятно, стоит
+лезть в Log или нет. Без индикатора единственный способ это узнать —
+переключиться на вкладку Log и вглядываться в поток строк.
+
+Референс — HUD Doomguy'а из классического Doom: маленький портрет, который
+меняет выражение в зависимости от текущего состояния здоровья и последних
+полученных повреждений. Визуально считываемо за 100 мс, даёт персонажу
+игры характер, хорошо работает как декоративный элемент.
+
+**Где на экране.** Под `ShieldArrowIcon`, над строкой статуса. Размер
+32dp, по центру. Не на месте иконки — `ShieldArrowIcon` остаётся главным
+визуальным якорем и показывает *фазу* подключения, health HUD показывает
+*состояние* уже работающего подключения. Эти две метрики ортогональны:
+`ShieldArrowIcon=Connected + HealthHUD=green` ≠ `ShieldArrowIcon=Connected
++ HealthHUD=red`. Альтернативный вариант размещения (если отдельный HUD
+перегружает экран) — вписать моську прямо в центр `ShieldArrowIcon`,
+между щитом и стрелой. Решаем при прототипировании.
+
+Скрыт во всех фазах кроме `Connected`: в Idle/Connecting/Stopping показывать
+«здоровье» бессмысленно.
+
+**Шкала здоровья.** Четыре состояния:
+
+| Уровень | Цвет | Выражение | Триггер |
+|---|---|---|---|
+| `Healthy`   | зелёный  | улыбка / `sentiment_satisfied`        | 0 ERROR и 0 WARN в последние 30 секунд |
+| `Watching`  | зелёный  | нейтральное / `sentiment_neutral`      | 0 ERROR, но ≥ 1 WARN в последние 30 секунд |
+| `Hurt`      | оранжевый | гримаса / `sentiment_dissatisfied`     | ≥ 1 ERROR в окне 30 секунд, но < 5 ошибок в 5 секунд |
+| `Critical`  | красный  | паника / `sentiment_very_dissatisfied` | ≥ 5 ERROR в последние 5 секунд (шквал отказов) |
+
+Переход в более «плохое» состояние — мгновенный. Переход в более «хорошее»
+— с задержкой ≥ 5 секунд, чтобы HUD не прыгал между Critical ↔ Hurt при
+редких всплесках.
+
+**Логика вычисления.** Не нужна полная история `recent_errors` — достаточно
+двух скользящих счётчиков по времени. В `XrVpnService` (или в VM) держим:
+
+```kotlin
+data class HealthTracker(
+    var lastSeenErrors: Long = 0,   // snapshot.relayErrors на прошлом тике
+    var lastSeenWarns:  Long = 0,   // snapshot.relayWarnings на прошлом тике
+    val errorBurst: ArrayDeque<Long> = ArrayDeque(),  // timestamps последних ERROR
+    val warnBurst:  ArrayDeque<Long> = ArrayDeque(),  // timestamps последних WARN
+)
+```
+
+На каждый snapshot (pollLoop раз в секунду):
+
+1. `deltaErr = snapshot.relayErrors - lastSeenErrors`, `deltaWarn = snapshot.relayWarnings - lastSeenWarns`.
+2. Если `deltaErr > 0`, добавить `deltaErr` меток `now` в `errorBurst`.
+   Аналогично с `deltaWarn → warnBurst`.
+3. Вычистить из `errorBurst` метки старше `now - 30 s`, из `warnBurst` — тоже.
+4. `healthLevel = when { errorBurst в окне 5s ≥ 5 → Critical; errorBurst.isNotEmpty() → Hurt; warnBurst.isNotEmpty() → Watching; else → Healthy }`.
+5. Плавный downshift: если предыдущий уровень был хуже, держим его ещё
+   `min(5s, timeSinceLastBadEvent)` прежде чем отпустить в healthier.
+
+Этот счётчик переживает ротацию `recent_errors` (которую делает smart
+drain в `stats.rs`) — мы считаем дельты cumulative counters
+`relay_warns`/`relay_errors`, а они монотонны и не уменьшаются при drain.
+
+**Где держать.** Предпочтительно в `XrVpnService`, чтобы state переживал
+recreate `VpnViewModel` (как и весь остальной state после LLD-02). Поле
+`ServiceState.health: HealthLevel` публикуется в `stateFlow` рядом с
+`snapshot`. VM только мапит в UI.
+
+**Визуализация — v1 (без нового арта).**
+
+Material Icons Extended (уже в deps — см. `material-icons-extended`)
+содержит `Icons.Filled.SentimentVerySatisfied / SentimentSatisfied /
+SentimentNeutral / SentimentDissatisfied / SentimentVeryDissatisfied`.
+Берём их напрямую, tint — цвет из палитры (`accent_ok` / `warning` / `error`),
+лёгкая анимация масштаба `scaleX/Y = 0.9..1.0` когда уровень ухудшается
+(pulse, 300 мс).
+
+Это не Doomguy, но даёт узнаваемый индикатор «доволен / недоволен /
+паника». Реализуется за час и не блокирует релиз.
+
+**Визуализация — v2 (Doomguy-style моська).**
+
+Кастомная `HealthFace` composable рисует стилизованное лицо на Canvas —
+квадратный помятый портрет в духе Doom HUD, но в стилистике бренда
+(тёмный navy-фон, cyan-контур, короткие штрихи). 5 кадров: `Happy`,
+`Calm`, `Watching`, `Hurt`, `Critical`. Каждый кадр — несколько примитивов
+(круг-голова, глаза-точки, линия-рот), никакого растрового арта.
+
+Переход между кадрами — crossfade 150 мс. Дополнительно «shake» на
+переходе в Critical (`offset.x` модулируется синусоидой ±2dp, 200 мс).
+
+v2 — это красивая часть, необязательная для первого релиза LLD-06.
+Порядок работы: сначала v1 (функциональность), потом при наличии
+времени/желания v2 (стилистика). v1 и v2 взаимозаменяемы — интерфейс
+компонента один и тот же: `HealthFace(level: HealthLevel, modifier: Modifier)`.
+
+**Что НЕ делаем в этом LLD.** Push-уведомление при переходе в Critical,
+звук, вибрация, история уровней здоровья, графики — всё это можно
+добавить позже отдельным LLD, если окажется нужным. Сейчас — только
+визуальный пассивный индикатор.
 
 ### 3.6 Детализация `ConnectPhase`
 
@@ -359,6 +465,60 @@ Relay
 - Action «Отключить» — иконка `ic_notification_stop` (маленький квадрат-stop,
   монохром), см. §3.9.
 
+### 3.9a Snackbar-и
+
+LLD-02 ввёл Snackbar как канал быстрых сообщений от `VpnViewModel` к UI:
+«Заполните сервер и ключ в Settings», «VPN-разрешение не получено»,
+«Сервер X:Y недоступен». Дефолтный Material3 Snackbar — тёмный прямоугольник
+снизу во всю ширину, без скруглений, без иконки, без цветового разделения
+по смыслу. Эмпирически он воспринимается как «что-то серьёзно сломалось»
+даже когда по сути это просто валидация формы или pre-connect probe.
+
+Целевой вид:
+
+- Закруглённая пилюля (`RoundedCornerShape(12.dp)`) с внутренними отступами
+  `16.dp` по горизонтали и `12.dp` по вертикали, не во всю ширину —
+  `padding(horizontal = 16.dp)` + `widthIn(max = 400.dp)`, центровка по
+  нижнему краю с отступом `24.dp` от bottom bar.
+- Фон — `surface_alt` из §3.1 (чуть светлее, чем базовый surface), тонкая
+  рамка `1.dp` цветом `divider`. Текст — `text_primary`, размер 14 sp,
+  Medium.
+- Слева 20 dp моно-иконка, отражающая категорию сообщения:
+  - **info** (заполните поля, разрешение не получено) — `ic_info` (кружок
+    с «i»), tint `text_secondary`;
+  - **warning** (probe failed — «Сервер недоступен») — `ic_warning_round`
+    (кружок с «!»), tint `warning` из палитры;
+  - **error** (резерв, пока не используется) — `ic_error`, tint `error`.
+  Категория приходит вместе с сообщением; см. ниже про `UiMessage`.
+- Плавное появление — `AnimatedVisibility` с `slideInVertically + fadeIn`
+  (250 мс), такое же исчезновение. Без «резкого выскока» стандартного
+  Material3 Snackbar.
+- Без action-кнопки по умолчанию. Если в будущем понадобится «Повторить» —
+  добавим как текст-кнопку справа тем же `primary`-цветом.
+
+Реализация — кастомный composable `XrSnackbar(message: UiMessage)`,
+передаваемый в `Scaffold(snackbarHost = { XrSnackbarHost(snackbarHostState) })`.
+`XrSnackbarHost` слушает `SnackbarHostState.currentSnackbarData` и
+переводит `visuals.message` в `UiMessage` через префикс-парсинг
+(`"warn:..."`, `"info:..."`) — чтобы не менять сигнатуру
+`SnackbarHostState.showSnackbar` и не ломать LLD-02 API.
+
+Альтернатива — расширить `VpnViewModel._messages: SharedFlow<String>` до
+`SharedFlow<UiMessage>`, где `UiMessage(text: String, severity: Severity)`.
+Это чище, но меняет контракт LLD-02 §3.2. Решаем при имплементации
+LLD-06: если в тот момент ещё никто не опирается на
+`_messages: SharedFlow<String>`, мигрируем на `UiMessage`; иначе делаем
+префикс-парсинг как временное решение с TODO на миграцию.
+
+В VpnViewModel тексты становятся:
+
+- `_messages.emit("info:Заполните сервер и ключ в Settings")`;
+- `_messages.emit("info:VPN-разрешение не получено")`;
+- `_messages.emit("warn:Сервер ${s.serverAddress}:${s.serverPort} недоступен")`.
+
+Префикс снимается в `XrSnackbarHost` и определяет категорию/иконку/tint.
+Если сообщение пришло без префикса — дефолт `info`.
+
 ### 3.9 Дополнительные мелкие иконки
 
 Список новых vector-ресурсов (все monochrome, без заливок-градиентов, чтобы
@@ -376,6 +536,9 @@ Relay
 | `drawable/ic_expand.xml` | Шеврон вниз 20dp (ротация при раскрытии) |
 | `drawable/ic_notification.xml` | 24dp, §3.3 |
 | `drawable/ic_notification_stop.xml` | 24dp квадрат для action «Отключить» |
+| `drawable/ic_info.xml` | 20dp кружок с «i» для info-Snackbar, §3.9a |
+| `drawable/ic_warning_round.xml` | 20dp кружок с «!» для warning-Snackbar, §3.9a |
+| `drawable/ic_error.xml` | 20dp крестик/восклик для error-Snackbar (резерв), §3.9a |
 
 Все создаются как простые vector-drawables, можно брать готовые shapes из
 Material Symbols (они имеют лицензию Apache-2.0) — это самый быстрый
@@ -391,16 +554,19 @@ Material Symbols (они имеют лицензию Apache-2.0) — это са
 | `xr-android/app/src/main/java/com/xrproxy/app/ui/theme/XrTheme.kt` (новый) | `darkColorScheme(...)` на основе ресурсов. `@Composable fun XrTheme(content: @Composable () -> Unit)`. |
 | [MainActivity.kt](../../xr-android/app/src/main/java/com/xrproxy/app/ui/MainActivity.kt) | `setContent { XrTheme { ... } }`. Edge-to-edge: `WindowCompat.setDecorFitsSystemWindows(window, false)`, стиль status bar — light icons. Переработать `ConnectionSection`: центральная `ShieldArrowIcon` вместо Lock/LockOpen, строка статуса + подстрока шагов, pill-кнопка, карточки статистики через `StatsCard`, `DebugSection` вместо плоской колонки метрик. |
 | `xr-android/app/src/main/java/com/xrproxy/app/ui/components/ShieldArrowIcon.kt` (новый) | Canvas-композит щита и стрелы, анимация по `ConnectPhase` (§3.5). |
+| `xr-android/app/src/main/java/com/xrproxy/app/ui/components/HealthFace.kt` (новый) | Индикатор здоровья сессии (§3.5a). v1 — обёртка над `Icons.Filled.Sentiment*` с tint по уровню; v2 — кастомный Canvas-рисунок Doomguy-style. Интерфейс: `HealthFace(level: HealthLevel, modifier: Modifier)`. |
+| `xr-android/app/src/main/java/com/xrproxy/app/model/HealthLevel.kt` (новый) | `enum HealthLevel { Healthy, Watching, Hurt, Critical }` + `HealthTracker` логика rolling-window, публикация в `ServiceState.health` (§3.5a). |
 | `xr-android/app/src/main/java/com/xrproxy/app/ui/components/StatsCard.kt` (новый) | Карточки Upload/Download/Speed/Uptime/Connections, сетка 2×2 + широкая снизу. |
 | `xr-android/app/src/main/java/com/xrproxy/app/ui/components/DebugSection.kt` (новый) | Аккордеон с группами Network / smoltcp / Relay + кнопка Copy all. |
-| [VpnViewModel.kt](../../xr-android/app/src/main/java/com/xrproxy/app/ui/VpnViewModel.kt) | `ConnectPhase` расширен до 8 вариантов (§3.6). Обёртка `stateFlow.transform { ... delay(300) }` для минимального времени показа фаз. Поля `speedUp`, `speedDown` в `VpnUiState`. Поле `debugExpanded: Boolean`, toggle-функция. |
-| [XrVpnService.kt](../../xr-android/app/src/main/java/com/xrproxy/app/service/XrVpnService.kt) | В polling-цикле хранить prev snapshot, вычислять delta → `speedUp/speedDown` в `ServiceState`. Публиковать Preparing/Connecting/Finalizing переходы в правильных точках (см. таблицу §3.6). Notification — добавить `setColor` из `R.color.primary` и моно-иконку `ic_notification`. |
+| `xr-android/app/src/main/java/com/xrproxy/app/ui/components/XrSnackbar.kt` (новый) | Кастомный `XrSnackbar` + `XrSnackbarHost` (§3.9a), префикс-парсинг `info:/warn:/error:`. Используется в `Scaffold(snackbarHost = ...)` вместо дефолтного. |
+| [VpnViewModel.kt](../../xr-android/app/src/main/java/com/xrproxy/app/ui/VpnViewModel.kt) | `ConnectPhase` расширен до 8 вариантов (§3.6). Обёртка `stateFlow.transform { ... delay(300) }` для минимального времени показа фаз. Поля `speedUp`, `speedDown` в `VpnUiState`. Поле `debugExpanded: Boolean`, toggle-функция. Тексты в `_messages.emit(...)` префиксуются `info:`/`warn:`/`error:` (§3.9a); либо — если контракт LLD-02 ещё можно менять — `_messages` мигрирует с `SharedFlow<String>` на `SharedFlow<UiMessage>`. |
+| [XrVpnService.kt](../../xr-android/app/src/main/java/com/xrproxy/app/service/XrVpnService.kt) | В polling-цикле хранить prev snapshot, вычислять delta → `speedUp/speedDown` в `ServiceState`. Публиковать Preparing/Connecting/Finalizing переходы в правильных точках (см. таблицу §3.6). Добавить `HealthTracker`, обновлять на каждом тике, публиковать `ServiceState.health` (§3.5a). Notification — добавить `setColor` из `R.color.primary` и моно-иконку `ic_notification`. |
 | `res/mipmap-anydpi-v26/ic_launcher.xml` | Adaptive icon с foreground+background, §3.2. |
 | `res/drawable/ic_launcher_foreground.xml` | Vector со щитом и стрелой, §3.2. |
 | `res/drawable/ic_launcher_background.xml` | Vector с градиентом, §3.2. |
 | `res/mipmap-*/ic_launcher.png` (legacy) | PNG-рендеры через Image Asset Studio, 48/72/96/144/192 dp. |
 | `res/drawable/ic_notification.xml` (новый) | §3.3. Можно будет использовать для LLD-02 (там она тоже указана). |
-| `res/drawable/ic_upload.xml`, `ic_download.xml`, `ic_speed_up.xml`, `ic_speed_down.xml`, `ic_uptime.xml`, `ic_connections.xml`, `ic_debug.xml`, `ic_expand.xml`, `ic_notification_stop.xml` | Новые моно-vector'ы, §3.9. |
+| `res/drawable/ic_upload.xml`, `ic_download.xml`, `ic_speed_up.xml`, `ic_speed_down.xml`, `ic_uptime.xml`, `ic_connections.xml`, `ic_debug.xml`, `ic_expand.xml`, `ic_notification_stop.xml`, `ic_info.xml`, `ic_warning_round.xml`, `ic_error.xml` | Новые моно-vector'ы, §3.9 и §3.9a. |
 | [AndroidManifest.xml](../../xr-android/app/src/main/AndroidManifest.xml) | `android:theme` — убрать `Theme.Material.Light.NoActionBar`, заменить на `@style/Theme.XrProxy` (наш, parent — `Theme.Material3.DynamicDark.NoActionBar` либо `Theme.Material3.DarkNoActionBar`). |
 | `res/values/themes.xml` (новый или дополнить) | `Theme.XrProxy` — parent `Theme.Material3.DarkNoActionBar`, статус-бар `background`, navigation-bar `background`, `windowLightStatusBar=false`. |
 

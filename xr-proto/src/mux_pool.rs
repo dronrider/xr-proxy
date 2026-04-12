@@ -40,6 +40,14 @@ impl MuxPool {
         })
     }
 
+    /// Pre-establish the mux connection (TCP + MuxInit handshake) without
+    /// opening a stream. Used by the engine health check — verifies full
+    /// protocol reachability and pre-warms the pool so the first relay
+    /// stream opens instantly.
+    pub async fn warmup(&self) -> io::Result<()> {
+        self.get_or_connect().await.map(|_| ())
+    }
+
     /// Open a new logical stream to the target through the multiplexed connection.
     ///
     /// - If no connection exists, establishes one (TCP + MuxInit handshake).

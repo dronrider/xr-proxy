@@ -1,22 +1,36 @@
 package com.xrproxy.app.ui
 
 import android.app.Application
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.content.SharedPreferences
 import android.net.VpnService
+import android.os.IBinder
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.xrproxy.app.jni.NativeBridge
 import com.xrproxy.app.service.XrVpnService
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
+/** High-level phase of the VPN session as seen by the UI. */
+enum class ConnectPhase {
+    Idle,
+    NeedsPermission,
+    Starting,
+    Connecting,
+    Connected,
+    Stopping,
+}
+
 data class VpnUiState(
-    val connected: Boolean = false,
-    val connecting: Boolean = false,
+    val phase: ConnectPhase = ConnectPhase.Idle,
     val state: String = "Disconnected",
     val bytesUp: Long = 0,
     val bytesDown: Long = 0,
@@ -27,10 +41,10 @@ data class VpnUiState(
     val tcpSyns: Long = 0,
     val smolRecv: Long = 0,
     val smolSend: Long = 0,
+    val relayWarnings: Long = 0,
     val relayErrors: Long = 0,
     val debugMsg: String = "",
     val recentErrors: List<String> = emptyList(),
-    val errorLog: String = "",
     // Settings
     val serverAddress: String = "",
     val serverPort: String = "8443",
@@ -43,7 +57,14 @@ data class VpnUiState(
     val customIpRanges: String = "",
     // UI feedback
     val settingsSaved: Boolean = false,
-)
+) {
+    val connected: Boolean
+        get() = phase == ConnectPhase.Connected
+    val connecting: Boolean
+        get() = phase == ConnectPhase.Starting ||
+                phase == ConnectPhase.Connecting ||
+                phase == ConnectPhase.Stopping
+}
 
 class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -53,10 +74,92 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(VpnUiState())
     val uiState: StateFlow<VpnUiState> = _uiState
 
-    private var statsPolling = false
+    private val _permissionRequest = MutableSharedFlow<Intent>(extraBufferCapacity = 1)
+    val permissionRequest: SharedFlow<Intent> = _permissionRequest
+
+    private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 4)
+    val messages: SharedFlow<String> = _messages
+
+    private var boundService: XrVpnService? = null
+    private var isBound = false
+    private var serviceObserverJob: Job? = null
+
+    private val bindConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+            val svc = (binder as XrVpnService.LocalBinder).service()
+            boundService = svc
+            serviceObserverJob?.cancel()
+            serviceObserverJob = viewModelScope.launch {
+                svc.stateFlow.collect { applyServiceState(it) }
+            }
+        }
+
+        override fun onServiceDisconnected(name: ComponentName) {
+            boundService = null
+            serviceObserverJob?.cancel()
+            serviceObserverJob = null
+            isBound = false
+            // Service went away unexpectedly — reflect Disconnected honestly.
+            _uiState.value = _uiState.value.copy(
+                phase = ConnectPhase.Idle,
+                state = "Disconnected",
+                bytesUp = 0, bytesDown = 0, activeConnections = 0, uptime = 0,
+                recentErrors = emptyList(),
+            )
+        }
+    }
+
+    /**
+     * Releases the current binding. Called after the service reports Idle
+     * (in `applyServiceState`) so the service can actually be destroyed —
+     * `stopSelf()` alone is a no-op while we keep a binding alive.
+     */
+    private fun unbindAndClear() {
+        serviceObserverJob?.cancel()
+        serviceObserverJob = null
+        boundService = null
+        if (isBound) {
+            try {
+                getApplication<Application>().unbindService(bindConnection)
+            } catch (_: Exception) {
+                // Already disconnected — ignore.
+            }
+            isBound = false
+        }
+    }
 
     init {
         loadSettings()
+        // Best-effort bind: if the service is already running (app re-entered
+        // from background), we immediately mirror its state. If it isn't, we
+        // stay Idle and bind again when the user hits Connect.
+        tryBind(autoCreate = false)
+    }
+
+    override fun onCleared() {
+        serviceObserverJob?.cancel()
+        if (isBound) {
+            try {
+                getApplication<Application>().unbindService(bindConnection)
+            } catch (_: Exception) {
+                // Already disconnected or never bound — ignore.
+            }
+            isBound = false
+        }
+        super.onCleared()
+    }
+
+    private fun tryBind(autoCreate: Boolean) {
+        if (isBound) return
+        val intent = Intent(getApplication(), XrVpnService::class.java).apply {
+            action = XrVpnService.ACTION_BIND_INTERNAL
+        }
+        val flags = if (autoCreate) Context.BIND_AUTO_CREATE else 0
+        isBound = try {
+            getApplication<Application>().bindService(intent, bindConnection, flags)
+        } catch (_: Exception) {
+            false
+        }
     }
 
     // ── Settings persistence ────────────────────────────────────────
@@ -104,13 +207,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun updateCustomDomains(value: String) { _uiState.value = _uiState.value.copy(customDomains = value) }
     fun updateCustomIpRanges(value: String) { _uiState.value = _uiState.value.copy(customIpRanges = value) }
 
-    fun refreshLog() {
-        _uiState.value = _uiState.value.copy(errorLog = NativeBridge.nativeGetErrorLog())
-    }
-
     fun clearLog() {
-        NativeBridge.nativeClearErrorLog()
-        _uiState.value = _uiState.value.copy(errorLog = "", relayErrors = 0)
+        boundService?.clearLog()
     }
 
     /// Import TOML config from clipboard text.
@@ -118,22 +216,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         // Parse domains and ip_ranges from TOML.
         val domains = mutableListOf<String>()
         val ipRanges = mutableListOf<String>()
-        var defaultAction = "direct"
 
-        for (line in toml.lines()) {
-            val trimmed = line.trim()
-            if (trimmed.startsWith("default_action")) {
-                if (trimmed.contains("proxy")) defaultAction = "proxy"
-                else defaultAction = "direct"
-            }
-            // Extract quoted strings from domains = [...] and ip_ranges = [...]
-            val quoted = Regex("\"([^\"]+)\"").findAll(trimmed)
-            if (trimmed.startsWith("domains") || trimmed.contains("\"*.") || trimmed.contains("\".")) {
-                // Heuristic: lines with domain patterns.
-            }
-        }
-
-        // Simpler approach: extract all quoted strings from domain/ip sections.
+        // Extract all quoted strings from domain/ip sections.
         var inDomains = false
         var inIpRanges = false
         for (line in toml.lines()) {
@@ -163,75 +247,139 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     // ── VPN connection ──────────────────────────────────────────────
 
-    fun prepareVpn(): Intent? = VpnService.prepare(getApplication())
+    /**
+     * Single entry point for the Connect button. Validates settings, requests
+     * VPN permission if needed, then starts the service. The actual server
+     * reachability check happens inside the Rust engine via a protected socket
+     * health check — the same code path used by real relay connections.
+     * A plain-socket probe from Kotlin is unreliable on Android: carrier NATs
+     * and port filtering cause false negatives on non-standard ports.
+     */
+    fun onConnectClicked() {
+        val s = _uiState.value
+        if (s.phase != ConnectPhase.Idle) return
+        if (s.serverAddress.isBlank() || s.obfuscationKey.isBlank()) {
+            viewModelScope.launch { _messages.emit("Заполните сервер и ключ в Settings") }
+            return
+        }
 
-    fun connect() {
-        val state = _uiState.value
-        if (state.serverAddress.isBlank() || state.obfuscationKey.isBlank()) return
+        _uiState.value = s.copy(phase = ConnectPhase.Starting, state = "Connecting...")
 
-        // Save settings before connecting.
+        val intent: Intent? = try {
+            VpnService.prepare(getApplication())
+        } catch (_: Exception) {
+            null
+        }
+        if (intent == null) {
+            actuallyStart()
+        } else {
+            _uiState.value = _uiState.value.copy(phase = ConnectPhase.NeedsPermission)
+            viewModelScope.launch { _permissionRequest.emit(intent) }
+        }
+    }
+
+    /** Called from Activity launcher callback, regardless of result code. */
+    fun onPermissionResult(granted: Boolean) {
+        if (granted) {
+            actuallyStart()
+        } else {
+            _uiState.value = _uiState.value.copy(
+                phase = ConnectPhase.Idle,
+                state = "Disconnected",
+            )
+            viewModelScope.launch { _messages.emit("VPN-разрешение не получено") }
+        }
+    }
+
+    private fun actuallyStart() {
         saveSettings()
-
-        _uiState.value = state.copy(connecting = true, state = "Connecting...")
-
         val configJson = buildConfigJson(_uiState.value)
         val intent = Intent(getApplication(), XrVpnService::class.java).apply {
             action = XrVpnService.ACTION_START
             putExtra(XrVpnService.EXTRA_CONFIG_JSON, configJson)
         }
         getApplication<Application>().startForegroundService(intent)
-        startStatsPolling()
+        // After startForegroundService the service is created; bind with
+        // BIND_AUTO_CREATE to ride out the race where the service isn't
+        // yet fully up when we call bindService.
+        tryBind(autoCreate = true)
+        _uiState.value = _uiState.value.copy(phase = ConnectPhase.Starting, state = "Connecting...")
     }
 
     fun disconnect() {
+        val svc = boundService
+        if (svc != null) {
+            // stopFromUi запускает корутину в сервисе, которая дойдёт до
+            // publish(Phase.Idle). applyServiceState увидит Idle и вызовет
+            // unbindAndClear — сервис тогда реально умрёт, и следующий
+            // Connect получит свежий instance. UI обновится через stateFlow.
+            svc.stopFromUi()
+            return
+        }
+        // Binder'а нет (init-bind не нашёл живого сервиса, actuallyStart
+        // ещё не успел привязаться). Fallback через intent ACTION_STOP
+        // + локально выставить Idle, потому что stateFlow нам ничего
+        // не пришлёт.
         val intent = Intent(getApplication(), XrVpnService::class.java).apply {
             action = XrVpnService.ACTION_STOP
         }
-        getApplication<Application>().startService(intent)
-
-        statsPolling = false
+        try {
+            getApplication<Application>().startService(intent)
+        } catch (_: Exception) {
+            // Ignore — nothing to stop.
+        }
         _uiState.value = _uiState.value.copy(
-            connected = false, connecting = false, state = "Disconnected",
+            phase = ConnectPhase.Idle,
+            state = "Disconnected",
             bytesUp = 0, bytesDown = 0, activeConnections = 0, uptime = 0,
+            recentErrors = emptyList(),
         )
     }
 
-    private fun startStatsPolling() {
-        if (statsPolling) return
-        statsPolling = true
-
-        viewModelScope.launch {
-            while (statsPolling) {
-                val stateStr = NativeBridge.nativeGetState()
-                val connected = stateStr == "Connected"
-                val connecting = stateStr == "Connecting"
-
-                val statsJson = NativeBridge.nativeGetStats()
-                val bytesUp = extractLong(statsJson, "bytes_up")
-                val bytesDown = extractLong(statsJson, "bytes_down")
-                val active = extractLong(statsJson, "active").toInt()
-                val uptime = extractLong(statsJson, "uptime")
-                val dns = extractLong(statsJson, "dns")
-                val syns = extractLong(statsJson, "syns")
-                val smolRecv = extractLong(statsJson, "smol_recv")
-                val smolSend = extractLong(statsJson, "smol_send")
-                val relayErr = extractLong(statsJson, "relay_err")
-                val debug = extractString(statsJson, "debug")
-                val errors = extractStringArray(statsJson, "errors")
-
-                _uiState.value = _uiState.value.copy(
-                    connected = connected, connecting = connecting, state = stateStr,
-                    bytesUp = bytesUp, bytesDown = bytesDown,
-                    activeConnections = active, uptime = uptime,
-                    dnsQueries = dns, tcpSyns = syns,
-                    smolRecv = smolRecv, smolSend = smolSend,
-                    relayErrors = relayErr, debugMsg = debug,
-                    recentErrors = errors,
-                )
-
-                if (!connected && !connecting) { statsPolling = false; break }
-                delay(1000)
-            }
+    private fun applyServiceState(svcState: XrVpnService.ServiceState) {
+        val phase = when (svcState.phase) {
+            XrVpnService.Phase.Idle -> ConnectPhase.Idle
+            XrVpnService.Phase.Preparing -> ConnectPhase.Starting
+            XrVpnService.Phase.Connecting -> ConnectPhase.Connecting
+            XrVpnService.Phase.Connected -> ConnectPhase.Connected
+            XrVpnService.Phase.Stopping -> ConnectPhase.Stopping
+            XrVpnService.Phase.Error -> ConnectPhase.Idle
+        }
+        val stateStr = when (svcState.phase) {
+            XrVpnService.Phase.Idle -> "Disconnected"
+            XrVpnService.Phase.Preparing -> "Preparing..."
+            XrVpnService.Phase.Connecting -> "Connecting..."
+            XrVpnService.Phase.Connected -> "Connected"
+            XrVpnService.Phase.Stopping -> "Disconnecting..."
+            XrVpnService.Phase.Error -> "Error"
+        }
+        val snap = svcState.snapshot
+        _uiState.value = _uiState.value.copy(
+            phase = phase,
+            state = stateStr,
+            bytesUp = snap?.bytesUp ?: 0,
+            bytesDown = snap?.bytesDown ?: 0,
+            activeConnections = snap?.activeConnections ?: 0,
+            uptime = snap?.uptime ?: 0,
+            dnsQueries = snap?.dnsQueries ?: 0,
+            tcpSyns = snap?.tcpSyns ?: 0,
+            smolRecv = snap?.smolRecv ?: 0,
+            smolSend = snap?.smolSend ?: 0,
+            relayWarnings = snap?.relayWarnings ?: 0,
+            relayErrors = snap?.relayErrors ?: 0,
+            debugMsg = snap?.debugMsg ?: "",
+            recentErrors = snap?.recentErrors ?: emptyList(),
+        )
+        if (svcState.phase == XrVpnService.Phase.Error && svcState.errorMessage != null) {
+            viewModelScope.launch { _messages.emit(svcState.errorMessage) }
+        }
+        if ((svcState.phase == XrVpnService.Phase.Idle ||
+             svcState.phase == XrVpnService.Phase.Error) && isBound) {
+            // Сервис завершил свою работу (нормально или по ошибке) и ждёт
+            // unbind, чтобы реально умереть. Отпускаем binding — `onDestroy`
+            // сервиса вычистит `NativeBridge.current` и `scope`, следующий
+            // Connect получит свежий instance через `startForegroundService`.
+            viewModelScope.launch { unbindAndClear() }
         }
     }
 
@@ -285,35 +433,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         return sb.toString()
-    }
-
-    private fun extractStringArray(json: String, key: String): List<String> {
-        val pattern = "\"$key\":["
-        val idx = json.indexOf(pattern)
-        if (idx < 0) return emptyList()
-        val rest = json.substring(idx + pattern.length)
-        val end = rest.indexOf(']')
-        if (end < 0) return emptyList()
-        val inner = rest.substring(0, end)
-        if (inner.isBlank()) return emptyList()
-        return Regex("\"([^\"]+)\"").findAll(inner).map { it.groupValues[1] }.toList()
-    }
-
-    private fun extractString(json: String, key: String): String {
-        val pattern = "\"$key\":\""
-        val idx = json.indexOf(pattern)
-        if (idx < 0) return ""
-        val rest = json.substring(idx + pattern.length)
-        val end = rest.indexOf('"')
-        return if (end >= 0) rest.substring(0, end) else ""
-    }
-
-    private fun extractLong(json: String, key: String): Long {
-        val pattern = "\"$key\":"
-        val idx = json.indexOf(pattern)
-        if (idx < 0) return 0
-        val rest = json.substring(idx + pattern.length).trimStart()
-        return rest.takeWhile { it.isDigit() }.toLongOrNull() ?: 0
     }
 
     companion object {

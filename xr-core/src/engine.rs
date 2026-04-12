@@ -117,6 +117,33 @@ impl VpnEngine {
 
         tokio::spawn(async move {
             stats.mark_started();
+
+            // Health check: establish the mux connection (TCP + MuxInit
+            // handshake) before reporting Connected. This verifies end-to-end
+            // protocol reachability AND pre-warms the pool — the first relay
+            // stream will open instantly without a separate TCP connect.
+            let mut health_shutdown = shutdown_rx.clone();
+            let health_result = tokio::select! {
+                r = ctx.mux_pool.warmup() => Some(r),
+                _ = health_shutdown.changed() => None,
+            };
+            match health_result {
+                None => {
+                    // Shutdown requested during health check.
+                    state.set(VpnState::Disconnected);
+                    return;
+                }
+                Some(Err(e)) => {
+                    let msg = format!("Сервер недоступен: {}", e);
+                    stats.add_error(&msg);
+                    state.set(VpnState::Error(msg));
+                    return;
+                }
+                Some(Ok(())) => {
+                    // Mux connection established — server is reachable.
+                }
+            }
+
             state.set(VpnState::Connected);
             if let Err(e) = run_event_loop(queue, ctx, fake_dns, shutdown_rx).await {
                 state.set(VpnState::Error(e.to_string()));
@@ -300,7 +327,9 @@ async fn run_event_loop(
                 let real_dst = session.real_dst;
                 let cached_domain = session.domain.clone();
                 let key_clone = *key;
-                let domain_tag = cached_domain.as_deref().unwrap_or("NO_DOMAIN").to_string();
+                // "ip-only" = сессия без восстановленного домена (IP-литерал или
+                // просроченный fake DNS-кэш). "NO_DOMAIN" было слишком техническим.
+                let domain_tag = cached_domain.as_deref().unwrap_or("ip-only").to_string();
                 let relay_waker = waker.clone();
                 tokio::spawn(async move {
                     let relay_key = TcpSessionKey {
@@ -310,9 +339,32 @@ async fn run_event_loop(
                     match relay_session_with_domain(ctx_clone.clone(), relay_key, cached_domain, to_relay_rx, from_relay_tx, relay_waker).await {
                         Ok(()) => {}
                         Err(e) => {
-                            ctx_clone.stats.add_relay_error(
-                                &format!("[{}] {}: {}", domain_tag, real_dst, e)
-                            );
+                            let msg = format!("[{}] {}: {}", domain_tag, real_dst, e);
+                            let err_text = e.to_string();
+
+                            // Специальный случай: DoT-блок. Он работает по контракту
+                            // Android (kind=ConnectionRefused заставляет Private DNS
+                            // упасть в UDP fallback), случается на КАЖДОМ DNS-запросе
+                            // и не является ни warning'ом, ни error'ом. Пишем только
+                            // в tracing для отладки; в recent_errors не пускаем.
+                            if err_text.contains("DoT blocked") {
+                                tracing::debug!("{}", msg);
+                                return;
+                            }
+
+                            // Классификация по io::ErrorKind:
+                            //   InvalidInput → policy drop (fake IP, private IP) →
+                            //     WARN. Это ожидаемая защитная реакция.
+                            //   Всё остальное (ConnectionRefused, TimedOut, ...) →
+                            //     реальный отказ → ERROR.
+                            match e.kind() {
+                                std::io::ErrorKind::InvalidInput => {
+                                    ctx_clone.stats.add_warn(&msg);
+                                }
+                                _ => {
+                                    ctx_clone.stats.add_error(&msg);
+                                }
+                            }
                         }
                     }
                 });

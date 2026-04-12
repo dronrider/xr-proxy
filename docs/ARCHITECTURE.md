@@ -123,8 +123,14 @@ Cargo-workspace + Android-модуль:
   + `recent_errors` (Mutex<Vec>). `snapshot()` → `StatsSnapshot`.
 
 **Важно:** `relay_errors` (счётчик) и `recent_errors` (журнал строк) — два
-независимых источника. Это причина расхождения бадж/список в Android-логах
-(разбирается в LLD-02).
+независимых источника. В Android UI бадж и заголовок вкладки Log считают
+WARN-строки прямо из `recent_errors` (см. §4.6), так что срез `entries.drain`
+в Rust автоматически уменьшает и бадж; `relay_errors` остался только как
+debug-метрика. Чтобы инвариант «бадж = число WARN в журнале» выполнялся,
+в `session.rs` строго разделены уровни: отказы mux-стрима идут через
+`add_relay_error` (WARN + счётчик), а шумный `mux relay for` — только через
+`tracing::debug!`, не засоряя `recent_errors` и не вытесняя WARN'ы через
+`drain(0..50)`.
 
 ### 4.3 xr-client — OpenWRT-клиент
 
@@ -183,18 +189,52 @@ Kotlin + Jetpack Compose, Material3, MVVM без DI-фреймворка.
 Ключевые файлы:
 
 - [MainActivity.kt](../xr-android/app/src/main/java/com/xrproxy/app/ui/MainActivity.kt) —
-  единственная Activity. Две вкладки: Connection и Logs. Использует
-  `rememberLauncherForActivityResult` для запроса разрешения VPN.
+  единственная Activity. Три вкладки: VPN / Log / Settings. Держит два
+  `ActivityResultLauncher`: для системного диалога `VpnService.prepare()` и для
+  runtime-запроса `POST_NOTIFICATIONS` (обязателен на API 33+ — иначе
+  foreground-уведомление молча не показывается). Подписывается на
+  `VpnViewModel.permissionRequest` и `VpnViewModel.messages` через
+  `LaunchedEffect`, сообщения уходят в `SnackbarHost`.
 - [VpnViewModel.kt](../xr-android/app/src/main/java/com/xrproxy/app/ui/VpnViewModel.kt) —
-  весь state. `StateFlow<VpnUiState>`, polling `nativeGetState()` +
-  `nativeGetStats()` раз в секунду во время активного соединения.
-  Хранит пресеты в виде захардкоженного companion object (`PRESET_RUSSIA`), три
-  FilterChip'а: `russia / proxy_all / custom`.
+  настройки и фасад над сервисом. В `init` делает `bindService` к
+  `XrVpnService` с экшеном `ACTION_BIND_INTERNAL` (без `BIND_AUTO_CREATE`) и
+  подписывается на `service.stateFlow`. Входная точка Connect — `onConnectClicked()`,
+  которая мгновенно переводит UI в `ConnectPhase.Starting`, затем либо вызывает
+  `VpnService.prepare` и эмитит intent в `_permissionRequest`, либо стартует
+  туннель через `actuallyStart()` + второй `tryBind(autoCreate=true)`, чтобы
+  подхватить binder после `startForegroundService`. Результат диалога разрешения
+  возвращается в `onPermissionResult(granted)`. Никакого native polling'а в VM
+  больше нет — статистика приходит через `applyServiceState`.
 - [XrVpnService.kt](../xr-android/app/src/main/java/com/xrproxy/app/service/XrVpnService.kt) —
-  `android.net.VpnService`. Создаёт TUN (IP 10.0.0.2, route 0.0.0.0/0, MTU 1500),
-  поднимает два потока (TUN↔native), держит foreground notification.
+  `android.net.VpnService` + единственный источник правды. Держит
+  `LocalBinder`, `StateFlow<ServiceState>` (`Phase` + `StatsSnapshot?`),
+  `CoroutineScope` с `SupervisorJob`. `startVpn` живёт в `scope` как suspend,
+  после успешного `nativeStart` запускает `pollLoop()` (раз в секунду читает
+  `nativeGetStats`, публикует snapshot, обновляет notification). `stopFromUi()`
+  — единая команда стопа для VM через binder; `clearLog()` — тоже. `onBind`
+  разветвляет: `ACTION_BIND_INTERNAL` → `LocalBinder`, иначе `super.onBind()`
+  (штатный `BIND_VPN_SERVICE`). `onStartCommand(intent = null, ...)` делает
+  `stopSelf()` → `START_NOT_STICKY`, чтобы не воскрешать зомби-сервис после
+  process death. Foreground-уведомление: канал `IMPORTANCE_DEFAULT`,
+  `CATEGORY_SERVICE`, `VISIBILITY_PUBLIC`, `setOnlyAlertOnce`, моно-иконка
+  `ic_notification`, action «Отключить» через `PendingIntent` на `ACTION_STOP`,
+  цвет из `R.color.brand_primary`. `foregroundServiceType="systemExempted"`.
 - [NativeBridge.kt](../xr-android/app/src/main/java/com/xrproxy/app/jni/NativeBridge.kt) —
-  объект-синглтон с `external fun` и колбэком `protectSocket`.
+  объект-синглтон с `external fun`. Ссылка `current: XrVpnService?`
+  обновляется в `XrVpnService.onCreate/onDestroy` (не из `startVpn`), что
+  гарантирует актуальность колбэка `protectSocket` при пересоздании сервиса.
+
+**Модель состояния на Android:**
+
+- `ConnectPhase { Idle, NeedsPermission, Starting, Connecting, Connected, Stopping }`
+  — единственный источник для рендера «Connect / Cancel / Disconnect» и
+  крутилки. Computed `connected`/`connecting` сохранены для совместимости
+  UI-кода, но внутри выводятся из `phase`.
+- `recentErrors: List<String>` — единственный источник журнала и бадджа Log.
+  Бадж/заголовок считают WARN-строки по критерию `" WARN "` (тот же, что
+  `colorizeLog`). `relayErrors: Long` осталась только как debug-метрика в
+  статистике, UI-бадж её не читает. Старое поле `errorLog: String` и метод
+  `refreshLog()` удалены.
 
 Хранилище настроек — SharedPreferences `xr_proxy`.
 
@@ -291,20 +331,40 @@ reference-файл и в Android как Kotlin-константа.
 
 ### 7.2 xr-android
 
-1. Пользователь нажимает **Connect**.
-2. `VpnService.prepare()` — если разрешения нет, открывается системный диалог.
-3. После получения разрешения: `startForegroundService(ACTION_START, configJson)`.
-4. `XrVpnService.establish()` создаёт TUN, открывает fd. Запускает два потока:
-   TUN→`nativePushPacket`, `nativePopPacket`→TUN.
-5. Вызывается `nativeStart(tunFd, configJson)` → `VpnEngine::start` → состояние
-   `Connecting → Connected`.
-6. `VpnViewModel` опрашивает `nativeGetState/Stats` раз в секунду, пока
-   connected/connecting.
-7. **Stop**: `ACTION_STOP` → `nativeStop()` → закрытие TUN → `stopForeground`.
-
-Известные проблемы этого цикла (Connect со второго раза, рассинхрон UI после
-возврата из Recent Apps, мигание foreground notification) разбираются в
-[lld/02-android-reliability.md](lld/02-android-reliability.md).
+1. `VpnViewModel.init` делает `bindService` к `XrVpnService` с
+   `ACTION_BIND_INTERNAL` (без `BIND_AUTO_CREATE`). Если сервис уже жив —
+   `onServiceConnected` сразу мапит `service.stateFlow` в `VpnUiState`, и UI
+   догоняет реальное состояние без действий пользователя. Если нет — VM
+   остаётся в `ConnectPhase.Idle`.
+2. Пользователь нажимает **Connect** → `onConnectClicked()`:
+   - Мгновенно `phase = Starting`, кнопка показывает крутилку.
+   - Если не заполнены `serverAddress`/`obfuscationKey` — Snackbar, возврат в
+     `Idle`.
+   - `VpnService.prepare(app)`: `null` → `actuallyStart()`; non-null → `phase =
+     NeedsPermission`, intent эмитится в `permissionRequest`, `MainActivity`
+     запускает системный диалог.
+3. `MainActivity` всегда прокидывает результат диалога в
+   `viewModel.onPermissionResult(granted)` — `RESULT_OK` → `actuallyStart()`,
+   иначе Snackbar «VPN-разрешение не получено» и возврат в `Idle`.
+4. `actuallyStart()` → `startForegroundService(ACTION_START, configJson)` +
+   повторный `tryBind(autoCreate = true)` для ride-out гонки между стартом
+   сервиса и подключением binder'а.
+5. `XrVpnService` в suspend-`startVpn`: `Phase.Preparing` →
+   `Builder().establish()` → `Phase.Connecting` → `NativeBridge.nativeStart(fd,
+   cfg)` → поднимает TUN read/write-потоки → `Phase.Connected`. Каждый переход
+   публикуется в `stateFlow`, и `updateNotification()` переотрисовывает
+   foreground-уведомление.
+6. `pollLoop()` внутри `scope` раз в секунду читает `nativeGetState()` +
+   `nativeGetStats()` → строит `StatsSnapshot` → публикует в `stateFlow`. VM
+   мирорит snapshot в `VpnUiState`. Это единственный источник статистики и
+   журнала `recentErrors` для UI.
+7. **Stop** (`viewModel.disconnect()` → `boundService.stopFromUi()` или
+   pending-intent action «Отключить» из уведомления → `ACTION_STOP` →
+   `stopFromUi()`): `Phase.Stopping` → `nativeStop()` → закрытие TUN →
+   `Phase.Idle` → `stopForeground(STOP_FOREGROUND_REMOVE)` → `stopSelf()`.
+8. `onStartCommand(intent = null)` после `START_STICKY`-рестарта делает
+   `stopSelf()` + `START_NOT_STICKY`: восстановление живого туннеля после
+   process death — вне скоупа, зато без зомби-сервиса в foreground.
 
 ## 8. Наблюдаемость
 
@@ -313,16 +373,20 @@ reference-файл и в Android как Kotlin-константа.
   connections, uptime, а также debug-метрики (DNS, SYNs, smol, relay_errors).
 - **Logs.** Два источника:
   - `recent_errors: Mutex<Vec<String>>` — последние ~200 записей, старые
-    обрезаются пачками по 50. Читаются `nativeGetErrorLog()`.
-  - `relay_errors: AtomicU64` — счётчик ошибок relay-задач. Используется как
-    бадж вкладки Logs.
+    обрезаются пачками по 50. Читаются через `StatsSnapshot` (поле `errors`
+    в JSON), т.е. теми же вызовами `nativeGetStats()`, что и метрики.
+    Android UI показывает журнал и бадж Log из этого списка.
+    `nativeGetErrorLog()` оставлен как JNI-экспорт для совместимости, но
+    актуальная Android-реализация его не использует.
+  - `relay_errors: AtomicU64` — счётчик ошибок relay-задач. На Android
+    остался только как debug-метрика в статистике; UI-бадж вкладки Log его
+    не читает.
 - **Серверные логи.** Нет централизованного сбора; пишется в stdout/stderr,
   procd/systemd забирает.
 - **Crash log на OpenWRT.** Watchdog сохраняет `/etc/xr-proxy/crash.log`
   (последние 50 КБ, включает dmesg OOM, фрагмент logread, свободную память).
 
-Цель ближайших доработок — привести журнал ошибок и бадж к единой модели,
-добавить поиск и поточное обновление (см. LLD-02, LLD-03).
+Поиск, auto-follow и скачивание журнала на Android — в LLD-03.
 
 ## 9. Запланированные доработки
 
@@ -335,7 +399,7 @@ reference-файл и в Android как Kotlin-константа.
 
 | Шаг | LLD | Область | Зависит от | Статус |
 |---|---|---|---|---|
-| 1 | [02-android-reliability.md](lld/02-android-reliability.md) | Connect / state hydration / бадж / foreground notification. Задаёт базу для всех остальных Android-LLD (binder, `ConnectPhase`, `recentErrors` как единый источник). | — | Draft |
+| 1 | [02-android-reliability.md](lld/02-android-reliability.md) | Connect / state hydration / бадж / foreground notification. Задаёт базу для всех остальных Android-LLD (binder, `ConnectPhase`, `recentErrors` как единый источник). | — | Implemented |
 | 2 | [01-control-plane.md](lld/01-control-plane.md) | `xr-hub`: пресеты, одноразовые инвайты, Admin SPA (Vue + PrimeVue), подпись ed25519, HTTPS через axum-server. Независим от Android, катается параллельно. | — | Draft |
 | 3 | [06-android-visual.md](lld/06-android-visual.md) | Иконка «щит со стрелой-молнией», тёмная палитра navy + cyan, анимация `ShieldArrowIcon` по фазам, перекомпоновка статистики с live-скоростью, Debug за аккордеоном. Параллелится с шагом 2. | Шаг 1 | Draft |
 | 4 | [04-onboarding-qr-uri.md](lld/04-onboarding-qr-uri.md) | Welcome-экран, Google Code Scanner, HTTPS deep link, экран подтверждения инвайта, TOFU public key. | Шаги 1-3 | Draft |

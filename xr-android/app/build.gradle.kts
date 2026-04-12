@@ -1,3 +1,6 @@
+import java.text.SimpleDateFormat
+import java.util.Date
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -13,9 +16,16 @@ android {
         minSdk = 29
         targetSdk = 34
         versionCode = 1
-        versionName = "0.1.0-" + providers.exec {
-            commandLine("git", "rev-parse", "--short", "HEAD")
+        // `git describe --always --dirty` даёт короткий хеш HEAD плюс "-dirty",
+        // если в рабочем дереве есть не-закоммиченные правки. buildStamp (HHmm)
+        // делает versionName уникальным между сборками одного и того же коммита
+        // — без этого при dirty-разработке экран "v0.1.0-<hash>-dirty" выглядит
+        // одинаково на каждом новом APK, и непонятно, какая сборка установлена.
+        val gitDescribe = providers.exec {
+            commandLine("git", "describe", "--always", "--dirty", "--abbrev=7")
         }.standardOutput.asText.get().trim()
+        val buildStamp = SimpleDateFormat("HHmm").format(Date())
+        versionName = "0.1.0-$gitDescribe-$buildStamp"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")

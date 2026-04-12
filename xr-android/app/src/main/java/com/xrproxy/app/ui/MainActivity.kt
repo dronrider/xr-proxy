@@ -1,10 +1,14 @@
 package com.xrproxy.app.ui
 
+import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.*
@@ -16,8 +20,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -29,23 +33,57 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
+/**
+ * Счётчики строк по уровням в `recent_errors`. Критерии совпадают с
+ * разметкой в `colorizeLog`, чтобы бадж и визуал журнала видели одно и то же.
+ * Формат сообщения из Rust: `"TS LVL msg"`, где LVL — INFO/WARN/ERROR,
+ * всегда обёрнут пробелами (ширина поля 5, выравнивание вправо).
+ */
+private val List<String>.errorCount: Int
+    get() = count { it.contains(" ERROR ") }
+
+private val List<String>.warnCount: Int
+    get() = count { it.contains(" WARN ") }
+
+private val List<String>.infoCount: Int
+    get() = size - errorCount - warnCount
+
 class MainActivity : ComponentActivity() {
     private val viewModel: VpnViewModel by viewModels()
 
-    private val vpnPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) viewModel.connect()
-    }
+    private lateinit var vpnPermissionLauncher: ActivityResultLauncher<Intent>
+    private lateinit var notificationPermissionLauncher: ActivityResultLauncher<String>
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        vpnPermissionLauncher = registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) { result ->
+            viewModel.onPermissionResult(result.resultCode == Activity.RESULT_OK)
+        }
+
+        notificationPermissionLauncher = registerForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { /* no-op — если отказано, туннель всё равно работает */ }
+
+        // Runtime POST_NOTIFICATIONS request on API 33+. Manifest permission
+        // alone is not enough — without the user tapping Allow on the system
+        // dialog, startForeground() silently shows nothing in the shade.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+                    PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+
         setContent {
             MaterialTheme {
-                MainScreen(viewModel = viewModel, onConnect = {
-                    val intent = viewModel.prepareVpn()
-                    if (intent != null) vpnPermissionLauncher.launch(intent) else viewModel.connect()
-                })
+                MainScreen(
+                    viewModel = viewModel,
+                    launchVpnPermission = { intent -> vpnPermissionLauncher.launch(intent) },
+                )
             }
         }
     }
@@ -53,11 +91,21 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MainScreen(viewModel: VpnViewModel, onConnect: () -> Unit) {
+fun MainScreen(viewModel: VpnViewModel, launchVpnPermission: (Intent) -> Unit) {
     val state by viewModel.uiState.collectAsState()
     var currentTab by remember { mutableIntStateOf(0) } // 0=VPN, 1=Log, 2=Settings
 
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    LaunchedEffect(Unit) {
+        viewModel.permissionRequest.collect { intent -> launchVpnPermission(intent) }
+    }
+    LaunchedEffect(Unit) {
+        viewModel.messages.collect { msg -> snackbarHostState.showSnackbar(msg) }
+    }
+
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
             NavigationBar {
                 NavigationBarItem(
@@ -68,11 +116,32 @@ fun MainScreen(viewModel: VpnViewModel, onConnect: () -> Unit) {
                 )
                 NavigationBarItem(
                     selected = currentTab == 1,
-                    onClick = { currentTab = 1; viewModel.refreshLog() },
+                    onClick = { currentTab = 1 },
                     icon = {
                         BadgedBox(badge = {
-                            if (state.relayErrors > 0) {
-                                Badge { Text("${state.relayErrors}") }
+                            val infos = state.recentErrors.infoCount
+                            val warns = state.recentErrors.warnCount
+                            val errs = state.recentErrors.errorCount
+                            if (infos + warns + errs > 0) {
+                                // Трёхцветный бадж: <info>/<warn>/<error>.
+                                // Цвета подобраны на нейтральном surface-фоне, чтобы
+                                // все три части читались контрастно.
+                                val infoColor = Color(0xFF4CAF50)    // green 500
+                                val warnColor = Color(0xFFFFA726)    // orange 400
+                                val errColor = MaterialTheme.colorScheme.error
+                                val label = buildAnnotatedString {
+                                    withStyle(SpanStyle(color = infoColor)) { append("$infos") }
+                                    append("/")
+                                    withStyle(SpanStyle(color = warnColor)) { append("$warns") }
+                                    append("/")
+                                    withStyle(SpanStyle(color = errColor)) { append("$errs") }
+                                }
+                                Badge(
+                                    containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                                    contentColor = MaterialTheme.colorScheme.onSurface,
+                                ) {
+                                    Text(label, fontSize = 10.sp)
+                                }
                             }
                         }) {
                             Icon(Icons.Default.List, null)
@@ -98,7 +167,11 @@ fun MainScreen(viewModel: VpnViewModel, onConnect: () -> Unit) {
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             when (currentTab) {
-                0 -> ConnectionSection(state, onConnect, viewModel::disconnect)
+                0 -> ConnectionSection(
+                    state = state,
+                    onConnect = { viewModel.onConnectClicked() },
+                    onDisconnect = viewModel::disconnect,
+                )
                 1 -> LogSection(state, viewModel)
                 2 -> SettingsSection(state, viewModel)
             }
@@ -186,7 +259,7 @@ fun ConnectionSection(state: VpnUiState, onConnect: () -> Unit, onDisconnect: ()
                 StatRow("DNS", "${state.dnsQueries}")
                 StatRow("SYNs", "${state.tcpSyns}")
                 StatRow("smol recv/send", "${formatBytes(state.smolRecv)} / ${formatBytes(state.smolSend)}")
-                StatRow("Relay errors", "${state.relayErrors}")
+                StatRow("Warnings / Errors", "${state.relayWarnings} / ${state.relayErrors}")
                 if (state.debugMsg.isNotBlank()) {
                     Spacer(Modifier.height(2.dp))
                     Text(state.debugMsg, style = MaterialTheme.typography.bodySmall, fontSize = 10.sp,
@@ -217,12 +290,22 @@ fun LogSection(state: VpnUiState, viewModel: VpnViewModel) {
     val clipboardManager = LocalClipboardManager.current
     val context = LocalContext.current
 
+    val logText = state.recentErrors.joinToString("\n")
+    val warns = state.recentErrors.warnCount
+    val errs = state.recentErrors.errorCount
+
     Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
         horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-        Text("Log (${state.relayErrors} errors)", style = MaterialTheme.typography.titleMedium)
+        val header = when {
+            errs > 0 && warns > 0 -> "Log ($errs errors, $warns warnings)"
+            errs > 0 -> "Log ($errs errors)"
+            warns > 0 -> "Log ($warns warnings)"
+            else -> "Log"
+        }
+        Text(header, style = MaterialTheme.typography.titleMedium)
         Row {
             IconButton(onClick = {
-                clipboardManager.setText(AnnotatedString(state.errorLog))
+                clipboardManager.setText(AnnotatedString(logText))
             }) {
                 Icon(Icons.Default.ContentCopy, "Copy")
             }
@@ -230,7 +313,7 @@ fun LogSection(state: VpnUiState, viewModel: VpnViewModel) {
                 // Save log to cache and share via Intent.
                 try {
                     val file = File(context.cacheDir, "xr-proxy.log")
-                    file.writeText(state.errorLog)
+                    file.writeText(logText)
                     val uri = androidx.core.content.FileProvider.getUriForFile(
                         context, "${context.packageName}.fileprovider", file
                     )
@@ -242,7 +325,7 @@ fun LogSection(state: VpnUiState, viewModel: VpnViewModel) {
                     context.startActivity(Intent.createChooser(intent, "Share log"))
                 } catch (_: Exception) {
                     // Fallback: copy to clipboard.
-                    clipboardManager.setText(AnnotatedString(state.errorLog))
+                    clipboardManager.setText(AnnotatedString(logText))
                 }
             }) {
                 Icon(Icons.Default.Share, "Share")
@@ -250,20 +333,17 @@ fun LogSection(state: VpnUiState, viewModel: VpnViewModel) {
             IconButton(onClick = { viewModel.clearLog() }) {
                 Icon(Icons.Default.Delete, "Clear")
             }
-            IconButton(onClick = { viewModel.refreshLog() }) {
-                Icon(Icons.Default.Refresh, "Refresh")
-            }
         }
     }
 
-    if (state.errorLog.isBlank()) {
+    if (state.recentErrors.isEmpty()) {
         Spacer(Modifier.height(32.dp))
         Text("No entries", style = MaterialTheme.typography.bodyLarge,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
     } else {
         Card(modifier = Modifier.fillMaxWidth()) {
             Text(
-                text = colorizeLog(state.errorLog),
+                text = colorizeLog(logText),
                 modifier = Modifier.padding(12.dp),
                 style = MaterialTheme.typography.bodySmall,
                 fontSize = 11.sp,
@@ -274,16 +354,17 @@ fun LogSection(state: VpnUiState, viewModel: VpnViewModel) {
     Spacer(Modifier.height(16.dp))
 }
 
-/** Highlight WARN lines in red. */
+/** Colour log lines by level: ERROR red, WARN orange, INFO default. */
 @Composable
 fun colorizeLog(log: String): AnnotatedString {
-    val warnColor = MaterialTheme.colorScheme.error
+    val errColor = MaterialTheme.colorScheme.error
+    val warnColor = Color(0xFFFFA726)
     return buildAnnotatedString {
         for (line in log.lines()) {
-            if (line.contains(" WARN ")) {
-                withStyle(SpanStyle(color = warnColor)) { append(line) }
-            } else {
-                append(line)
+            when {
+                line.contains(" ERROR ") -> withStyle(SpanStyle(color = errColor)) { append(line) }
+                line.contains(" WARN ") -> withStyle(SpanStyle(color = warnColor)) { append(line) }
+                else -> append(line)
             }
             append("\n")
         }
