@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { usePresetsStore } from '../stores/presets'
 import RulesEditor from '../components/RulesEditor.vue'
@@ -21,6 +21,11 @@ const updatedAt = ref('')
 const saving = ref(false)
 const error = ref('')
 
+// Visual editor vs raw TOML editor
+const mode = ref<'visual' | 'toml'>('visual')
+const rawToml = ref('')
+const tomlError = ref('')
+
 onMounted(async () => {
   if (!isNew.value && presetName.value) {
     try {
@@ -37,8 +42,36 @@ onMounted(async () => {
   }
 })
 
+// Sync: when switching to TOML mode, serialize current rules
+watch(mode, (newMode) => {
+  if (newMode === 'toml') {
+    rawToml.value = rulesToToml(defaultAction.value, rules.value)
+    tomlError.value = ''
+  } else {
+    // Switching back to visual — parse TOML into rules
+    const parsed = parseToml(rawToml.value)
+    if (parsed) {
+      defaultAction.value = parsed.default_action
+      rules.value = parsed.rules
+      tomlError.value = ''
+    }
+  }
+})
+
 async function save() {
   error.value = ''
+
+  // If in TOML mode, parse first
+  if (mode.value === 'toml') {
+    const parsed = parseToml(rawToml.value)
+    if (!parsed) {
+      error.value = tomlError.value || 'Failed to parse TOML'
+      return
+    }
+    defaultAction.value = parsed.default_action
+    rules.value = parsed.rules
+  }
+
   saving.value = true
   try {
     const config: RoutingConfig = {
@@ -64,22 +97,67 @@ async function save() {
   }
 }
 
-const tomlPreview = computed(() => {
-  let out = `[routing]\ndefault_action = "${defaultAction.value}"\n`
-  for (const rule of rules.value) {
+// ── TOML serializer ──
+
+function rulesToToml(defAction: string, rulesList: RoutingRule[]): string {
+  let out = `[routing]\ndefault_action = "${defAction}"\n`
+  for (const rule of rulesList) {
     out += `\n[[routing.rules]]\naction = "${rule.action}"\n`
     if (rule.domains.length) {
-      out += `domains = [\n${rule.domains.map((d) => `  "${d}"`).join(',\n')}\n]\n`
+      out += `domains = [\n${rule.domains.map((d) => `  "${d}",`).join('\n')}\n]\n`
     }
     if (rule.ip_ranges.length) {
-      out += `ip_ranges = [\n${rule.ip_ranges.map((r) => `  "${r}"`).join(',\n')}\n]\n`
+      out += `ip_ranges = [\n${rule.ip_ranges.map((r) => `  "${r}",`).join('\n')}\n]\n`
     }
     if (rule.geoip.length) {
       out += `geoip = [${rule.geoip.map((g) => `"${g}"`).join(', ')}]\n`
     }
   }
   return out
-})
+}
+
+// ── TOML parser (minimal, for routing config format) ──
+
+function parseToml(text: string): RoutingConfig | null {
+  try {
+    // Extract default_action
+    const daMatch = text.match(/default_action\s*=\s*"(\w+)"/)
+    const defAction = daMatch ? daMatch[1] : 'direct'
+
+    // Split by [[routing.rules]]
+    const blocks = text.split(/\[\[routing\.rules\]\]/).slice(1)
+    const parsed: RoutingRule[] = []
+
+    for (const block of blocks) {
+      const actionMatch = block.match(/action\s*=\s*"(\w+)"/)
+      const action = actionMatch ? actionMatch[1] : 'proxy'
+
+      const domains = parseTomlArray(block, 'domains')
+      const ip_ranges = parseTomlArray(block, 'ip_ranges')
+      const geoip = parseTomlArray(block, 'geoip')
+
+      parsed.push({ action, domains, ip_ranges, geoip })
+    }
+
+    tomlError.value = ''
+    return { default_action: defAction, rules: parsed }
+  } catch (e) {
+    tomlError.value = `Parse error: ${e}`
+    return null
+  }
+}
+
+function parseTomlArray(block: string, key: string): string[] {
+  const re = new RegExp(`${key}\\s*=\\s*\\[([^\\]]*?)\\]`, 's')
+  const m = block.match(re)
+  if (!m) return []
+  return m[1]
+    .split(/,|\n/)
+    .map((s) => s.replace(/#.*$/, '').trim().replace(/^["']|["']$/g, ''))
+    .filter(Boolean)
+}
+
+const tomlPreview = computed(() => rulesToToml(defaultAction.value, rules.value))
 </script>
 
 <template>
@@ -91,18 +169,30 @@ const tomlPreview = computed(() => {
 
     <p v-if="error" class="error">{{ error }}</p>
 
-    <div class="edit-layout">
+    <div class="field" v-if="isNew">
+      <label>Name (slug)</label>
+      <input v-model="name" placeholder="e.g. russia" pattern="[a-z0-9_-]+" />
+    </div>
+
+    <div class="field">
+      <label>Description</label>
+      <input v-model="description" placeholder="Optional description" />
+    </div>
+
+    <div class="mode-switcher">
+      <button
+        :class="{ active: mode === 'visual' }"
+        @click="mode = 'visual'"
+      >Visual Editor</button>
+      <button
+        :class="{ active: mode === 'toml' }"
+        @click="mode = 'toml'"
+      >TOML Editor</button>
+    </div>
+
+    <!-- Visual mode -->
+    <div v-if="mode === 'visual'" class="edit-layout">
       <div class="edit-form">
-        <div class="field" v-if="isNew">
-          <label>Name (slug)</label>
-          <input v-model="name" placeholder="e.g. russia" pattern="[a-z0-9_-]+" />
-        </div>
-
-        <div class="field">
-          <label>Description</label>
-          <input v-model="description" placeholder="Optional description" />
-        </div>
-
         <div class="field">
           <label>Default Action</label>
           <select v-model="defaultAction">
@@ -112,10 +202,6 @@ const tomlPreview = computed(() => {
         </div>
 
         <RulesEditor v-model="rules" />
-
-        <button class="btn-primary" @click="save" :disabled="saving">
-          {{ saving ? 'Saving...' : 'Save' }}
-        </button>
       </div>
 
       <div class="preview">
@@ -123,6 +209,24 @@ const tomlPreview = computed(() => {
         <pre>{{ tomlPreview }}</pre>
       </div>
     </div>
+
+    <!-- TOML mode -->
+    <div v-if="mode === 'toml'" class="toml-editor">
+      <p class="toml-hint">
+        Вставьте или отредактируйте правила в формате TOML.
+        Формат аналогичен <code>routing-russia.toml</code>.
+      </p>
+      <p v-if="tomlError" class="error">{{ tomlError }}</p>
+      <textarea
+        v-model="rawToml"
+        class="toml-textarea"
+        spellcheck="false"
+      ></textarea>
+    </div>
+
+    <button class="btn-primary" @click="save" :disabled="saving">
+      {{ saving ? 'Saving...' : 'Save' }}
+    </button>
   </div>
 </template>
 
@@ -142,6 +246,35 @@ const tomlPreview = computed(() => {
 .error {
   color: #d32f2f;
   margin-bottom: 1rem;
+}
+
+.mode-switcher {
+  display: flex;
+  gap: 0;
+  margin-bottom: 1.5rem;
+}
+
+.mode-switcher button {
+  padding: 0.5rem 1.5rem;
+  border: 1px solid #ccc;
+  background: #f5f5f5;
+  cursor: pointer;
+  font-size: 0.875rem;
+}
+
+.mode-switcher button:first-child {
+  border-radius: 4px 0 0 4px;
+}
+
+.mode-switcher button:last-child {
+  border-radius: 0 4px 4px 0;
+  border-left: none;
+}
+
+.mode-switcher button.active {
+  background: #1a1a2e;
+  color: #fff;
+  border-color: #1a1a2e;
 }
 
 .edit-layout {
@@ -205,5 +338,35 @@ const tomlPreview = computed(() => {
   font-size: 0.8rem;
   white-space: pre-wrap;
   overflow-x: auto;
+}
+
+.toml-editor {
+  margin-bottom: 1rem;
+}
+
+.toml-hint {
+  font-size: 0.85rem;
+  color: #666;
+  margin-bottom: 0.75rem;
+}
+
+.toml-hint code {
+  background: #eee;
+  padding: 0.1rem 0.3rem;
+  border-radius: 3px;
+}
+
+.toml-textarea {
+  width: 100%;
+  min-height: 500px;
+  padding: 1rem;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #fafafa;
+  resize: vertical;
+  tab-size: 2;
 }
 </style>
