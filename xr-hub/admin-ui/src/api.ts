@@ -21,6 +21,13 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   })
 
   if (!resp.ok) {
+    if (resp.status === 401 && !path.includes('/auth/login')) {
+      // Session expired — clear and redirect to login.
+      localStorage.removeItem('xr-hub-token')
+      localStorage.removeItem('xr-hub-username')
+      window.location.href = '/login'
+      throw new Error('Session expired')
+    }
     const text = await resp.text()
     throw new Error(`${resp.status}: ${text}`)
   }

@@ -36,10 +36,33 @@ const router = createRouter({
   ],
 })
 
-router.beforeEach((to) => {
+// Track whether session has been validated this app lifecycle.
+let sessionChecked = false
+
+router.beforeEach(async (to) => {
   const auth = useAuthStore()
-  if (to.name !== 'Login' && !auth.token) {
+
+  if (to.name === 'Login') return
+
+  if (!auth.token) {
     return { name: 'Login' }
+  }
+
+  // On first navigation, verify the session is still valid on the server.
+  if (!sessionChecked) {
+    try {
+      const resp = await fetch('/api/v1/admin/invites', {
+        headers: { Authorization: `Bearer ${auth.token}` },
+      })
+      if (resp.status === 401) {
+        auth.logout()
+        return { name: 'Login' }
+      }
+      sessionChecked = true
+    } catch {
+      // Network error — let through, will fail on actual requests.
+      sessionChecked = true
+    }
   }
 })
 
