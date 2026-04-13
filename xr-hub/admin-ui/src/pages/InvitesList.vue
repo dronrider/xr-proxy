@@ -62,7 +62,7 @@ function formatDate(iso: string): string {
 
 function inviteUrl(invite: Invite): string {
   const base = invite.payload.hub_url || window.location.origin
-  return `${base}/api/v1/invite/${invite.token}`
+  return `${base}/api/v1/invite/${invite.token}/view`
 }
 
 async function showQr(invite: Invite) {

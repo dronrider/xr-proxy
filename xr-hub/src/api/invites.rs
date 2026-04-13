@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use axum::extract::{self, State};
 use axum::http::StatusCode;
+use axum::response::Html;
 use axum::Json;
 use base64::Engine;
 use serde::Deserialize;
@@ -40,6 +41,103 @@ pub async fn get_invite_info(
         status: status.into(),
         expires_at: invite.expires_at.clone(),
     }))
+}
+
+/// GET /invite/:token/view — HTML page with invite info and QR code.
+pub async fn view_invite(
+    State(state): State<Arc<AppState>>,
+    extract::Path(token): extract::Path<String>,
+) -> Result<Html<String>, (StatusCode, String)> {
+    let invites = state.invites.read().await;
+    let invite = invites
+        .get(&token)
+        .ok_or((StatusCode::NOT_FOUND, "invite not found".into()))?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let status = if invite.consumed_at.is_some() {
+        "consumed"
+    } else if invite.expires_at <= now {
+        "expired"
+    } else {
+        "active"
+    };
+
+    let preset = &invite.payload.preset;
+    let comment = &invite.comment;
+    let expires = &invite.expires_at;
+    let status_badge = match status {
+        "active" => r#"<span style="color:#2e7d32;font-weight:600">Active</span>"#,
+        "expired" => r#"<span style="color:#999">Expired</span>"#,
+        "consumed" => r#"<span style="color:#f57c00">Already used</span>"#,
+        _ => status,
+    };
+
+    // QR code via inline SVG from qrserver API (simple, no JS needed)
+    let qr_data = format!("/api/v1/invite/{}/claim", token);
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>xr-proxy Invite</title>
+<style>
+  body {{ font-family: -apple-system, system-ui, sans-serif; background: #f5f5f5; color: #333; display: flex; justify-content: center; padding: 2rem; }}
+  @media (prefers-color-scheme: dark) {{ body {{ background: #1a1a2e; color: #e0e0e0; }} .card {{ background: #16213e; }} }}
+  .card {{ background: #fff; border-radius: 12px; padding: 2rem; max-width: 400px; width: 100%; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center; }}
+  h1 {{ font-size: 1.5rem; margin-bottom: 0.5rem; }}
+  .meta {{ color: #888; font-size: 0.9rem; margin-bottom: 1rem; }}
+  .field {{ text-align: left; margin-bottom: 0.75rem; }}
+  .field-label {{ font-size: 0.75rem; color: #888; text-transform: uppercase; }}
+  .field-value {{ font-size: 1rem; }}
+  .qr {{ margin: 1.5rem 0; }}
+  .qr img {{ border-radius: 8px; }}
+  .btn {{ display: inline-block; padding: 0.75rem 2rem; background: #1a1a2e; color: #fff; border: none; border-radius: 6px; font-size: 1rem; text-decoration: none; cursor: pointer; }}
+  .btn:disabled, .btn.disabled {{ opacity: 0.4; pointer-events: none; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>xr-proxy Invite</h1>
+  <p class="meta">Scan this QR code in the xr-proxy app to connect</p>
+  <div class="field"><div class="field-label">Preset</div><div class="field-value">{preset}</div></div>
+  <div class="field"><div class="field-label">Status</div><div class="field-value">{status_badge}</div></div>
+  <div class="field"><div class="field-label">Expires</div><div class="field-value">{expires}</div></div>
+  {comment_html}
+  <div class="qr">
+    <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data={qr_data_encoded}" width="200" height="200" alt="QR Code">
+  </div>
+  {action_html}
+</div>
+</body>
+</html>"#,
+        preset = preset,
+        status_badge = status_badge,
+        expires = expires,
+        comment_html = if comment.is_empty() {
+            String::new()
+        } else {
+            format!(r#"<div class="field"><div class="field-label">Comment</div><div class="field-value">{comment}</div></div>"#)
+        },
+        qr_data_encoded = urlencoding(&qr_data),
+        action_html = if status == "active" {
+            format!(r#"<p class="meta">Use the xr-proxy app to scan and activate this invite.</p>"#)
+        } else {
+            format!(r#"<p class="meta">This invite is no longer available.</p>"#)
+        },
+    );
+
+    Ok(Html(html))
+}
+
+fn urlencoding(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' | '/' => c.to_string(),
+            _ => format!("%{:02X}", c as u8),
+        })
+        .collect()
 }
 
 /// POST /invite/:token/claim — return full payload and consume one-time invites.

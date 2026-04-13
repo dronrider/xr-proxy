@@ -35,6 +35,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/presets", get(presets::list_presets))
         .route("/presets/{name}", get(presets::get_preset))
         .route("/invite/{token}", get(invites::get_invite_info))
+        .route("/invite/{token}/view", get(invites::view_invite))
         .route("/invite/{token}/claim", post(invites::claim_invite))
         .route("/public-key", get(presets::get_public_key));
 
