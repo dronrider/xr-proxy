@@ -1,4 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="brand_primary">#FF4285F4</color>
+    <!-- XR Proxy brand palette (LLD-06 §3.1) -->
+    <color name="background">#FF0B1220</color>
+    <color name="surface">#FF121A2B</color>
+    <color name="surface_variant">#FF1B2540</color>
+    <color name="on_background">#FFE6EDF7</color>
+    <color name="on_surface_variant">#FF94A3B8</color>
+    <color name="primary">#FF22D3EE</color>
+    <color name="on_primary">#FF0B1220</color>
+    <color name="tertiary">#FF7C8BFF</color>
+    <color name="error">#FFF87171</color>
+    <color name="on_error">#FF0B1220</color>
+    <color name="outline">#FF334155</color>
+
+    <!-- Adaptive icon background gradient endpoints -->
+    <color name="gradient_top">#FF0F172A</color>
+    <color name="gradient_bottom">#FF0B1220</color>
+
+    <!-- Legacy alias for notification (backward compat) -->
+    <color name="brand_primary">#FF22D3EE</color>
 </resources>

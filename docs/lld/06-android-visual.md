@@ -1,6 +1,6 @@
 # LLD-06 — Android visual
 
-**Статус:** Draft
+**Статус:** Implemented
 **Область:** `xr-android` (UI, ресурсы, Compose)
 **Зависимости:** [LLD-02](02-android-reliability.md) — использует и расширяет `ConnectPhase`
 **Связанные документы:** [ARCHITECTURE.md §4.6](../ARCHITECTURE.md)

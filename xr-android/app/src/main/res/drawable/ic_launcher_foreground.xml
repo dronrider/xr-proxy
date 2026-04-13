@@ -1,21 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Shield + lightning app icon, non-adaptive fallback (LLD-06 §3.2) -->
+<!-- Shield pierced by lightning arrow (LLD-06 §3.2) -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- Dark background -->
-    <path
-        android:fillColor="#0D1B2A"
-        android:pathData="M0,0 L108,0 L108,108 L0,108 Z" />
-
-    <!-- Shield -->
+    <!-- Shield: heater-shield silhouette, primary cyan fill -->
     <path
         android:fillColor="#22D3EE"
         android:pathData="
             M54,21
+            Q54,21 54,21
             L77,21
             Q79.5,21 79.5,23
             Q82,35 82,45
@@ -27,9 +23,9 @@
             Q28.5,21 31,21
             Z" />
 
-    <!-- Lightning hole -->
+    <!-- Lightning bolt "hole" through shield — background color = cut-out effect -->
     <path
-        android:fillColor="#0D1B2A"
+        android:fillColor="#0B1220"
         android:pathData="
             M68,26
             L58,46
@@ -40,7 +36,7 @@
             L56,26
             Z" />
 
-    <!-- Lightning top extension -->
+    <!-- Lightning bolt extension above shield — visible primary -->
     <path
         android:fillColor="#22D3EE"
         android:pathData="
@@ -50,7 +46,7 @@
             L62,17
             Z" />
 
-    <!-- Lightning bottom extension -->
+    <!-- Lightning bolt extension below shield — visible primary -->
     <path
         android:fillColor="#22D3EE"
         android:pathData="

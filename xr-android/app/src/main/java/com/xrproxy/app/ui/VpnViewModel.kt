@@ -10,6 +10,7 @@ import android.net.VpnService
 import android.os.IBinder
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.xrproxy.app.model.HealthLevel
 import com.xrproxy.app.service.XrVpnService
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -19,15 +20,24 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
-/** High-level phase of the VPN session as seen by the UI. */
+/** High-level phase of the VPN session as seen by the UI (LLD-06 §3.6). */
 enum class ConnectPhase {
     Idle,
     NeedsPermission,
-    Starting,
+    Preparing,
     Connecting,
+    Finalizing,
     Connected,
     Stopping,
+    ;
+
+    val isTransitioning: Boolean
+        get() = this == Preparing || this == Connecting || this == Finalizing || this == Stopping
 }
+
+/** Snackbar message with severity for styled XrSnackbar (LLD-06 §3.9a). */
+enum class UiSeverity { Info, Warn, Error }
+data class UiMessage(val text: String, val severity: UiSeverity = UiSeverity.Info)
 
 data class VpnUiState(
     val phase: ConnectPhase = ConnectPhase.Idle,
@@ -36,6 +46,11 @@ data class VpnUiState(
     val bytesDown: Long = 0,
     val activeConnections: Int = 0,
     val uptime: Long = 0,
+    // Speed (bytes/sec)
+    val speedUp: Long = 0,
+    val speedDown: Long = 0,
+    // Health
+    val health: HealthLevel = HealthLevel.Healthy,
     // Debug
     val dnsQueries: Long = 0,
     val tcpSyns: Long = 0,
@@ -45,6 +60,7 @@ data class VpnUiState(
     val relayErrors: Long = 0,
     val debugMsg: String = "",
     val recentErrors: List<String> = emptyList(),
+    val debugExpanded: Boolean = false,
     // Settings
     val serverAddress: String = "",
     val serverPort: String = "8443",
@@ -61,9 +77,7 @@ data class VpnUiState(
     val connected: Boolean
         get() = phase == ConnectPhase.Connected
     val connecting: Boolean
-        get() = phase == ConnectPhase.Starting ||
-                phase == ConnectPhase.Connecting ||
-                phase == ConnectPhase.Stopping
+        get() = phase.isTransitioning
 }
 
 class VpnViewModel(application: Application) : AndroidViewModel(application) {
@@ -77,8 +91,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private val _permissionRequest = MutableSharedFlow<Intent>(extraBufferCapacity = 1)
     val permissionRequest: SharedFlow<Intent> = _permissionRequest
 
-    private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 4)
-    val messages: SharedFlow<String> = _messages
+    private val _messages = MutableSharedFlow<UiMessage>(extraBufferCapacity = 4)
+    val messages: SharedFlow<UiMessage> = _messages
 
     private var boundService: XrVpnService? = null
     private var isBound = false
@@ -211,6 +225,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         boundService?.clearLog()
     }
 
+    fun toggleDebug() {
+        _uiState.value = _uiState.value.copy(debugExpanded = !_uiState.value.debugExpanded)
+    }
+
     /// Import TOML config from clipboard text.
     fun importToml(toml: String) {
         // Parse domains and ip_ranges from TOML.
@@ -259,11 +277,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         val s = _uiState.value
         if (s.phase != ConnectPhase.Idle) return
         if (s.serverAddress.isBlank() || s.obfuscationKey.isBlank()) {
-            viewModelScope.launch { _messages.emit("Заполните сервер и ключ в Settings") }
+            viewModelScope.launch { _messages.emit(UiMessage("Заполните сервер и ключ в Settings", UiSeverity.Info)) }
             return
         }
 
-        _uiState.value = s.copy(phase = ConnectPhase.Starting, state = "Connecting...")
+        _uiState.value = s.copy(phase = ConnectPhase.Preparing, state = "Connecting...")
 
         val intent: Intent? = try {
             VpnService.prepare(getApplication())
@@ -287,7 +305,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 phase = ConnectPhase.Idle,
                 state = "Disconnected",
             )
-            viewModelScope.launch { _messages.emit("VPN-разрешение не получено") }
+            viewModelScope.launch { _messages.emit(UiMessage("VPN-разрешение не получено", UiSeverity.Info)) }
         }
     }
 
@@ -303,7 +321,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         // BIND_AUTO_CREATE to ride out the race where the service isn't
         // yet fully up when we call bindService.
         tryBind(autoCreate = true)
-        _uiState.value = _uiState.value.copy(phase = ConnectPhase.Starting, state = "Connecting...")
+        _uiState.value = _uiState.value.copy(phase = ConnectPhase.Preparing, state = "Connecting...")
     }
 
     fun disconnect() {
@@ -339,8 +357,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private fun applyServiceState(svcState: XrVpnService.ServiceState) {
         val phase = when (svcState.phase) {
             XrVpnService.Phase.Idle -> ConnectPhase.Idle
-            XrVpnService.Phase.Preparing -> ConnectPhase.Starting
+            XrVpnService.Phase.Preparing -> ConnectPhase.Preparing
             XrVpnService.Phase.Connecting -> ConnectPhase.Connecting
+            XrVpnService.Phase.Finalizing -> ConnectPhase.Finalizing
             XrVpnService.Phase.Connected -> ConnectPhase.Connected
             XrVpnService.Phase.Stopping -> ConnectPhase.Stopping
             XrVpnService.Phase.Error -> ConnectPhase.Idle
@@ -349,6 +368,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             XrVpnService.Phase.Idle -> "Disconnected"
             XrVpnService.Phase.Preparing -> "Preparing..."
             XrVpnService.Phase.Connecting -> "Connecting..."
+            XrVpnService.Phase.Finalizing -> "Finalizing..."
             XrVpnService.Phase.Connected -> "Connected"
             XrVpnService.Phase.Stopping -> "Disconnecting..."
             XrVpnService.Phase.Error -> "Error"
@@ -361,6 +381,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             bytesDown = snap?.bytesDown ?: 0,
             activeConnections = snap?.activeConnections ?: 0,
             uptime = snap?.uptime ?: 0,
+            speedUp = svcState.speedUp,
+            speedDown = svcState.speedDown,
+            health = svcState.health,
             dnsQueries = snap?.dnsQueries ?: 0,
             tcpSyns = snap?.tcpSyns ?: 0,
             smolRecv = snap?.smolRecv ?: 0,
@@ -371,7 +394,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             recentErrors = snap?.recentErrors ?: emptyList(),
         )
         if (svcState.phase == XrVpnService.Phase.Error && svcState.errorMessage != null) {
-            viewModelScope.launch { _messages.emit(svcState.errorMessage) }
+            viewModelScope.launch { _messages.emit(UiMessage(svcState.errorMessage, UiSeverity.Error)) }
         }
         if ((svcState.phase == XrVpnService.Phase.Idle ||
              svcState.phase == XrVpnService.Phase.Error) && isBound) {

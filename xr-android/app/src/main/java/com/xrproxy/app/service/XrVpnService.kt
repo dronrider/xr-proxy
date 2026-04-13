@@ -13,6 +13,8 @@ import android.os.ParcelFileDescriptor
 import androidx.core.content.ContextCompat
 import com.xrproxy.app.R
 import com.xrproxy.app.jni.NativeBridge
+import com.xrproxy.app.model.HealthLevel
+import com.xrproxy.app.model.HealthTracker
 import com.xrproxy.app.ui.MainActivity
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -45,7 +47,7 @@ class XrVpnService : VpnService() {
         private const val NOTIFICATION_ID = 1
     }
 
-    enum class Phase { Idle, Preparing, Connecting, Connected, Stopping, Error }
+    enum class Phase { Idle, Preparing, Connecting, Finalizing, Connected, Stopping, Error }
 
     data class StatsSnapshot(
         val bytesUp: Long,
@@ -68,6 +70,9 @@ class XrVpnService : VpnService() {
         val phase: Phase = Phase.Idle,
         val errorMessage: String? = null,
         val snapshot: StatsSnapshot? = null,
+        val speedUp: Long = 0,
+        val speedDown: Long = 0,
+        val health: HealthLevel = HealthLevel.Healthy,
     )
 
     inner class LocalBinder : Binder() {
@@ -85,6 +90,14 @@ class XrVpnService : VpnService() {
     private var tunReadThread: Thread? = null
     private var tunWriteThread: Thread? = null
     @Volatile private var running = false
+
+    // Speed tracking: previous snapshot for delta computation
+    private var prevBytesUp: Long = 0
+    private var prevBytesDown: Long = 0
+    private var prevTickMs: Long = 0
+
+    // Health tracking (LLD-06 §3.5a)
+    private val healthTracker = HealthTracker()
 
     // ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -167,6 +180,10 @@ class XrVpnService : VpnService() {
     // ── Connection flow ───────────────────────────────────────────────
 
     private suspend fun startVpn(configJson: String) {
+        // Reset speed and health tracking for new session
+        prevBytesUp = 0; prevBytesDown = 0; prevTickMs = 0
+        healthTracker.reset()
+
         publish(Phase.Preparing)
         startForeground(NOTIFICATION_ID, buildNotification(_stateFlow.value))
 
@@ -228,6 +245,10 @@ class XrVpnService : VpnService() {
             }
         }.apply { name = "tun-write"; isDaemon = true; start() }
 
+        // Transition through Finalizing before Connected (LLD-06 §3.6)
+        publish(Phase.Finalizing)
+        updateNotification()
+
         publish(Phase.Connected, snapshot = readSnapshot())
         updateNotification()
 
@@ -257,7 +278,32 @@ class XrVpnService : VpnService() {
                 "Disconnecting" -> Phase.Stopping
                 else -> _stateFlow.value.phase
             }
-            _stateFlow.value = _stateFlow.value.copy(phase = phase, snapshot = readSnapshot())
+
+            val snap = readSnapshot()
+
+            // Speed computation: bytes/sec delta since previous tick
+            val now = System.currentTimeMillis()
+            var speedUp = 0L
+            var speedDown = 0L
+            if (prevTickMs > 0) {
+                val dtSec = ((now - prevTickMs).coerceAtLeast(1)) / 1000.0
+                speedUp = ((snap.bytesUp - prevBytesUp) / dtSec).toLong().coerceAtLeast(0)
+                speedDown = ((snap.bytesDown - prevBytesDown) / dtSec).toLong().coerceAtLeast(0)
+            }
+            prevBytesUp = snap.bytesUp
+            prevBytesDown = snap.bytesDown
+            prevTickMs = now
+
+            // Health tracking
+            val health = healthTracker.update(snap.relayErrors, snap.relayWarnings)
+
+            _stateFlow.value = _stateFlow.value.copy(
+                phase = phase,
+                snapshot = snap,
+                speedUp = speedUp,
+                speedDown = speedDown,
+                health = health,
+            )
             updateNotification()
             delay(1000)
         }
@@ -359,6 +405,7 @@ class XrVpnService : VpnService() {
         val text = when (state.phase) {
             Phase.Idle, Phase.Preparing -> "Запуск…"
             Phase.Connecting -> "Подключение…"
+            Phase.Finalizing -> "Проверка маршрутов…"
             Phase.Connected -> state.snapshot?.let { s ->
                 "↑${formatBytes(s.bytesUp)} ↓${formatBytes(s.bytesDown)} • ${formatUptime(s.uptime)}"
             } ?: "Подключено"
@@ -367,7 +414,7 @@ class XrVpnService : VpnService() {
         }
 
         val stopAction = Notification.Action.Builder(
-            Icon.createWithResource(this, R.drawable.ic_stop),
+            Icon.createWithResource(this, R.drawable.ic_notification_stop),
             "Отключить",
             stopIntent,
         ).build()

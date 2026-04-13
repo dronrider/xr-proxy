@@ -13,6 +13,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -32,12 +33,19 @@ import java.io.File
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.view.WindowCompat
+import com.xrproxy.app.ui.components.DebugSection
+import com.xrproxy.app.ui.components.HealthFace
+import com.xrproxy.app.ui.components.ShieldArrowIcon
+import com.xrproxy.app.ui.components.StatsGrid
+import com.xrproxy.app.ui.components.XrSnackbarHost
+import com.xrproxy.app.ui.components.formatBytes
+import com.xrproxy.app.ui.components.formatUptime
+import com.xrproxy.app.ui.theme.XrTheme
 
 /**
  * Счётчики строк по уровням в `recent_errors`. Критерии совпадают с
  * разметкой в `colorizeLog`, чтобы бадж и визуал журнала видели одно и то же.
- * Формат сообщения из Rust: `"TS LVL msg"`, где LVL — INFO/WARN/ERROR,
- * всегда обёрнут пробелами (ширина поля 5, выравнивание вправо).
  */
 private val List<String>.errorCount: Int
     get() = count { it.contains(" ERROR ") }
@@ -57,6 +65,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Edge-to-edge (LLD-06 §3.1)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+
         vpnPermissionLauncher = registerForActivityResult(
             ActivityResultContracts.StartActivityForResult()
         ) { result ->
@@ -67,9 +78,6 @@ class MainActivity : ComponentActivity() {
             ActivityResultContracts.RequestPermission()
         ) { /* no-op — если отказано, туннель всё равно работает */ }
 
-        // Runtime POST_NOTIFICATIONS request on API 33+. Manifest permission
-        // alone is not enough — without the user tapping Allow on the system
-        // dialog, startForeground() silently shows nothing in the shade.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val granted = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
                     PackageManager.PERMISSION_GRANTED
@@ -79,7 +87,7 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            MaterialTheme {
+            XrTheme {
                 MainScreen(
                     viewModel = viewModel,
                     launchVpnPermission = { intent -> vpnPermissionLauncher.launch(intent) },
@@ -93,25 +101,32 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MainScreen(viewModel: VpnViewModel, launchVpnPermission: (Intent) -> Unit) {
     val state by viewModel.uiState.collectAsState()
-    var currentTab by remember { mutableIntStateOf(0) } // 0=VPN, 1=Log, 2=Settings
+    var currentTab by remember { mutableIntStateOf(0) }
 
     val snackbarHostState = remember { SnackbarHostState() }
+    var lastSeverity by remember { mutableStateOf(UiSeverity.Info) }
 
     LaunchedEffect(Unit) {
         viewModel.permissionRequest.collect { intent -> launchVpnPermission(intent) }
     }
     LaunchedEffect(Unit) {
-        viewModel.messages.collect { msg -> snackbarHostState.showSnackbar(msg) }
+        viewModel.messages.collect { msg ->
+            lastSeverity = msg.severity
+            snackbarHostState.showSnackbar(msg.text)
+        }
     }
 
     Scaffold(
-        snackbarHost = { SnackbarHost(snackbarHostState) },
+        snackbarHost = { XrSnackbarHost(snackbarHostState, lastSeverity) },
+        containerColor = MaterialTheme.colorScheme.background,
         bottomBar = {
-            NavigationBar {
+            NavigationBar(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant,
+            ) {
                 NavigationBarItem(
                     selected = currentTab == 0,
                     onClick = { currentTab = 0 },
-                    icon = { Icon(Icons.Default.Lock, null) },
+                    icon = { Icon(Icons.Default.Shield, null) },
                     label = { Text("VPN") },
                 )
                 NavigationBarItem(
@@ -123,11 +138,8 @@ fun MainScreen(viewModel: VpnViewModel, launchVpnPermission: (Intent) -> Unit) {
                             val warns = state.recentErrors.warnCount
                             val errs = state.recentErrors.errorCount
                             if (infos + warns + errs > 0) {
-                                // Трёхцветный бадж: <info>/<warn>/<error>.
-                                // Цвета подобраны на нейтральном surface-фоне, чтобы
-                                // все три части читались контрастно.
-                                val infoColor = Color(0xFF4CAF50)    // green 500
-                                val warnColor = Color(0xFFFFA726)    // orange 400
+                                val infoColor = Color(0xFF4CAF50)
+                                val warnColor = Color(0xFFFFA726)
                                 val errColor = MaterialTheme.colorScheme.error
                                 val label = buildAnnotatedString {
                                     withStyle(SpanStyle(color = infoColor)) { append("$infos") }
@@ -162,7 +174,7 @@ fun MainScreen(viewModel: VpnViewModel, launchVpnPermission: (Intent) -> Unit) {
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .padding(horizontal = 16.dp)
+                .padding(horizontal = 24.dp)
                 .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
@@ -171,6 +183,8 @@ fun MainScreen(viewModel: VpnViewModel, launchVpnPermission: (Intent) -> Unit) {
                     state = state,
                     onConnect = { viewModel.onConnectClicked() },
                     onDisconnect = viewModel::disconnect,
+                    onToggleDebug = viewModel::toggleDebug,
+                    snackbarHostState = snackbarHostState,
                 )
                 1 -> LogSection(state, viewModel)
                 2 -> SettingsSection(state, viewModel)
@@ -182,39 +196,78 @@ fun MainScreen(viewModel: VpnViewModel, launchVpnPermission: (Intent) -> Unit) {
 // ── VPN Connection tab ──────────────────────────────────────────────
 
 @Composable
-fun ConnectionSection(state: VpnUiState, onConnect: () -> Unit, onDisconnect: () -> Unit) {
-    Spacer(Modifier.height(24.dp))
+fun ConnectionSection(
+    state: VpnUiState,
+    onConnect: () -> Unit,
+    onDisconnect: () -> Unit,
+    onToggleDebug: () -> Unit,
+    snackbarHostState: SnackbarHostState,
+) {
+    Spacer(Modifier.height(32.dp))
 
-    val (statusColor, statusText) = when {
-        state.connected -> MaterialTheme.colorScheme.primary to "Connected"
-        state.connecting -> MaterialTheme.colorScheme.tertiary to "Connecting..."
-        else -> MaterialTheme.colorScheme.outline to "Disconnected"
+    // 1. Central shield icon (LLD-06 §3.5)
+    ShieldArrowIcon(
+        phase = state.phase,
+        modifier = Modifier.size(128.dp),
+    )
+
+    // 1a. Health HUD — only in Connected (LLD-06 §3.5a)
+    if (state.connected) {
+        Spacer(Modifier.height(8.dp))
+        HealthFace(level = state.health)
     }
 
-    Box(contentAlignment = Alignment.Center) {
-        if (state.connecting) {
-            CircularProgressIndicator(modifier = Modifier.size(80.dp), color = statusColor, strokeWidth = 3.dp)
-        }
-        Icon(
-            imageVector = if (state.connected) Icons.Default.Lock else Icons.Default.LockOpen,
-            contentDescription = null, tint = statusColor,
-            modifier = Modifier.size(if (state.connecting) 40.dp else 64.dp)
+    Spacer(Modifier.height(16.dp))
+
+    // 2. Status line (LLD-06 §3.4)
+    val statusText = when (state.phase) {
+        ConnectPhase.Idle, ConnectPhase.NeedsPermission -> "Disconnected"
+        ConnectPhase.Preparing -> "Подготовка…"
+        ConnectPhase.Connecting -> "Подключение…"
+        ConnectPhase.Finalizing -> "Проверка маршрутов…"
+        ConnectPhase.Connected -> "Подключено"
+        ConnectPhase.Stopping -> "Отключение…"
+    }
+    val statusColor = when (state.phase) {
+        ConnectPhase.Connected -> MaterialTheme.colorScheme.primary
+        ConnectPhase.Preparing, ConnectPhase.Connecting, ConnectPhase.Finalizing ->
+            MaterialTheme.colorScheme.tertiary
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Text(
+        statusText,
+        style = MaterialTheme.typography.headlineMedium,
+        color = statusColor,
+    )
+
+    // 3. Phase substep line (LLD-06 §3.4)
+    val substep = when (state.phase) {
+        ConnectPhase.Preparing -> "1/3 · Подготовка"
+        ConnectPhase.Connecting -> "2/3 · Установка туннеля"
+        ConnectPhase.Finalizing -> "3/3 · Проверка маршрутов"
+        else -> null
+    }
+    if (substep != null) {
+        Spacer(Modifier.height(4.dp))
+        Text(
+            substep,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 
-    Spacer(Modifier.height(4.dp))
-    Text(statusText, style = MaterialTheme.typography.headlineSmall, color = statusColor)
-
-    // Version.
-    val context = androidx.compose.ui.platform.LocalContext.current
+    // Version
+    val context = LocalContext.current
     val versionName = remember {
         try { context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "" }
         catch (_: Exception) { "" }
     }
-    if (versionName.isNotBlank()) {
+    if (versionName.isNotBlank() && !state.connected && !state.connecting) {
+        Spacer(Modifier.height(4.dp))
         Text("v$versionName", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
     }
 
+    // 5. Preset hint (LLD-06 §3.4)
     if (!state.connected && !state.connecting) {
         val presetLabel = when (state.routingPreset) {
             "russia" -> "Preset: Russia"
@@ -227,56 +280,60 @@ fun ConnectionSection(state: VpnUiState, onConnect: () -> Unit, onDisconnect: ()
 
     Spacer(Modifier.height(24.dp))
 
+    // 4. Connect / Disconnect / Cancel button — pill shape (LLD-06 §3.4)
+    val btnColor = when {
+        state.connected -> MaterialTheme.colorScheme.error
+        state.connecting -> MaterialTheme.colorScheme.tertiary
+        else -> MaterialTheme.colorScheme.primary
+    }
+    val btnTextColor = when {
+        state.connected -> MaterialTheme.colorScheme.onError
+        else -> MaterialTheme.colorScheme.onPrimary
+    }
+
     Button(
         onClick = { if (state.connected || state.connecting) onDisconnect() else onConnect() },
-        modifier = Modifier.fillMaxWidth(0.6f),
+        modifier = Modifier
+            .fillMaxWidth(0.7f)
+            .height(56.dp),
+        shape = RoundedCornerShape(28.dp),
         colors = ButtonDefaults.buttonColors(
-            containerColor = if (state.connected || state.connecting) MaterialTheme.colorScheme.error
-            else MaterialTheme.colorScheme.primary
+            containerColor = btnColor,
+            contentColor = btnTextColor,
         ),
     ) {
-        if (state.connecting) {
-            CircularProgressIndicator(modifier = Modifier.size(18.dp), color = MaterialTheme.colorScheme.onError, strokeWidth = 2.dp)
-            Spacer(Modifier.width(8.dp))
-            Text("Cancel")
-        } else {
-            Text(if (state.connected) "Disconnect" else "Connect", style = MaterialTheme.typography.titleMedium)
+        val btnText = when {
+            state.connecting -> "Cancel"
+            state.connected -> "Disconnect"
+            else -> "Connect"
         }
+        Text(btnText, style = MaterialTheme.typography.titleMedium)
     }
 
+    // 6. Statistics cards — only in Connected (LLD-06 §3.7)
     if (state.connected) {
         Spacer(Modifier.height(24.dp))
-        Card(modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Text("Statistics", style = MaterialTheme.typography.titleSmall)
-                Spacer(Modifier.height(8.dp))
-                StatRow("Upload", formatBytes(state.bytesUp))
-                StatRow("Download", formatBytes(state.bytesDown))
-                StatRow("Connections", "${state.activeConnections}")
-                StatRow("Uptime", formatUptime(state.uptime))
-                Spacer(Modifier.height(8.dp))
-                Text("Debug", style = MaterialTheme.typography.labelSmall)
-                StatRow("DNS", "${state.dnsQueries}")
-                StatRow("SYNs", "${state.tcpSyns}")
-                StatRow("smol recv/send", "${formatBytes(state.smolRecv)} / ${formatBytes(state.smolSend)}")
-                StatRow("Warnings / Errors", "${state.relayWarnings} / ${state.relayErrors}")
-                if (state.debugMsg.isNotBlank()) {
-                    Spacer(Modifier.height(2.dp))
-                    Text(state.debugMsg, style = MaterialTheme.typography.bodySmall, fontSize = 10.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
-        }
+        StatsGrid(state = state)
+        Spacer(Modifier.height(8.dp))
+        DebugSection(
+            state = state,
+            expanded = state.debugExpanded,
+            onToggle = onToggleDebug,
+            snackbarHostState = snackbarHostState,
+        )
     }
 
+    // 7. Configure server banner (LLD-06 §3.4)
     if (!state.connected && !state.connecting && state.serverAddress.isBlank()) {
         Spacer(Modifier.height(24.dp))
-        Card(modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF2A1818)),
+        ) {
             Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Default.Warning, null, tint = MaterialTheme.colorScheme.error)
                 Spacer(Modifier.width(12.dp))
-                Text("Configure server in Settings tab", color = MaterialTheme.colorScheme.onErrorContainer)
+                Text("Configure server in Settings tab", color = MaterialTheme.colorScheme.error)
             }
         }
     }
@@ -310,7 +367,6 @@ fun LogSection(state: VpnUiState, viewModel: VpnViewModel) {
                 Icon(Icons.Default.ContentCopy, "Copy")
             }
             IconButton(onClick = {
-                // Save log to cache and share via Intent.
                 try {
                     val file = File(context.cacheDir, "xr-proxy.log")
                     file.writeText(logText)
@@ -324,7 +380,6 @@ fun LogSection(state: VpnUiState, viewModel: VpnViewModel) {
                     }
                     context.startActivity(Intent.createChooser(intent, "Share log"))
                 } catch (_: Exception) {
-                    // Fallback: copy to clipboard.
                     clipboardManager.setText(AnnotatedString(logText))
                 }
             }) {
@@ -341,7 +396,10 @@ fun LogSection(state: VpnUiState, viewModel: VpnViewModel) {
         Text("No entries", style = MaterialTheme.typography.bodyLarge,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
     } else {
-        Card(modifier = Modifier.fillMaxWidth()) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        ) {
             Text(
                 text = colorizeLog(logText),
                 modifier = Modifier.padding(12.dp),
@@ -460,26 +518,4 @@ fun SettingsSection(state: VpnUiState, viewModel: VpnViewModel) {
         Text("Settings saved", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
     }
     Spacer(Modifier.height(16.dp))
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────
-
-@Composable
-fun StatRow(label: String, value: String) {
-    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-        Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-        Text(value, style = MaterialTheme.typography.bodySmall)
-    }
-}
-
-fun formatBytes(bytes: Long): String = when {
-    bytes < 1024 -> "$bytes B"
-    bytes < 1024 * 1024 -> "${bytes / 1024} KB"
-    bytes < 1024L * 1024 * 1024 -> "${"%.1f".format(bytes / 1024.0 / 1024.0)} MB"
-    else -> "${"%.2f".format(bytes / 1024.0 / 1024.0 / 1024.0)} GB"
-}
-
-fun formatUptime(seconds: Long): String {
-    val h = seconds / 3600; val m = (seconds % 3600) / 60; val s = seconds % 60
-    return if (h > 0) "${h}h ${m}m" else "${m}m ${s}s"
 }
