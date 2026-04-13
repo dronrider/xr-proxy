@@ -152,9 +152,14 @@ fn parse_config(json: &str) -> Result<VpnConfig, String> {
         default_routing()
     };
 
+    let hub_url = get_str("hub_url").ok();
+    let hub_preset = get_str("hub_preset").ok();
+    let hub_cache_dir = get_str("hub_cache_dir").ok();
+
     Ok(VpnConfig {
         server_address, server_port, obfuscation_key, modifier, salt,
         padding_min, padding_max, routing, geoip_path: None, on_server_down,
+        hub_url, hub_preset, hub_cache_dir,
     })
 }
 

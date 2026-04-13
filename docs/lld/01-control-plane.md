@@ -1,6 +1,6 @@
 # LLD-01 — Control-plane сервис `xr-hub`
 
-**Статус:** Draft
+**Статус:** Implemented
 **Область:** новый крейт `xr-hub`, обновления клиентской конфигурации в `xr-client` / `xr-android`, расширения `xr-proto`
 **Связанные документы:** [ARCHITECTURE.md §2, §5.3, §6.2](../ARCHITECTURE.md), [LLD-04](04-onboarding-qr-uri.md), [LLD-05](05-android-rules-editor.md)
 

@@ -90,9 +90,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.obfuscation.padding_max,
     );
 
-    // Build router
+    // Build router, optionally merging with hub preset.
     let geoip_path = config.geoip.as_ref().map(|g| g.database.as_str());
-    let router = routing::Router::new(&config.routing, geoip_path);
+    let hub_config = config.hub.as_ref();
+    let router = if let Some(hub) = hub_config {
+        let cache_dir = std::path::Path::new("/var/lib/xr-proxy/presets");
+        let mut cache = xr_core::presets::PresetCache::new(cache_dir, &hub.url, &hub.preset);
+        cache.load_from_disk();
+        // Forced fetch at startup with short timeout.
+        let _ = cache.fetch_if_stale(std::time::Duration::from_secs(2)).await;
+        if let Some(preset_rules) = cache.routing_config() {
+            tracing::info!("preset '{}' loaded, merging with local overrides", hub.preset);
+            routing::Router::from_merged(&config.routing, preset_rules, geoip_path)
+        } else {
+            tracing::warn!(
+                "preset '{}' unavailable, running with local overrides only",
+                hub.preset
+            );
+            routing::Router::new(&config.routing, geoip_path)
+        }
+    } else {
+        routing::Router::new(&config.routing, geoip_path)
+    };
 
     // Resolve server address
     let server_addr: SocketAddr = format!("{}:{}", config.server.address, config.server.port)
@@ -150,6 +169,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run TCP proxy
     let proxy_handle = tokio::spawn(proxy::run_proxy(config.client.listen_port, state));
+
+    // Background preset refresh task (updates disk cache only, does not hot-swap router).
+    if let Some(hub) = config.hub.as_ref() {
+        let hub_url = hub.url.clone();
+        let preset_name = hub.preset.clone();
+        let interval_secs = hub.refresh_interval_secs;
+        tokio::spawn(async move {
+            let cache_dir = std::path::Path::new("/var/lib/xr-proxy/presets");
+            let mut cache = xr_core::presets::PresetCache::new(cache_dir, &hub_url, &preset_name);
+            cache.load_from_disk();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+                let _ = cache
+                    .fetch_if_stale(std::time::Duration::from_secs(5))
+                    .await;
+            }
+        });
+    }
 
     // Run UDP relay if configured
     let server_address = config.server.address.clone();

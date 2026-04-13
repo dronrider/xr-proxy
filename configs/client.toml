@@ -54,6 +54,16 @@ log_level = "info"                    # error, warn, info, debug
 # Useful for game consoles, smart TVs, etc. Use their static DHCP IP.
 # bypass_ips = ["192.168.1.50", "192.168.1.51"]
 
+# ─── Hub (centralized presets from xr-hub) ───────────────────────────
+# When configured, the client fetches routing presets from xr-hub on startup
+# and refreshes them periodically. Local [[routing.rules]] above become
+# overrides that take priority over the preset.
+# [hub]
+# url = "https://xr-hub.example.com"
+# preset = "russia"
+# # trusted_public_key = "<base64 ed25519 public key>"  # optional, for signature verification
+# # refresh_interval_secs = 300                          # background check interval (default 5 min)
+
 # ─── GeoIP (only with --features geoip build) ────────────────────────
 # [geoip]
 # database = "/etc/xr-proxy/GeoLite2-Country.mmdb"

@@ -52,6 +52,10 @@ pub struct VpnConfig {
     pub routing: RoutingConfig,
     pub geoip_path: Option<String>,
     pub on_server_down: String,
+    /// Hub configuration for centralized presets.
+    pub hub_url: Option<String>,
+    pub hub_preset: Option<String>,
+    pub hub_cache_dir: Option<String>,
 }
 
 pub struct VpnEngine {
@@ -80,7 +84,41 @@ impl VpnEngine {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "unknown modifier"))?;
         let obfuscator = Obfuscator::new(key, self.config.salt, strategy);
         let codec = Codec::new(obfuscator, self.config.padding_min, self.config.padding_max);
-        let router = Router::new(&self.config.routing, self.config.geoip_path.as_deref());
+
+        // Build router, optionally merging with hub preset.
+        let router = if let (Some(hub_url), Some(preset_name), Some(cache_dir)) = (
+            &self.config.hub_url,
+            &self.config.hub_preset,
+            &self.config.hub_cache_dir,
+        ) {
+            let mut cache = crate::presets::PresetCache::new(
+                std::path::Path::new(cache_dir),
+                hub_url,
+                preset_name,
+            );
+            cache.load_from_disk();
+            // Try short fetch (2s timeout) at startup.
+            let rt = tokio::runtime::Handle::try_current();
+            if let Ok(handle) = rt {
+                let _ = handle.block_on(cache.fetch_if_stale(Duration::from_secs(2)));
+            }
+            if let Some(preset_rules) = cache.routing_config() {
+                tracing::info!("merging preset '{}' with local overrides", preset_name);
+                Router::from_merged(
+                    &self.config.routing,
+                    preset_rules,
+                    self.config.geoip_path.as_deref(),
+                )
+            } else {
+                tracing::warn!(
+                    "preset '{}' unavailable, running with local overrides only",
+                    preset_name
+                );
+                Router::new(&self.config.routing, self.config.geoip_path.as_deref())
+            }
+        } else {
+            Router::new(&self.config.routing, self.config.geoip_path.as_deref())
+        };
         let server_addr: SocketAddr = format!("{}:{}", self.config.server_address, self.config.server_port)
             .parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{}", e)))?;
         let on_server_down = Action::from_str(&self.config.on_server_down);
