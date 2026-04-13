@@ -61,7 +61,33 @@ EOF
 
 ## 3. TLS-сертификат
 
-### Let's Encrypt (рекомендуется)
+### Cloudflare Origin Certificate (рекомендуется если домен на Cloudflare)
+
+Cloudflare терминирует публичный TLS. Между Cloudflare и VPS — Origin
+Certificate. Клиенты (браузер, xr-client, Android) видят валидный
+сертификат Cloudflare, а не origin cert.
+
+1. Cloudflare Dashboard → SSL/TLS → Origin Server → Create Certificate.
+2. Скопировать сертификат и ключ на VPS:
+
+```bash
+# Вставить содержимое из Cloudflare:
+nano /etc/xr-hub/tls/fullchain.pem   # Origin Certificate (PEM)
+nano /etc/xr-hub/tls/privkey.pem     # Private Key (PEM)
+chmod 600 /etc/xr-hub/tls/privkey.pem
+```
+
+3. В Cloudflare: SSL/TLS → Overview → режим **Full (strict)**.
+4. DNS-запись домена — Proxied (оранжевое облако).
+5. В `config.toml` порт `bind` может быть любым (например 8080) — Cloudflare
+   пойдёт на него через origin rules, либо можно повесить на 443 напрямую.
+
+> **Важно:** Origin Certificate подписан Cloudflare CA, который не в
+> публичных trust store'ах. Если клиент ходит мимо Cloudflare (например
+> по IP напрямую), reqwest отклонит сертификат. Это нормально — весь
+> трафик должен идти через Cloudflare.
+
+### Let's Encrypt
 
 ```bash
 apt install -y certbot
