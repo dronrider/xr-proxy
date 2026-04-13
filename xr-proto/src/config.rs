@@ -1,5 +1,5 @@
 /// Configuration parsing for client and server.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 // ── Client config ────────────────────────────────────────────────────
@@ -15,6 +15,8 @@ pub struct ClientConfig {
     pub geoip: Option<GeoIpConfig>,
     #[serde(default)]
     pub udp_relay: Option<UdpRelayClientConfig>,
+    #[serde(default)]
+    pub hub: Option<HubClientConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,7 +38,7 @@ pub struct ObfuscationConfig {
     pub padding_max: u8,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingConfig {
     #[serde(default = "default_action")]
     pub default_action: String,
@@ -44,7 +46,7 @@ pub struct RoutingConfig {
     pub rules: Vec<RoutingRule>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingRule {
     pub action: String,
     #[serde(default)]
@@ -81,6 +83,15 @@ impl Default for ClientSettings {
             bypass_ips: vec![],
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HubClientConfig {
+    pub url: String,
+    pub trusted_public_key: Option<String>,
+    pub preset: String,
+    #[serde(default = "default_refresh_interval")]
+    pub refresh_interval_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,6 +272,9 @@ fn default_incoming_port_min() -> u16 {
 }
 fn default_incoming_port_max() -> u16 {
     65535
+}
+fn default_refresh_interval() -> u64 {
+    300
 }
 
 // ── Loaders ──────────────────────────────────────────────────────────

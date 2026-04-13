@@ -120,6 +120,44 @@ impl Router {
         }
     }
 
+    /// Create a router by merging override rules (higher priority) with preset
+    /// rules (fallback). `default_action` is taken from `overrides`.
+    pub fn from_merged(
+        overrides: &RoutingConfig,
+        preset: &RoutingConfig,
+        #[allow(unused)] geoip_path: Option<&str>,
+    ) -> Self {
+        let rules: Vec<CompiledRule> = overrides
+            .rules
+            .iter()
+            .chain(preset.rules.iter())
+            .map(|r| compile_rule(r))
+            .collect();
+
+        let default_action = Action::from_str(&overrides.default_action);
+
+        #[cfg(feature = "geoip")]
+        let geoip_reader = geoip_path.and_then(|path| {
+            match maxminddb::Reader::open_readfile(path) {
+                Ok(reader) => {
+                    tracing::info!("GeoIP database loaded: {}", path);
+                    Some(reader)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load GeoIP database {}: {}", path, e);
+                    None
+                }
+            }
+        });
+
+        Self {
+            rules,
+            default_action,
+            #[cfg(feature = "geoip")]
+            geoip_reader,
+        }
+    }
+
     /// Decide routing for a connection.
     ///
     /// `sni` is extracted from TLS ClientHello (may be None for non-TLS).
@@ -362,5 +400,60 @@ mod tests {
         assert_eq!(router.resolve(None, "91.108.56.1".parse().unwrap()), Action::Proxy);
         // Neither
         assert_eq!(router.resolve(Some("example.com"), "8.8.8.8".parse().unwrap()), Action::Direct);
+    }
+
+    #[test]
+    fn test_from_merged_override_takes_priority() {
+        let overrides = RoutingConfig {
+            default_action: "direct".into(),
+            rules: vec![RoutingRule {
+                action: "direct".into(),
+                domains: vec!["github.corp.internal".into()],
+                ip_ranges: vec![],
+                geoip: vec![],
+            }],
+        };
+        let preset = RoutingConfig {
+            default_action: "proxy".into(), // ignored — overrides wins
+            rules: vec![RoutingRule {
+                action: "proxy".into(),
+                domains: vec!["*.github.com".into()],
+                ip_ranges: vec![],
+                geoip: vec![],
+            }],
+        };
+        let router = Router::from_merged(&overrides, &preset, None);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+
+        // Override rule matches first → direct
+        assert_eq!(router.resolve(Some("github.corp.internal"), ip), Action::Direct);
+        // Preset rule provides fallback → proxy
+        assert_eq!(router.resolve(Some("api.github.com"), ip), Action::Proxy);
+        // Neither → default_action from overrides (direct)
+        assert_eq!(router.resolve(Some("example.com"), ip), Action::Direct);
+    }
+
+    #[test]
+    fn test_from_merged_empty_override() {
+        let overrides = RoutingConfig {
+            default_action: "direct".into(),
+            rules: vec![],
+        };
+        let preset = RoutingConfig {
+            default_action: "proxy".into(),
+            rules: vec![RoutingRule {
+                action: "proxy".into(),
+                domains: vec!["youtube.com".into()],
+                ip_ranges: vec![],
+                geoip: vec![],
+            }],
+        };
+        let router = Router::from_merged(&overrides, &preset, None);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+
+        // Preset rule works
+        assert_eq!(router.resolve(Some("youtube.com"), ip), Action::Proxy);
+        // default_action from overrides
+        assert_eq!(router.resolve(Some("example.com"), ip), Action::Direct);
     }
 }

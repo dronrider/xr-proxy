@@ -1,0 +1,21 @@
+# xr-hub configuration example
+
+[server]
+bind = "0.0.0.0:8080"
+data_dir = "/var/lib/xr-hub"
+
+# [tls]
+# cert = "/etc/xr-hub/tls/fullchain.pem"
+# key  = "/etc/xr-hub/tls/privkey.pem"
+
+[admin]
+token = "CHANGE_ME_TO_A_LONG_RANDOM_STRING"
+# allowed_origins = ["https://xr-hub.example.com"]
+
+# [signing]
+# private_key = "/var/lib/xr-hub/signing_key"
+
+[invites]
+dev_mode = false
+default_ttl_seconds = 86400      # 24h
+max_ttl_seconds = 604800         # 7d

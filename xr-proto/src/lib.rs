@@ -2,6 +2,7 @@ pub mod config;
 pub mod mux;
 pub mod mux_pool;
 pub mod obfuscation;
+pub mod preset;
 pub mod protocol;
 pub mod routing;
 pub mod sni;
