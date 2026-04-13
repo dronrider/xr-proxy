@@ -1,4 +1,4 @@
-mod auth;
+pub mod auth;
 pub mod invites;
 pub mod presets;
 
@@ -34,10 +34,15 @@ pub fn router(state: Arc<AppState>) -> Router {
     let public = Router::new()
         .route("/presets", get(presets::list_presets))
         .route("/presets/{name}", get(presets::get_preset))
-        .route("/invite/{token}", get(invites::get_by_token))
+        .route("/invite/{token}", get(invites::get_invite_info))
+        .route("/invite/{token}/claim", post(invites::claim_invite))
         .route("/public-key", get(presets::get_public_key));
 
-    // Admin API routes (require Bearer token).
+    // Auth (no session required).
+    let auth_routes = Router::new()
+        .route("/auth/login", post(auth::login));
+
+    // Admin API routes (require session token).
     let admin = Router::new()
         .route("/presets", post(presets::create_preset))
         .route("/presets/{name}", put(presets::update_preset))
@@ -45,13 +50,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/invites", get(invites::list_invites))
         .route("/invites", post(invites::create_invite))
         .route("/invites/{token}", delete(invites::revoke_invite))
+        .route("/invite-defaults", get(invites::get_invite_defaults))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            auth::require_admin_token,
+            auth::require_admin,
         ));
 
     let api = Router::new()
         .nest("/api/v1", public)
+        .nest("/api/v1", auth_routes)
         .nest("/api/v1/admin", admin)
         .with_state(state)
         .layer(cors)

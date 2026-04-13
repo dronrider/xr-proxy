@@ -61,3 +61,13 @@ pub struct InvitePayload {
     pub preset: String,
     pub hub_url: String,
 }
+
+/// Public invite metadata (no secrets). Returned by GET /invite/:token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InviteInfo {
+    pub token: String,
+    pub preset: String,
+    pub comment: String,
+    pub status: String,
+    pub expires_at: String,
+}

@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -18,11 +18,31 @@ struct Cli {
     /// Path to config file.
     #[arg(long, short, default_value = "/etc/xr-hub/config.toml")]
     config: String,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Generate argon2 password hash for config file.
+    HashPassword {
+        /// Password to hash.
+        password: String,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Handle subcommands.
+    if let Some(Commands::HashPassword { password }) = &cli.command {
+        let hash = api::auth::hash_password(password)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        println!("{hash}");
+        return Ok(());
+    }
 
     // Load config.
     let config_path = Path::new(&cli.config);
@@ -35,8 +55,9 @@ async fn main() -> Result<()> {
         eprintln!("bind = \"0.0.0.0:8080\"");
         eprintln!("data_dir = \"/var/lib/xr-hub\"");
         eprintln!();
-        eprintln!("[admin]");
-        eprintln!("token = \"<your-secret-token>\"");
+        eprintln!("[[admin.users]]");
+        eprintln!("username = \"admin\"");
+        eprintln!("password_hash = \"<run: xr-hub hash-password YOUR_PASSWORD>\"");
         std::process::exit(2);
     }
 

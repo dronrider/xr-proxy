@@ -1,17 +1,24 @@
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { usePresetsStore } from '../stores/presets'
 
 const store = usePresetsStore()
 const router = useRouter()
+const toast = ref('')
 
 onMounted(() => store.fetchList())
 
 async function handleDelete(name: string) {
   if (confirm(`Delete preset "${name}"?`)) {
     await store.remove(name)
+    showToast('Preset deleted')
   }
+}
+
+function showToast(msg: string) {
+  toast.value = msg
+  setTimeout(() => (toast.value = ''), 3000)
 }
 
 function formatDate(iso: string): string {
@@ -26,7 +33,7 @@ function formatDate(iso: string): string {
       <button class="btn-primary" @click="router.push('/presets/new')">New Preset</button>
     </div>
 
-    <p v-if="store.loading">Loading...</p>
+    <p v-if="store.loading" class="muted">Loading...</p>
 
     <table v-else class="data-table">
       <thead>
@@ -52,10 +59,12 @@ function formatDate(iso: string): string {
           </td>
         </tr>
         <tr v-if="!store.summaries.length">
-          <td colspan="5" style="text-align: center; color: #999">No presets yet</td>
+          <td colspan="5" class="empty">No presets yet</td>
         </tr>
       </tbody>
     </table>
+
+    <div v-if="toast" class="toast">{{ toast }}</div>
   </div>
 </template>
 
@@ -67,6 +76,9 @@ function formatDate(iso: string): string {
   margin-bottom: 1.5rem;
 }
 
+.muted { color: var(--text-muted); }
+.empty { text-align: center; color: var(--text-muted); }
+
 .data-table {
   width: 100%;
   border-collapse: collapse;
@@ -76,20 +88,25 @@ function formatDate(iso: string): string {
 .data-table td {
   padding: 0.75rem 1rem;
   text-align: left;
-  border-bottom: 1px solid #eee;
+  border-bottom: 1px solid var(--border-light);
 }
 
 .data-table th {
   font-weight: 600;
-  color: #666;
+  color: var(--text-muted);
   font-size: 0.875rem;
   text-transform: uppercase;
 }
 
+.data-table a {
+  color: var(--text);
+  text-decoration: underline;
+}
+
 .btn-primary {
   padding: 0.5rem 1.5rem;
-  background: #1a1a2e;
-  color: #fff;
+  background: var(--btn-bg);
+  color: var(--btn-text);
   border: none;
   border-radius: 4px;
   cursor: pointer;
@@ -98,15 +115,16 @@ function formatDate(iso: string): string {
 .btn-sm {
   padding: 0.25rem 0.75rem;
   font-size: 0.875rem;
-  border: 1px solid #ccc;
-  background: #fff;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
   border-radius: 4px;
   cursor: pointer;
   margin-right: 0.5rem;
 }
 
 .btn-danger {
-  color: #d32f2f;
-  border-color: #d32f2f;
+  color: var(--danger);
+  border-color: var(--danger);
 }
 </style>

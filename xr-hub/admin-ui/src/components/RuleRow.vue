@@ -76,53 +76,11 @@ const geoipText = computed({
 </template>
 
 <style scoped>
-.row-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 0.75rem;
-}
-
-.row-header select {
-  padding: 0.25rem 0.5rem;
-  border: 1px solid #ccc;
-  border-radius: 4px;
-}
-
-.btn-remove {
-  padding: 0.25rem 0.5rem;
-  font-size: 0.8rem;
-  color: #d32f2f;
-  border: 1px solid #d32f2f;
-  background: transparent;
-  border-radius: 4px;
-  cursor: pointer;
-}
-
-.row-fields {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 0.75rem;
-}
-
-.field label {
-  display: block;
-  font-size: 0.75rem;
-  color: #666;
-  margin-bottom: 0.25rem;
-}
-
-.field textarea,
-.field input {
-  width: 100%;
-  padding: 0.5rem;
-  border: 1px solid #ccc;
-  border-radius: 4px;
-  font-family: monospace;
-  font-size: 0.8rem;
-}
-
-.field:last-child {
-  grid-column: 1 / -1;
-}
+.row-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; }
+.row-header select { padding: 0.25rem 0.5rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-input); color: var(--text); }
+.btn-remove { padding: 0.25rem 0.5rem; font-size: 0.8rem; color: var(--danger); border: 1px solid var(--danger); background: transparent; border-radius: 4px; cursor: pointer; }
+.row-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+.field label { display: block; font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0.25rem; }
+.field textarea, .field input { width: 100%; padding: 0.5rem; border: 1px solid var(--border); border-radius: 4px; font-family: monospace; font-size: 0.8rem; background: var(--bg-input); color: var(--text); }
+.field:last-child { grid-column: 1 / -1; }
 </style>

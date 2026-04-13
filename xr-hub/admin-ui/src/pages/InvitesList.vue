@@ -1,33 +1,45 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useInvitesStore } from '../stores/invites'
 import { usePresetsStore } from '../stores/presets'
-import type { CreateInviteRequest, Invite } from '../api'
+import { api } from '../api'
+import type { CreateInviteRequest, Invite, InviteDefaultsResponse } from '../api'
 import QRCode from 'qrcode'
 
 const invitesStore = useInvitesStore()
 const presetsStore = usePresetsStore()
 
 const showDialog = ref(false)
-const createdInvite = ref<Invite | null>(null)
+const toast = ref('')
+
+// QR modal
 const qrDataUrl = ref('')
+const qrLink = ref('')
+const showQrModal = ref(false)
+
+// Defaults from server config
+const defaults = ref<InviteDefaultsResponse | null>(null)
 
 // Form fields
-const serverAddress = ref('')
-const serverPort = ref(8443)
-const obfuscationKey = ref('')
-const modifier = ref('positional_xor_rotate')
-const salt = ref(0)
 const preset = ref('')
-const hubUrl = ref('')
 const ttlOption = ref('86400')
 const oneTime = ref(true)
 const comment = ref('')
 
-onMounted(() => {
+onMounted(async () => {
   invitesStore.fetchList()
   presetsStore.fetchList()
+  try {
+    defaults.value = await api.getInviteDefaults()
+  } catch {
+    // defaults not configured
+  }
 })
+
+function showToast(msg: string) {
+  toast.value = msg
+  setTimeout(() => (toast.value = ''), 3000)
+}
 
 function statusOf(invite: Invite): string {
   if (invite.consumed_at) return 'consumed'
@@ -48,11 +60,17 @@ function formatDate(iso: string): string {
   return new Date(iso).toLocaleString()
 }
 
-const inviteUrl = computed(() => {
-  if (!createdInvite.value) return ''
-  const base = hubUrl.value || window.location.origin
-  return `${base}/api/v1/invite/${createdInvite.value.token}`
-})
+function inviteUrl(invite: Invite): string {
+  const base = invite.payload.hub_url || window.location.origin
+  return `${base}/api/v1/invite/${invite.token}`
+}
+
+async function showQr(invite: Invite) {
+  const url = inviteUrl(invite)
+  qrLink.value = url
+  qrDataUrl.value = await QRCode.toDataURL(url, { width: 256 })
+  showQrModal.value = true
+}
 
 async function handleCreate() {
   const ttl = parseInt(ttlOption.value)
@@ -60,38 +78,26 @@ async function handleCreate() {
     ttl_seconds: ttl,
     one_time: oneTime.value,
     comment: comment.value,
-    payload: {
-      server_address: serverAddress.value,
-      server_port: serverPort.value,
-      obfuscation_key: obfuscationKey.value,
-      modifier: modifier.value,
-      salt: salt.value,
-      preset: preset.value,
-      hub_url: hubUrl.value || window.location.origin,
-    },
+    preset: preset.value,
   }
   const invite = await invitesStore.create(req)
-  createdInvite.value = invite
   showDialog.value = false
+  showToast('Invite created')
 
-  // Generate QR
-  const url = `${req.payload.hub_url}/api/v1/invite/${invite.token}`
-  qrDataUrl.value = await QRCode.toDataURL(url, { width: 256 })
+  // Show QR for newly created invite
+  await showQr(invite)
 }
 
 async function handleRevoke(token: string) {
   if (confirm('Revoke this invite?')) {
     await invitesStore.revoke(token)
+    showToast('Invite revoked')
   }
 }
 
-function copyLink() {
-  navigator.clipboard.writeText(inviteUrl.value)
-}
-
-function closeResult() {
-  createdInvite.value = null
-  qrDataUrl.value = ''
+function copyLink(invite: Invite) {
+  navigator.clipboard.writeText(inviteUrl(invite))
+  showToast('Link copied')
 }
 </script>
 
@@ -102,15 +108,16 @@ function closeResult() {
       <button class="btn-primary" @click="showDialog = true">New Invite</button>
     </div>
 
-    <!-- Created invite result -->
-    <div v-if="createdInvite" class="invite-result">
-      <h3>Invite Created</h3>
-      <div class="result-row">
-        <code>{{ inviteUrl }}</code>
-        <button class="btn-sm" @click="copyLink">Copy</button>
+    <!-- QR Modal -->
+    <div v-if="showQrModal" class="dialog-overlay" @click.self="showQrModal = false">
+      <div class="dialog qr-dialog">
+        <h3>Invite QR Code</h3>
+        <img v-if="qrDataUrl" :src="qrDataUrl" alt="QR" class="qr-image" />
+        <div class="qr-link-row">
+          <code class="qr-link">{{ qrLink }}</code>
+        </div>
+        <button class="btn-sm" @click="showQrModal = false">Close</button>
       </div>
-      <img v-if="qrDataUrl" :src="qrDataUrl" alt="QR" class="qr-image" />
-      <button class="btn-sm" @click="closeResult">Close</button>
     </div>
 
     <!-- Create dialog -->
@@ -129,38 +136,6 @@ function closeResult() {
 
         <div class="field-row">
           <div class="field">
-            <label>Server Address</label>
-            <input v-model="serverAddress" placeholder="1.2.3.4" />
-          </div>
-          <div class="field">
-            <label>Port</label>
-            <input v-model.number="serverPort" type="number" />
-          </div>
-        </div>
-
-        <div class="field">
-          <label>Obfuscation Key (base64)</label>
-          <input v-model="obfuscationKey" />
-        </div>
-
-        <div class="field-row">
-          <div class="field">
-            <label>Modifier</label>
-            <input v-model="modifier" />
-          </div>
-          <div class="field">
-            <label>Salt</label>
-            <input v-model.number="salt" type="number" />
-          </div>
-        </div>
-
-        <div class="field">
-          <label>Hub URL</label>
-          <input v-model="hubUrl" placeholder="https://xr-hub.example.com" />
-        </div>
-
-        <div class="field-row">
-          <div class="field">
             <label>TTL</label>
             <select v-model="ttlOption">
               <option value="3600">1 hour</option>
@@ -169,7 +144,7 @@ function closeResult() {
             </select>
           </div>
           <div class="field">
-            <label>
+            <label class="checkbox-label">
               <input type="checkbox" v-model="oneTime" />
               One-time
             </label>
@@ -180,6 +155,10 @@ function closeResult() {
           <label>Comment</label>
           <input v-model="comment" placeholder="Optional" />
         </div>
+
+        <p v-if="defaults" class="defaults-hint">
+          Server: {{ defaults.server_address }}:{{ defaults.server_port }} | Preset: {{ preset || '—' }}
+        </p>
 
         <div class="dialog-actions">
           <button class="btn-primary" @click="handleCreate">Create</button>
@@ -209,168 +188,76 @@ function closeResult() {
           <td>{{ formatDate(inv.expires_at) }}</td>
           <td><span :class="statusClass(inv)">{{ statusOf(inv) }}</span></td>
           <td>{{ inv.comment }}</td>
-          <td>
+          <td class="actions">
+            <button
+              v-if="statusOf(inv) === 'active'"
+              class="btn-sm"
+              @click="showQr(inv)"
+            >QR</button>
+            <button
+              v-if="statusOf(inv) === 'active'"
+              class="btn-sm"
+              @click="copyLink(inv)"
+            >Copy</button>
             <button
               v-if="statusOf(inv) === 'active'"
               class="btn-sm btn-danger"
               @click="handleRevoke(inv.token)"
-            >
-              Revoke
-            </button>
+            >Revoke</button>
           </td>
         </tr>
         <tr v-if="!invitesStore.invites.length">
-          <td colspan="7" style="text-align: center; color: #999">No invites yet</td>
+          <td colspan="7" class="empty">No invites yet</td>
         </tr>
       </tbody>
     </table>
+
+    <div v-if="toast" class="toast">{{ toast }}</div>
   </div>
 </template>
 
 <style scoped>
-.page-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 1.5rem;
-}
-
-.invite-result {
-  margin-bottom: 1.5rem;
-  padding: 1rem;
-  background: #e8f5e9;
-  border-radius: 8px;
-}
-
-.invite-result h3 {
-  margin-bottom: 0.5rem;
-}
-
-.result-row {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  margin-bottom: 0.5rem;
-}
-
-.result-row code {
-  font-size: 0.8rem;
-  word-break: break-all;
-}
-
-.qr-image {
-  display: block;
-  margin: 0.5rem 0;
-}
+.page-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; }
+.empty { text-align: center; color: var(--text-muted); }
 
 .dialog-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.4);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 100;
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5);
+  display: flex; align-items: center; justify-content: center; z-index: 100;
 }
 
 .dialog {
-  background: #fff;
-  border-radius: 8px;
-  padding: 1.5rem;
-  max-width: 500px;
-  width: 90%;
-  max-height: 90vh;
-  overflow-y: auto;
+  background: var(--bg-card); border-radius: 8px; padding: 1.5rem;
+  max-width: 460px; width: 90%; max-height: 90vh; overflow-y: auto;
+  color: var(--text);
 }
 
-.dialog h3 {
-  margin-bottom: 1rem;
-}
+.dialog h3 { margin-bottom: 1rem; }
 
-.field {
-  margin-bottom: 0.75rem;
-}
+.qr-dialog { text-align: center; }
+.qr-image { display: block; margin: 1rem auto; border-radius: 8px; }
+.qr-link-row { margin-bottom: 1rem; }
+.qr-link { font-size: 0.75rem; word-break: break-all; color: var(--text-muted); }
 
-.field label {
-  display: block;
-  font-size: 0.8rem;
-  font-weight: 600;
-  margin-bottom: 0.25rem;
-}
+.field { margin-bottom: 0.75rem; }
+.field label { display: block; font-size: 0.8rem; font-weight: 600; margin-bottom: 0.25rem; color: var(--text); }
+.field input, .field select { width: 100%; padding: 0.5rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-input); color: var(--text); }
+.checkbox-label { display: flex; align-items: center; gap: 0.5rem; margin-top: 1.5rem; }
+.checkbox-label input[type="checkbox"] { width: auto; }
+.field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+.defaults-hint { font-size: 0.8rem; color: var(--text-muted); margin: 0.5rem 0; }
+.dialog-actions { display: flex; gap: 0.5rem; margin-top: 1rem; }
 
-.field input,
-.field select {
-  width: 100%;
-  padding: 0.5rem;
-  border: 1px solid #ccc;
-  border-radius: 4px;
-}
+.data-table { width: 100%; border-collapse: collapse; }
+.data-table th, .data-table td { padding: 0.75rem 0.5rem; text-align: left; border-bottom: 1px solid var(--border-light); font-size: 0.875rem; }
+.data-table th { font-weight: 600; color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; }
+.data-table code { color: var(--text); }
+.actions { white-space: nowrap; }
 
-.field-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 0.75rem;
-}
+.btn-primary { padding: 0.5rem 1.5rem; background: var(--btn-bg); color: var(--btn-text); border: none; border-radius: 4px; cursor: pointer; }
+.btn-sm { padding: 0.25rem 0.75rem; font-size: 0.8rem; border: 1px solid var(--border); background: transparent; color: var(--text); border-radius: 4px; cursor: pointer; margin-right: 0.25rem; }
+.btn-danger { color: var(--danger); border-color: var(--danger); }
 
-.dialog-actions {
-  display: flex;
-  gap: 0.5rem;
-  margin-top: 1rem;
-}
-
-.data-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-
-.data-table th,
-.data-table td {
-  padding: 0.75rem 0.5rem;
-  text-align: left;
-  border-bottom: 1px solid #eee;
-  font-size: 0.875rem;
-}
-
-.data-table th {
-  font-weight: 600;
-  color: #666;
-  font-size: 0.75rem;
-  text-transform: uppercase;
-}
-
-.btn-primary {
-  padding: 0.5rem 1.5rem;
-  background: #1a1a2e;
-  color: #fff;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-}
-
-.btn-sm {
-  padding: 0.25rem 0.75rem;
-  font-size: 0.875rem;
-  border: 1px solid #ccc;
-  background: #fff;
-  border-radius: 4px;
-  cursor: pointer;
-}
-
-.btn-danger {
-  color: #d32f2f;
-  border-color: #d32f2f;
-}
-
-.status-active {
-  color: #2e7d32;
-  font-weight: 600;
-}
-
-.status-expired {
-  color: #999;
-}
-
-.status-consumed {
-  color: #f57c00;
-}
+.status-active { color: var(--success); font-weight: 600; }
+.status-expired { color: var(--text-muted); }
+.status-consumed { color: var(--warning); }
 </style>

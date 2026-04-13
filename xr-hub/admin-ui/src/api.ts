@@ -33,9 +33,19 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 }
 
 export const api = {
+  // Auth
+  login: (username: string, password: string) =>
+    request<LoginResponse>('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ username, password }),
+    }),
+
   // Public
   listPresets: () => request<PresetSummary[]>('/presets'),
   getPreset: (name: string) => request<Preset>(`/presets/${name}`),
+  getInviteInfo: (token: string) => request<InviteInfo>(`/invite/${token}`),
+  claimInvite: (token: string) =>
+    request<InvitePayload>(`/invite/${token}/claim`, { method: 'POST' }),
 
   // Admin presets
   createPreset: (data: CreatePresetRequest) =>
@@ -53,6 +63,7 @@ export const api = {
 
   // Admin invites
   listInvites: () => request<Invite[]>('/admin/invites'),
+  getInviteDefaults: () => request<InviteDefaultsResponse>('/admin/invite-defaults'),
   createInvite: (data: CreateInviteRequest) =>
     request<Invite>('/admin/invites', {
       method: 'POST',
@@ -60,17 +71,14 @@ export const api = {
     }),
   revokeInvite: (token: string) =>
     request<void>(`/admin/invites/${token}`, { method: 'DELETE' }),
-
-  // Auth test
-  testAuth: () => request<PresetSummary[]>('/admin/presets', { method: 'POST', body: '{}' })
-    .then(() => true)
-    .catch((e: Error) => {
-      // 401 = bad token, anything else means we authed ok (even 400 validation error)
-      return !e.message.startsWith('401')
-    }),
 }
 
 // Types
+export interface LoginResponse {
+  token: string
+  username: string
+}
+
 export interface RoutingRule {
   action: string
   domains: string[]
@@ -109,6 +117,14 @@ export interface InvitePayload {
   hub_url: string
 }
 
+export interface InviteInfo {
+  token: string
+  preset: string
+  comment: string
+  status: string
+  expires_at: string
+}
+
 export interface Invite {
   token: string
   created_at: string
@@ -117,6 +133,15 @@ export interface Invite {
   one_time: boolean
   comment: string
   payload: InvitePayload
+}
+
+export interface InviteDefaultsResponse {
+  server_address: string
+  server_port: number
+  obfuscation_key: string
+  modifier: string
+  salt: number
+  hub_url: string
 }
 
 export interface CreatePresetRequest {
@@ -129,5 +154,6 @@ export interface CreateInviteRequest {
   ttl_seconds?: number
   one_time: boolean
   comment: string
-  payload: InvitePayload
+  preset?: string
+  payload?: InvitePayload
 }

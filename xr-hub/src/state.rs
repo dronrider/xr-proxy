@@ -13,6 +13,7 @@ use crate::storage;
 pub struct AppState {
     pub presets: RwLock<HashMap<String, Preset>>,
     pub invites: RwLock<HashMap<String, Invite>>,
+    pub sessions: RwLock<HashMap<String, String>>, // session_token → username
     pub config: HubConfig,
     pub signing: Option<SigningContext>,
 }
@@ -44,6 +45,7 @@ pub fn hydrate(config: HubConfig) -> Result<Arc<AppState>> {
     Ok(Arc::new(AppState {
         presets: RwLock::new(presets),
         invites: RwLock::new(invites),
+        sessions: RwLock::new(HashMap::new()),
         config,
         signing,
     }))

@@ -33,31 +33,8 @@ function updateRule(index: number, rule: RoutingRule) {
 </template>
 
 <style scoped>
-.rules-editor h3 {
-  margin-bottom: 0.5rem;
-  font-size: 0.875rem;
-  color: #666;
-  text-transform: uppercase;
-}
-
-.rule-item {
-  margin-bottom: 1rem;
-  padding: 1rem;
-  border: 1px solid #e0e0e0;
-  border-radius: 4px;
-}
-
-.btn-add {
-  padding: 0.5rem 1rem;
-  border: 1px dashed #ccc;
-  background: transparent;
-  border-radius: 4px;
-  cursor: pointer;
-  color: #666;
-}
-
-.btn-add:hover {
-  border-color: #999;
-  color: #333;
-}
+.rules-editor h3 { margin-bottom: 0.5rem; font-size: 0.875rem; color: var(--text-muted); text-transform: uppercase; }
+.rule-item { margin-bottom: 1rem; padding: 1rem; border: 1px solid var(--border-light); border-radius: 4px; }
+.btn-add { padding: 0.5rem 1rem; border: 1px dashed var(--border); background: transparent; border-radius: 4px; cursor: pointer; color: var(--text-muted); }
+.btn-add:hover { border-color: var(--text-muted); color: var(--text); }
 </style>

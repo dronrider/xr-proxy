@@ -8,8 +8,11 @@ data_dir = "/var/lib/xr-hub"
 # cert = "/etc/xr-hub/tls/fullchain.pem"
 # key  = "/etc/xr-hub/tls/privkey.pem"
 
-[admin]
-token = "CHANGE_ME_TO_A_LONG_RANDOM_STRING"
+# Generate password hash: xr-hub hash-password YOUR_PASSWORD
+[[admin.users]]
+username = "admin"
+password_hash = "$argon2id$..."   # xr-hub hash-password <password>
+
 # allowed_origins = ["https://xr-hub.example.com"]
 
 # [signing]
@@ -19,3 +22,12 @@ token = "CHANGE_ME_TO_A_LONG_RANDOM_STRING"
 dev_mode = false
 default_ttl_seconds = 86400      # 24h
 max_ttl_seconds = 604800         # 7d
+
+# Default values for invite payloads (so you don't type them every time).
+[invites.defaults]
+server_address = "YOUR_SERVER_IP"
+server_port = 8443
+obfuscation_key = "YOUR_BASE64_KEY"
+modifier = "positional_xor_rotate"
+salt = 0xDEADBEEF
+hub_url = "https://xr-hub.example.com"

@@ -20,6 +20,12 @@ const version = ref(0)
 const updatedAt = ref('')
 const saving = ref(false)
 const error = ref('')
+const toast = ref('')
+
+function showToast(msg: string) {
+  toast.value = msg
+  setTimeout(() => (toast.value = ''), 3000)
+}
 
 // Visual editor vs raw TOML editor
 const mode = ref<'visual' | 'toml'>('visual')
@@ -89,6 +95,7 @@ async function save() {
       })
       version.value = updated.version
       updatedAt.value = updated.updated_at
+      showToast(`Preset saved (v${updated.version})`)
     }
   } catch (e) {
     error.value = `${e}`
@@ -227,6 +234,8 @@ const tomlPreview = computed(() => rulesToToml(defaultAction.value, rules.value)
     <button class="btn-primary" @click="save" :disabled="saving">
       {{ saving ? 'Saving...' : 'Save' }}
     </button>
+
+    <div v-if="toast" class="toast">{{ toast }}</div>
   </div>
 </template>
 
@@ -238,15 +247,8 @@ const tomlPreview = computed(() => rulesToToml(defaultAction.value, rules.value)
   margin-bottom: 1.5rem;
 }
 
-.meta {
-  color: #999;
-  font-size: 0.875rem;
-}
-
-.error {
-  color: #d32f2f;
-  margin-bottom: 1rem;
-}
+.meta { color: var(--text-muted); font-size: 0.875rem; }
+.error { color: var(--danger); margin-bottom: 1rem; }
 
 .mode-switcher {
   display: flex;
@@ -256,25 +258,20 @@ const tomlPreview = computed(() => rulesToToml(defaultAction.value, rules.value)
 
 .mode-switcher button {
   padding: 0.5rem 1.5rem;
-  border: 1px solid #ccc;
-  background: #f5f5f5;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
   cursor: pointer;
   font-size: 0.875rem;
 }
 
-.mode-switcher button:first-child {
-  border-radius: 4px 0 0 4px;
-}
-
-.mode-switcher button:last-child {
-  border-radius: 0 4px 4px 0;
-  border-left: none;
-}
+.mode-switcher button:first-child { border-radius: 4px 0 0 4px; }
+.mode-switcher button:last-child { border-radius: 0 4px 4px 0; border-left: none; }
 
 .mode-switcher button.active {
-  background: #1a1a2e;
-  color: #fff;
-  border-color: #1a1a2e;
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  border-color: var(--btn-bg);
 }
 
 .edit-layout {
@@ -284,77 +281,38 @@ const tomlPreview = computed(() => rulesToToml(defaultAction.value, rules.value)
 }
 
 @media (max-width: 800px) {
-  .edit-layout {
-    grid-template-columns: 1fr;
-  }
+  .edit-layout { grid-template-columns: 1fr; }
 }
 
-.field {
-  margin-bottom: 1rem;
-}
-
-.field label {
-  display: block;
-  margin-bottom: 0.25rem;
-  font-weight: 600;
-  font-size: 0.875rem;
-}
-
-.field input,
-.field select {
+.field { margin-bottom: 1rem; }
+.field label { display: block; margin-bottom: 0.25rem; font-weight: 600; font-size: 0.875rem; color: var(--text); }
+.field input, .field select {
   width: 100%;
   padding: 0.5rem;
-  border: 1px solid #ccc;
+  border: 1px solid var(--border);
   border-radius: 4px;
+  background: var(--bg-input);
+  color: var(--text);
 }
 
 .btn-primary {
   margin-top: 1rem;
   padding: 0.5rem 2rem;
-  background: #1a1a2e;
-  color: #fff;
+  background: var(--btn-bg);
+  color: var(--btn-text);
   border: none;
   border-radius: 4px;
   cursor: pointer;
 }
+.btn-primary:disabled { opacity: 0.5; }
 
-.btn-primary:disabled {
-  opacity: 0.5;
-}
+.preview { background: var(--bg-preview); border-radius: 8px; padding: 1rem; }
+.preview h3 { margin-bottom: 0.5rem; font-size: 0.875rem; color: var(--text-muted); }
+.preview pre { font-size: 0.8rem; white-space: pre-wrap; overflow-x: auto; color: var(--text); }
 
-.preview {
-  background: #f9f9f9;
-  border-radius: 8px;
-  padding: 1rem;
-}
-
-.preview h3 {
-  margin-bottom: 0.5rem;
-  font-size: 0.875rem;
-  color: #666;
-}
-
-.preview pre {
-  font-size: 0.8rem;
-  white-space: pre-wrap;
-  overflow-x: auto;
-}
-
-.toml-editor {
-  margin-bottom: 1rem;
-}
-
-.toml-hint {
-  font-size: 0.85rem;
-  color: #666;
-  margin-bottom: 0.75rem;
-}
-
-.toml-hint code {
-  background: #eee;
-  padding: 0.1rem 0.3rem;
-  border-radius: 3px;
-}
+.toml-editor { margin-bottom: 1rem; }
+.toml-hint { font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.75rem; }
+.toml-hint code { background: var(--bg-preview); padding: 0.1rem 0.3rem; border-radius: 3px; }
 
 .toml-textarea {
   width: 100%;
@@ -363,9 +321,10 @@ const tomlPreview = computed(() => rulesToToml(defaultAction.value, rules.value)
   font-family: 'SF Mono', 'Fira Code', monospace;
   font-size: 0.85rem;
   line-height: 1.5;
-  border: 1px solid #ccc;
+  border: 1px solid var(--border);
   border-radius: 4px;
-  background: #fafafa;
+  background: var(--bg-input);
+  color: var(--text);
   resize: vertical;
   tab-size: 2;
 }
