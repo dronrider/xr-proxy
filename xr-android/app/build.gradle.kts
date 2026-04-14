@@ -35,6 +35,12 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            // Подпись debug-ключом — это НЕ production-release. Нужна, чтобы
+            // локальная release-сборка (для проверки скорости/оптимизаций)
+            // была установимой без настройки отдельного keystore. Для
+            // публикации в Play Store потом настраивается отдельный
+            // signingConfig с production-ключом.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
