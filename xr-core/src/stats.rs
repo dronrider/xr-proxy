@@ -79,6 +79,24 @@ pub struct StatsSnapshot {
     pub debug_msg: String,
 }
 
+/// Parse "... (×N)" suffix. Returns (core, count). If no suffix — count is 1.
+/// Used by both appender (to coalesce) and tests (to inspect output).
+/// Note: `×` is U+00D7 (2 bytes in UTF-8); byte-slicing is safe here because
+/// we only split at ASCII boundaries (the leading space and trailing `)`).
+fn split_count_suffix(s: &str) -> (&str, u64) {
+    if !s.ends_with(')') { return (s, 1); }
+    let Some(open) = s.rfind(" (×") else { return (s, 1); };
+    // Offsets: " " = 1 byte, "(" = 1, "×" = 2 → 4 bytes total.
+    let num_start = open + 4;
+    let num_end = s.len() - 1;
+    if num_start >= num_end { return (s, 1); }
+    let num_str = &s[num_start..num_end];
+    match num_str.parse::<u64>() {
+        Ok(n) => (&s[..open], n),
+        Err(_) => (s, 1),
+    }
+}
+
 impl Stats {
     pub fn new() -> Self {
         Self {
@@ -157,6 +175,29 @@ impl Stats {
 
     fn append_entry(&self, level: &str, msg: &str) {
         let mut entries = self.inner.recent_errors.lock().unwrap();
+
+        // Ширина уровня 5, чтобы "ERROR" (5) и "WARN"/"INFO" (4) выровнялись.
+        let new_entry = format!("{} {:>5} {}", timestamp(), level, msg);
+
+        // Сворачивание дубликатов. Когда подряд приходят одинаковые записи
+        // (напр. burst `geller-pa.googleapis.com` 50 раз за секунду), читать
+        // лог становится невозможно. Сравниваем с последней записью по core
+        // (без суффикса " (×N)") — если совпадает, переписываем last на
+        // "core (×N+1)". Timestamp уже внутри core → свёртка ограничена
+        // одной секундой естественным образом.
+        //
+        // Counters WARN/ERROR инкрементятся в вызывающей функции ДО нас —
+        // это гарантирует, что relay_warns/relay_errors честно отражают
+        // число событий, даже если в журнале мы их схлопнули.
+        if let Some(last) = entries.last_mut() {
+            let (last_core, last_count) = split_count_suffix(last);
+            let (new_core, _) = split_count_suffix(&new_entry);
+            if last_core == new_core {
+                *last = format!("{} (×{})", last_core, last_count + 1);
+                return;
+            }
+        }
+
         if entries.len() >= 200 {
             // Трёхуровневый приоритетный drain:
             //   1. Сначала 50 самых старых INFO → скидываем.
@@ -185,8 +226,7 @@ impl Stats {
                 entries.drain(0..50);
             }
         }
-        // Ширина уровня 5, чтобы "ERROR" (5) и "WARN"/"INFO" (4) выровнялись.
-        entries.push(format!("{} {:>5} {}", timestamp(), level, msg));
+        entries.push(new_entry);
     }
 
     pub fn recent_errors(&self) -> Vec<String> {
@@ -312,6 +352,75 @@ mod tests {
 
         // Часть WARN выпала через drain.
         assert!(entries.len() <= 200);
+    }
+
+    #[test]
+    fn coalesce_duplicate_entries() {
+        let stats = Stats::new();
+        stats.add_log("mux relay for Domain(\"x.example\", 443)");
+        stats.add_log("mux relay for Domain(\"x.example\", 443)");
+        stats.add_log("mux relay for Domain(\"x.example\", 443)");
+
+        let entries = stats.recent_errors();
+        // Три одинаковых → одна запись с суффиксом (×3).
+        assert_eq!(entries.len(), 1, "entries: {:?}", entries);
+        assert!(entries[0].ends_with(" (\u{00D7}3)"), "unexpected: {}", entries[0]);
+    }
+
+    #[test]
+    fn coalesce_increments_existing_suffix() {
+        let stats = Stats::new();
+        stats.add_log("same");
+        stats.add_log("same");
+        stats.add_log("same");
+        stats.add_log("same");
+
+        let entries = stats.recent_errors();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].ends_with(" (\u{00D7}4)"), "unexpected: {}", entries[0]);
+    }
+
+    #[test]
+    fn different_messages_not_coalesced() {
+        let stats = Stats::new();
+        stats.add_log("mux relay for X");
+        stats.add_log("mux relay for Y");
+        stats.add_log("mux relay for X");
+
+        let entries = stats.recent_errors();
+        // Чередование разных сообщений не схлопывается.
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().all(|e| !e.contains("(\u{00D7}")));
+    }
+
+    #[test]
+    fn coalesce_does_not_affect_counters() {
+        let stats = Stats::new();
+        stats.add_warn("same warn");
+        stats.add_warn("same warn");
+        stats.add_warn("same warn");
+        stats.add_error("same err");
+        stats.add_error("same err");
+
+        let snap = stats.snapshot();
+        // Счётчики считают КАЖДОЕ событие, даже если в логе они свёрнуты.
+        assert_eq!(snap.relay_warns, 3);
+        assert_eq!(snap.relay_errors, 2);
+
+        let entries = stats.recent_errors();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].ends_with(" (\u{00D7}3)"));
+        assert!(entries[1].ends_with(" (\u{00D7}2)"));
+    }
+
+    #[test]
+    fn split_count_suffix_parses() {
+        assert_eq!(split_count_suffix("hello"), ("hello", 1));
+        assert_eq!(split_count_suffix("hello (\u{00D7}5)"), ("hello", 5));
+        assert_eq!(split_count_suffix("hello (\u{00D7}42)"), ("hello", 42));
+        // Невалидные суффиксы не отрезаются.
+        assert_eq!(split_count_suffix("hello (world)"), ("hello (world)", 1));
+        assert_eq!(split_count_suffix("hello (\u{00D7}x)"), ("hello (\u{00D7}x)", 1));
     }
 
     #[test]
