@@ -61,6 +61,11 @@ pub struct VpnConfig {
     pub hub_url: Option<String>,
     pub hub_preset: Option<String>,
     pub hub_cache_dir: Option<String>,
+    /// Seconds between background preset refresh attempts (default 300).
+    /// Same semantic as `xr-client` — hot-swaps active Router when preset
+    /// version changes on the hub. Ignored if `hub_url`/`hub_preset`/
+    /// `hub_cache_dir` are not all set.
+    pub hub_refresh_interval_secs: Option<u64>,
 }
 
 pub struct VpnEngine {
@@ -164,7 +169,8 @@ impl VpnEngine {
             .collect();
 
         let ctx = Arc::new(SessionContext {
-            router, codec, server_addr,
+            router: std::sync::RwLock::new(Arc::new(router)),
+            codec, server_addr,
             fake_dns: fake_dns.clone(),
             stats: self.stats.clone(),
             on_server_down, protect_socket,
@@ -176,6 +182,61 @@ impl VpnEngine {
         self.shutdown_tx = Some(shutdown_tx);
         let state = self.state.clone();
         let stats = self.stats.clone();
+
+        // Background preset refresh — hot-swaps `ctx.router` when the hub
+        // publishes a new version. Поведение то же, что в `xr-client` (см.
+        // LLD-01 §5.4): оператор правит пресет один раз, а каждый VpnEngine
+        // (телефон, ноутбук) подхватывает правила без рестарта. Live-сессии
+        // продолжают со своим Action, новые подключения видят обновления.
+        if let (Some(hub_url), Some(preset_name), Some(cache_dir)) = (
+            self.config.hub_url.clone(),
+            self.config.hub_preset.clone(),
+            self.config.hub_cache_dir.clone(),
+        ) {
+            let interval_secs = self.config.hub_refresh_interval_secs.unwrap_or(300);
+            let local_overrides = self.config.routing.clone();
+            let geoip_path_owned = self.config.geoip_path.clone();
+            let ctx_bg = ctx.clone();
+            let mut shutdown_rx_bg = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let mut cache = crate::presets::PresetCache::new(
+                    std::path::Path::new(&cache_dir),
+                    &hub_url,
+                    &preset_name,
+                );
+                cache.load_from_disk();
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {},
+                        _ = shutdown_rx_bg.changed() => return,
+                    }
+                    let changed = cache.fetch_if_stale(Duration::from_secs(5)).await;
+                    if !changed {
+                        continue;
+                    }
+                    let Some(preset_rules) = cache.routing_config() else {
+                        continue;
+                    };
+                    let new_router = Router::from_merged(
+                        &local_overrides,
+                        preset_rules,
+                        geoip_path_owned.as_deref(),
+                    );
+                    match ctx_bg.router.write() {
+                        Ok(mut guard) => {
+                            *guard = Arc::new(new_router);
+                            tracing::info!(
+                                "preset '{}' hot-swapped: new rules active without restart",
+                                preset_name
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("failed to acquire router write lock: {}", e);
+                        }
+                    }
+                }
+            });
+        }
 
         tokio::spawn(async move {
             stats.mark_started();

@@ -155,6 +155,7 @@ fn parse_config(json: &str) -> Result<VpnConfig, String> {
     let hub_url = get_str("hub_url").ok();
     let hub_preset = get_str("hub_preset").ok();
     let hub_cache_dir = get_str("hub_cache_dir").ok();
+    let hub_refresh_interval_secs = get_num("hub_refresh_interval_secs").ok();
 
     let dns_resolvers = parse_dns_resolvers(json);
 
@@ -162,7 +163,7 @@ fn parse_config(json: &str) -> Result<VpnConfig, String> {
         server_address, server_port, obfuscation_key, modifier, salt,
         padding_min, padding_max, routing, geoip_path: None, on_server_down,
         dns_resolvers,
-        hub_url, hub_preset, hub_cache_dir,
+        hub_url, hub_preset, hub_cache_dir, hub_refresh_interval_secs,
     })
 }
 

@@ -466,21 +466,18 @@ long-lived соединений:
    бы вынужден обходить 10+ роутеров SSH'ом после каждого обновления
    пресета.
 
-   **Hot-swap в `xr-client`.** `ProxyState.router` хранится как
-   `RwLock<Arc<Router>>`. Hot path — один read-lock на `resolve()` per
-   connection, занимает наносекунды. При `fetch_if_stale == true`
-   фоновая задача перестраивает `Router::from_merged(...)` и делает
-   `write()`, подменяя `Arc` целиком. Новые TCP-сессии сразу видят
-   обновлённые правила; уже активные сессии держат выбранный `Action`
-   по value — их маршрут не меняется, это честная семантика
-   «изменение применяется к новым соединениям». Тест в
-   `xr-client/src/proxy.rs` проверяет оба инварианта.
-
-   **Android (`VpnEngine`) hot-swap пока не делаем.** На мобильном
-   перезапуск VPN = короткий disconnect, оператор клиента — сам
-   пользователь, не админ. Архитектурно тот же паттерн тривиально
-   переносится в `SessionContext`, но до появления реального спроса
-   лишние обёртки не тащим.
+   **Hot-swap одинаково реализован в `xr-client` и `VpnEngine` (Android).**
+   Состояние роутера хранится как `RwLock<Arc<Router>>`:
+   в `ProxyState.router` у xr-client и в `SessionContext.router` у
+   xr-core. Hot path — один read-lock на `resolve()` per connection,
+   занимает наносекунды. При `fetch_if_stale == true` фоновая задача
+   перестраивает `Router::from_merged(...)` и делает `write()`,
+   подменяя `Arc` целиком. Новые TCP-сессии сразу видят обновлённые
+   правила; уже активные сессии держат выбранный `Action` по value —
+   их маршрут не меняется, это честная семантика «изменение
+   применяется к новым соединениям». Тесты в `xr-client/src/proxy.rs`
+   проверяют оба инварианта; для `VpnEngine` тот же паттерн работает
+   идентично, потому что логика лежит в общих структурах.
 
 Подпись. Если `trusted_public_key` задан и верификация не прошла — новая
 версия отклоняется, пишется WARN, используется старый кэш. Это правило
@@ -529,7 +526,8 @@ WARN «preset russia unavailable, running overrides-only».
 | `xr-proto/src/routing.rs` | Добавить `Router::from_merged(overrides, preset)` — создание компилированного роутера поверх двух источников. Существующий конструктор оставить. |
 | `xr-proto/Cargo.toml` | Новая optional feature `ts-rs`. |
 | `xr-core/src/presets.rs` (новый) | `PresetCache` с методами `load_from_disk`, `fetch_if_stale`, `merged_router_config`. Использует `reqwest` с `rustls-tls` (уже в дереве). |
-| [xr-core/src/engine.rs](../../xr-core/src/engine.rs) | При `VpnEngine::start` — если `hub` задан, инициализировать `PresetCache` и слить с `routing` override'ами перед построением роутера. |
+| [xr-core/src/engine.rs](../../xr-core/src/engine.rs) | При `VpnEngine::start` — если `hub` задан, инициализировать `PresetCache` и слить с `routing` override'ами перед построением роутера. `VpnConfig.hub_refresh_interval_secs` (Option<u64>, default 300) управляет периодом фонового рефреша. После создания `SessionContext` — spawn background-таск, который делает `fetch_if_stale` и при `true` перестраивает `Router::from_merged(...)` + подменяет через `ctx.router.write()`. Завершается по `shutdown_rx.changed()`. |
+| [xr-core/src/session.rs](../../xr-core/src/session.rs) | `SessionContext.router: RwLock<Arc<Router>>` вместо value-поля. `relay_session_with_domain` берёт short-lived read-lock для `resolve()`. |
 | [xr-client/src/main.rs](../../xr-client/src/main.rs) | Аналогично: при старте подгрузить пресет, запустить фоновую tokio-задачу обновления раз в `refresh_interval_secs`. Задача при `fetch_if_stale == true` перестраивает `Router` и подменяет его в `ProxyState` через `RwLock::write` (hot-swap, см. §5.4). |
 | [xr-client/src/proxy.rs](../../xr-client/src/proxy.rs) | `ProxyState.router: RwLock<Arc<Router>>` вместо value-поля. `handle_connection` берёт short-lived read-lock и сразу дропает — `resolve()` возвращает `Action` по value. Тесты `hot_swap_changes_router_decision` / `hot_swap_leaves_snapshot_readers_untouched`. |
 | [configs/client.toml](../../configs/client.toml) | Обновить пример с новой секцией `[hub]` + пояснение семантики override'ов. |
@@ -572,13 +570,10 @@ WARN «preset russia unavailable, running overrides-only».
    не нужен вообще — `fetch` идёт на тот же host. Проверка в первой
    реализации.
 9. **Обновление пресета во время активного соединения.**
-   В `xr-client` (OpenWRT) — hot-swap применяется автоматически, см. §5.4.
-   Живые TCP-сессии продолжают со старым выбором `Action` (они держат
-   его by-value), новые видят обновлённые правила сразу.
-   В `VpnEngine` (Android) hot-swap пока не реализован — новые правила
-   вступают в силу при следующем старте движка. Это сознательное
-   упрощение: для одного пользователя ручной рестарт VPN приемлем,
-   а для оператора 10+ роутеров — нет.
+   И в `xr-client` (OpenWRT), и в `VpnEngine` (Android) hot-swap
+   применяется автоматически фоновой задачей, см. §5.4. Живые TCP-сессии
+   продолжают со старым выбором `Action` (они держат его by-value),
+   новые видят обновлённые правила сразу после swap'а.
 10. **`build.rs` без `dist/`.** Если разработчик делает `cargo build -p xr-hub`
     без `npm run build`, мы даём ошибку — но в dev-режиме (`--features dev-ui`)
     проверку пропускаем. Ошибка содержит точную команду для починки.

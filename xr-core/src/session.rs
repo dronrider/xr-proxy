@@ -35,7 +35,12 @@ pub type ProtectSocketFn = Arc<dyn Fn(i32) -> bool + Send + Sync>;
 
 /// Shared context for session management.
 pub struct SessionContext {
-    pub router: Router,
+    /// `RwLock<Arc<Router>>` — тот же паттерн, что в `xr-client::proxy::ProxyState`.
+    /// Background preset-refresh внутри `VpnEngine` подменяет активные правила
+    /// без рестарта движка (hot-swap). Hot path — один short-lived read-lock
+    /// на `resolve()` per сессию; write — раз в `hub_refresh_interval_secs`.
+    /// Живые сессии не «едут под ногами»: Action выбирается один раз по value.
+    pub router: std::sync::RwLock<Arc<Router>>,
     pub codec: Codec,
     pub server_addr: SocketAddr,
     pub fake_dns: Arc<FakeDns>,
@@ -140,7 +145,10 @@ pub async fn relay_session_with_domain(
         ));
     }
 
-    let action = ctx.router.resolve(domain.as_deref(), key.dst_addr.ip());
+    // Short-lived read-lock: resolve() возвращает Action по value.
+    // После drop'а guard'а live-сессия не пересчитывает маршрут, даже если
+    // фоновый hot-swap подменит Router — это осознанное поведение.
+    let action = ctx.router.read().unwrap().resolve(domain.as_deref(), key.dst_addr.ip());
 
     let target_addr = if let Some(ref domain) = domain {
         TargetAddr::Domain(domain.clone(), key.dst_addr.port())
