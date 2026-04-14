@@ -415,12 +415,25 @@ async fn run_event_loop(
                             }
 
                             // Классификация по io::ErrorKind:
-                            //   InvalidInput → policy drop (fake IP, private IP) →
-                            //     WARN. Это ожидаемая защитная реакция.
-                            //   Всё остальное (ConnectionRefused, TimedOut, ...) →
-                            //     реальный отказ → ERROR.
+                            //   InvalidInput → policy drop (fake IP, private IP) → WARN.
+                            //   ConnectionReset / ConnectionAborted → удалённый сервер
+                            //     закрыл соединение (RST) или ядро оборвало при смене
+                            //     сети. Не наш косяк — это нормальное сетевое событие,
+                            //     понижаем до WARN, чтобы реальные ошибки не тонули в
+                            //     повторяющемся шуме (напр. Kaspersky-телеметрия в
+                            //     цикле получает RST от своих же серверов).
+                            //     Исключение: "mux open fail" всегда ERROR — тут
+                            //     недоступен наш прокси-сервер, пользователю это важно.
+                            //   Всё остальное (TimedOut на connect, Other, ...) → ERROR.
+                            let is_mux_fail = err_text.contains("mux open fail");
                             match e.kind() {
                                 std::io::ErrorKind::InvalidInput => {
+                                    ctx_clone.stats.add_warn(&msg);
+                                }
+                                std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                    if !is_mux_fail =>
+                                {
                                     ctx_clone.stats.add_warn(&msg);
                                 }
                                 _ => {

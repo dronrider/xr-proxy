@@ -221,6 +221,18 @@ async fn relay_direct(
 
     // Connect with PROTECTED socket.
     let target = connect_protected(real_dst, &ctx.protect_socket).await?;
+
+    // Симметрично `mux relay for ...`: без этой записи пользователь не может
+    // отличить по логу ошибок, какой путь выбрал роутер — direct или proxy.
+    // Формат TargetAddr::{Domain, Ip} повторяет mux-вариант, чтобы обе строки
+    // выглядели узнаваемо в ленте.
+    let target_label = match domain {
+        Some(d) => format!("Domain({:?}, {})", d, dst.port()),
+        None => format!("Ip({})", real_dst),
+    };
+    ctx.stats.add_log(&format!("direct connect for {}", target_label));
+    tracing::debug!("direct connect for {}", target_label);
+
     let (mut tr, mut tw) = target.into_split();
 
     let upload = async move {
