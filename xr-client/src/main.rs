@@ -134,7 +134,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let state = Arc::new(proxy::ProxyState {
-        router,
+        router: std::sync::RwLock::new(Arc::new(router)),
         on_server_down,
         listen_port: config.client.listen_port,
         mux_pool,
@@ -168,22 +168,55 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Run TCP proxy
-    let proxy_handle = tokio::spawn(proxy::run_proxy(config.client.listen_port, state));
+    let proxy_handle = tokio::spawn(proxy::run_proxy(config.client.listen_port, state.clone()));
 
-    // Background preset refresh task (updates disk cache only, does not hot-swap router).
+    // Background preset refresh task — hot-swaps the active Router when
+    // the hub publishes a new preset version. Без этого таска изменения
+    // в xr-hub применялись бы только при рестарте xr-client, а обойти
+    // десяток роутеров вручную оператор не готов.
+    //
+    // Новые TCP-сессии после swap'а видят обновлённые правила; уже
+    // активные продолжают со своим выбранным Action — это честная
+    // семантика "изменение применяется к новым соединениям".
     if let Some(hub) = config.hub.as_ref() {
         let hub_url = hub.url.clone();
         let preset_name = hub.preset.clone();
         let interval_secs = hub.refresh_interval_secs;
+        let local_overrides = config.routing.clone();
+        let geoip_path_owned = config.geoip.as_ref().map(|g| g.database.clone());
+        let state = state.clone();
         tokio::spawn(async move {
             let cache_dir = std::path::Path::new("/var/lib/xr-proxy/presets");
             let mut cache = xr_core::presets::PresetCache::new(cache_dir, &hub_url, &preset_name);
             cache.load_from_disk();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-                let _ = cache
+                let changed = cache
                     .fetch_if_stale(std::time::Duration::from_secs(5))
                     .await;
+                if !changed {
+                    continue;
+                }
+                let Some(preset_rules) = cache.routing_config() else {
+                    continue;
+                };
+                let new_router = routing::Router::from_merged(
+                    &local_overrides,
+                    preset_rules,
+                    geoip_path_owned.as_deref(),
+                );
+                match state.router.write() {
+                    Ok(mut guard) => {
+                        *guard = Arc::new(new_router);
+                        tracing::info!(
+                            "preset '{}' hot-swapped: new rules active without restart",
+                            preset_name
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to acquire router write lock: {}", e);
+                    }
+                }
             }
         });
     }

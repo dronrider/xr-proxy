@@ -5,7 +5,7 @@ use xr_proto::sni;
 use xr_proto::tunnel;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Duration;
@@ -46,7 +46,16 @@ fn get_original_dst(stream: &TcpStream) -> io::Result<SocketAddr> {
 // ── Shared state ─────────────────────────────────────────────────────
 
 pub struct ProxyState {
-    pub router: Router,
+    /// `RwLock<Arc<Router>>` позволяет background preset-refresh'у
+    /// подменять активные правила без рестарта клиента. Hot path —
+    /// один `resolve()` на connection, read-lock держится миллисекунды;
+    /// write случается раз в `refresh_interval_secs` (5 мин default).
+    ///
+    /// Уже установленные TCP-relay-сессии держат Action по value, так
+    /// что их маршрут не меняется при swap'е — только новые подключения
+    /// видят обновлённые правила. Это честная семантика "обновление
+    /// применяется к новым соединениям".
+    pub router: RwLock<Arc<Router>>,
     pub on_server_down: Action,
     pub listen_port: u16,
     pub mux_pool: Arc<MuxPool>,
@@ -127,7 +136,9 @@ async fn handle_connection(
     let sni_name = sni::extract_sni(&peek_buf[..n]);
 
     let sni_display = sni_name.as_deref().unwrap_or("-");
-    let action = state.router.resolve(sni_name.as_deref(), dest_ip);
+    // Один short-lived read-lock: resolve() возвращает Action по value,
+    // поэтому guard живёт ровно длину этого statement.
+    let action = state.router.read().unwrap().resolve(sni_name.as_deref(), dest_ip);
 
     tracing::info!(
         "{} -> {} [SNI: {}] => {:?}",
@@ -220,5 +231,67 @@ async fn relay_mux(
     match tokio::time::timeout(max_lifetime, upload).await {
         Ok(r) => r,
         Err(_) => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xr_proto::config::{RoutingConfig, RoutingRule};
+
+    fn router_proxying(domains: &[&str]) -> Router {
+        let cfg = RoutingConfig {
+            default_action: "direct".into(),
+            rules: vec![RoutingRule {
+                action: "proxy".into(),
+                domains: domains.iter().map(|s| s.to_string()).collect(),
+                ip_ranges: vec![],
+                geoip: vec![],
+            }],
+        };
+        Router::new(&cfg, None)
+    }
+
+    /// Hot-swap должен менять решение `resolve()` для новых запросов.
+    /// Без этого теста можно случайно сломать RwLock<Arc<Router>> семантику
+    /// (напр. забыть `*guard = ...` и получить тихий no-op).
+    #[test]
+    fn hot_swap_changes_router_decision() {
+        let initial = router_proxying(&["youtube.com"]);
+        let slot: RwLock<Arc<Router>> = RwLock::new(Arc::new(initial));
+
+        // До swap'а: youtube → Proxy, ya.ru → Direct.
+        let ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
+        assert_eq!(slot.read().unwrap().resolve(Some("youtube.com"), ip), Action::Proxy);
+        assert_eq!(slot.read().unwrap().resolve(Some("ya.ru"), ip), Action::Direct);
+
+        // Swap: теперь в списке только ya.ru.
+        let replacement = router_proxying(&["ya.ru"]);
+        *slot.write().unwrap() = Arc::new(replacement);
+
+        // После swap'а: youtube → Direct (выпал из правил), ya.ru → Proxy.
+        assert_eq!(slot.read().unwrap().resolve(Some("youtube.com"), ip), Action::Direct);
+        assert_eq!(slot.read().unwrap().resolve(Some("ya.ru"), ip), Action::Proxy);
+    }
+
+    /// Active Arc<Router>, полученный ДО swap'а, должен продолжать видеть
+    /// старые правила — это гарантирует, что уже установленные TCP-сессии
+    /// не "меняют маршрут под ногами".
+    #[test]
+    fn hot_swap_leaves_snapshot_readers_untouched() {
+        let slot: RwLock<Arc<Router>> = RwLock::new(Arc::new(router_proxying(&["youtube.com"])));
+
+        // Читатель взял снимок Router'а до swap'а.
+        let snapshot: Arc<Router> = slot.read().unwrap().clone();
+
+        let ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
+        assert_eq!(snapshot.resolve(Some("youtube.com"), ip), Action::Proxy);
+
+        // Swap на полностью другой набор.
+        *slot.write().unwrap() = Arc::new(router_proxying(&["ya.ru"]));
+
+        // Старый snapshot остался с прежним решением.
+        assert_eq!(snapshot.resolve(Some("youtube.com"), ip), Action::Proxy);
+        assert_eq!(snapshot.resolve(Some("ya.ru"), ip), Action::Direct);
     }
 }

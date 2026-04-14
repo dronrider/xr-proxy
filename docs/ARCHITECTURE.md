@@ -315,7 +315,11 @@ GeoIP (за feature-flag).
   `[[routing.rules]]` как override'ы с более высоким приоритетом.
 - При старте клиент делает `GET /api/v1/presets/:name` (forced fetch, timeout 2 с),
   кэширует результат локально. Фоновая задача раз в `refresh_interval_secs`
-  сверяет версию по `ETag`. Обновлённые правила применяются при следующем старте.
+  сверяет версию по `ETag`. В `xr-client` (OpenWRT) обновлённые правила
+  применяются **hot-swap'ом** без рестарта — `ProxyState.router` хранится
+  как `RwLock<Arc<Router>>`, живые сессии продолжают со старым выбором,
+  новые видят новые правила. В `VpnEngine` (Android) пока только при
+  следующем старте — hot-swap туда добавится по спросу.
 - `Router::from_merged(overrides, preset, geoip)` — overrides-правила проверяются
   первыми, пресет — как fallback, `default_action` берётся из overrides.
 - Если хаб недоступен — клиент работает с кэшом или только с локальными правилами.
