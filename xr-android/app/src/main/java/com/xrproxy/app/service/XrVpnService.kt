@@ -379,13 +379,29 @@ class XrVpnService : VpnService() {
     }
 
     private fun createNotificationChannel() {
+        // IMPORTANCE_LOW — канал виден в статус-баре, но БЕЗ звука и без
+        // heads-up pop-up'а. Для persistent foreground VPN-сервиса это
+        // стандарт (так же делают Tailscale, WireGuard, ProtonVPN):
+        // пользователь не должен слышать "дзынь" при каждом Connect,
+        // тем более при внутренних рестартах сервиса.
+        //
+        // Важно: канал создаётся ОДИН раз на инсталляцию. Если до этой
+        // правки приложение уже было установлено с IMPORTANCE_DEFAULT,
+        // новый уровень сам по себе не применится — Android не позволяет
+        // понижать importance существующего канала. Чтобы сброс
+        // сработал для test-инсталла, пользователю нужно либо
+        // переустановить приложение, либо вручную отключить звук в
+        // Settings → Apps → XR Proxy → Notifications → "XR Proxy VPN"
+        // → Sound: None.
         val channel = NotificationChannel(
             CHANNEL_ID,
             "XR Proxy VPN",
-            NotificationManager.IMPORTANCE_DEFAULT,
+            NotificationManager.IMPORTANCE_LOW,
         ).apply {
             description = "VPN connection status"
             setShowBadge(false)
+            setSound(null, null)
+            enableVibration(false)
             lockscreenVisibility = Notification.VISIBILITY_PUBLIC
         }
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
