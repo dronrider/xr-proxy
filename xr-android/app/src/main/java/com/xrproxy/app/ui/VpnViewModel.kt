@@ -459,14 +459,14 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Prefer the active network's resolvers.
+        // activeNetwork в момент ДО старта VPN — это реальная сеть (Wi-Fi
+        // или мобильная). Этого достаточно: после старта VPN эта же сеть
+        // остаётся под капотом, а DNS её по-прежнему применимы. Раньше
+        // дополнительно обходили cm.allNetworks, чтобы подобрать Wi-Fi DNS
+        // когда активна мобильная, но allNetworks deprecated с API 31, а
+        // сценарий не принципиален: fallback на public DNS (1.1.1.1/8.8.8.8)
+        // всё равно срабатывает в race вместе с активным резолвером.
         addFrom(cm.activeNetwork)
-        // Then any other non-VPN networks (Wi-Fi while on cellular, etc.).
-        for (network in cm.allNetworks) {
-            val caps = cm.getNetworkCapabilities(network) ?: continue
-            if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) continue
-            addFrom(network)
-        }
 
         return result
     }
