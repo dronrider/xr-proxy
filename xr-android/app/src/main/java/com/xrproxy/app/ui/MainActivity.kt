@@ -44,17 +44,27 @@ import com.xrproxy.app.ui.components.formatUptime
 import com.xrproxy.app.ui.theme.XrTheme
 
 /**
- * Счётчики строк по уровням в `recent_errors`. Критерии совпадают с
+ * Счётчики событий по уровням в `recent_errors`. Критерии совпадают с
  * разметкой в `colorizeLog`, чтобы бадж и визуал журнала видели одно и то же.
+ *
+ * Rust-сторона сворачивает подряд идущие дубликаты в пределах одной
+ * секунды и дописывает суффикс `(×N)`. Бадж должен показывать число
+ * СОБЫТИЙ, а не строк — поэтому каждая запись даёт свой N в сумму.
  */
+private val COUNT_SUFFIX_RE = Regex(" \\(\u00D7(\\d+)\\)\$")
+
+private fun String.repeatCount(): Int =
+    COUNT_SUFFIX_RE.find(this)?.groupValues?.get(1)?.toIntOrNull() ?: 1
+
 private val List<String>.errorCount: Int
-    get() = count { it.contains(" ERROR ") }
+    get() = filter { it.contains(" ERROR ") }.sumOf { it.repeatCount() }
 
 private val List<String>.warnCount: Int
-    get() = count { it.contains(" WARN ") }
+    get() = filter { it.contains(" WARN ") }.sumOf { it.repeatCount() }
 
 private val List<String>.infoCount: Int
-    get() = size - errorCount - warnCount
+    get() = filter { !it.contains(" ERROR ") && !it.contains(" WARN ") }
+        .sumOf { it.repeatCount() }
 
 class MainActivity : ComponentActivity() {
     private val viewModel: VpnViewModel by viewModels()
