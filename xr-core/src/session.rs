@@ -43,6 +43,10 @@ pub struct SessionContext {
     pub on_server_down: Action,
     pub protect_socket: ProtectSocketFn,
     pub mux_pool: Arc<xr_proto::mux_pool::MuxPool>,
+    /// DNS resolvers for direct-connection name resolution, tried in parallel.
+    /// First one to answer wins. System-provided (via Android ConnectivityManager)
+    /// resolvers come first, with public resolvers as a universal fallback.
+    pub dns_resolvers: Vec<SocketAddr>,
 }
 
 /// Create a TCP connection that bypasses the VPN tunnel.
@@ -150,7 +154,31 @@ pub async fn relay_session_with_domain(
                 "proxy: {} [{}] -> srv {}",
                 key.dst_addr, domain.as_deref().unwrap_or("-"), ctx.server_addr,
             ));
-            relay_via_proxy(ctx, target_addr, data_rx, data_tx, waker).await
+            // Open the mux stream upfront so that a failure here can fall back
+            // to direct without having consumed anything from the inbound
+            // channels yet (relay_via_mux_stream drains data_rx, so we can't
+            // retry after that starts).
+            match ctx.mux_pool.open_stream(&target_addr).await {
+                Ok(mux_stream) => {
+                    ctx.stats.add_log(&format!("mux relay for {:?}", target_addr));
+                    tracing::debug!("mux relay for {:?}", target_addr);
+                    relay_via_mux_stream(mux_stream, data_rx, data_tx, waker, &ctx.stats).await
+                }
+                Err(e) => {
+                    if ctx.on_server_down == Action::Direct {
+                        ctx.stats.add_log(&format!(
+                            "mux fail for {:?}, falling back to direct: {}",
+                            target_addr, e,
+                        ));
+                        tracing::info!("mux fail for {:?}, direct fallback: {}", target_addr, e);
+                        relay_direct(ctx, key.dst_addr, domain.as_deref(), data_rx, data_tx, waker).await
+                    } else {
+                        // Preserve the "mux open fail:" prefix so engine.rs
+                        // error classification keeps the existing behaviour.
+                        Err(io::Error::new(e.kind(), format!("mux open fail: {}", e)))
+                    }
+                }
+            }
         }
         Action::Direct => {
             ctx.stats.set_debug(format!(
@@ -160,30 +188,6 @@ pub async fn relay_session_with_domain(
             relay_direct(ctx, key.dst_addr, domain.as_deref(), data_rx, data_tx, waker).await
         }
     }
-}
-
-/// Relay through the xr-server tunnel.
-async fn relay_via_proxy(
-    ctx: Arc<SessionContext>,
-    target_addr: TargetAddr,
-    data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    waker: Arc<Notify>,
-) -> io::Result<()> {
-    // Оборачиваем ошибку в новую io::Error с тем же kind — контекст "mux open fail"
-    // сохраняется в тексте, а классификация уровня (WARN vs ERROR) происходит
-    // в одном месте — `engine.rs:313` по `io::ErrorKind`. Тут никакого add_*,
-    // чтобы не дублировать запись в журнале.
-    let mux_stream = ctx.mux_pool.open_stream(&target_addr).await
-        .map_err(|e| io::Error::new(e.kind(), format!("mux open fail: {}", e)))?;
-
-    // INFO: успешное открытие стрима — это часть нормального feed'а вкладки
-    // Log, пользователь смотрит на журнал как на индикатор "приложение что-то
-    // делает". Smart drain в stats.rs защищает ERROR и WARN от вытеснения
-    // INFO-потоком, так что писать сюда безопасно.
-    ctx.stats.add_log(&format!("mux relay for {:?}", target_addr));
-    tracing::debug!("mux relay for {:?}", target_addr);
-    relay_via_mux_stream(mux_stream, data_rx, data_tx, waker, &ctx.stats).await
 }
 
 /// Relay directly to the target.
@@ -203,7 +207,7 @@ async fn relay_direct(
     let real_dst = if let IpAddr::V4(v4) = dst.ip() {
         if FakeDns::is_fake_ip(v4) {
             if let Some(domain) = domain {
-                let ip = resolve_via_protected_dns(domain, &ctx.protect_socket).await?;
+                let ip = resolve_via_protected_dns(domain, &ctx.dns_resolvers, &ctx.protect_socket).await?;
                 SocketAddr::new(IpAddr::V4(ip), dst.port())
             } else {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "fake IP without domain"));
@@ -296,17 +300,78 @@ async fn relay_via_mux_stream(
 
 // ── Protected DNS resolver ─────────────────────────────────────────
 
-/// External DNS server used for direct-connection resolution.
-/// Protected socket bypasses VPN, so this query goes to the real internet.
-const DNS_RESOLVER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
+/// Fallback public DNS resolvers, used when no system-provided resolvers
+/// are available or they all fail. Covers cases where the carrier blocks
+/// Google (8.8.8.8) but allows Cloudflare (1.1.1.1) or Yandex (77.88.8.8).
+pub const FALLBACK_DNS_RESOLVERS: &[SocketAddr] = &[
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(77, 88, 8, 8)), 53),
+];
 
-/// Resolve a domain to an IPv4 address via a protected UDP socket.
+/// Resolve a domain to an IPv4 address via protected UDP sockets.
 ///
 /// On Android, the system DNS resolver routes through the VPN's FakeDNS,
-/// returning fake IPs and creating a loop. This function sends a raw DNS
-/// query through a protected (VPN-bypassing) UDP socket to 8.8.8.8.
+/// returning fake IPs and creating a loop. This function sends raw DNS
+/// queries through protected (VPN-bypassing) UDP sockets.
+///
+/// Queries **all resolvers in parallel** and returns the first successful
+/// answer. This matters in restricted carrier networks where one resolver
+/// may be blocked while another works (e.g. mobile operator whitelist).
 async fn resolve_via_protected_dns(
     domain: &str,
+    resolvers: &[SocketAddr],
+    protect: &ProtectSocketFn,
+) -> io::Result<Ipv4Addr> {
+    // Always query at least the fallback resolvers — if the caller passed an
+    // empty list we'd otherwise silently return "no DNS" here.
+    let effective: Vec<SocketAddr> = if resolvers.is_empty() {
+        FALLBACK_DNS_RESOLVERS.to_vec()
+    } else {
+        // Deduplicate while preserving caller-provided order so system
+        // resolvers still win in the happy path.
+        let mut seen: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
+        let mut out: Vec<SocketAddr> = Vec::new();
+        for r in resolvers.iter().chain(FALLBACK_DNS_RESOLVERS.iter()) {
+            if seen.insert(*r) {
+                out.push(*r);
+            }
+        }
+        out
+    };
+
+    // Race all resolvers concurrently. First success wins; collect errors
+    // until the last task to finish.
+    let n = effective.len();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<io::Result<Ipv4Addr>>(n);
+    for &resolver in &effective {
+        let tx = tx.clone();
+        let domain = domain.to_string();
+        let protect = protect.clone();
+        tokio::spawn(async move {
+            let result = query_single_resolver(&domain, resolver, &protect).await;
+            let _ = tx.send(result).await;
+        });
+    }
+    drop(tx); // close sender so the channel ends after all tasks finish
+
+    let mut last_err: Option<io::Error> = None;
+    while let Some(result) = rx.recv().await {
+        match result {
+            Ok(ip) => return Ok(ip),
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("DNS resolve timeout for {}", domain),
+    )))
+}
+
+async fn query_single_resolver(
+    domain: &str,
+    resolver: SocketAddr,
     protect: &ProtectSocketFn,
 ) -> io::Result<Ipv4Addr> {
     let std_sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
@@ -317,12 +382,15 @@ async fn resolve_via_protected_dns(
     let sock = tokio::net::UdpSocket::from_std(std_sock)?;
 
     let query = build_dns_query(domain);
-    sock.send_to(&query, DNS_RESOLVER).await?;
+    sock.send_to(&query, resolver).await?;
 
     let mut buf = [0u8; 512];
-    let n = tokio::time::timeout(Duration::from_secs(5), sock.recv(&mut buf))
+    let n = tokio::time::timeout(Duration::from_secs(3), sock.recv(&mut buf))
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("DNS resolve timeout for {}", domain)))??;
+        .map_err(|_| io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("DNS resolve timeout for {} via {}", domain, resolver),
+        ))??;
 
     parse_dns_a_record(&buf[..n], domain)
 }

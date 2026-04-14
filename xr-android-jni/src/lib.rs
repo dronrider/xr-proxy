@@ -156,11 +156,43 @@ fn parse_config(json: &str) -> Result<VpnConfig, String> {
     let hub_preset = get_str("hub_preset").ok();
     let hub_cache_dir = get_str("hub_cache_dir").ok();
 
+    let dns_resolvers = parse_dns_resolvers(json);
+
     Ok(VpnConfig {
         server_address, server_port, obfuscation_key, modifier, salt,
         padding_min, padding_max, routing, geoip_path: None, on_server_down,
+        dns_resolvers,
         hub_url, hub_preset, hub_cache_dir,
     })
+}
+
+/// Extract the `dns_resolvers` JSON array of strings, e.g.
+/// `"dns_resolvers": ["1.1.1.1", "8.8.8.8:53"]`.
+/// Tolerant of missing key (returns empty vec) and minor whitespace.
+fn parse_dns_resolvers(json: &str) -> Vec<String> {
+    let key = "\"dns_resolvers\"";
+    let pos = match json.find(key) { Some(p) => p, None => return vec![] };
+    let after = &json[pos + key.len()..];
+    let bracket = match after.find('[') { Some(p) => p, None => return vec![] };
+    let close = match after[bracket..].find(']') { Some(p) => p, None => return vec![] };
+    let inner = &after[bracket + 1..bracket + close];
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    for c in inner.chars() {
+        match c {
+            '"' if !in_string => in_string = true,
+            '"' if in_string => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+                in_string = false;
+            }
+            _ if in_string => current.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn default_routing() -> RoutingConfig {
@@ -440,5 +472,29 @@ domains = ["youtube.com", "*.youtube.com"]"#;
     fn get_str_unterminated() {
         let json = r#"{"foo":"bar"#;
         assert!(json_get_str(json, "foo").is_err());
+    }
+
+    #[test]
+    fn parse_dns_resolvers_basic() {
+        let json = r#"{"dns_resolvers":["1.1.1.1","8.8.8.8:53","77.88.8.8"]}"#;
+        assert_eq!(parse_dns_resolvers(json), vec!["1.1.1.1", "8.8.8.8:53", "77.88.8.8"]);
+    }
+
+    #[test]
+    fn parse_dns_resolvers_missing() {
+        let json = r#"{"server_address":"1.2.3.4"}"#;
+        assert!(parse_dns_resolvers(json).is_empty());
+    }
+
+    #[test]
+    fn parse_dns_resolvers_empty_array() {
+        let json = r#"{"dns_resolvers":[]}"#;
+        assert!(parse_dns_resolvers(json).is_empty());
+    }
+
+    #[test]
+    fn parse_dns_resolvers_with_whitespace() {
+        let json = r#"{"dns_resolvers": [ "1.1.1.1" , "8.8.4.4" ]}"#;
+        assert_eq!(parse_dns_resolvers(json), vec!["1.1.1.1", "8.8.4.4"]);
     }
 }

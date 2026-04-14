@@ -6,6 +6,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.SharedPreferences
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
 import android.net.VpnService
 import android.os.IBinder
 import androidx.lifecycle.AndroidViewModel
@@ -410,6 +413,12 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun buildConfigJson(state: VpnUiState): String {
         val routingToml = buildRoutingToml(state)
+        // System DNS comes from the ACTIVE network we have BEFORE the VPN
+        // takes over — once the TUN is up, getActiveNetwork() returns the
+        // VPN itself and its DNS would be 10.0.0.1 (FakeDNS), creating a
+        // resolution loop. Сбор делаем тут, до запуска сервиса.
+        val systemDns = collectSystemDnsServers()
+        val dnsArray = systemDns.joinToString(", ") { "\"$it\"" }
         return """
             {
                 "server_address": "${state.serverAddress}",
@@ -420,9 +429,46 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 "padding_min": 16,
                 "padding_max": 128,
                 "routing_toml": "${routingToml.replace("\"", "\\\"").replace("\n", "\\n")}",
-                "on_server_down": "direct"
+                "on_server_down": "direct",
+                "dns_resolvers": [$dnsArray]
             }
         """.trimIndent()
+    }
+
+    /**
+     * Returns DNS servers from the currently active (non-VPN) network.
+     * Used to give the engine a working resolver path through carrier-imposed
+     * whitelists where public resolvers (8.8.8.8, 1.1.1.1) might be blocked.
+     */
+    private fun collectSystemDnsServers(): List<String> {
+        val cm = getApplication<Application>()
+            .getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return emptyList()
+
+        val seen = mutableSetOf<String>()
+        val result = mutableListOf<String>()
+
+        fun addFrom(network: Network?) {
+            if (network == null) return
+            val lp: LinkProperties = cm.getLinkProperties(network) ?: return
+            for (addr in lp.dnsServers) {
+                val ip = addr.hostAddress ?: continue
+                // Skip VPN / loopback / link-local addresses.
+                if (ip.startsWith("10.0.0.") || ip == "127.0.0.1" || ip.startsWith("169.254.")) continue
+                if (seen.add(ip)) result.add(ip)
+            }
+        }
+
+        // Prefer the active network's resolvers.
+        addFrom(cm.activeNetwork)
+        // Then any other non-VPN networks (Wi-Fi while on cellular, etc.).
+        for (network in cm.allNetworks) {
+            val caps = cm.getNetworkCapabilities(network) ?: continue
+            if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) continue
+            addFrom(network)
+        }
+
+        return result
     }
 
     private fun buildRoutingToml(state: VpnUiState): String {

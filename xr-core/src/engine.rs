@@ -52,6 +52,11 @@ pub struct VpnConfig {
     pub routing: RoutingConfig,
     pub geoip_path: Option<String>,
     pub on_server_down: String,
+    /// DNS resolvers (host:port or IP) used for direct-connection name
+    /// resolution via protected sockets. Typically supplied by the host
+    /// platform (e.g. Android ConnectivityManager). Empty means use only
+    /// the public fallback list.
+    pub dns_resolvers: Vec<String>,
     /// Hub configuration for centralized presets.
     pub hub_url: Option<String>,
     pub hub_preset: Option<String>,
@@ -140,12 +145,31 @@ impl VpnEngine {
             )
         };
 
+        // Parse DNS resolvers from config strings.
+        // Accept both "1.2.3.4" (assume :53) and "1.2.3.4:53". Bad entries
+        // are logged and skipped — they shouldn't kill startup.
+        let dns_resolvers: Vec<SocketAddr> = self.config.dns_resolvers.iter()
+            .filter_map(|s| {
+                let s = s.trim();
+                if s.is_empty() { return None; }
+                if let Ok(addr) = s.parse::<SocketAddr>() {
+                    return Some(addr);
+                }
+                if let Ok(ip) = s.parse::<IpAddr>() {
+                    return Some(SocketAddr::new(ip, 53));
+                }
+                tracing::warn!("ignoring malformed DNS resolver entry: {}", s);
+                None
+            })
+            .collect();
+
         let ctx = Arc::new(SessionContext {
             router, codec, server_addr,
             fake_dns: fake_dns.clone(),
             stats: self.stats.clone(),
             on_server_down, protect_socket,
             mux_pool,
+            dns_resolvers,
         });
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
