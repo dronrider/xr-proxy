@@ -41,4 +41,26 @@ object NativeBridge {
 
     external fun nativePushPacket(packet: ByteArray)
     external fun nativePopPacket(): ByteArray?
+
+    // ── Onboarding (LLD-04) ─────────────────────────────────────────
+    // All functions return JSON strings — parse on Kotlin side.
+
+    /** Parse a raw URL (scanned / pasted / deep-linked). Returns either
+     *  `{"kind":"https|custom","hub_url":..,"token":..}` or `{"error":".."}`. */
+    external fun nativeParseInviteLink(raw: String): String
+
+    /** GET invite metadata (does NOT consume). Returns InviteInfo JSON
+     *  (fields: token, preset, comment, status, expires_at) or `{"error":".."}`. */
+    external fun nativeFetchInviteInfo(hubUrl: String, token: String, timeoutMs: Long): String
+
+    /** Claim + TOFU public key + pre-warm preset cache. Returns JSON:
+     *  `{"payload":..?,"public_key":..?,"preset_cached":bool,"errors":[..]}`.
+     *  `payload` null means the whole apply failed — check `errors`. */
+    external fun nativeApplyInvite(
+        hubUrl: String,
+        token: String,
+        preset: String,
+        cacheDir: String,
+        timeoutMs: Long,
+    ): String
 }

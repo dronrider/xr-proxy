@@ -42,7 +42,12 @@ import com.xrproxy.app.ui.components.StatsGrid
 import com.xrproxy.app.ui.components.XrSnackbarHost
 import com.xrproxy.app.ui.components.formatBytes
 import com.xrproxy.app.ui.components.formatUptime
+import com.xrproxy.app.ui.onboarding.InviteConfirmScreen
+import com.xrproxy.app.ui.onboarding.PasteLinkDialog
+import com.xrproxy.app.ui.onboarding.WelcomeScreen
+import com.xrproxy.app.ui.onboarding.scanInviteQr
 import com.xrproxy.app.ui.theme.XrTheme
+import kotlinx.coroutines.launch
 
 /**
  * Счётчики событий по уровням в `recent_errors`. Критерии совпадают с
@@ -97,25 +102,52 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        handleIntent(intent)
+
         setContent {
             XrTheme {
                 MainScreen(
                     viewModel = viewModel,
                     launchVpnPermission = { intent -> vpnPermissionLauncher.launch(intent) },
+                    finishActivity = { finish() },
                 )
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleIntent(intent)
+    }
+
+    /**
+     * HTTPS-ссылки `/invite/...` и `xr://invite` — две точки входа по deep link.
+     * Парсинг/сетевая часть живут в VpnViewModel, здесь — только роутинг URI.
+     */
+    private fun handleIntent(intent: Intent?) {
+        if (intent == null) return
+        if (intent.action != Intent.ACTION_VIEW) return
+        val data = intent.data ?: return
+        viewModel.onInviteLinkReceived(data.toString())
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MainScreen(viewModel: VpnViewModel, launchVpnPermission: (Intent) -> Unit) {
+fun MainScreen(
+    viewModel: VpnViewModel,
+    launchVpnPermission: (Intent) -> Unit,
+    finishActivity: () -> Unit,
+) {
     val state by viewModel.uiState.collectAsState()
+    val onboarding by viewModel.onboardingState.collectAsState()
     var currentTab by remember { mutableIntStateOf(0) }
 
     val snackbarHostState = remember { SnackbarHostState() }
     var lastSeverity by remember { mutableStateOf(UiSeverity.Info) }
+    var pasteDialogOpen by remember { mutableStateOf(false) }
+    val activity = LocalContext.current as Activity
+    val scope = rememberCoroutineScope()
 
     LaunchedEffect(Unit) {
         viewModel.permissionRequest.collect { intent -> launchVpnPermission(intent) }
@@ -125,6 +157,74 @@ fun MainScreen(viewModel: VpnViewModel, launchVpnPermission: (Intent) -> Unit) {
             lastSeverity = msg.severity
             snackbarHostState.showSnackbar(msg.text)
         }
+    }
+
+    // ── Onboarding overlays ────────────────────────────────────────
+    // До `Completed` главный Scaffold с табами не рендерим — чтобы
+    // пользователь не видел пустой экран с нижней навигацией.
+    if (onboarding != OnboardingState.Completed) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            when (val ob = onboarding) {
+                is OnboardingState.ShowingWelcome -> {
+                    WelcomeScreen(
+                        onScanClick = {
+                            scope.launch {
+                                try {
+                                    val raw = scanInviteQr(activity) ?: return@launch
+                                    viewModel.onInviteLinkReceived(raw)
+                                } catch (_: Throwable) {
+                                    snackbarHostState.showSnackbar(
+                                        "Сканер QR недоступен, используйте \"Вставить ссылку\""
+                                    )
+                                }
+                            }
+                        },
+                        onPasteClick = { pasteDialogOpen = true },
+                        onManualClick = { viewModel.onManualSetupChosen() },
+                    )
+                    if (pasteDialogOpen) {
+                        PasteLinkDialog(
+                            onDismiss = { pasteDialogOpen = false },
+                            onSubmit = { raw ->
+                                pasteDialogOpen = false
+                                viewModel.onInviteLinkReceived(raw)
+                            },
+                        )
+                    }
+                }
+                is OnboardingState.Loading -> {
+                    Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = Alignment.Center,
+                    ) { CircularProgressIndicator() }
+                }
+                is OnboardingState.ConfirmInvite -> {
+                    val willReplace = state.serverAddress.isNotBlank() || state.hubUrl.isNotBlank()
+                    InviteConfirmScreen(
+                        hubUrl = ob.hubUrl,
+                        preset = ob.preset,
+                        comment = ob.comment,
+                        status = ob.status,
+                        expiresAt = ob.expiresAt,
+                        willReplaceExisting = willReplace,
+                        applyEnabled = state.phase == ConnectPhase.Idle,
+                        applyInProgress = ob.applyInProgress,
+                        onApply = { viewModel.onInviteConfirmed() },
+                        onCancel = {
+                            viewModel.onInviteCancelled()
+                            if (!willReplace) finishActivity()
+                        },
+                    )
+                }
+                is OnboardingState.Completed -> { /* unreachable */ }
+            }
+            XrSnackbarHost(
+                snackbarHostState,
+                lastSeverity,
+                modifier = Modifier.align(Alignment.BottomCenter),
+            )
+        }
+        return
     }
 
     Scaffold(

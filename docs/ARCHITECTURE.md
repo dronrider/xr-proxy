@@ -100,6 +100,12 @@ Cargo-workspace + Android-модуль:
 - mux — поверх TCP создаётся мультиплексированный поток (см. `MuxPool`,
   `MuxStream`). Это позволяет держать один живой обфусцированный туннель и
   гонять по нему множество логических соединений.
+- [invite_url.rs](../xr-proto/src/invite_url.rs) — парсер invite-ссылок
+  для Android onboarding (LLD-04): `InviteLink::{Https, Custom}`,
+  `parse_invite_link`, `build_https_url`. Принимает `https://<hub>/invite/<token>`
+  (основной формат QR) и `xr://invite/<token>?hub=<host>` (кастомная схема
+  для deep link). Валидирует токен (base64url 22 chars), отсекает
+  loopback/private хосты.
 
 ### 4.2 xr-core — ядро персонального клиента
 
@@ -122,6 +128,12 @@ Cargo-workspace + Android-модуль:
   `tokio::sync::watch`. Реактивная доставка смены состояния.
 - [stats.rs](../xr-core/src/stats.rs) — `Stats` (atomic-счётчики без блокировок)
   + `recent_errors` (Mutex<Vec>). `snapshot()` → `StatsSnapshot`.
+- [onboarding.rs](../xr-core/src/onboarding.rs) — one-shot HTTP-вызовы
+  xr-hub для Android onboarding (LLD-04): `fetch_invite_info` (GET,
+  без consume) и `apply_invite` (POST `/claim` → `InvitePayload` + TOFU
+  `/public-key` + pre-warm preset cache через `PresetCache::write_to_disk`).
+  Живёт рядом с `presets.rs`, чтобы переиспользовать тот же reqwest-клиент
+  и формат кэша; JNI-обёртки в `xr-android-jni` лишь прокидывают вызовы.
 
 **Важно:** `relay_errors` (счётчик) и `recent_errors` (журнал строк) — два
 независимых источника. В Android UI бадж и заголовок вкладки Log считают
@@ -161,8 +173,9 @@ xr-core** — там другая модель (TUN/smoltcp vs TPROXY).
 
 ### 4.5 xr-android-jni — JNI-мост
 
-[lib.rs](../xr-android-jni/src/lib.rs) экспортирует 8 функций в
-`com.xrproxy.app.jni.NativeBridge`:
+[lib.rs](../xr-android-jni/src/lib.rs) экспортирует в
+`com.xrproxy.app.jni.NativeBridge` два набора функций — engine-control
+и onboarding:
 
 | JNI-функция | Назначение |
 |---|---|
@@ -174,6 +187,9 @@ xr-core** — там другая модель (TUN/smoltcp vs TPROXY).
 | `nativeClearErrorLog()` | Очистка журнала и счётчика `relay_errors`. |
 | `nativePushPacket(packet)` | Пакет TUN → `PacketQueue.inbound`. |
 | `nativePopPacket()` → `byte[]?` | Пакет `PacketQueue.outbound` → TUN. |
+| `nativeParseInviteLink(raw)` → `String (JSON)` | Парсинг invite-URL (LLD-04). Успех: `{kind,hub_url,token}`, ошибка: `{error}`. |
+| `nativeFetchInviteInfo(hub_url, token, timeoutMs)` → `String (JSON)` | GET `/api/v1/invite/<token>` → `InviteInfo` (без consume). |
+| `nativeApplyInvite(hub_url, token, preset, cacheDir, timeoutMs)` → `String (JSON)` | Claim + TOFU public-key + pre-warm preset. Одноразовый `tokio::runtime::Runtime` на вызов. |
 
 **Обратный колбэк:** `NativeBridge.protectSocket(fd): Boolean` — статический
 метод Kotlin, вызывается из Rust при создании исходящих сокетов. Реализация
@@ -224,6 +240,12 @@ Kotlin + Jetpack Compose, Material3, MVVM без DI-фреймворка.
   объект-синглтон с `external fun`. Ссылка `current: XrVpnService?`
   обновляется в `XrVpnService.onCreate/onDestroy` (не из `startVpn`), что
   гарантирует актуальность колбэка `protectSocket` при пересоздании сервиса.
+- [ui/onboarding/](../xr-android/app/src/main/java/com/xrproxy/app/ui/onboarding/) —
+  экраны онбординга (LLD-04): `WelcomeScreen` (три кнопки), `PasteLinkDialog`,
+  `InviteConfirmScreen` с live TTL-countdown'ом, `QrScanner` — suspend-обёртка
+  над Google Code Scanner (`play-services-code-scanner`, system UI без
+  `CAMERA`). Deep link: `AndroidManifest.xml` перехватывает `https://*/invite/*`
+  и `xr://invite/*` без `autoVerify` — хаб self-hosted, единого домена нет.
 
 **Модель состояния на Android:**
 
@@ -236,8 +258,18 @@ Kotlin + Jetpack Compose, Material3, MVVM без DI-фреймворка.
   `colorizeLog`). `relayErrors: Long` осталась только как debug-метрика в
   статистике, UI-бадж её не читает. Старое поле `errorLog: String` и метод
   `refreshLog()` удалены.
+- `OnboardingState { ShowingWelcome, Loading, ConfirmInvite(...), Completed }`
+  — параллельный StateFlow (LLD-04). Рендер MainActivity до `Completed`
+  подменяет главный Scaffold onboarding-экранами; переход в `Completed`
+  происходит после успешного `applyInvite` или при ручной настройке.
+  `initialOnboardingState()` смотрит на prefs: если пусты `server_address`
+  и `hub_url`, показываем Welcome.
 
-Хранилище настроек — SharedPreferences `xr_proxy`.
+Хранилище настроек — SharedPreferences `xr_proxy`. Новые ключи от LLD-04:
+`hub_url`, `hub_preset`, `trusted_public_key` — пишутся при Apply инвайта,
+читаются в `buildConfigJson` и включают в движке PresetCache +
+периодический sanity-check раз в 5 минут. Кэш пресета живёт в
+`filesDir/presets/<name>.json`.
 
 ## 5. Протоколы
 
@@ -410,7 +442,7 @@ GeoIP (за feature-flag).
 | 1 | [02-android-reliability.md](lld/02-android-reliability.md) | Connect / state hydration / бадж / foreground notification. Задаёт базу для всех остальных Android-LLD (binder, `ConnectPhase`, `recentErrors` как единый источник). | — | Implemented |
 | 2 | [01-control-plane.md](lld/01-control-plane.md) | `xr-hub`: пресеты, одноразовые инвайты, Admin SPA (Vue + PrimeVue), подпись ed25519, HTTPS через axum-server. Независим от Android, катается параллельно. | — | Implemented |
 | 3 | [06-android-visual.md](lld/06-android-visual.md) | Иконка «щит со стрелой-молнией», тёмная палитра navy + cyan, анимация `ShieldArrowIcon` по фазам, перекомпоновка статистики с live-скоростью, Debug за аккордеоном. Параллелится с шагом 2. | Шаг 1 | Implemented |
-| 4 | [04-onboarding-qr-uri.md](lld/04-onboarding-qr-uri.md) | Welcome-экран, Google Code Scanner, HTTPS deep link, экран подтверждения инвайта, TOFU public key. | Шаги 1-3 | Draft |
+| 4 | [04-onboarding-qr-uri.md](lld/04-onboarding-qr-uri.md) | Welcome-экран, Google Code Scanner, HTTPS deep link, экран подтверждения инвайта, TOFU public key. | Шаги 1-3 | Implemented |
 | 5 | [03-android-logs-ux.md](lld/03-android-logs-ux.md) | Sticky toolbar, substring + regex поиск, auto-follow, скачивание через SAF. | Шаг 1 | Draft |
 | 6 | [05-android-rules-editor.md](lld/05-android-rules-editor.md) | Четвёртая вкладка Rules, read-only пресет + упорядоченные user overrides, TOML-preview модал, удаление хардкода `PRESET_RUSSIA`. Закрывает всю пачку. | Шаги 1, 2, 4 | Draft |
 | 7 | [07-android-per-app-tunnel.md](lld/07-android-per-app-tunnel.md) | Per-app split tunneling: `VpnService.Builder.addAllowed/DisallowedApplication`. Три режима (all/exclude/include), picker приложений, QUERY_ALL_PACKAGES. Фикс жалоб приложений на «вы используете VPN», когда их трафик идёт direct. | Шаг 1 | Draft |

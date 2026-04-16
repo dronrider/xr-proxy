@@ -22,6 +22,24 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- HTTPS invite links от любого self-hosted xr-hub:
+                 не используем autoVerify (нет assetlinks.json у клиентских доменов). -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" />
+                <data android:pathPrefix="/invite/" />
+            </intent-filter>
+
+            <!-- Custom-схема для ручных deep-link'ов. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="xr" android:host="invite" />
+            </intent-filter>
         </activity>
 
         <service

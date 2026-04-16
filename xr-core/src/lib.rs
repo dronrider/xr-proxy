@@ -9,6 +9,7 @@
 pub mod dns;
 pub mod engine;
 pub mod ip_stack;
+pub mod onboarding;
 pub mod presets;
 pub mod session;
 pub mod state;

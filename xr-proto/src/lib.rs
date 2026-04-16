@@ -1,4 +1,5 @@
 pub mod config;
+pub mod invite_url;
 pub mod mux;
 pub mod mux_pool;
 pub mod obfuscation;

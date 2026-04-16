@@ -15,6 +15,7 @@ rand = "0.8"
 tracing = "0.1"
 maxminddb = { version = "0.24", optional = true }
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros", "sync"] }
+url = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

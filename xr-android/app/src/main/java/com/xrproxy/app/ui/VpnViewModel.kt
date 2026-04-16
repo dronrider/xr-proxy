@@ -11,10 +11,13 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.VpnService
 import android.os.IBinder
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.xrproxy.app.jni.NativeBridge
 import com.xrproxy.app.model.HealthLevel
 import com.xrproxy.app.service.XrVpnService
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -22,6 +25,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.io.File
 
 /** High-level phase of the VPN session as seen by the UI (LLD-06 §3.6). */
 enum class ConnectPhase {
@@ -41,6 +47,25 @@ enum class ConnectPhase {
 /** Snackbar message with severity for styled XrSnackbar (LLD-06 §3.9a). */
 enum class UiSeverity { Info, Warn, Error }
 data class UiMessage(val text: String, val severity: UiSeverity = UiSeverity.Info)
+
+/**
+ * Onboarding flow state (LLD-04 §3.8). `Completed` = основной UI; всё
+ * остальное — pre-main экраны, в которых нижний NavigationBar скрыт.
+ */
+sealed interface OnboardingState {
+    object ShowingWelcome : OnboardingState
+    object Loading : OnboardingState
+    data class ConfirmInvite(
+        val hubUrl: String,
+        val token: String,
+        val preset: String,
+        val comment: String,
+        val status: String,
+        val expiresAt: String,
+        val applyInProgress: Boolean = false,
+    ) : OnboardingState
+    object Completed : OnboardingState
+}
 
 data class VpnUiState(
     val phase: ConnectPhase = ConnectPhase.Idle,
@@ -74,6 +99,10 @@ data class VpnUiState(
     val routingPreset: String = "russia", // "russia", "proxy_all", "custom"
     val customDomains: String = "",
     val customIpRanges: String = "",
+    // Hub (LLD-04 onboarding, populated after Apply)
+    val hubUrl: String = "",
+    val hubPreset: String = "",
+    val trustedPublicKey: String = "",
     // UI feedback
     val settingsSaved: Boolean = false,
 ) {
@@ -91,11 +120,18 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(VpnUiState())
     val uiState: StateFlow<VpnUiState> = _uiState
 
+    private val _onboardingState = MutableStateFlow<OnboardingState>(OnboardingState.Loading)
+    val onboardingState: StateFlow<OnboardingState> = _onboardingState
+
     private val _permissionRequest = MutableSharedFlow<Intent>(extraBufferCapacity = 1)
     val permissionRequest: SharedFlow<Intent> = _permissionRequest
 
     private val _messages = MutableSharedFlow<UiMessage>(extraBufferCapacity = 4)
     val messages: SharedFlow<UiMessage> = _messages
+
+    private val presetCacheDir: File by lazy {
+        File(getApplication<Application>().filesDir, "presets").also { it.mkdirs() }
+    }
 
     private var boundService: XrVpnService? = null
     private var isBound = false
@@ -147,10 +183,24 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         loadSettings()
+        _onboardingState.value = initialOnboardingState()
         // Best-effort bind: if the service is already running (app re-entered
         // from background), we immediately mirror its state. If it isn't, we
         // stay Idle and bind again when the user hits Connect.
         tryBind(autoCreate = false)
+    }
+
+    /**
+     * Welcome отображается, пока нет ни ручной конфигурации (server_address)
+     * ни хаба (hub_url). Любое из двух — считаем настройку завершённой.
+     */
+    private fun initialOnboardingState(): OnboardingState {
+        val s = _uiState.value
+        return if (s.serverAddress.isBlank() && s.hubUrl.isBlank()) {
+            OnboardingState.ShowingWelcome
+        } else {
+            OnboardingState.Completed
+        }
     }
 
     override fun onCleared() {
@@ -191,6 +241,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             routingPreset = prefs.getString("routing_preset", "russia") ?: "russia",
             customDomains = prefs.getString("custom_domains", "") ?: "",
             customIpRanges = prefs.getString("custom_ip_ranges", "") ?: "",
+            hubUrl = prefs.getString("hub_url", "") ?: "",
+            hubPreset = prefs.getString("hub_preset", "") ?: "",
+            trustedPublicKey = prefs.getString("trusted_public_key", "") ?: "",
         )
     }
 
@@ -264,6 +317,185 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 customIpRanges = ipRanges.joinToString("\n"),
             )
         }
+    }
+
+    // ── Onboarding (LLD-04) ─────────────────────────────────────────
+
+    /**
+     * Вход для трёх точек: отсканированный QR, вставленная ссылка, deep link.
+     * Парсим URL → GET invite info → выставляем ConfirmInvite или Error
+     * через Snackbar. Invite в этот момент **не** consume'ится.
+     */
+    fun onInviteLinkReceived(raw: String) {
+        _onboardingState.value = OnboardingState.Loading
+        viewModelScope.launch {
+            val parsedJson = withContext(Dispatchers.IO) {
+                NativeBridge.nativeParseInviteLink(raw)
+            }
+            val parsed = runCatching { JSONObject(parsedJson) }.getOrNull()
+            if (parsed == null || parsed.has("error")) {
+                val err = parsed?.optString("error") ?: "parse failed"
+                emitMessage("Неправильный формат приглашения", UiSeverity.Error)
+                Log.w("xr-onboarding", "parseInviteLink: $err")
+                _onboardingState.value = initialOnboardingState()
+                return@launch
+            }
+            val hubUrl = parsed.optString("hub_url")
+            val token = parsed.optString("token")
+            if (hubUrl.isBlank() || token.isBlank()) {
+                emitMessage("Неправильный формат приглашения", UiSeverity.Error)
+                _onboardingState.value = initialOnboardingState()
+                return@launch
+            }
+
+            val infoJson = withContext(Dispatchers.IO) {
+                NativeBridge.nativeFetchInviteInfo(hubUrl, token, 5_000L)
+            }
+            val info = runCatching { JSONObject(infoJson) }.getOrNull()
+            if (info == null) {
+                emitMessage("Ошибка ответа хаба", UiSeverity.Error)
+                _onboardingState.value = initialOnboardingState()
+                return@launch
+            }
+            if (info.has("error")) {
+                val err = info.optString("error")
+                emitMessage(friendlyInviteInfoError(err), UiSeverity.Error)
+                _onboardingState.value = initialOnboardingState()
+                return@launch
+            }
+
+            _onboardingState.value = OnboardingState.ConfirmInvite(
+                hubUrl = hubUrl,
+                token = token,
+                preset = info.optString("preset"),
+                comment = info.optString("comment"),
+                status = info.optString("status", "active"),
+                expiresAt = info.optString("expires_at"),
+            )
+        }
+    }
+
+    fun onInviteCancelled() {
+        _onboardingState.value = initialOnboardingState()
+    }
+
+    /** Welcome → Settings (ручная настройка). Создаём «заглушку» в prefs —
+     *  серверного адреса ещё нет, но пользователь попадает в главный UI. */
+    fun onManualSetupChosen() {
+        _onboardingState.value = OnboardingState.Completed
+    }
+
+    /**
+     * Фаза 2: claim + TOFU public-key + pre-warm preset. Вызывается по
+     * нажатию «Применить» на экране подтверждения.
+     */
+    fun onInviteConfirmed() {
+        val current = _onboardingState.value as? OnboardingState.ConfirmInvite ?: return
+        if (current.applyInProgress) return
+        if (_uiState.value.phase != ConnectPhase.Idle) {
+            emitMessage("Сначала отключите VPN", UiSeverity.Warn)
+            return
+        }
+        _onboardingState.value = current.copy(applyInProgress = true)
+
+        viewModelScope.launch {
+            val resultJson = withContext(Dispatchers.IO) {
+                NativeBridge.nativeApplyInvite(
+                    current.hubUrl,
+                    current.token,
+                    current.preset,
+                    presetCacheDir.absolutePath,
+                    5_000L,
+                )
+            }
+            val result = runCatching { JSONObject(resultJson) }.getOrNull()
+            val payload = result?.optJSONObject("payload")
+            if (payload == null) {
+                val errors = result?.optJSONArray("errors")
+                val first = if (errors != null && errors.length() > 0) errors.optString(0) else "unknown"
+                emitMessage(friendlyClaimError(first), UiSeverity.Error)
+                _onboardingState.value = current.copy(applyInProgress = false)
+                return@launch
+            }
+
+            val publicKey = result.optString("public_key").takeIf {
+                it.isNotBlank() && it != "null"
+            } ?: ""
+            val presetCached = result.optBoolean("preset_cached", false)
+
+            persistApplyResult(payload, current.hubUrl, publicKey)
+
+            if (!presetCached) {
+                emitMessage(
+                    "Хаб недоступен, подпись пресета не будет проверяться",
+                    UiSeverity.Warn,
+                )
+            }
+            _onboardingState.value = OnboardingState.Completed
+        }
+    }
+
+    private fun persistApplyResult(payload: JSONObject, hubUrl: String, publicKey: String) {
+        val serverAddress = payload.optString("server_address")
+        val serverPort = payload.optInt("server_port", 8443).toString()
+        val obfKey = payload.optString("obfuscation_key")
+        val modifier = payload.optString("modifier", "positional_xor_rotate")
+        val salt = payload.optLong("salt", 0xDEADBEEFL).toString()
+        val presetName = payload.optString("preset")
+        // Payload хранит собственный hub_url — используем его, а не тот, по
+        // которому пришла ссылка, чтобы хаб мог направить клиента на canonical
+        // адрес (например, при смене домена).
+        val hubFromPayload = payload.optString("hub_url").ifBlank { hubUrl }
+
+        prefs.edit()
+            .putString("server_address", serverAddress)
+            .putString("server_port", serverPort)
+            .putString("obfuscation_key", obfKey)
+            .putString("modifier", modifier)
+            .putString("salt", salt)
+            .putString("routing_preset", presetName.ifBlank { "russia" })
+            .putString("hub_url", hubFromPayload)
+            .putString("hub_preset", presetName)
+            .putString("trusted_public_key", publicKey)
+            .apply()
+
+        _uiState.value = _uiState.value.copy(
+            serverAddress = serverAddress,
+            serverPort = serverPort,
+            obfuscationKey = obfKey,
+            modifier = modifier,
+            salt = salt,
+            routingPreset = presetName.ifBlank { "russia" },
+            hubUrl = hubFromPayload,
+            hubPreset = presetName,
+            trustedPublicKey = publicKey,
+        )
+    }
+
+    private fun friendlyInviteInfoError(code: String): String = when (code) {
+        "not_found" -> "Приглашение не найдено"
+        "gone" -> "Приглашение уже использовано или истекло"
+        else -> when {
+            code.startsWith("network") -> "Хаб недоступен. Проверьте интернет"
+            code.contains("invalid certificate") || code.contains("certificate") ->
+                "Небезопасное соединение с хабом"
+            code.startsWith("http_4") || code.startsWith("http_5") ->
+                "Ошибка хаба: ${code.removePrefix("http_")}"
+            else -> "Ошибка: $code"
+        }
+    }
+
+    private fun friendlyClaimError(code: String): String = when {
+        code.contains("gone") -> "Приглашение уже использовано или истекло"
+        code.contains("not_found") -> "Приглашение не найдено"
+        code.startsWith("claim network") || code.startsWith("network") ->
+            "Хаб недоступен. Проверьте интернет"
+        code.contains("certificate") -> "Небезопасное соединение с хабом"
+        else -> "Ошибка применения: $code"
+    }
+
+    private fun emitMessage(text: String, severity: UiSeverity) {
+        viewModelScope.launch { _messages.emit(UiMessage(text, severity)) }
     }
 
     // ── VPN connection ──────────────────────────────────────────────
@@ -419,6 +651,18 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         // resolution loop. Сбор делаем тут, до запуска сервиса.
         val systemDns = collectSystemDnsServers()
         val dnsArray = systemDns.joinToString(", ") { "\"$it\"" }
+        // Hub-поля опциональны: если инвайт ещё не применялся, движок их не
+        // увидит и будет работать на локальном routing_toml. Если применялся —
+        // движок включит PresetCache и начнёт периодический sanity-check.
+        val hubFields = if (state.hubUrl.isNotBlank() && state.hubPreset.isNotBlank()) {
+            """,
+                "hub_url": "${state.hubUrl}",
+                "hub_preset": "${state.hubPreset}",
+                "hub_cache_dir": "${presetCacheDir.absolutePath}",
+                "hub_refresh_interval_secs": 300"""
+        } else {
+            ""
+        }
         return """
             {
                 "server_address": "${state.serverAddress}",
@@ -430,7 +674,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 "padding_max": 128,
                 "routing_toml": "${routingToml.replace("\"", "\\\"").replace("\n", "\\n")}",
                 "on_server_down": "direct",
-                "dns_resolvers": [$dnsArray]
+                "dns_resolvers": [$dnsArray]$hubFields
             }
         """.trimIndent()
     }

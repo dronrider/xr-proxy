@@ -75,6 +75,13 @@ dependencies {
 
     // Security (encrypted preferences)
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
+    // Google Code Scanner (system-UI QR scanner, no CAMERA permission needed)
+    implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
+
+    // Явный апгрейд androidx.fragment — play-services-code-scanner транзитивно
+    // тащит старый fragment, а lint требует >= 1.3.0 для registerForActivityResult.
+    implementation("androidx.fragment:fragment-ktx:1.8.3")
 }
 
 // Task to build Rust native libraries before Android build.

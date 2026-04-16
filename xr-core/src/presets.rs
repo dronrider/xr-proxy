@@ -163,11 +163,17 @@ impl PresetCache {
     }
 
     fn save_to_disk(&self, preset: &Preset) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.cache_dir)?;
+        Self::write_to_disk(&self.cache_dir, preset)
+    }
+
+    /// Atomically write `preset` to `<cache_dir>/<preset.name>.json`.
+    /// Public so onboarding (one-shot, no live `PresetCache`) can pre-warm
+    /// the cache for the engine that will pick it up on first Connect.
+    pub fn write_to_disk(cache_dir: &Path, preset: &Preset) -> std::io::Result<()> {
+        std::fs::create_dir_all(cache_dir)?;
         let data = serde_json::to_string_pretty(preset)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        let path = self.cache_path();
-        // Simple atomic-ish write: write to tmp then rename.
+        let path = cache_dir.join(format!("{}.json", preset.name));
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, data)?;
         std::fs::rename(&tmp, &path)?;

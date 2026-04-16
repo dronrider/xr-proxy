@@ -58,6 +58,11 @@ log_level = "info"                    # error, warn, info, debug
 # When configured, the client fetches routing presets from xr-hub on startup
 # and refreshes them periodically. Local [[routing.rules]] above become
 # overrides that take priority over the preset.
+#
+# Android-клиент (LLD-04) заполняет эти поля автоматически из инвайта
+# (QR / deep link / вставленная ссылка) — ручное редактирование не нужно.
+# OpenWRT-клиент пока заполняет вручную; onboarding через инвайт для
+# router'а — предмет отдельного LLD.
 # [hub]
 # url = "https://xr-hub.example.com"
 # preset = "russia"

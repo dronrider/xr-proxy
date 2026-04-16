@@ -3149,6 +3149,8 @@ name = "xr-android-jni"
 version = "0.1.0"
 dependencies = [
  "jni",
+ "serde",
+ "serde_json",
  "tokio",
  "toml 0.8.23",
  "tracing",
@@ -3227,6 +3229,7 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
+ "url",
 ]
 
 [[package]]
