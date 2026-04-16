@@ -44,6 +44,8 @@ pub struct Invite {
     pub expires_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_by_ip: Option<String>,
     pub one_time: bool,
     #[serde(default)]
     pub comment: String,

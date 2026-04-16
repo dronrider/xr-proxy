@@ -64,7 +64,7 @@ pub async fn view_invite(
 
     let preset = &invite.payload.preset;
     let comment = &invite.comment;
-    let expires = &invite.expires_at;
+    let expires = format_datetime(&invite.expires_at);
     let status_badge = match status {
         "active" => r#"<span style="color:#2e7d32;font-weight:600">Active</span>"#,
         "expired" => r#"<span style="color:#999">Expired</span>"#,
@@ -108,7 +108,6 @@ pub async fn view_invite(
   <div class="qr">
     <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data={qr_data_encoded}" width="200" height="200" alt="QR Code">
   </div>
-  {action_html}
 </div>
 </body>
 </html>"#,
@@ -121,14 +120,16 @@ pub async fn view_invite(
             format!(r#"<div class="field"><div class="field-label">Comment</div><div class="field-value">{comment}</div></div>"#)
         },
         qr_data_encoded = urlencoding(&qr_data),
-        action_html = if status == "active" {
-            format!(r#"<p class="meta">Use the xr-proxy app to scan and activate this invite.</p>"#)
-        } else {
-            format!(r#"<p class="meta">This invite is no longer available.</p>"#)
-        },
     );
 
     Ok(Html(html))
+}
+
+/// Format RFC3339 datetime to human-readable "YYYY-MM-DD HH:MM:SS UTC".
+fn format_datetime(rfc3339: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|_| rfc3339.to_string())
 }
 
 fn urlencoding(s: &str) -> String {
@@ -144,6 +145,7 @@ fn urlencoding(s: &str) -> String {
 pub async fn claim_invite(
     State(state): State<Arc<AppState>>,
     extract::Path(token): extract::Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<InvitePayload>, (StatusCode, String)> {
     let mut invites = state.invites.write().await;
     let invite = invites
@@ -158,11 +160,26 @@ pub async fn claim_invite(
         return Err((StatusCode::GONE, "invite already used".into()));
     }
 
+    // Extract client IP (X-Real-IP from nginx, or direct connection).
+    let client_ip = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .or_else(|| {
+            headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split(',').next())
+                .map(|s| s.trim().to_string())
+        })
+        ;
+
     let payload = invite.payload.clone();
 
     // Consume one-time invites (unless dev_mode).
     if invite.one_time && !state.config.invites.dev_mode {
         invite.consumed_at = Some(now);
+        invite.claimed_by_ip = client_ip;
         let data_dir = Path::new(&state.config.server.data_dir);
         let _ = storage::save_invite(data_dir, invite);
     }
@@ -249,6 +266,7 @@ pub async fn create_invite(
         created_at: now.to_rfc3339(),
         expires_at: expires.to_rfc3339(),
         consumed_at: None,
+        claimed_by_ip: None,
         one_time: req.one_time,
         comment: req.comment,
         payload,

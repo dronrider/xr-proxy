@@ -23,6 +23,7 @@ const defaults = ref<InviteDefaultsResponse | null>(null)
 // Form fields
 const preset = ref('')
 const ttlOption = ref('86400')
+const customTtlHours = ref(48)
 const oneTime = ref(true)
 const comment = ref('')
 
@@ -73,7 +74,9 @@ async function showQr(invite: Invite) {
 }
 
 async function handleCreate() {
-  const ttl = parseInt(ttlOption.value)
+  const ttl = ttlOption.value === 'custom'
+    ? customTtlHours.value * 3600
+    : parseInt(ttlOption.value)
   const req: CreateInviteRequest = {
     ttl_seconds: ttl,
     one_time: oneTime.value,
@@ -141,8 +144,21 @@ function copyLink(invite: Invite) {
               <option value="3600">1 hour</option>
               <option value="86400">24 hours</option>
               <option value="604800">7 days</option>
+              <option value="custom">Custom...</option>
             </select>
           </div>
+          <div class="field" v-if="ttlOption === 'custom'">
+            <label>Hours</label>
+            <input v-model.number="customTtlHours" type="number" min="1" max="8760" placeholder="48" />
+          </div>
+          <div class="field" v-else>
+            <label class="checkbox-label">
+              <input type="checkbox" v-model="oneTime" />
+              One-time
+            </label>
+          </div>
+        </div>
+        <div class="field-row" v-if="ttlOption === 'custom'">
           <div class="field">
             <label class="checkbox-label">
               <input type="checkbox" v-model="oneTime" />
@@ -176,6 +192,7 @@ function copyLink(invite: Invite) {
           <th>Created</th>
           <th>Expires</th>
           <th>Status</th>
+          <th>Claimed by</th>
           <th>Comment</th>
           <th>Actions</th>
         </tr>
@@ -187,6 +204,7 @@ function copyLink(invite: Invite) {
           <td>{{ formatDate(inv.created_at) }}</td>
           <td>{{ formatDate(inv.expires_at) }}</td>
           <td><span :class="statusClass(inv)">{{ statusOf(inv) }}</span></td>
+          <td><code v-if="inv.claimed_by_ip">{{ inv.claimed_by_ip }}</code></td>
           <td>{{ inv.comment }}</td>
           <td class="actions">
             <button
@@ -207,7 +225,7 @@ function copyLink(invite: Invite) {
           </td>
         </tr>
         <tr v-if="!invitesStore.invites.length">
-          <td colspan="7" class="empty">No invites yet</td>
+          <td colspan="8" class="empty">No invites yet</td>
         </tr>
       </tbody>
     </table>

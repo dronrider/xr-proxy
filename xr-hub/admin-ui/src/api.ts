@@ -137,6 +137,7 @@ export interface Invite {
   created_at: string
   expires_at: string
   consumed_at?: string
+  claimed_by_ip?: string
   one_time: boolean
   comment: string
   payload: InvitePayload
