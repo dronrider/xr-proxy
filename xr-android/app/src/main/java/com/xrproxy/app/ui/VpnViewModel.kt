@@ -5,7 +5,6 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
-import android.content.SharedPreferences
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
@@ -14,6 +13,9 @@ import android.os.IBinder
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.xrproxy.app.data.ServerProfile
+import com.xrproxy.app.data.ServerRepository
+import com.xrproxy.app.data.ServerSource
 import com.xrproxy.app.jni.NativeBridge
 import com.xrproxy.app.model.HealthLevel
 import com.xrproxy.app.service.XrVpnService
@@ -24,12 +26,15 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
+import java.time.OffsetDateTime
+import java.util.UUID
 
-/** High-level phase of the VPN session as seen by the UI (LLD-06 §3.6). */
 enum class ConnectPhase {
     Idle,
     NeedsPermission,
@@ -44,14 +49,9 @@ enum class ConnectPhase {
         get() = this == Preparing || this == Connecting || this == Finalizing || this == Stopping
 }
 
-/** Snackbar message with severity for styled XrSnackbar (LLD-06 §3.9a). */
 enum class UiSeverity { Info, Warn, Error }
 data class UiMessage(val text: String, val severity: UiSeverity = UiSeverity.Info)
 
-/**
- * Onboarding flow state (LLD-04 §3.8). `Completed` = основной UI; всё
- * остальное — pre-main экраны, в которых нижний NavigationBar скрыт.
- */
 sealed interface OnboardingState {
     object ShowingWelcome : OnboardingState
     object Loading : OnboardingState
@@ -74,12 +74,9 @@ data class VpnUiState(
     val bytesDown: Long = 0,
     val activeConnections: Int = 0,
     val uptime: Long = 0,
-    // Speed (bytes/sec)
     val speedUp: Long = 0,
     val speedDown: Long = 0,
-    // Health
     val health: HealthLevel = HealthLevel.Healthy,
-    // Debug
     val dnsQueries: Long = 0,
     val tcpSyns: Long = 0,
     val smolRecv: Long = 0,
@@ -89,22 +86,6 @@ data class VpnUiState(
     val debugMsg: String = "",
     val recentErrors: List<String> = emptyList(),
     val debugExpanded: Boolean = false,
-    // Settings
-    val serverAddress: String = "",
-    val serverPort: String = "8443",
-    val obfuscationKey: String = "",
-    val modifier: String = "positional_xor_rotate",
-    val salt: String = "3735928559",
-    // Routing
-    val routingPreset: String = "russia", // "russia", "proxy_all", "custom"
-    val customDomains: String = "",
-    val customIpRanges: String = "",
-    // Hub (LLD-04 onboarding, populated after Apply)
-    val hubUrl: String = "",
-    val hubPreset: String = "",
-    val trustedPublicKey: String = "",
-    // UI feedback
-    val settingsSaved: Boolean = false,
 ) {
     val connected: Boolean
         get() = phase == ConnectPhase.Connected
@@ -114,8 +95,9 @@ data class VpnUiState(
 
 class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val prefs: SharedPreferences =
-        application.getSharedPreferences("xr_proxy", Context.MODE_PRIVATE)
+    private val prefs = application.getSharedPreferences("xr_proxy", Context.MODE_PRIVATE)
+
+    val repo = ServerRepository(prefs)
 
     private val _uiState = MutableStateFlow(VpnUiState())
     val uiState: StateFlow<VpnUiState> = _uiState
@@ -152,7 +134,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             serviceObserverJob?.cancel()
             serviceObserverJob = null
             isBound = false
-            // Service went away unexpectedly — reflect Disconnected honestly.
             _uiState.value = _uiState.value.copy(
                 phase = ConnectPhase.Idle,
                 state = "Disconnected",
@@ -162,11 +143,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Releases the current binding. Called after the service reports Idle
-     * (in `applyServiceState`) so the service can actually be destroyed —
-     * `stopSelf()` alone is a no-op while we keep a binding alive.
-     */
     private fun unbindAndClear() {
         serviceObserverJob?.cancel()
         serviceObserverJob = null
@@ -174,43 +150,24 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         if (isBound) {
             try {
                 getApplication<Application>().unbindService(bindConnection)
-            } catch (_: Exception) {
-                // Already disconnected — ignore.
-            }
+            } catch (_: Exception) {}
             isBound = false
         }
     }
 
     init {
-        loadSettings()
         _onboardingState.value = initialOnboardingState()
-        // Best-effort bind: if the service is already running (app re-entered
-        // from background), we immediately mirror its state. If it isn't, we
-        // stay Idle and bind again when the user hits Connect.
         tryBind(autoCreate = false)
     }
 
-    /**
-     * Welcome отображается, пока нет ни ручной конфигурации (server_address)
-     * ни хаба (hub_url). Любое из двух — считаем настройку завершённой.
-     */
-    private fun initialOnboardingState(): OnboardingState {
-        val s = _uiState.value
-        return if (s.serverAddress.isBlank() && s.hubUrl.isBlank()) {
-            OnboardingState.ShowingWelcome
-        } else {
-            OnboardingState.Completed
-        }
-    }
+    private fun initialOnboardingState(): OnboardingState =
+        if (repo.servers.value.isEmpty()) OnboardingState.ShowingWelcome
+        else OnboardingState.Completed
 
     override fun onCleared() {
         serviceObserverJob?.cancel()
         if (isBound) {
-            try {
-                getApplication<Application>().unbindService(bindConnection)
-            } catch (_: Exception) {
-                // Already disconnected or never bound — ignore.
-            }
+            try { getApplication<Application>().unbindService(bindConnection) } catch (_: Exception) {}
             isBound = false
         }
         super.onCleared()
@@ -224,108 +181,68 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         val flags = if (autoCreate) Context.BIND_AUTO_CREATE else 0
         isBound = try {
             getApplication<Application>().bindService(intent, bindConnection, flags)
-        } catch (_: Exception) {
-            false
-        }
+        } catch (_: Exception) { false }
     }
 
-    // ── Settings persistence ────────────────────────────────────────
+    // ── Server management (LLD-08) ──────────────────────────────────
 
-    private fun loadSettings() {
-        _uiState.value = _uiState.value.copy(
-            serverAddress = prefs.getString("server_address", "") ?: "",
-            serverPort = prefs.getString("server_port", "8443") ?: "8443",
-            obfuscationKey = prefs.getString("obfuscation_key", "") ?: "",
-            modifier = prefs.getString("modifier", "positional_xor_rotate") ?: "positional_xor_rotate",
-            salt = prefs.getString("salt", "3735928559") ?: "3735928559",
-            routingPreset = prefs.getString("routing_preset", "russia") ?: "russia",
-            customDomains = prefs.getString("custom_domains", "") ?: "",
-            customIpRanges = prefs.getString("custom_ip_ranges", "") ?: "",
-            hubUrl = prefs.getString("hub_url", "") ?: "",
-            hubPreset = prefs.getString("hub_preset", "") ?: "",
-            trustedPublicKey = prefs.getString("trusted_public_key", "") ?: "",
-        )
-    }
-
-    fun saveSettings() {
+    fun selectServer(id: String) {
         val s = _uiState.value
-        prefs.edit()
-            .putString("server_address", s.serverAddress)
-            .putString("server_port", s.serverPort)
-            .putString("obfuscation_key", s.obfuscationKey)
-            .putString("modifier", s.modifier)
-            .putString("salt", s.salt)
-            .putString("routing_preset", s.routingPreset)
-            .putString("custom_domains", s.customDomains)
-            .putString("custom_ip_ranges", s.customIpRanges)
-            .apply()
+        if (s.phase != ConnectPhase.Idle && repo.activeId.value != id) {
+            emitMessage("Сначала отключите VPN", UiSeverity.Warn)
+            return
+        }
+        repo.setActive(id)
+    }
 
-        _uiState.value = _uiState.value.copy(settingsSaved = true)
-        viewModelScope.launch {
-            delay(2000)
-            _uiState.value = _uiState.value.copy(settingsSaved = false)
+    fun upsertServer(profile: ServerProfile) {
+        repo.upsert(profile)
+        if (repo.activeId.value == null) {
+            repo.setActive(profile.id)
         }
     }
 
-    // ── Field updates ───────────────────────────────────────────────
-
-    fun updateServerAddress(value: String) { _uiState.value = _uiState.value.copy(serverAddress = value) }
-    fun updateServerPort(value: String) { _uiState.value = _uiState.value.copy(serverPort = value) }
-    fun updateObfuscationKey(value: String) { _uiState.value = _uiState.value.copy(obfuscationKey = value) }
-    fun updateSalt(value: String) { _uiState.value = _uiState.value.copy(salt = value) }
-    fun updateRoutingPreset(value: String) { _uiState.value = _uiState.value.copy(routingPreset = value) }
-    fun updateCustomDomains(value: String) { _uiState.value = _uiState.value.copy(customDomains = value) }
-    fun updateCustomIpRanges(value: String) { _uiState.value = _uiState.value.copy(customIpRanges = value) }
-
-    fun clearLog() {
-        boundService?.clearLog()
+    fun deleteServer(id: String) {
+        val isActive = repo.activeId.value == id
+        if (isActive && _uiState.value.phase != ConnectPhase.Idle) {
+            viewModelScope.launch {
+                disconnect()
+                _uiState.map { it.phase == ConnectPhase.Idle }.first { it }
+                repo.delete(id)
+                if (repo.servers.value.isEmpty()) {
+                    _onboardingState.value = OnboardingState.ShowingWelcome
+                }
+            }
+        } else {
+            repo.delete(id)
+            if (repo.servers.value.isEmpty()) {
+                _onboardingState.value = OnboardingState.ShowingWelcome
+            }
+        }
     }
+
+    fun onServerEditSaved(profile: ServerProfile) {
+        val wasActive = repo.activeId.value == profile.id
+        repo.upsert(profile)
+        if (wasActive && _uiState.value.phase == ConnectPhase.Connected) {
+            emitMessage("Применяю новые настройки…", UiSeverity.Info)
+            viewModelScope.launch {
+                disconnect()
+                _uiState.map { it.phase == ConnectPhase.Idle }.first { it }
+                delay(300)
+                onConnectClicked()
+            }
+        }
+    }
+
+    fun clearLog() { boundService?.clearLog() }
 
     fun toggleDebug() {
         _uiState.value = _uiState.value.copy(debugExpanded = !_uiState.value.debugExpanded)
     }
 
-    /// Import TOML config from clipboard text.
-    fun importToml(toml: String) {
-        // Parse domains and ip_ranges from TOML.
-        val domains = mutableListOf<String>()
-        val ipRanges = mutableListOf<String>()
+    // ── Onboarding (LLD-04 + LLD-08) ───────────────────────────────
 
-        // Extract all quoted strings from domain/ip sections.
-        var inDomains = false
-        var inIpRanges = false
-        for (line in toml.lines()) {
-            val t = line.trim()
-            if (t.startsWith("domains")) inDomains = true
-            if (t.startsWith("ip_ranges")) { inDomains = false; inIpRanges = true }
-            if (t.startsWith("action") || t.startsWith("[[") || t.startsWith("[routing")) {
-                inDomains = false; inIpRanges = false
-            }
-
-            val matches = Regex("\"([^\"]+)\"").findAll(t)
-            for (m in matches) {
-                val v = m.groupValues[1]
-                if (inDomains && (v.contains(".") || v.startsWith("*"))) domains.add(v)
-                if (inIpRanges && v.contains("/")) ipRanges.add(v)
-            }
-        }
-
-        if (domains.isNotEmpty() || ipRanges.isNotEmpty()) {
-            _uiState.value = _uiState.value.copy(
-                routingPreset = "custom",
-                customDomains = domains.joinToString("\n"),
-                customIpRanges = ipRanges.joinToString("\n"),
-            )
-        }
-    }
-
-    // ── Onboarding (LLD-04) ─────────────────────────────────────────
-
-    /**
-     * Вход для трёх точек: отсканированный QR, вставленная ссылка, deep link.
-     * Парсим URL → GET invite info → выставляем ConfirmInvite или Error
-     * через Snackbar. Invite в этот момент **не** consume'ится.
-     */
     fun onInviteLinkReceived(raw: String) {
         _onboardingState.value = OnboardingState.Loading
         viewModelScope.launch {
@@ -358,8 +275,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
             if (info.has("error")) {
-                val err = info.optString("error")
-                emitMessage(friendlyInviteInfoError(err), UiSeverity.Error)
+                emitMessage(friendlyInviteInfoError(info.optString("error")), UiSeverity.Error)
                 _onboardingState.value = initialOnboardingState()
                 return@launch
             }
@@ -379,16 +295,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         _onboardingState.value = initialOnboardingState()
     }
 
-    /** Welcome → Settings (ручная настройка). Создаём «заглушку» в prefs —
-     *  серверного адреса ещё нет, но пользователь попадает в главный UI. */
     fun onManualSetupChosen() {
         _onboardingState.value = OnboardingState.Completed
     }
 
-    /**
-     * Фаза 2: claim + TOFU public-key + pre-warm preset. Вызывается по
-     * нажатию «Применить» на экране подтверждения.
-     */
     fun onInviteConfirmed() {
         val current = _onboardingState.value as? OnboardingState.ConfirmInvite ?: return
         if (current.applyInProgress) return
@@ -401,11 +311,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val resultJson = withContext(Dispatchers.IO) {
                 NativeBridge.nativeApplyInvite(
-                    current.hubUrl,
-                    current.token,
-                    current.preset,
-                    presetCacheDir.absolutePath,
-                    5_000L,
+                    current.hubUrl, current.token, current.preset,
+                    presetCacheDir.absolutePath, 5_000L,
                 )
             }
             val result = runCatching { JSONObject(resultJson) }.getOrNull()
@@ -423,53 +330,34 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             } ?: ""
             val presetCached = result.optBoolean("preset_cached", false)
 
-            persistApplyResult(payload, current.hubUrl, publicKey)
+            val hubFromPayload = payload.optString("hub_url").ifBlank { current.hubUrl }
+            val serverAddr = payload.optString("server_address")
+            val serverPort = payload.optInt("server_port", 8443)
+            val presetName = payload.optString("preset")
+
+            val profile = ServerProfile(
+                id = UUID.randomUUID().toString(),
+                name = repo.generateName(serverAddr, hubFromPayload, current.comment),
+                serverAddress = serverAddr,
+                serverPort = serverPort,
+                obfuscationKey = payload.optString("obfuscation_key"),
+                modifier = payload.optString("modifier", "positional_xor_rotate"),
+                salt = payload.optLong("salt", 0xDEADBEEFL),
+                routingPreset = presetName.ifBlank { "russia" },
+                hubUrl = hubFromPayload,
+                hubPreset = presetName,
+                trustedPublicKey = publicKey,
+                createdAt = OffsetDateTime.now().toString(),
+                source = ServerSource.Invite,
+            )
+            repo.upsert(profile)
+            repo.setActive(profile.id)
 
             if (!presetCached) {
-                emitMessage(
-                    "Хаб недоступен, подпись пресета не будет проверяться",
-                    UiSeverity.Warn,
-                )
+                emitMessage("Хаб недоступен, подпись пресета не будет проверяться", UiSeverity.Warn)
             }
             _onboardingState.value = OnboardingState.Completed
         }
-    }
-
-    private fun persistApplyResult(payload: JSONObject, hubUrl: String, publicKey: String) {
-        val serverAddress = payload.optString("server_address")
-        val serverPort = payload.optInt("server_port", 8443).toString()
-        val obfKey = payload.optString("obfuscation_key")
-        val modifier = payload.optString("modifier", "positional_xor_rotate")
-        val salt = payload.optLong("salt", 0xDEADBEEFL).toString()
-        val presetName = payload.optString("preset")
-        // Payload хранит собственный hub_url — используем его, а не тот, по
-        // которому пришла ссылка, чтобы хаб мог направить клиента на canonical
-        // адрес (например, при смене домена).
-        val hubFromPayload = payload.optString("hub_url").ifBlank { hubUrl }
-
-        prefs.edit()
-            .putString("server_address", serverAddress)
-            .putString("server_port", serverPort)
-            .putString("obfuscation_key", obfKey)
-            .putString("modifier", modifier)
-            .putString("salt", salt)
-            .putString("routing_preset", presetName.ifBlank { "russia" })
-            .putString("hub_url", hubFromPayload)
-            .putString("hub_preset", presetName)
-            .putString("trusted_public_key", publicKey)
-            .apply()
-
-        _uiState.value = _uiState.value.copy(
-            serverAddress = serverAddress,
-            serverPort = serverPort,
-            obfuscationKey = obfKey,
-            modifier = modifier,
-            salt = salt,
-            routingPreset = presetName.ifBlank { "russia" },
-            hubUrl = hubFromPayload,
-            hubPreset = presetName,
-            trustedPublicKey = publicKey,
-        )
     }
 
     private fun friendlyInviteInfoError(code: String): String = when (code) {
@@ -477,10 +365,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         "gone" -> "Приглашение уже использовано или истекло"
         else -> when {
             code.startsWith("network") -> "Хаб недоступен. Проверьте интернет"
-            code.contains("invalid certificate") || code.contains("certificate") ->
-                "Небезопасное соединение с хабом"
-            code.startsWith("http_4") || code.startsWith("http_5") ->
-                "Ошибка хаба: ${code.removePrefix("http_")}"
+            code.contains("certificate") -> "Небезопасное соединение с хабом"
+            code.startsWith("http_") -> "Ошибка хаба: ${code.removePrefix("http_")}"
             else -> "Ошибка: $code"
         }
     }
@@ -488,8 +374,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private fun friendlyClaimError(code: String): String = when {
         code.contains("gone") -> "Приглашение уже использовано или истекло"
         code.contains("not_found") -> "Приглашение не найдено"
-        code.startsWith("claim network") || code.startsWith("network") ->
-            "Хаб недоступен. Проверьте интернет"
+        code.contains("network") -> "Хаб недоступен. Проверьте интернет"
         code.contains("certificate") -> "Небезопасное соединение с хабом"
         else -> "Ошибка применения: $code"
     }
@@ -500,19 +385,12 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     // ── VPN connection ──────────────────────────────────────────────
 
-    /**
-     * Single entry point for the Connect button. Validates settings, requests
-     * VPN permission if needed, then starts the service. The actual server
-     * reachability check happens inside the Rust engine via a protected socket
-     * health check — the same code path used by real relay connections.
-     * A plain-socket probe from Kotlin is unreliable on Android: carrier NATs
-     * and port filtering cause false negatives on non-standard ports.
-     */
     fun onConnectClicked() {
         val s = _uiState.value
         if (s.phase != ConnectPhase.Idle) return
-        if (s.serverAddress.isBlank() || s.obfuscationKey.isBlank()) {
-            viewModelScope.launch { _messages.emit(UiMessage("Заполните сервер и ключ в Settings", UiSeverity.Info)) }
+        val server = repo.activeServer()
+        if (server == null || server.serverAddress.isBlank() || server.obfuscationKey.isBlank()) {
+            emitMessage("Заполните сервер и ключ", UiSeverity.Info)
             return
         }
 
@@ -520,9 +398,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
         val intent: Intent? = try {
             VpnService.prepare(getApplication())
-        } catch (_: Exception) {
-            null
-        }
+        } catch (_: Exception) { null }
         if (intent == null) {
             actuallyStart()
         } else {
@@ -531,30 +407,23 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** Called from Activity launcher callback, regardless of result code. */
     fun onPermissionResult(granted: Boolean) {
         if (granted) {
             actuallyStart()
         } else {
-            _uiState.value = _uiState.value.copy(
-                phase = ConnectPhase.Idle,
-                state = "Disconnected",
-            )
-            viewModelScope.launch { _messages.emit(UiMessage("VPN-разрешение не получено", UiSeverity.Info)) }
+            _uiState.value = _uiState.value.copy(phase = ConnectPhase.Idle, state = "Disconnected")
+            emitMessage("VPN-разрешение не получено", UiSeverity.Info)
         }
     }
 
     private fun actuallyStart() {
-        saveSettings()
-        val configJson = buildConfigJson(_uiState.value)
+        val server = repo.activeServer() ?: return
+        val configJson = buildConfigJson(server)
         val intent = Intent(getApplication(), XrVpnService::class.java).apply {
             action = XrVpnService.ACTION_START
             putExtra(XrVpnService.EXTRA_CONFIG_JSON, configJson)
         }
         getApplication<Application>().startForegroundService(intent)
-        // After startForegroundService the service is created; bind with
-        // BIND_AUTO_CREATE to ride out the race where the service isn't
-        // yet fully up when we call bindService.
         tryBind(autoCreate = true)
         _uiState.value = _uiState.value.copy(phase = ConnectPhase.Preparing, state = "Connecting...")
     }
@@ -562,28 +431,15 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun disconnect() {
         val svc = boundService
         if (svc != null) {
-            // stopFromUi запускает корутину в сервисе, которая дойдёт до
-            // publish(Phase.Idle). applyServiceState увидит Idle и вызовет
-            // unbindAndClear — сервис тогда реально умрёт, и следующий
-            // Connect получит свежий instance. UI обновится через stateFlow.
             svc.stopFromUi()
             return
         }
-        // Binder'а нет (init-bind не нашёл живого сервиса, actuallyStart
-        // ещё не успел привязаться). Fallback через intent ACTION_STOP
-        // + локально выставить Idle, потому что stateFlow нам ничего
-        // не пришлёт.
         val intent = Intent(getApplication(), XrVpnService::class.java).apply {
             action = XrVpnService.ACTION_STOP
         }
-        try {
-            getApplication<Application>().startService(intent)
-        } catch (_: Exception) {
-            // Ignore — nothing to stop.
-        }
+        try { getApplication<Application>().startService(intent) } catch (_: Exception) {}
         _uiState.value = _uiState.value.copy(
-            phase = ConnectPhase.Idle,
-            state = "Disconnected",
+            phase = ConnectPhase.Idle, state = "Disconnected",
             bytesUp = 0, bytesDown = 0, activeConnections = 0, uptime = 0,
             recentErrors = emptyList(),
         )
@@ -629,47 +485,35 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             recentErrors = snap?.recentErrors ?: emptyList(),
         )
         if (svcState.phase == XrVpnService.Phase.Error && svcState.errorMessage != null) {
-            viewModelScope.launch { _messages.emit(UiMessage(svcState.errorMessage, UiSeverity.Error)) }
+            emitMessage(svcState.errorMessage, UiSeverity.Error)
         }
         if ((svcState.phase == XrVpnService.Phase.Idle ||
-             svcState.phase == XrVpnService.Phase.Error) && isBound) {
-            // Сервис завершил свою работу (нормально или по ошибке) и ждёт
-            // unbind, чтобы реально умереть. Отпускаем binding — `onDestroy`
-            // сервиса вычистит `NativeBridge.current` и `scope`, следующий
-            // Connect получит свежий instance через `startForegroundService`.
+                    svcState.phase == XrVpnService.Phase.Error) && isBound
+        ) {
             viewModelScope.launch { unbindAndClear() }
         }
     }
 
     // ── Config building ─────────────────────────────────────────────
 
-    private fun buildConfigJson(state: VpnUiState): String {
-        val routingToml = buildRoutingToml(state)
-        // System DNS comes from the ACTIVE network we have BEFORE the VPN
-        // takes over — once the TUN is up, getActiveNetwork() returns the
-        // VPN itself and its DNS would be 10.0.0.1 (FakeDNS), creating a
-        // resolution loop. Сбор делаем тут, до запуска сервиса.
+    private fun buildConfigJson(server: ServerProfile): String {
+        val routingToml = buildRoutingToml(server)
         val systemDns = collectSystemDnsServers()
         val dnsArray = systemDns.joinToString(", ") { "\"$it\"" }
-        // Hub-поля опциональны: если инвайт ещё не применялся, движок их не
-        // увидит и будет работать на локальном routing_toml. Если применялся —
-        // движок включит PresetCache и начнёт периодический sanity-check.
-        val hubFields = if (state.hubUrl.isNotBlank() && state.hubPreset.isNotBlank()) {
+        val hubFields = if (server.hubUrl.isNotBlank() && server.hubPreset.isNotBlank()) {
             """,
-                "hub_url": "${state.hubUrl}",
-                "hub_preset": "${state.hubPreset}",
+                "hub_url": "${server.hubUrl}",
+                "hub_preset": "${server.hubPreset}",
                 "hub_cache_dir": "${presetCacheDir.absolutePath}",
                 "hub_refresh_interval_secs": 300"""
-        } else {
-            ""
-        }
+        } else ""
         return """
             {
-                "server_address": "${state.serverAddress}",
-                "server_port": ${state.serverPort},
-                "obfuscation_key": "${state.obfuscationKey}",
-                "modifier": "${state.modifier}",
-                "salt": ${state.salt},
+                "server_address": "${server.serverAddress}",
+                "server_port": ${server.serverPort},
+                "obfuscation_key": "${server.obfuscationKey}",
+                "modifier": "${server.modifier}",
+                "salt": ${server.salt},
                 "padding_min": 16,
                 "padding_max": 128,
                 "routing_toml": "${routingToml.replace("\"", "\\\"").replace("\n", "\\n")}",
@@ -679,58 +523,37 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         """.trimIndent()
     }
 
-    /**
-     * Returns DNS servers from the currently active (non-VPN) network.
-     * Used to give the engine a working resolver path through carrier-imposed
-     * whitelists where public resolvers (8.8.8.8, 1.1.1.1) might be blocked.
-     */
     private fun collectSystemDnsServers(): List<String> {
         val cm = getApplication<Application>()
             .getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
             ?: return emptyList()
-
         val seen = mutableSetOf<String>()
         val result = mutableListOf<String>()
-
         fun addFrom(network: Network?) {
             if (network == null) return
             val lp: LinkProperties = cm.getLinkProperties(network) ?: return
             for (addr in lp.dnsServers) {
                 val ip = addr.hostAddress ?: continue
-                // Skip VPN / loopback / link-local addresses.
                 if (ip.startsWith("10.0.0.") || ip == "127.0.0.1" || ip.startsWith("169.254.")) continue
                 if (seen.add(ip)) result.add(ip)
             }
         }
-
-        // activeNetwork в момент ДО старта VPN — это реальная сеть (Wi-Fi
-        // или мобильная). Этого достаточно: после старта VPN эта же сеть
-        // остаётся под капотом, а DNS её по-прежнему применимы. Раньше
-        // дополнительно обходили cm.allNetworks, чтобы подобрать Wi-Fi DNS
-        // когда активна мобильная, но allNetworks deprecated с API 31, а
-        // сценарий не принципиален: fallback на public DNS (1.1.1.1/8.8.8.8)
-        // всё равно срабатывает в race вместе с активным резолвером.
         addFrom(cm.activeNetwork)
-
         return result
     }
 
-    private fun buildRoutingToml(state: VpnUiState): String {
-        return when (state.routingPreset) {
-            "proxy_all" -> "default_action = \"proxy\"\n"
-            "russia" -> PRESET_RUSSIA
-            "custom" -> buildCustomRoutingToml(state)
-            else -> PRESET_RUSSIA
-        }
+    private fun buildRoutingToml(server: ServerProfile): String = when (server.routingPreset) {
+        "proxy_all" -> "default_action = \"proxy\"\n"
+        "russia" -> PRESET_RUSSIA
+        "custom" -> buildCustomRoutingToml(server)
+        else -> PRESET_RUSSIA
     }
 
-    private fun buildCustomRoutingToml(state: VpnUiState): String {
+    private fun buildCustomRoutingToml(server: ServerProfile): String {
         val sb = StringBuilder()
         sb.appendLine("default_action = \"direct\"")
-
-        val domains = state.customDomains.lines().map { it.trim() }.filter { it.isNotBlank() }
-        val ipRanges = state.customIpRanges.lines().map { it.trim() }.filter { it.isNotBlank() }
-
+        val domains = server.customDomains.lines().map { it.trim() }.filter { it.isNotBlank() }
+        val ipRanges = server.customIpRanges.lines().map { it.trim() }.filter { it.isNotBlank() }
         if (domains.isNotEmpty() || ipRanges.isNotEmpty()) {
             sb.appendLine("[[rules]]")
             sb.appendLine("action = \"proxy\"")
@@ -749,7 +572,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     companion object {
-        /** Preset routing rules for Russia — embedded from configs/routing-russia.toml */
         val PRESET_RUSSIA = """
 default_action = "direct"
 [[rules]]
@@ -796,5 +618,27 @@ domains = ["bbc.com", "*.bbc.com", "bbc.co.uk", "*.bbc.co.uk", "*.bbci.co.uk", "
 action = "proxy"
 domains = ["notion.so", "*.notion.so", "notion.com", "*.notion.com", "figma.com", "*.figma.com", "cloudflare.com", "*.cloudflare.com"]
         """.trimIndent()
+
+        fun parseTomlDomains(toml: String): Pair<List<String>, List<String>> {
+            val domains = mutableListOf<String>()
+            val ipRanges = mutableListOf<String>()
+            var inDomains = false
+            var inIpRanges = false
+            for (line in toml.lines()) {
+                val t = line.trim()
+                if (t.startsWith("domains")) inDomains = true
+                if (t.startsWith("ip_ranges")) { inDomains = false; inIpRanges = true }
+                if (t.startsWith("action") || t.startsWith("[[") || t.startsWith("[routing")) {
+                    inDomains = false; inIpRanges = false
+                }
+                val matches = Regex("\"([^\"]+)\"").findAll(t)
+                for (m in matches) {
+                    val v = m.groupValues[1]
+                    if (inDomains && (v.contains(".") || v.startsWith("*"))) domains.add(v)
+                    if (inIpRanges && v.contains("/")) ipRanges.add(v)
+                }
+            }
+            return domains to ipRanges
+        }
     }
 }

@@ -50,7 +50,7 @@ fun InviteConfirmScreen(
     comment: String,
     status: String,
     expiresAt: String,
-    willReplaceExisting: Boolean,
+    willReplaceExisting: Boolean = false,
     applyEnabled: Boolean,
     applyInProgress: Boolean,
     onApply: () -> Unit,
@@ -136,7 +136,7 @@ fun InviteConfirmScreen(
                         )
                         Spacer(Modifier.width(8.dp))
                     }
-                    Text("Применить")
+                    Text("Добавить")
                 }
             }
 

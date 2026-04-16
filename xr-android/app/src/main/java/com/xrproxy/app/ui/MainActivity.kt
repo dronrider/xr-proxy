@@ -28,15 +28,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.withStyle
 import java.io.File
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
+import com.xrproxy.app.data.ServerProfile
+import com.xrproxy.app.model.HealthLevel
 import com.xrproxy.app.ui.components.DebugSection
-import com.xrproxy.app.ui.components.HealthFace
 import com.xrproxy.app.ui.components.ShieldArrowIcon
 import com.xrproxy.app.ui.components.StatsGrid
 import com.xrproxy.app.ui.components.XrSnackbarHost
@@ -46,17 +45,14 @@ import com.xrproxy.app.ui.onboarding.InviteConfirmScreen
 import com.xrproxy.app.ui.onboarding.PasteLinkDialog
 import com.xrproxy.app.ui.onboarding.WelcomeScreen
 import com.xrproxy.app.ui.onboarding.scanInviteQr
+import com.xrproxy.app.ui.servers.AddServerDialog
+import com.xrproxy.app.ui.servers.ServerEditScreen
+import com.xrproxy.app.ui.servers.ServerSwitcherChip
+import com.xrproxy.app.ui.servers.ServerSwitcherSheet
+import com.xrproxy.app.ui.servers.ServersSection
 import com.xrproxy.app.ui.theme.XrTheme
 import kotlinx.coroutines.launch
 
-/**
- * Счётчики событий по уровням в `recent_errors`. Критерии совпадают с
- * разметкой в `colorizeLog`, чтобы бадж и визуал журнала видели одно и то же.
- *
- * Rust-сторона сворачивает подряд идущие дубликаты в пределах одной
- * секунды и дописывает суффикс `(×N)`. Бадж должен показывать число
- * СОБЫТИЙ, а не строк — поэтому каждая запись даёт свой N в сумму.
- */
 private val COUNT_SUFFIX_RE = Regex(" \\(\u00D7(\\d+)\\)\$")
 
 private fun String.repeatCount(): Int =
@@ -81,7 +77,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Edge-to-edge (LLD-06 §3.1)
         WindowCompat.setDecorFitsSystemWindows(window, false)
 
         vpnPermissionLauncher = registerForActivityResult(
@@ -92,7 +87,7 @@ class MainActivity : ComponentActivity() {
 
         notificationPermissionLauncher = registerForActivityResult(
             ActivityResultContracts.RequestPermission()
-        ) { /* no-op — если отказано, туннель всё равно работает */ }
+        ) {}
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val granted = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
@@ -132,6 +127,13 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+// ── Navigation state for server editing ─────────────────────────────
+
+private sealed interface EditMode {
+    data class Create(val fromWelcome: Boolean = false) : EditMode
+    data class Edit(val profile: ServerProfile) : EditMode
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
@@ -141,11 +143,19 @@ fun MainScreen(
 ) {
     val state by viewModel.uiState.collectAsState()
     val onboarding by viewModel.onboardingState.collectAsState()
-    var currentTab by remember { mutableIntStateOf(0) }
+    val servers by viewModel.repo.servers.collectAsState()
+    val activeId by viewModel.repo.activeId.collectAsState()
+    val activeServer = remember(servers, activeId) {
+        servers.firstOrNull { it.id == activeId }
+    }
 
+    var currentTab by remember { mutableIntStateOf(0) }
     val snackbarHostState = remember { SnackbarHostState() }
     var lastSeverity by remember { mutableStateOf(UiSeverity.Info) }
     var pasteDialogOpen by remember { mutableStateOf(false) }
+    var addServerDialogOpen by remember { mutableStateOf(false) }
+    var switcherSheetOpen by remember { mutableStateOf(false) }
+    var editMode by remember { mutableStateOf<EditMode?>(null) }
     val activity = LocalContext.current as Activity
     val scope = rememberCoroutineScope()
 
@@ -159,9 +169,38 @@ fun MainScreen(
         }
     }
 
+    // ── ServerEditScreen overlay ────────────────────────────────────
+    editMode?.let { mode ->
+        ServerEditScreen(
+            initial = when (mode) {
+                is EditMode.Create -> null
+                is EditMode.Edit -> mode.profile
+            },
+            onSave = { profile ->
+                when (mode) {
+                    is EditMode.Create -> {
+                        viewModel.upsertServer(profile)
+                        viewModel.repo.setActive(profile.id)
+                        if (mode.fromWelcome) {
+                            viewModel.onManualSetupChosen()
+                        }
+                    }
+                    is EditMode.Edit -> viewModel.onServerEditSaved(profile)
+                }
+                editMode = null
+            },
+            onCancel = {
+                if (mode is EditMode.Create && mode.fromWelcome &&
+                    servers.isEmpty()) {
+                    // Nothing to go back to — stay on Welcome
+                }
+                editMode = null
+            },
+        )
+        return
+    }
+
     // ── Onboarding overlays ────────────────────────────────────────
-    // До `Completed` главный Scaffold с табами не рендерим — чтобы
-    // пользователь не видел пустой экран с нижней навигацией.
     if (onboarding != OnboardingState.Completed) {
         Box(modifier = Modifier.fillMaxSize()) {
             when (val ob = onboarding) {
@@ -180,7 +219,7 @@ fun MainScreen(
                             }
                         },
                         onPasteClick = { pasteDialogOpen = true },
-                        onManualClick = { viewModel.onManualSetupChosen() },
+                        onManualClick = { editMode = EditMode.Create(fromWelcome = true) },
                     )
                     if (pasteDialogOpen) {
                         PasteLinkDialog(
@@ -193,47 +232,91 @@ fun MainScreen(
                     }
                 }
                 is OnboardingState.Loading -> {
-                    Box(
-                        modifier = Modifier.fillMaxSize(),
-                        contentAlignment = Alignment.Center,
-                    ) { CircularProgressIndicator() }
+                    Box(Modifier.fillMaxSize(), Alignment.Center) {
+                        CircularProgressIndicator()
+                    }
                 }
                 is OnboardingState.ConfirmInvite -> {
-                    val willReplace = state.serverAddress.isNotBlank() || state.hubUrl.isNotBlank()
                     InviteConfirmScreen(
                         hubUrl = ob.hubUrl,
                         preset = ob.preset,
                         comment = ob.comment,
                         status = ob.status,
                         expiresAt = ob.expiresAt,
-                        willReplaceExisting = willReplace,
+                        willReplaceExisting = false,
                         applyEnabled = state.phase == ConnectPhase.Idle,
                         applyInProgress = ob.applyInProgress,
                         onApply = { viewModel.onInviteConfirmed() },
                         onCancel = {
                             viewModel.onInviteCancelled()
-                            if (!willReplace) finishActivity()
+                            if (servers.isEmpty()) finishActivity()
                         },
                     )
                 }
-                is OnboardingState.Completed -> { /* unreachable */ }
+                is OnboardingState.Completed -> {}
             }
             XrSnackbarHost(
-                snackbarHostState,
-                lastSeverity,
+                snackbarHostState, lastSeverity,
                 modifier = Modifier.align(Alignment.BottomCenter),
             )
         }
         return
     }
 
+    // ── Add-server dialog ──────────────────────────────────────────
+    if (addServerDialogOpen) {
+        AddServerDialog(
+            onScanQr = {
+                addServerDialogOpen = false
+                scope.launch {
+                    try {
+                        val raw = scanInviteQr(activity) ?: return@launch
+                        viewModel.onInviteLinkReceived(raw)
+                    } catch (_: Throwable) {
+                        snackbarHostState.showSnackbar(
+                            "Сканер QR недоступен, используйте \"Вставить ссылку\""
+                        )
+                    }
+                }
+            },
+            onPasteLink = {
+                addServerDialogOpen = false
+                pasteDialogOpen = true
+            },
+            onManual = {
+                addServerDialogOpen = false
+                editMode = EditMode.Create()
+            },
+            onDismiss = { addServerDialogOpen = false },
+        )
+    }
+    if (pasteDialogOpen) {
+        PasteLinkDialog(
+            onDismiss = { pasteDialogOpen = false },
+            onSubmit = { raw ->
+                pasteDialogOpen = false
+                viewModel.onInviteLinkReceived(raw)
+            },
+        )
+    }
+
+    // ── Server switcher BottomSheet ────────────────────────────────
+    if (switcherSheetOpen) {
+        ServerSwitcherSheet(
+            servers = servers,
+            activeId = activeId,
+            onSelect = { id -> viewModel.selectServer(id) },
+            onAddServer = { addServerDialogOpen = true },
+            onDismiss = { switcherSheetOpen = false },
+        )
+    }
+
+    // ── Main scaffold ──────────────────────────────────────────────
     Scaffold(
         snackbarHost = { XrSnackbarHost(snackbarHostState, lastSeverity) },
         containerColor = MaterialTheme.colorScheme.background,
         bottomBar = {
-            NavigationBar(
-                containerColor = MaterialTheme.colorScheme.surfaceVariant,
-            ) {
+            NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceVariant) {
                 NavigationBarItem(
                     selected = currentTab == 0,
                     onClick = { currentTab = 0 },
@@ -262,21 +345,17 @@ fun MainScreen(
                                 Badge(
                                     containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
                                     contentColor = MaterialTheme.colorScheme.onSurface,
-                                ) {
-                                    Text(label, fontSize = 10.sp)
-                                }
+                                ) { Text(label, fontSize = 10.sp) }
                             }
-                        }) {
-                            Icon(Icons.AutoMirrored.Filled.List, null)
-                        }
+                        }) { Icon(Icons.AutoMirrored.Filled.List, null) }
                     },
                     label = { Text("Log") },
                 )
                 NavigationBarItem(
                     selected = currentTab == 2,
                     onClick = { currentTab = 2 },
-                    icon = { Icon(Icons.Default.Settings, null) },
-                    label = { Text("Settings") },
+                    icon = { Icon(Icons.Default.Dns, null) },
+                    label = { Text("Servers") },
                 )
             }
         }
@@ -292,13 +371,23 @@ fun MainScreen(
             when (currentTab) {
                 0 -> ConnectionSection(
                     state = state,
+                    activeServer = activeServer,
                     onConnect = { viewModel.onConnectClicked() },
                     onDisconnect = viewModel::disconnect,
                     onToggleDebug = viewModel::toggleDebug,
+                    onSwitcherClick = { switcherSheetOpen = true },
                     snackbarHostState = snackbarHostState,
                 )
                 1 -> LogSection(state, viewModel)
-                2 -> SettingsSection(state, viewModel)
+                2 -> ServersSection(
+                    servers = servers,
+                    activeId = activeId,
+                    isConnected = state.connected,
+                    onSetActive = { viewModel.selectServer(it) },
+                    onEdit = { editMode = EditMode.Edit(it) },
+                    onDelete = { viewModel.deleteServer(it) },
+                    onAddServer = { addServerDialogOpen = true },
+                )
             }
         }
     }
@@ -309,34 +398,33 @@ fun MainScreen(
 @Composable
 fun ConnectionSection(
     state: VpnUiState,
+    activeServer: ServerProfile?,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
     onToggleDebug: () -> Unit,
+    onSwitcherClick: () -> Unit,
     snackbarHostState: SnackbarHostState,
 ) {
     Spacer(Modifier.height(32.dp))
 
-    // 1. Central shield icon (LLD-06 §3.5)
-    ShieldArrowIcon(
-        phase = state.phase,
-        modifier = Modifier.size(128.dp),
-    )
-
-    // 1a. Health HUD — only in Connected (LLD-06 §3.5a)
-    if (state.connected) {
-        Spacer(Modifier.height(8.dp))
-        HealthFace(level = state.health)
-    }
-
+    ShieldArrowIcon(phase = state.phase, modifier = Modifier.size(128.dp))
     Spacer(Modifier.height(16.dp))
 
-    // 2. Status line (LLD-06 §3.4)
+    // Status text with inline health emoji (LLD-08 §2.4)
+    val healthEmoji = if (state.connected) {
+        when (state.health) {
+            HealthLevel.Healthy -> " \uD83D\uDE0A"
+            HealthLevel.Watching -> " \uD83D\uDE10"
+            HealthLevel.Hurt -> " \uD83D\uDE1F"
+            HealthLevel.Critical -> " \uD83D\uDE35"
+        }
+    } else ""
     val statusText = when (state.phase) {
         ConnectPhase.Idle, ConnectPhase.NeedsPermission -> "Disconnected"
         ConnectPhase.Preparing -> "Подготовка…"
         ConnectPhase.Connecting -> "Подключение…"
         ConnectPhase.Finalizing -> "Проверка маршрутов…"
-        ConnectPhase.Connected -> "Подключено"
+        ConnectPhase.Connected -> "Подключено$healthEmoji"
         ConnectPhase.Stopping -> "Отключение…"
     }
     val statusColor = when (state.phase) {
@@ -345,13 +433,9 @@ fun ConnectionSection(
             MaterialTheme.colorScheme.tertiary
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
-    Text(
-        statusText,
-        style = MaterialTheme.typography.headlineMedium,
-        color = statusColor,
-    )
+    Text(statusText, style = MaterialTheme.typography.headlineMedium, color = statusColor)
 
-    // 3. Phase substep line (LLD-06 §3.4)
+    // Phase substep
     val substep = when (state.phase) {
         ConnectPhase.Preparing -> "1/3 · Подготовка"
         ConnectPhase.Connecting -> "2/3 · Установка туннеля"
@@ -360,11 +444,8 @@ fun ConnectionSection(
     }
     if (substep != null) {
         Spacer(Modifier.height(4.dp))
-        Text(
-            substep,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        Text(substep, style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 
     // Version
@@ -375,23 +456,26 @@ fun ConnectionSection(
     }
     if (versionName.isNotBlank() && !state.connected && !state.connecting) {
         Spacer(Modifier.height(4.dp))
-        Text("v$versionName", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
+        Text("v$versionName", style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.outline)
     }
 
-    // 5. Preset hint (LLD-06 §3.4)
-    if (!state.connected && !state.connecting) {
-        val presetLabel = when (state.routingPreset) {
-            "russia" -> "Preset: Russia"
-            "proxy_all" -> "Proxy all traffic"
-            "custom" -> "Custom rules"
-            else -> ""
-        }
-        Text(presetLabel, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    Spacer(Modifier.height(16.dp))
+
+    // Server switcher chip (LLD-08 §2.4)
+    if (activeServer != null) {
+        ServerSwitcherChip(
+            activeName = activeServer.name,
+            presetLabel = activeServer.presetLabel,
+            enabled = state.phase == ConnectPhase.Idle,
+            onClick = onSwitcherClick,
+            modifier = Modifier.fillMaxWidth(0.7f),
+        )
     }
 
-    Spacer(Modifier.height(24.dp))
+    Spacer(Modifier.height(12.dp))
 
-    // 4. Connect / Disconnect / Cancel button — pill shape (LLD-06 §3.4)
+    // Connect / Disconnect button
     val btnColor = when {
         state.connected -> MaterialTheme.colorScheme.error
         state.connecting -> MaterialTheme.colorScheme.tertiary
@@ -401,17 +485,11 @@ fun ConnectionSection(
         state.connected -> MaterialTheme.colorScheme.onError
         else -> MaterialTheme.colorScheme.onPrimary
     }
-
     Button(
         onClick = { if (state.connected || state.connecting) onDisconnect() else onConnect() },
-        modifier = Modifier
-            .fillMaxWidth(0.7f)
-            .height(56.dp),
+        modifier = Modifier.fillMaxWidth(0.7f).height(56.dp),
         shape = RoundedCornerShape(28.dp),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = btnColor,
-            contentColor = btnTextColor,
-        ),
+        colors = ButtonDefaults.buttonColors(containerColor = btnColor, contentColor = btnTextColor),
     ) {
         val btnText = when {
             state.connecting -> "Cancel"
@@ -421,21 +499,19 @@ fun ConnectionSection(
         Text(btnText, style = MaterialTheme.typography.titleMedium)
     }
 
-    // 6. Statistics cards — only in Connected (LLD-06 §3.7)
+    // Statistics
     if (state.connected) {
         Spacer(Modifier.height(24.dp))
         StatsGrid(state = state)
         Spacer(Modifier.height(8.dp))
         DebugSection(
-            state = state,
-            expanded = state.debugExpanded,
-            onToggle = onToggleDebug,
-            snackbarHostState = snackbarHostState,
+            state = state, expanded = state.debugExpanded,
+            onToggle = onToggleDebug, snackbarHostState = snackbarHostState,
         )
     }
 
-    // 7. Configure server banner (LLD-06 §3.4)
-    if (!state.connected && !state.connecting && state.serverAddress.isBlank()) {
+    // No-server banner
+    if (!state.connected && !state.connecting && activeServer == null) {
         Spacer(Modifier.height(24.dp))
         Card(
             modifier = Modifier.fillMaxWidth(),
@@ -444,7 +520,7 @@ fun ConnectionSection(
             Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Default.Warning, null, tint = MaterialTheme.colorScheme.error)
                 Spacer(Modifier.width(12.dp))
-                Text("Configure server in Settings tab", color = MaterialTheme.colorScheme.error)
+                Text("Добавьте сервер во вкладке Servers", color = MaterialTheme.colorScheme.error)
             }
         }
     }
@@ -474,9 +550,7 @@ fun LogSection(state: VpnUiState, viewModel: VpnViewModel) {
         Row {
             IconButton(onClick = {
                 clipboardManager.setText(AnnotatedString(logText))
-            }) {
-                Icon(Icons.Default.ContentCopy, "Copy")
-            }
+            }) { Icon(Icons.Default.ContentCopy, "Copy") }
             IconButton(onClick = {
                 try {
                     val file = File(context.cacheDir, "xr-proxy.log")
@@ -493,9 +567,7 @@ fun LogSection(state: VpnUiState, viewModel: VpnViewModel) {
                 } catch (_: Exception) {
                     clipboardManager.setText(AnnotatedString(logText))
                 }
-            }) {
-                Icon(Icons.Default.Share, "Share")
-            }
+            }) { Icon(Icons.Default.Share, "Share") }
             IconButton(onClick = { viewModel.clearLog() }) {
                 Icon(Icons.Default.Delete, "Clear")
             }
@@ -515,15 +587,13 @@ fun LogSection(state: VpnUiState, viewModel: VpnViewModel) {
                 text = colorizeLog(logText),
                 modifier = Modifier.padding(12.dp),
                 style = MaterialTheme.typography.bodySmall,
-                fontSize = 11.sp,
-                lineHeight = 16.sp,
+                fontSize = 11.sp, lineHeight = 16.sp,
             )
         }
     }
     Spacer(Modifier.height(16.dp))
 }
 
-/** Colour log lines by level: ERROR red, WARN orange, INFO default. */
 @Composable
 fun colorizeLog(log: String): AnnotatedString {
     val errColor = MaterialTheme.colorScheme.error
@@ -538,95 +608,4 @@ fun colorizeLog(log: String): AnnotatedString {
             append("\n")
         }
     }
-}
-
-// ── Settings tab ────────────────────────────────────────────────────
-
-@Composable
-fun SettingsSection(state: VpnUiState, viewModel: VpnViewModel) {
-    var showKey by remember { mutableStateOf(false) }
-    val clipboardManager = LocalClipboardManager.current
-
-    Spacer(Modifier.height(8.dp))
-    Text("Server", style = MaterialTheme.typography.titleMedium)
-    Spacer(Modifier.height(8.dp))
-
-    OutlinedTextField(value = state.serverAddress, onValueChange = viewModel::updateServerAddress,
-        label = { Text("Server address") }, placeholder = { Text("1.2.3.4") },
-        modifier = Modifier.fillMaxWidth(), singleLine = true)
-    Spacer(Modifier.height(8.dp))
-
-    OutlinedTextField(value = state.serverPort, onValueChange = viewModel::updateServerPort,
-        label = { Text("Port") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-    Spacer(Modifier.height(16.dp))
-
-    Text("Obfuscation", style = MaterialTheme.typography.titleMedium)
-    Spacer(Modifier.height(8.dp))
-
-    OutlinedTextField(value = state.obfuscationKey, onValueChange = viewModel::updateObfuscationKey,
-        label = { Text("Key (base64)") }, modifier = Modifier.fillMaxWidth(), singleLine = true,
-        visualTransformation = if (showKey) VisualTransformation.None else PasswordVisualTransformation(),
-        trailingIcon = {
-            IconButton(onClick = { showKey = !showKey }) {
-                Icon(if (showKey) Icons.Default.VisibilityOff else Icons.Default.Visibility, "Toggle key visibility")
-            }
-        })
-    Spacer(Modifier.height(8.dp))
-
-    OutlinedTextField(value = state.salt, onValueChange = viewModel::updateSalt,
-        label = { Text("Salt") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-    Spacer(Modifier.height(16.dp))
-
-    Text("Routing", style = MaterialTheme.typography.titleMedium)
-    Spacer(Modifier.height(8.dp))
-
-    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        FilterChip(selected = state.routingPreset == "russia", onClick = { viewModel.updateRoutingPreset("russia") },
-            label = { Text("Russia") },
-            leadingIcon = if (state.routingPreset == "russia") {{ Icon(Icons.Default.Check, null, Modifier.size(16.dp)) }} else null)
-        FilterChip(selected = state.routingPreset == "proxy_all", onClick = { viewModel.updateRoutingPreset("proxy_all") },
-            label = { Text("Proxy all") },
-            leadingIcon = if (state.routingPreset == "proxy_all") {{ Icon(Icons.Default.Check, null, Modifier.size(16.dp)) }} else null)
-        FilterChip(selected = state.routingPreset == "custom", onClick = { viewModel.updateRoutingPreset("custom") },
-            label = { Text("Custom") },
-            leadingIcon = if (state.routingPreset == "custom") {{ Icon(Icons.Default.Check, null, Modifier.size(16.dp)) }} else null)
-    }
-
-    if (state.routingPreset == "custom") {
-        Spacer(Modifier.height(8.dp))
-        OutlinedButton(onClick = {
-            val text = clipboardManager.getText()?.text ?: ""
-            if (text.isNotBlank()) viewModel.importToml(text)
-        }, modifier = Modifier.fillMaxWidth()) {
-            Icon(Icons.Default.ContentPaste, null, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(8.dp))
-            Text("Import TOML from clipboard")
-        }
-        Spacer(Modifier.height(8.dp))
-        OutlinedTextField(value = state.customDomains, onValueChange = viewModel::updateCustomDomains,
-            label = { Text("Domains to proxy") }, placeholder = { Text("youtube.com\n*.google.com") },
-            modifier = Modifier.fillMaxWidth().height(120.dp), maxLines = 8)
-        Spacer(Modifier.height(8.dp))
-        OutlinedTextField(value = state.customIpRanges, onValueChange = viewModel::updateCustomIpRanges,
-            label = { Text("IP ranges to proxy") }, placeholder = { Text("91.108.56.0/22") },
-            modifier = Modifier.fillMaxWidth().height(100.dp), maxLines = 6)
-    }
-
-    if (state.routingPreset == "russia") {
-        Spacer(Modifier.height(4.dp))
-        Text("YouTube, Meta, Twitter/X, Telegram, Discord, Google, LinkedIn, AI, Dev tools, etc.",
-            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    }
-
-    Spacer(Modifier.height(24.dp))
-    Button(onClick = { viewModel.saveSettings() }, modifier = Modifier.fillMaxWidth()) {
-        Icon(Icons.Default.Check, null, modifier = Modifier.size(18.dp))
-        Spacer(Modifier.width(8.dp))
-        Text("Save")
-    }
-    if (state.settingsSaved) {
-        Spacer(Modifier.height(4.dp))
-        Text("Settings saved", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
-    }
-    Spacer(Modifier.height(16.dp))
 }
