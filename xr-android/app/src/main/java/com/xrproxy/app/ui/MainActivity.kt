@@ -414,6 +414,7 @@ fun ConnectionSection(
     val healthEmoji = if (state.connected) {
         when (state.health) {
             HealthLevel.Healthy -> " \uD83D\uDE0A"
+            HealthLevel.Good -> " \uD83D\uDE42"
             HealthLevel.Watching -> " \uD83D\uDE10"
             HealthLevel.Hurt -> " \uD83D\uDE1F"
             HealthLevel.Critical -> " \uD83D\uDE35"

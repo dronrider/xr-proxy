@@ -7,9 +7,11 @@ package com.xrproxy.app.model
 enum class HealthLevel {
     /** 0 ERROR and 0 WARN in last 30 seconds. */
     Healthy,
-    /** 0 ERROR but >= 1 WARN in last 30 seconds. */
+    /** 0 ERROR, 1-10 WARN in last 30 seconds (background noise). */
+    Good,
+    /** 0 ERROR, >10 WARN in last 30 seconds. */
     Watching,
-    /** >= 1 ERROR in 30s window, but < 5 errors in 5 seconds. */
+    /** >= 3 ERROR in 30s window, but < 5 errors in 5 seconds. */
     Hurt,
     /** >= 5 ERROR in last 5 seconds (burst of failures). */
     Critical,
@@ -30,6 +32,8 @@ class HealthTracker {
         const val BURST_WINDOW_MS = 5_000L
         const val BURST_THRESHOLD = 5
         const val DOWNSHIFT_HOLD_MS = 5_000L
+        const val WARN_NOISE_THRESHOLD = 10
+        const val ERROR_HURT_THRESHOLD = 3
     }
 
     private var lastSeenErrors: Long = 0
@@ -73,8 +77,9 @@ class HealthTracker {
         val recentBurstErrors = errorTimestamps.count { it >= burstCutoff }
         val rawLevel = when {
             recentBurstErrors >= BURST_THRESHOLD -> HealthLevel.Critical
-            errorTimestamps.isNotEmpty() -> HealthLevel.Hurt
-            warnTimestamps.isNotEmpty() -> HealthLevel.Watching
+            errorTimestamps.size >= ERROR_HURT_THRESHOLD -> HealthLevel.Hurt
+            warnTimestamps.size > WARN_NOISE_THRESHOLD -> HealthLevel.Watching
+            warnTimestamps.isNotEmpty() -> HealthLevel.Good
             else -> HealthLevel.Healthy
         }
 

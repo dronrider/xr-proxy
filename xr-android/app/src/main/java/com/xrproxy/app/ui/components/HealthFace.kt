@@ -26,6 +26,7 @@ import com.xrproxy.app.model.HealthLevel
 fun HealthFace(level: HealthLevel, modifier: Modifier = Modifier) {
     val (icon, tint) = when (level) {
         HealthLevel.Healthy -> Icons.Filled.SentimentSatisfied to Color(0xFF4CAF50)
+        HealthLevel.Good -> Icons.Filled.SentimentSatisfied to Color(0xFF81C784)
         HealthLevel.Watching -> Icons.Filled.SentimentNeutral to Color(0xFF4CAF50)
         HealthLevel.Hurt -> Icons.Filled.SentimentDissatisfied to Color(0xFFFFA726)
         HealthLevel.Critical -> Icons.Filled.SentimentVeryDissatisfied to Color(0xFFF87171)
