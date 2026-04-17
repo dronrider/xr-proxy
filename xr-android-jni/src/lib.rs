@@ -4,6 +4,7 @@ use jni::objects::{JClass, JString, GlobalRef};
 use jni::sys::{jint, jlong, jmethodID, jstring};
 use jni::{JNIEnv, JavaVM};
 
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -11,7 +12,7 @@ use std::time::Duration;
 use xr_core::engine::{VpnConfig, VpnEngine};
 use xr_core::ip_stack::PacketQueue;
 use xr_core::onboarding;
-use xr_core::session::ProtectSocketFn;
+use xr_core::session::{ProtectSocketFn, SystemResolverFn};
 use xr_proto::config::RoutingConfig;
 use xr_proto::invite_url;
 
@@ -24,7 +25,17 @@ static JVM: OnceLock<JavaVM> = OnceLock::new();
 /// Cached class reference and method ID — resolved on main thread, safe to use from any thread.
 static PROTECT_METHOD: OnceLock<ProtectMethodCache> = OnceLock::new();
 
+/// Cached method ID for `NativeBridge.resolveDomain(String): String?`.
+/// Same lifetime invariants as PROTECT_METHOD. Resolved lazily on the main
+/// thread at engine start.
+static RESOLVE_METHOD: OnceLock<ResolveMethodCache> = OnceLock::new();
+
 struct ProtectMethodCache {
+    class: GlobalRef,
+    method_id: jmethodID,
+}
+
+struct ResolveMethodCache {
     class: GlobalRef,
     method_id: jmethodID,
 }
@@ -34,6 +45,8 @@ struct ProtectMethodCache {
 // GlobalRef is Send+Sync by design.
 unsafe impl Send for ProtectMethodCache {}
 unsafe impl Sync for ProtectMethodCache {}
+unsafe impl Send for ResolveMethodCache {}
+unsafe impl Sync for ResolveMethodCache {}
 
 struct EngineHandle {
     engine: VpnEngine,
@@ -82,6 +95,51 @@ fn make_protect_fn() -> ProtectSocketFn {
                 }
             }
         }
+    })
+}
+
+/// Build a `SystemResolverFn` that calls Kotlin
+/// `NativeBridge.resolveDomain(host)` through the cached JNI method.
+///
+/// Kotlin returns either an IPv4 literal (e.g. "93.184.216.34") or null
+/// when the underlying non-VPN network is unknown / host resolution fails.
+/// We only accept IPv4 — direct-mode connect is IPv4-only downstream
+/// anyway (see `session.rs` dst.ip() branch).
+fn make_system_resolver_fn() -> SystemResolverFn {
+    Arc::new(|host: &str| -> Option<Ipv4Addr> {
+        let jvm = JVM.get()?;
+        let cache = RESOLVE_METHOD.get()?;
+
+        let mut env = jvm.attach_current_thread_as_daemon().ok()?;
+        let host_jstr = env.new_string(host).ok()?;
+
+        let result = unsafe {
+            env.call_static_method_unchecked(
+                &cache.class,
+                jni::objects::JStaticMethodID::from_raw(cache.method_id),
+                jni::signature::ReturnType::Object,
+                &[jni::sys::jvalue {
+                    l: host_jstr.as_raw(),
+                },],
+            )
+        };
+
+        let jvalue = match result {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = env.exception_clear();
+                return None;
+            }
+        };
+
+        // Kotlin's nullable String? comes back as a JObject that may be null.
+        let obj = jvalue.l().ok()?;
+        if obj.is_null() {
+            return None;
+        }
+        let jstr = jni::objects::JString::from(obj);
+        let rust_str: String = env.get_string(&jstr).ok()?.into();
+        rust_str.parse::<Ipv4Addr>().ok()
     })
 }
 
@@ -168,6 +226,9 @@ fn parse_config(json: &str) -> Result<VpnConfig, String> {
         padding_min, padding_max, routing, geoip_path: None, on_server_down,
         dns_resolvers,
         hub_url, hub_preset, hub_cache_dir, hub_refresh_interval_secs,
+        // Wired in at engine start (nativeStart), not from JSON — the
+        // resolver is a JNI callback, not a config value.
+        system_resolver: None,
     })
 }
 
@@ -243,24 +304,50 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
         }
     }
 
-    // Cache class + method ID on the MAIN thread where ClassLoader works.
+    // Cache class + method IDs on the MAIN thread where ClassLoader works.
     // NativeBridge is a Kotlin `object`, so `class` parameter may be the instance,
     // not the JClass. Use FindClass explicitly to get the correct JClass.
-    if PROTECT_METHOD.get().is_none() {
+    if PROTECT_METHOD.get().is_none() || RESOLVE_METHOD.get().is_none() {
         match env.find_class("com/xrproxy/app/jni/NativeBridge") {
             Ok(found_class) => {
-                match env.get_static_method_id(&found_class, "protectSocket", "(I)Z") {
-                    Ok(mid) => {
-                        if let Ok(global_class) = env.new_global_ref(&found_class) {
-                            let _ = PROTECT_METHOD.set(ProtectMethodCache {
-                                class: global_class,
-                                method_id: mid.into_raw(),
-                            });
-                            tracing::info!("Cached protectSocket method ID");
+                if PROTECT_METHOD.get().is_none() {
+                    match env.get_static_method_id(&found_class, "protectSocket", "(I)Z") {
+                        Ok(mid) => {
+                            if let Ok(global_class) = env.new_global_ref(&found_class) {
+                                let _ = PROTECT_METHOD.set(ProtectMethodCache {
+                                    class: global_class,
+                                    method_id: mid.into_raw(),
+                                });
+                                tracing::info!("Cached protectSocket method ID");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to get protectSocket method: {:?}", e);
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to get protectSocket method: {:?}", e);
+                }
+                if RESOLVE_METHOD.get().is_none() {
+                    // Return type is nullable String, so signature is `(String)Ljava/lang/String;`.
+                    match env.get_static_method_id(
+                        &found_class,
+                        "resolveDomain",
+                        "(Ljava/lang/String;)Ljava/lang/String;",
+                    ) {
+                        Ok(mid) => {
+                            if let Ok(global_class) = env.new_global_ref(&found_class) {
+                                let _ = RESOLVE_METHOD.set(ResolveMethodCache {
+                                    class: global_class,
+                                    method_id: mid.into_raw(),
+                                });
+                                tracing::info!("Cached resolveDomain method ID");
+                            }
+                        }
+                        Err(e) => {
+                            // Not fatal — direct mode will fall back to UDP:53
+                            // probes. Older builds without the Kotlin bridge
+                            // method keep working.
+                            tracing::warn!("resolveDomain not found, UDP-only DNS: {:?}", e);
+                        }
                     }
                 }
             }
@@ -281,10 +368,15 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
         Err(_) => return err(&mut env, "Failed to read config string"),
     };
 
-    let config = match parse_config(&config_str) {
+    let mut config = match parse_config(&config_str) {
         Ok(c) => c,
         Err(e) => return err(&mut env, &format!("Ошибка конфигурации: {}", e)),
     };
+    // Only wire the resolver if Kotlin exposes the bridge method; otherwise
+    // leave it None so direct mode goes through the UDP fallback as before.
+    if RESOLVE_METHOD.get().is_some() {
+        config.system_resolver = Some(make_system_resolver_fn());
+    }
 
     let mut engine = VpnEngine::new(config);
     let queue = PacketQueue::new();

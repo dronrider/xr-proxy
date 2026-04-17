@@ -24,7 +24,7 @@ use xr_proto::routing::{Action, Router};
 
 use crate::dns::FakeDns;
 use crate::ip_stack::{IpStack, PacketQueue};
-use crate::session::{relay_session_with_domain, ProtectSocketFn, SessionContext, TcpSessionKey};
+use crate::session::{relay_session_with_domain, ProtectSocketFn, SessionContext, SystemResolverFn, TcpSessionKey};
 use crate::state::{StateHandle, VpnState};
 use crate::stats::Stats;
 
@@ -66,6 +66,10 @@ pub struct VpnConfig {
     /// version changes on the hub. Ignored if `hub_url`/`hub_preset`/
     /// `hub_cache_dir` are not all set.
     pub hub_refresh_interval_secs: Option<u64>,
+    /// Optional host-OS resolver for direct-mode fake-IP resolution.
+    /// On Android it should call `Network.getAllByName()` on the underlying
+    /// non-VPN network. When set, it's tried before the UDP:53 fallback.
+    pub system_resolver: Option<SystemResolverFn>,
 }
 
 pub struct VpnEngine {
@@ -176,6 +180,7 @@ impl VpnEngine {
             on_server_down, protect_socket,
             mux_pool,
             dns_resolvers,
+            system_resolver: self.config.system_resolver.clone(),
         });
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

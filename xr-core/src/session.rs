@@ -33,6 +33,20 @@ pub struct TcpSessionKey {
 /// On Android, this calls VpnService.protect(fd).
 pub type ProtectSocketFn = Arc<dyn Fn(i32) -> bool + Send + Sync>;
 
+/// Host-provided domain resolver that MUST bypass the VPN tunnel.
+///
+/// Used for direct-mode connections: when the tunnel is down and xr-core
+/// needs to find the real IP of a fake-DNS domain, asking the host OS (e.g.
+/// Android `Network.getAllByName()` on the underlying non-VPN network)
+/// goes through whichever DNS channel the carrier actually allows — plain
+/// UDP, DoT, DoH — whereas our own UDP:53 probes in `resolve_via_protected_dns`
+/// get dropped on networks that whitelist traffic by destination port.
+///
+/// Returning `None` means "I can't resolve this, try the UDP fallback."
+/// Implementations are called from async context but may block — wrap the
+/// call site in `spawn_blocking` to avoid stalling the tokio worker.
+pub type SystemResolverFn = Arc<dyn Fn(&str) -> Option<Ipv4Addr> + Send + Sync>;
+
 /// Shared context for session management.
 pub struct SessionContext {
     /// `RwLock<Arc<Router>>` — тот же паттерн, что в `xr-client::proxy::ProxyState`.
@@ -52,6 +66,9 @@ pub struct SessionContext {
     /// First one to answer wins. System-provided (via Android ConnectivityManager)
     /// resolvers come first, with public resolvers as a universal fallback.
     pub dns_resolvers: Vec<SocketAddr>,
+    /// Optional host-level resolver (Android `Network.getAllByName`) tried
+    /// BEFORE the UDP:53 fallback. See `SystemResolverFn` docs.
+    pub system_resolver: Option<SystemResolverFn>,
 }
 
 /// Create a TCP connection that bypasses the VPN tunnel.
@@ -215,7 +232,16 @@ async fn relay_direct(
     let real_dst = if let IpAddr::V4(v4) = dst.ip() {
         if FakeDns::is_fake_ip(v4) {
             if let Some(domain) = domain {
-                let ip = resolve_via_protected_dns(domain, &ctx.dns_resolvers, &ctx.protect_socket).await?;
+                // Prefer the host resolver: on Android it uses the underlying
+                // non-VPN Network and whatever DNS channel (plain / DoT / DoH)
+                // the carrier actually allows. Our own UDP:53 probes die on
+                // whitelist networks that only permit port-443 traffic.
+                let ip = resolve_domain_with_fallback(
+                    domain,
+                    ctx.system_resolver.as_ref(),
+                    &ctx.dns_resolvers,
+                    &ctx.protect_socket,
+                ).await?;
                 SocketAddr::new(IpAddr::V4(ip), dst.port())
             } else {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "fake IP without domain"));
@@ -328,6 +354,41 @@ pub const FALLBACK_DNS_RESOLVERS: &[SocketAddr] = &[
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(77, 88, 8, 8)), 53),
 ];
+
+/// Resolve a domain to an IPv4 via the host OS first, falling back to our
+/// own UDP:53 client on protected sockets.
+///
+/// The host-level path matters on whitelist-style carrier networks where
+/// plain UDP DNS to public resolvers is dropped but the OS resolver (via
+/// DoT/DoH set up by the carrier) still works. Without it, a dead xr-server
+/// combined with a blocked UDP:53 means even "direct" traffic can't resolve
+/// fake IPs — so the user loses whitelist sites too, not just proxied ones.
+pub(crate) async fn resolve_domain_with_fallback(
+    domain: &str,
+    system_resolver: Option<&SystemResolverFn>,
+    resolvers: &[SocketAddr],
+    protect: &ProtectSocketFn,
+) -> io::Result<Ipv4Addr> {
+    if let Some(resolver) = system_resolver {
+        let resolver = resolver.clone();
+        let domain_owned = domain.to_string();
+        // System resolvers are synchronous JNI/syscall chains — run on a
+        // blocking pool so we don't stall the tokio worker.
+        match tokio::task::spawn_blocking(move || resolver(&domain_owned)).await {
+            Ok(Some(ip)) => {
+                tracing::debug!("system resolver returned {} for {}", ip, domain);
+                return Ok(ip);
+            }
+            Ok(None) => {
+                tracing::debug!("system resolver has no answer for {}, using UDP fallback", domain);
+            }
+            Err(e) => {
+                tracing::warn!("system resolver task panicked for {}: {}", domain, e);
+            }
+        }
+    }
+    resolve_via_protected_dns(domain, resolvers, protect).await
+}
 
 /// Resolve a domain to an IPv4 address via protected UDP sockets.
 ///
@@ -529,5 +590,49 @@ mod tests {
         // ANCOUNT stays 0.
         let err = parse_dns_a_record(&resp, "nxdomain.test").unwrap_err();
         assert!(err.to_string().contains("no answers"));
+    }
+
+    #[tokio::test]
+    async fn system_resolver_short_circuits_udp_fallback() {
+        // When the host resolver returns an IP we must NOT fall through to
+        // the UDP path — otherwise we'd still time out on whitelist networks
+        // that block UDP:53. Using an unroutable resolver as a canary:
+        // if it ever gets contacted the test would hang on the 3s timeout.
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen_clone = seen.clone();
+        let resolver: SystemResolverFn = Arc::new(move |host: &str| {
+            seen_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(host, "example.com");
+            Some(Ipv4Addr::new(93, 184, 216, 34))
+        });
+        let protect: ProtectSocketFn = Arc::new(|_| true);
+        let ip = resolve_domain_with_fallback(
+            "example.com",
+            Some(&resolver),
+            &[SocketAddr::new(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1)), 53)],
+            &protect,
+        ).await.expect("system resolver should succeed");
+        assert_eq!(ip, Ipv4Addr::new(93, 184, 216, 34));
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn system_resolver_none_falls_back_to_udp() {
+        // Resolver returns None → must hit UDP path. We supply no resolvers
+        // and a protect that always fails, so the UDP branch errors out
+        // quickly; the assertion is that the error surfaces (i.e. fallback
+        // ran), not that DNS worked.
+        let resolver: SystemResolverFn = Arc::new(|_| None);
+        let protect: ProtectSocketFn = Arc::new(|_| false);
+        let err = resolve_domain_with_fallback(
+            "example.com",
+            Some(&resolver),
+            &[SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)],
+            &protect,
+        ).await.expect_err("UDP fallback must fail with protect returning false");
+        assert!(
+            err.to_string().contains("protect") || err.to_string().contains("DNS"),
+            "unexpected error: {}", err,
+        );
     }
 }

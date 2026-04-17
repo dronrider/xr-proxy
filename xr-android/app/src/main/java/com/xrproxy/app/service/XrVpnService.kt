@@ -4,8 +4,13 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.graphics.drawable.Icon
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Binder
 import android.os.IBinder
@@ -90,6 +95,11 @@ class XrVpnService : VpnService() {
     private var tunReadThread: Thread? = null
     private var tunWriteThread: Thread? = null
     @Volatile private var running = false
+
+    // Tracks the underlying (non-VPN) network so xr-core can bypass the
+    // tunnel for direct-mode DNS lookups. Registered at VPN start, torn
+    // down on stop. See NativeBridge.resolveDomain for the consumer side.
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     // Speed tracking: previous snapshot for delta computation
     private var prevBytesUp: Long = 0
@@ -187,6 +197,13 @@ class XrVpnService : VpnService() {
         publish(Phase.Preparing)
         startForeground(NOTIFICATION_ID, buildNotification(_stateFlow.value))
 
+        // Register BEFORE establish() so the underlying network is known by
+        // the time xr-core starts resolving. registerNetworkCallback gives
+        // us the non-VPN default network directly — we explicitly exclude
+        // VPN-capable networks, otherwise we'd pick up our own tunnel after
+        // it's up and get a resolve loop.
+        registerUnderlyingNetworkCallback()
+
         val iface = Builder()
             .setSession("XR Proxy")
             .addAddress("10.0.0.2", 32)
@@ -197,6 +214,7 @@ class XrVpnService : VpnService() {
             .establish()
 
         if (iface == null) {
+            unregisterUnderlyingNetworkCallback()
             publish(Phase.Error, errorMessage = "TUN establish failed")
             updateNotification()
             stopSelf()
@@ -211,6 +229,7 @@ class XrVpnService : VpnService() {
         if (startError != null) {
             iface.close()
             vpnInterface = null
+            unregisterUnderlyingNetworkCallback()
             publish(Phase.Error, errorMessage = startError)
             updateNotification()
             stopSelf()
@@ -318,6 +337,59 @@ class XrVpnService : VpnService() {
         tunWriteThread = null
         vpnInterface?.close()
         vpnInterface = null
+        unregisterUnderlyingNetworkCallback()
+    }
+
+    // ── Underlying network tracking ───────────────────────────────────
+
+    private fun registerUnderlyingNetworkCallback() {
+        if (networkCallback != null) return
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+
+        // Match any real uplink (WiFi/cellular/ethernet) but exclude our own
+        // VPN transport. `NET_CAPABILITY_NOT_VPN` is exactly that filter and
+        // has been available since API 21, unlike `removeTransportType`.
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                NativeBridge.underlyingNetwork = network
+                // Inform the framework that traffic is metered/unmetered
+                // through this uplink — it's also what SystemUI uses to
+                // decide the signal-strength indicator above the VPN key.
+                setUnderlyingNetworks(arrayOf(network))
+            }
+            override fun onLost(network: Network) {
+                // Only clear if the lost one is what we were pointing at;
+                // another network may already be Available.
+                if (NativeBridge.underlyingNetwork == network) {
+                    NativeBridge.underlyingNetwork = null
+                }
+            }
+        }
+        try {
+            cm.registerNetworkCallback(request, callback)
+            networkCallback = callback
+        } catch (_: SecurityException) {
+            // Some OEM ROMs deny registerNetworkCallback without
+            // ACCESS_NETWORK_STATE edge cases. Swallow and let direct
+            // mode fall back to UDP:53 probes — no regression vs before.
+        }
+    }
+
+    private fun unregisterUnderlyingNetworkCallback() {
+        val cb = networkCallback ?: return
+        networkCallback = null
+        NativeBridge.underlyingNetwork = null
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        try {
+            cm.unregisterNetworkCallback(cb)
+        } catch (_: IllegalArgumentException) {
+            // Already unregistered — benign race with Android-side cleanup.
+        }
     }
 
     // ── State publishing helpers ──────────────────────────────────────
