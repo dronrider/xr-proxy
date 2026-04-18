@@ -112,12 +112,37 @@ fn is_private_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// How long to wait for the client's first TCP payload before giving up on
+/// SNI sniffing. TLS clients send ClientHello right after the 3-way
+/// handshake — half a second is generous but keeps non-TLS direct sessions
+/// (which may not send anything first) from paying visibly for the probe.
+const SNI_PEEK_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Wait briefly for the first client payload and try to extract an SNI
+/// hostname from it. Returns `(Some(sni), data)` on a TLS ClientHello,
+/// `(None, data)` on any other first packet (still worth preserving so the
+/// downstream relay can forward it), and `(None, empty)` on timeout or
+/// EOF. The consumed bytes are never lost — the caller flushes them into
+/// the target before resuming the normal relay loop.
+async fn peek_sni_from_rx(
+    data_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    timeout: Duration,
+) -> (Option<String>, Vec<u8>) {
+    match tokio::time::timeout(timeout, data_rx.recv()).await {
+        Ok(Some(data)) if !data.is_empty() => {
+            let sni = xr_proto::sni::extract_sni(&data);
+            (sni, data)
+        }
+        _ => (None, Vec::new()),
+    }
+}
+
 /// Spawn a relay task with a pre-resolved domain.
 pub async fn relay_session_with_domain(
     ctx: Arc<SessionContext>,
     key: TcpSessionKey,
     domain: Option<String>,
-    data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     waker: Arc<Notify>,
 ) -> io::Result<()> {
@@ -162,6 +187,25 @@ pub async fn relay_session_with_domain(
         ));
     }
 
+    // SNI sniffing fallback: when fake-DNS didn't give us a domain (usually
+    // because the app runs its own DoH/DoT resolver and connects to the
+    // real IP directly — Signal is the canonical case), try to recover the
+    // hostname from the TLS ClientHello. This lets `*.signal.org` routing
+    // rules match even when the DNS path bypassed FakeDns entirely.
+    //
+    // The data we peek here is the app's first upload bytes. We must feed
+    // them to the downstream relay verbatim — hence `initial_data`.
+    let mut domain = domain;
+    let mut initial_data: Vec<u8> = Vec::new();
+    if domain.is_none() {
+        let (sni, data) = peek_sni_from_rx(&mut data_rx, SNI_PEEK_TIMEOUT).await;
+        if let Some(sni) = sni {
+            tracing::debug!("SNI sniff: {} -> {}", key.dst_addr, sni);
+            domain = Some(sni);
+        }
+        initial_data = data;
+    }
+
     // Short-lived read-lock: resolve() возвращает Action по value.
     // После drop'а guard'а live-сессия не пересчитывает маршрут, даже если
     // фоновый hot-swap подменит Router — это осознанное поведение.
@@ -187,7 +231,7 @@ pub async fn relay_session_with_domain(
                 Ok(mux_stream) => {
                     ctx.stats.add_log(&format!("mux relay for {:?}", target_addr));
                     tracing::debug!("mux relay for {:?}", target_addr);
-                    relay_via_mux_stream(mux_stream, data_rx, data_tx, waker, &ctx.stats).await
+                    relay_via_mux_stream(mux_stream, initial_data, data_rx, data_tx, waker, &ctx.stats).await
                 }
                 Err(e) => {
                     if ctx.on_server_down == Action::Direct {
@@ -196,7 +240,7 @@ pub async fn relay_session_with_domain(
                             target_addr, e,
                         ));
                         tracing::info!("mux fail for {:?}, direct fallback: {}", target_addr, e);
-                        relay_direct(ctx, key.dst_addr, domain.as_deref(), data_rx, data_tx, waker).await
+                        relay_direct(ctx, key.dst_addr, domain.as_deref(), initial_data, data_rx, data_tx, waker).await
                     } else {
                         // Preserve the "mux open fail:" prefix so engine.rs
                         // error classification keeps the existing behaviour.
@@ -210,16 +254,21 @@ pub async fn relay_session_with_domain(
                 "direct: {} [{}]",
                 key.dst_addr, domain.as_deref().unwrap_or("-"),
             ));
-            relay_direct(ctx, key.dst_addr, domain.as_deref(), data_rx, data_tx, waker).await
+            relay_direct(ctx, key.dst_addr, domain.as_deref(), initial_data, data_rx, data_tx, waker).await
         }
     }
 }
 
 /// Relay directly to the target.
+///
+/// `initial_data` is any bytes already read from the client side (e.g. the
+/// TLS ClientHello consumed for SNI sniffing) and must be sent to the target
+/// before we start draining `data_rx` again.
 async fn relay_direct(
     ctx: Arc<SessionContext>,
     dst: SocketAddr,
     domain: Option<&str>,
+    initial_data: Vec<u8>,
     mut data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     waker: Arc<Notify>,
@@ -270,6 +319,9 @@ async fn relay_direct(
     let (mut tr, mut tw) = target.into_split();
 
     let upload = async move {
+        if !initial_data.is_empty() {
+            tw.write_all(&initial_data).await?;
+        }
         while let Some(data) = data_rx.recv().await {
             if data.is_empty() { break; }
             tw.write_all(&data).await?;
@@ -303,14 +355,22 @@ async fn relay_direct(
 }
 
 /// Relay data between smoltcp channels and a MuxStream.
+///
+/// `initial_data` is any bytes already read from the client (e.g. consumed
+/// by SNI sniffing) and must be flushed into the mux stream first.
 async fn relay_via_mux_stream(
     mut mux_stream: xr_proto::mux::MuxStream,
+    initial_data: Vec<u8>,
     mut data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     waker: Arc<Notify>,
     stats: &Stats,
 ) -> io::Result<()> {
     let upload = async {
+        if !initial_data.is_empty() {
+            stats.add_bytes_up(initial_data.len() as u64);
+            mux_stream.send(&initial_data).await?;
+        }
         loop {
             tokio::select! {
                 data = data_rx.recv() => {
@@ -614,6 +674,74 @@ mod tests {
         ).await.expect("system resolver should succeed");
         assert_eq!(ip, Ipv4Addr::new(93, 184, 216, 34));
         assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Minimal TLS 1.2 ClientHello with SNI=host, enough bytes to make
+    /// `extract_sni` happy. Based on the test fixture in xr-proto/sni.
+    fn make_client_hello(host: &str) -> Vec<u8> {
+        let host_bytes = host.as_bytes();
+        let mut ext = Vec::new();
+        // server_name extension: type 0x0000, then body.
+        ext.extend_from_slice(&[0x00, 0x00]);
+        let sni_body_len = 2 /*list len*/ + 1 /*name type*/ + 2 /*host len*/ + host_bytes.len();
+        ext.extend_from_slice(&(sni_body_len as u16).to_be_bytes());
+        ext.extend_from_slice(&((sni_body_len - 2) as u16).to_be_bytes());
+        ext.push(0x00); // name_type = host_name
+        ext.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
+        ext.extend_from_slice(host_bytes);
+
+        let mut ch_body = Vec::new();
+        ch_body.extend_from_slice(&[0x03, 0x03]); // legacy_version
+        ch_body.extend_from_slice(&[0u8; 32]); // random
+        ch_body.push(0); // session_id len
+        ch_body.extend_from_slice(&[0x00, 0x02, 0x00, 0x2F]); // cipher_suites
+        ch_body.extend_from_slice(&[0x01, 0x00]); // compression_methods
+        ch_body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        ch_body.extend_from_slice(&ext);
+
+        let mut hs = Vec::new();
+        hs.push(0x01); // handshake type = ClientHello
+        let body_len = ch_body.len() as u32;
+        hs.extend_from_slice(&[(body_len >> 16) as u8, (body_len >> 8) as u8, body_len as u8]);
+        hs.extend_from_slice(&ch_body);
+
+        let mut record = Vec::new();
+        record.push(0x16); // ContentType = Handshake
+        record.extend_from_slice(&[0x03, 0x01]); // version
+        record.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        record.extend_from_slice(&hs);
+        record
+    }
+
+    #[tokio::test]
+    async fn peek_sni_recovers_host_from_client_hello() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let hello = make_client_hello("chat.signal.org");
+        tx.send(hello.clone()).await.unwrap();
+        let (sni, data) = peek_sni_from_rx(&mut rx, Duration::from_millis(100)).await;
+        assert_eq!(sni.as_deref(), Some("chat.signal.org"));
+        // Initial_data must be preserved byte-for-byte — otherwise the target
+        // would see a truncated TLS handshake and the connection would stall.
+        assert_eq!(data, hello);
+    }
+
+    #[tokio::test]
+    async fn peek_sni_returns_none_on_non_tls_but_keeps_data() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+        tx.send(payload.clone()).await.unwrap();
+        let (sni, data) = peek_sni_from_rx(&mut rx, Duration::from_millis(100)).await;
+        assert!(sni.is_none());
+        assert_eq!(data, payload);
+    }
+
+    #[tokio::test]
+    async fn peek_sni_times_out_with_no_data() {
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        // Sender kept alive — we don't want an EOF, we want a real timeout.
+        let (sni, data) = peek_sni_from_rx(&mut rx, Duration::from_millis(20)).await;
+        assert!(sni.is_none());
+        assert!(data.is_empty());
     }
 
     #[tokio::test]
