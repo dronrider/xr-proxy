@@ -197,38 +197,52 @@ async fn tunnel_connection(
 }
 
 /// Relay data between a local client and a MuxStream.
+///
+/// Upload (LAN→mux) and download (mux→LAN) run as independent tasks. They
+/// must NOT share a `tokio::select!` loop: a slow LAN writer would otherwise
+/// stall mux recv polling, the per-stream channel would overflow on a CDN
+/// burst, and the mux reader task would kill the stream with
+/// "channel full, closing".
 async fn relay_mux(
     client: &mut TcpStream,
-    mut mux_stream: xr_proto::mux::MuxStream,
+    mux_stream: xr_proto::mux::MuxStream,
     idle_timeout: Duration,
     max_lifetime: Duration,
 ) -> io::Result<()> {
     let (mut cr, mut cw) = client.split();
+    let (mut mux_r, mut mux_w) = mux_stream.split();
 
     let upload = async {
         let mut buf = vec![0u8; 8192];
         loop {
-            tokio::select! {
-                result = tokio::time::timeout(idle_timeout, cr.read(&mut buf)) => {
-                    match result {
-                        Ok(Ok(0)) | Err(_) => break,
-                        Ok(Ok(n)) => mux_stream.send(&buf[..n]).await?,
-                        Ok(Err(e)) => return Err(e),
-                    }
-                }
-                data = mux_stream.recv() => {
-                    match data {
-                        Some(d) if !d.is_empty() => cw.write_all(&d).await?,
-                        _ => break,
-                    }
-                }
+            match tokio::time::timeout(idle_timeout, cr.read(&mut buf)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(n)) => mux_w.send(&buf[..n]).await?,
+                Ok(Err(e)) => return Err(e),
             }
         }
-        mux_stream.close().await?;
+        mux_w.close().await?;
         Ok::<(), io::Error>(())
     };
 
-    match tokio::time::timeout(max_lifetime, upload).await {
+    let download = async {
+        loop {
+            match mux_r.recv().await {
+                Some(d) if !d.is_empty() => cw.write_all(&d).await?,
+                _ => break,
+            }
+        }
+        Ok::<(), io::Error>(())
+    };
+
+    let combined = async {
+        tokio::select! {
+            r = upload => r,
+            r = download => r,
+        }
+    };
+
+    match tokio::time::timeout(max_lifetime, combined).await {
         Ok(r) => r,
         Err(_) => Ok(()),
     }

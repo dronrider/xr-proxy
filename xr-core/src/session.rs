@@ -358,47 +358,53 @@ async fn relay_direct(
 ///
 /// `initial_data` is any bytes already read from the client (e.g. consumed
 /// by SNI sniffing) and must be flushed into the mux stream first.
+///
+/// Upload and download run as independent tasks (see analogous note in
+/// xr-client `relay_mux`). Sharing a `tokio::select!` would couple the
+/// download path to the upload's smoltcp `data_rx.recv()` cadence and let
+/// CDN bursts overflow the per-stream channel — killing the stream.
 async fn relay_via_mux_stream(
-    mut mux_stream: xr_proto::mux::MuxStream,
+    mux_stream: xr_proto::mux::MuxStream,
     initial_data: Vec<u8>,
     mut data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     waker: Arc<Notify>,
     stats: &Stats,
 ) -> io::Result<()> {
+    let (mut mux_r, mut mux_w) = mux_stream.split();
+
     let upload = async {
         if !initial_data.is_empty() {
             stats.add_bytes_up(initial_data.len() as u64);
-            mux_stream.send(&initial_data).await?;
+            mux_w.send(&initial_data).await?;
         }
-        loop {
-            tokio::select! {
-                data = data_rx.recv() => {
-                    match data {
-                        Some(d) if !d.is_empty() => {
-                            stats.add_bytes_up(d.len() as u64);
-                            mux_stream.send(&d).await?;
-                        }
-                        _ => break,
-                    }
-                }
-                data = mux_stream.recv() => {
-                    match data {
-                        Some(d) if !d.is_empty() => {
-                            stats.add_bytes_down(d.len() as u64);
-                            if data_tx.send(d).await.is_err() { break; }
-                            waker.notify_one();
-                        }
-                        _ => break,
-                    }
-                }
-            }
+        while let Some(d) = data_rx.recv().await {
+            if d.is_empty() { break; }
+            stats.add_bytes_up(d.len() as u64);
+            mux_w.send(&d).await?;
         }
-        mux_stream.close().await?;
+        mux_w.close().await?;
         Ok::<(), io::Error>(())
     };
 
-    match tokio::time::timeout(Duration::from_secs(3600), upload).await {
+    let download = async {
+        while let Some(d) = mux_r.recv().await {
+            if d.is_empty() { break; }
+            stats.add_bytes_down(d.len() as u64);
+            if data_tx.send(d).await.is_err() { break; }
+            waker.notify_one();
+        }
+        Ok::<(), io::Error>(())
+    };
+
+    let combined = async {
+        tokio::select! {
+            r = upload => r,
+            r = download => r,
+        }
+    };
+
+    match tokio::time::timeout(Duration::from_secs(3600), combined).await {
         Ok(r) => r,
         Err(_) => Ok(()),
     }

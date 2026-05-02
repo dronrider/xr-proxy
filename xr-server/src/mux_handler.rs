@@ -94,8 +94,13 @@ pub async fn handle_mux_client(
 }
 
 /// Relay data between a MuxStream and a target TCP connection.
+///
+/// MuxStream is split so the upstream (target→mux) and downstream
+/// (mux→target) flows run as independent tasks. This avoids the
+/// "channel full, closing" failure mode where a slow target write would
+/// stall mux recv polling under a CDN burst on the upstream side.
 async fn relay_stream(
-    mut mux_stream: xr_proto::mux::MuxStream,
+    mux_stream: xr_proto::mux::MuxStream,
     target_addr: TargetAddr,
 ) -> io::Result<()> {
     // Resolve and connect to target.
@@ -110,34 +115,19 @@ async fn relay_stream(
     configure_target(&target);
 
     let (mut tr, mut tw) = target.split();
+    let (mut mux_r, mux_w) = mux_stream.split();
 
-    // Use channels to decouple MuxStream recv (mutable) from send (shared).
-    let (dl_tx, mut dl_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-
-    // MuxStream → Target (upload) + receive download notifications.
-    let upload = async {
-        loop {
-            tokio::select! {
-                data = mux_stream.recv() => {
-                    match data {
-                        Some(d) if !d.is_empty() => tw.write_all(&d).await?,
-                        _ => break,
-                    }
-                }
-                // Forward downloaded data to MuxStream.
-                data = dl_rx.recv() => {
-                    match data {
-                        Some(d) => mux_stream.send(&d).await?,
-                        None => break,
-                    }
-                }
-            }
+    // MuxStream → Target (downstream from server's POV: data going to origin).
+    let to_target = async {
+        while let Some(d) = mux_r.recv().await {
+            if d.is_empty() { break; }
+            tw.write_all(&d).await?;
         }
         Ok::<(), io::Error>(())
     };
 
-    // Target → download channel.
-    let download = async {
+    // Target → MuxStream (upstream: origin's response back to client).
+    let to_mux = async {
         let mut buf = vec![0u8; 8192];
         loop {
             let n = match tokio::time::timeout(IDLE_TIMEOUT, tr.read(&mut buf)).await {
@@ -145,15 +135,15 @@ async fn relay_stream(
                 Err(_) => return Ok::<(), io::Error>(()),
             };
             if n == 0 { break; }
-            if dl_tx.send(buf[..n].to_vec()).await.is_err() { break; }
+            mux_w.send(&buf[..n]).await?;
         }
         Ok::<(), io::Error>(())
     };
 
     let result = tokio::time::timeout(MAX_LIFETIME, async {
         tokio::select! {
-            r = upload => r,
-            r = download => r,
+            r = to_target => r,
+            r = to_mux => r,
         }
     });
 

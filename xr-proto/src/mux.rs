@@ -27,8 +27,17 @@ use crate::protocol::{
 
 // ── Constants ───────────────────────────────────────────────────────
 
-const STREAM_CHANNEL_SIZE: usize = 256;
-const WRITER_CHANNEL_SIZE: usize = 512;
+// Per-stream channel: holds frames pending consumption by the LAN/target
+// reader. CDN bursts (Cloudflare/googlevideo) can deliver tens of frames in
+// a single millisecond, so this must be large enough to absorb a burst while
+// the consumer drains it. 256 was too small — the consumer side of `relay_*`
+// used to share one tokio::select! with the slow LAN write, so a single TLS
+// handshake burst overflowed the channel and killed the stream.
+const STREAM_CHANNEL_SIZE: usize = 1024;
+// Shared writer channel: every stream's send() funnels through this single
+// queue. Under torrent-like load (many parallel streams) the previous 512
+// became a contention bottleneck.
+const WRITER_CHANNEL_SIZE: usize = 2048;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// Force mux reconnection every 4 hours to prevent TCP degradation.
 const MUX_MAX_LIFETIME: Duration = Duration::from_secs(4 * 3600);
@@ -50,17 +59,23 @@ struct OutFrame {
 #[derive(Debug)]
 pub struct MuxStream {
     stream_id: u32,
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: Option<mpsc::Receiver<Vec<u8>>>,
     writer_tx: mpsc::Sender<OutFrame>,
     alive: Arc<AtomicBool>,
     closed: bool,
+    /// Set by `split()` so Drop on the husk skips Close — the WriteHalf now
+    /// owns that contract.
+    detached: bool,
 }
 
 impl MuxStream {
     /// Receive data from this stream. Returns None if the stream or
     /// mux connection is closed.
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        self.rx.recv().await
+        match self.rx.as_mut() {
+            Some(rx) => rx.recv().await,
+            None => None,
+        }
     }
 
     /// Send data on this stream.
@@ -101,9 +116,109 @@ impl MuxStream {
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
+
+    /// Split into independent read and write halves, so a download (recv→LAN)
+    /// loop and an upload (LAN→send) loop can run as separate tasks. Without
+    /// this, both directions live in one `tokio::select!`, and a slow LAN
+    /// writer stalls the recv side — overflowing the per-stream channel and
+    /// triggering "channel full, closing".
+    pub fn split(mut self) -> (MuxReadHalf, MuxWriteHalf) {
+        let rx = self.rx.take().expect("MuxStream already split");
+        self.detached = true;
+        let write = MuxWriteHalf {
+            stream_id: self.stream_id,
+            writer_tx: self.writer_tx.clone(),
+            alive: self.alive.clone(),
+            closed: self.closed,
+        };
+        // self drops here; Drop honors `detached` and skips Close.
+        (MuxReadHalf { rx }, write)
+    }
 }
 
 impl Drop for MuxStream {
+    fn drop(&mut self) {
+        if self.detached {
+            return;
+        }
+        if !self.closed && self.alive.load(Ordering::Relaxed) {
+            let tx = self.writer_tx.clone();
+            let sid = self.stream_id;
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(OutFrame {
+                        stream_id: sid,
+                        command: Command::Close,
+                        payload: Vec::new(),
+                    })
+                    .await;
+            });
+        }
+    }
+}
+
+// ── MuxStream split halves ──────────────────────────────────────────
+
+/// Read half of a split MuxStream. Owns the per-stream receive channel.
+#[derive(Debug)]
+pub struct MuxReadHalf {
+    rx: mpsc::Receiver<Vec<u8>>,
+}
+
+impl MuxReadHalf {
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.rx.recv().await
+    }
+}
+
+/// Write half of a split MuxStream. Owns the Close contract: dropping it
+/// without prior `close()` enqueues a Close frame, mirroring the original
+/// MuxStream Drop behavior.
+#[derive(Debug)]
+pub struct MuxWriteHalf {
+    stream_id: u32,
+    writer_tx: mpsc::Sender<OutFrame>,
+    alive: Arc<AtomicBool>,
+    closed: bool,
+}
+
+impl MuxWriteHalf {
+    pub async fn send(&self, data: &[u8]) -> io::Result<()> {
+        if !self.alive.load(Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "mux connection dead"));
+        }
+        self.writer_tx
+            .send(OutFrame {
+                stream_id: self.stream_id,
+                command: Command::Data,
+                payload: data.to_vec(),
+            })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "mux writer closed"))
+    }
+
+    pub async fn close(&mut self) -> io::Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        let _ = self
+            .writer_tx
+            .send(OutFrame {
+                stream_id: self.stream_id,
+                command: Command::Close,
+                payload: Vec::new(),
+            })
+            .await;
+        Ok(())
+    }
+
+    pub fn stream_id(&self) -> u32 {
+        self.stream_id
+    }
+}
+
+impl Drop for MuxWriteHalf {
     fn drop(&mut self) {
         if !self.closed && self.alive.load(Ordering::Relaxed) {
             let tx = self.writer_tx.clone();
@@ -223,10 +338,11 @@ impl Multiplexer {
 
         MuxStream {
             stream_id,
-            rx: data_rx,
+            rx: Some(data_rx),
             writer_tx: self.writer_tx.clone(),
             alive: self.alive.clone(),
             closed: false,
+            detached: false,
         }
     }
 
@@ -501,10 +617,11 @@ pub async fn mux_open_stream(
             // ConnectAck received — stream is ready.
             Ok(MuxStream {
                 stream_id,
-                rx: data_rx,
+                rx: Some(data_rx),
                 writer_tx: mux.writer_tx.clone(),
                 alive: mux.alive.clone(),
                 closed: false,
+                detached: false,
             })
         }
         Ok(None) => {
