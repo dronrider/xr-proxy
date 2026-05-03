@@ -156,14 +156,23 @@ async fn handle_connection(
             tunnel::relay_bidirectional(&mut client, &mut target, max_lifetime).await
         }
         Action::Proxy => {
-            // Connect through the obfuscated tunnel
+            // Connect through the obfuscated tunnel.
+            //
+            // We distinguish errors by side: if the LAN client closed first
+            // (RST/EPIPE on read/write), there is nothing to fall back to —
+            // the local socket is dead. Only tunnel-side failures justify the
+            // direct fallback.
             match tunnel_connection(&mut client, orig_dst, sni_name.as_deref(), &state, idle_timeout, max_lifetime).await {
                 Ok(()) => Ok(()),
-                Err(e) => {
+                Err(RelayError::LocalClient(e)) => {
+                    tracing::debug!("LAN client closed early ({} -> {}): {}", client_addr, orig_dst, e);
+                    Ok(())
+                }
+                Err(RelayError::Tunnel(e)) => {
                     tracing::warn!("Tunnel to {} failed: {}, fallback={:?}",
                         orig_dst, e, state.on_server_down);
                     if state.on_server_down == Action::Direct {
-                        // Fallback: try direct connection
+                        // Fallback: try direct connection.
                         let mut target = TcpStream::connect(orig_dst).await?;
                         set_keepalive(&target);
                         tunnel::relay_bidirectional(&mut client, &mut target, max_lifetime).await
@@ -172,6 +181,24 @@ async fn handle_connection(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Side that produced a relay error. We need to distinguish them because a
+/// LAN-side reset is normal (browser tab closed, app backgrounded) and must
+/// not trigger a direct fallback or a noisy warn — but a tunnel-side error
+/// is a real signal that the obfuscated path is unhealthy.
+#[derive(Debug)]
+enum RelayError {
+    LocalClient(io::Error),
+    Tunnel(io::Error),
+}
+
+impl From<RelayError> for io::Error {
+    fn from(e: RelayError) -> Self {
+        match e {
+            RelayError::LocalClient(e) | RelayError::Tunnel(e) => e,
         }
     }
 }
@@ -185,14 +212,20 @@ async fn tunnel_connection(
     state: &ProxyState,
     idle_timeout: Duration,
     max_lifetime: Duration,
-) -> io::Result<()> {
+) -> Result<(), RelayError> {
     let target_addr = if let Some(domain) = sni_name {
         TargetAddr::Domain(domain.to_string(), orig_dst.port())
     } else {
         TargetAddr::Ip(orig_dst)
     };
 
-    let mux_stream = state.mux_pool.open_stream(&target_addr).await?;
+    // Failure to open a mux stream is a tunnel-side problem (mux dead,
+    // ConnectAck timeout, etc.) — direct fallback is appropriate.
+    let mux_stream = state
+        .mux_pool
+        .open_stream(&target_addr)
+        .await
+        .map_err(RelayError::Tunnel)?;
     relay_mux(client, mux_stream, idle_timeout, max_lifetime).await
 }
 
@@ -208,31 +241,38 @@ async fn relay_mux(
     mux_stream: xr_proto::mux::MuxStream,
     idle_timeout: Duration,
     max_lifetime: Duration,
-) -> io::Result<()> {
+) -> Result<(), RelayError> {
     let (mut cr, mut cw) = client.split();
     let (mut mux_r, mut mux_w) = mux_stream.split();
 
+    // Each direction tags its own errors so the caller can tell whether the
+    // LAN side or the tunnel side died. Without this distinction a perfectly
+    // normal browser-tab close shows up as "Tunnel to X failed: Connection
+    // reset by peer" and triggers a pointless direct fallback on a dead
+    // local socket.
     let upload = async {
         let mut buf = vec![0u8; 8192];
         loop {
             match tokio::time::timeout(idle_timeout, cr.read(&mut buf)).await {
                 Ok(Ok(0)) | Err(_) => break,
-                Ok(Ok(n)) => mux_w.send(&buf[..n]).await?,
-                Ok(Err(e)) => return Err(e),
+                Ok(Ok(n)) => mux_w.send(&buf[..n]).await.map_err(RelayError::Tunnel)?,
+                Ok(Err(e)) => return Err(RelayError::LocalClient(e)),
             }
         }
-        mux_w.close().await?;
-        Ok::<(), io::Error>(())
+        mux_w.close().await.map_err(RelayError::Tunnel)?;
+        Ok::<(), RelayError>(())
     };
 
     let download = async {
         loop {
             match mux_r.recv().await {
-                Some(d) if !d.is_empty() => cw.write_all(&d).await?,
+                Some(d) if !d.is_empty() => {
+                    cw.write_all(&d).await.map_err(RelayError::LocalClient)?
+                }
                 _ => break,
             }
         }
-        Ok::<(), io::Error>(())
+        Ok::<(), RelayError>(())
     };
 
     let combined = async {
