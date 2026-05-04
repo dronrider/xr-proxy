@@ -98,8 +98,10 @@ Cargo-workspace + Android-модуль:
 - [udp_relay.rs](../xr-proto/src/udp_relay.rs) — wire-формат UDP relay:
   `[Nonce:4B][Obfuscated: type + dst + src_port + payload]`.
 - mux — поверх TCP создаётся мультиплексированный поток (см. `MuxPool`,
-  `MuxStream`). Это позволяет держать один живой обфусцированный туннель и
-  гонять по нему множество логических соединений.
+  `MuxStream`). `MuxPool` держит N параллельных TCP-туннелей (`mux_pool_size`,
+  default 4); стримы балансируются round-robin, при обрыве слота open_stream
+  failover'ит на следующий, мёртвый слот переподнимается лениво. Это убирает
+  HoL-blocking одного TCP — потеря пакета на одном туннеле не тормозит остальные.
 - [invite_url.rs](../xr-proto/src/invite_url.rs) — парсер invite-ссылок
   для Android onboarding (LLD-04): `InviteLink::{Https, Custom}`,
   `parse_invite_link`, `build_https_url`. Принимает `https://<hub>/invite/<token>`
@@ -447,7 +449,7 @@ GeoIP (за feature-flag).
 | 6 | [05-android-rules-editor.md](lld/05-android-rules-editor.md) | Четвёртая вкладка Rules, read-only пресет + упорядоченные user overrides, TOML-preview модал, удаление хардкода `PRESET_RUSSIA`. Закрывает всю пачку. | Шаги 1, 2, 4 | Draft |
 | 7 | [07-android-per-app-tunnel.md](lld/07-android-per-app-tunnel.md) | Per-app split tunneling: `VpnService.Builder.addAllowed/DisallowedApplication`. Три режима (all/exclude/include), picker приложений, QUERY_ALL_PACKAGES. Фикс жалоб приложений на «вы используете VPN», когда их трафик идёт direct. | Шаг 1 | Draft |
 | 8 | [08-android-multi-server.md](lld/08-android-multi-server.md) | Мультисерверная модель: `ServerProfile` + `ServerRepository`, переключатель серверов (chip + BottomSheet) на главном экране, вкладка Servers (CRUD), Edit с реконнектом, Delete с disconnect, миграция из flat-prefs, интеграция с LLD-04 (Apply = добавить профиль). | Шаги 1, 4 | Draft |
-| 9 | [09-multi-mux-pool.md](lld/09-multi-mux-pool.md) | Multi-mux pool: `MuxPool` ведёт N (default 4) параллельных TCP-туннелей к VPS, стримы балансируются round-robin, failover при разрыве слота. Устраняет HoL-blocking одного TCP — главный bottleneck по медленному старту стримов (5-7с/Mac, 20с/Android) после фиксов 104c268/dde442b/3a56e89. | — | Draft |
+| 9 | [09-multi-mux-pool.md](lld/09-multi-mux-pool.md) | Multi-mux pool: `MuxPool` ведёт N (default 4) параллельных TCP-туннелей к VPS, стримы балансируются round-robin, failover при разрыве слота. Устраняет HoL-blocking одного TCP — главный bottleneck по медленному старту стримов (5-7с/Mac, 20с/Android) после фиксов 104c268/dde442b/3a56e89. | — | Implemented |
 
 ## 10. Как поддерживать этот документ
 

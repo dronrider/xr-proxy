@@ -120,7 +120,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let on_server_down = routing::Action::from_str(&config.client.on_server_down);
 
-    // Build mux pool: persistent multiplexed connection to server.
+    // Build mux pool: N parallel multiplexed tunnels to the server.
     let mux_pool = {
         let addr = server_addr;
         xr_proto::mux_pool::MuxPool::new(
@@ -130,6 +130,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 })
             }),
             codec.clone(),
+            config.client.mux_pool_size,
         )
     };
 

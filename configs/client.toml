@@ -53,6 +53,11 @@ log_level = "info"                    # error, warn, info, debug
 # bypass_ips: LAN devices whose traffic should NOT go through the proxy.
 # Useful for game consoles, smart TVs, etc. Use their static DHCP IP.
 # bypass_ips = ["192.168.1.50", "192.168.1.51"]
+# mux_pool_size: number of parallel TCP tunnels to the server (default 4).
+# Multiple tunnels eliminate head-of-line blocking — a packet loss on one
+# TCP no longer stalls every other stream. Set to 2 on small networks,
+# 4-8 on heavy multi-device traffic.
+# mux_pool_size = 4
 
 # ─── Hub (centralized presets from xr-hub) ───────────────────────────
 # When configured, the client fetches routing presets from xr-hub on startup

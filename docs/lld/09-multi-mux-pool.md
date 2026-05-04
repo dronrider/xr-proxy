@@ -1,6 +1,6 @@
 # LLD-09 — Multi-mux pool: параллельные туннели для устранения HoL
 
-**Статус:** Draft
+**Статус:** Implemented
 **Область:** `xr-proto::mux_pool`, `xr-proto::mux`, использование пула в `xr-client::handle_connection` и `xr-core::session`
 **Связанные документы:** [ARCHITECTURE.md §3 (mux-протокол)](../ARCHITECTURE.md), [CLAUDE.md](../../CLAUDE.md)
 

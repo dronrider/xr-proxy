@@ -70,6 +70,8 @@ pub struct VpnConfig {
     /// On Android it should call `Network.getAllByName()` on the underlying
     /// non-VPN network. When set, it's tried before the UDP:53 fallback.
     pub system_resolver: Option<SystemResolverFn>,
+    /// Number of parallel mux tunnels (0 → pool default).
+    pub mux_pool_size: usize,
 }
 
 pub struct VpnEngine {
@@ -151,6 +153,7 @@ impl VpnEngine {
                     })
                 }),
                 codec.clone(),
+                self.config.mux_pool_size,
             )
         };
 

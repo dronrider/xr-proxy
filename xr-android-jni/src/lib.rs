@@ -218,6 +218,7 @@ fn parse_config(json: &str) -> Result<VpnConfig, String> {
     let hub_preset = get_str("hub_preset").ok();
     let hub_cache_dir = get_str("hub_cache_dir").ok();
     let hub_refresh_interval_secs = get_num("hub_refresh_interval_secs").ok();
+    let mux_pool_size = get_num("mux_pool_size").map(|v| v as usize).unwrap_or(0);
 
     let dns_resolvers = parse_dns_resolvers(json);
 
@@ -229,6 +230,7 @@ fn parse_config(json: &str) -> Result<VpnConfig, String> {
         // Wired in at engine start (nativeStart), not from JSON — the
         // resolver is a JNI callback, not a config value.
         system_resolver: None,
+        mux_pool_size,
     })
 }
 

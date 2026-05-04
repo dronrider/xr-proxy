@@ -71,6 +71,11 @@ pub struct ClientSettings {
     /// Useful for game consoles, smart TVs, etc.
     #[serde(default)]
     pub bypass_ips: Vec<String>,
+    /// Number of parallel mux tunnels to keep open to the server.
+    /// 0 falls back to the pool's default (4). Multiple tunnels remove
+    /// head-of-line blocking when one TCP enters slow-start or recovery.
+    #[serde(default = "default_mux_pool_size")]
+    pub mux_pool_size: usize,
 }
 
 impl Default for ClientSettings {
@@ -81,6 +86,7 @@ impl Default for ClientSettings {
             on_server_down: default_on_server_down(),
             log_level: default_log_level(),
             bypass_ips: vec![],
+            mux_pool_size: default_mux_pool_size(),
         }
     }
 }
@@ -275,6 +281,9 @@ fn default_incoming_port_max() -> u16 {
 }
 fn default_refresh_interval() -> u64 {
     300
+}
+fn default_mux_pool_size() -> usize {
+    4
 }
 
 // ── Loaders ──────────────────────────────────────────────────────────
