@@ -138,7 +138,18 @@ async fn handle_connection(
     let sni_display = sni_name.as_deref().unwrap_or("-");
     // Один short-lived read-lock: resolve() возвращает Action по value,
     // поэтому guard живёт ровно длину этого statement.
-    let action = state.router.read().unwrap().resolve(sni_name.as_deref(), dest_ip);
+    let resolved_action = state.router.read().unwrap().resolve(sni_name.as_deref(), dest_ip);
+
+    // SNI-роутинг доверяем только на стандартных web-портах (80/443). На любом
+    // нестандартном порту SNI скорее всего fake (Telegram MTProto маскирует
+    // обфусцированный поток под TLS-handshake с self.events.data.microsoft.com,
+    // ssl.gstatic.com и подобными доменами для обхода DPI). Решение по такому
+    // SNI = заведомо неправильный routing → direct → провайдерский RST.
+    // Поэтому всё, что не 80/443, отправляем через прокси безусловно.
+    let action = match orig_dst.port() {
+        80 | 443 => resolved_action,
+        _ => Action::Proxy,
+    };
 
     tracing::info!(
         "{} -> {} [SNI: {}] => {:?}",

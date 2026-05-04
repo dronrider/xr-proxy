@@ -123,7 +123,14 @@ table ip {table} {{
         ip daddr 172.16.0.0/12 return
         ip daddr 192.168.0.0/16 return
         ip daddr 127.0.0.0/8 return
-        tcp dport {{ 80, 443 }} redirect to :{listen_port}
+        # iifname "br-lan" — перехватываем только LAN-трафик. Это критично:
+        # без iifname-фильтра catch-all redirect на :listen_port захватит и
+        # WAN-входящий трафик, включая SSH 8822 на сам роутер и любые DNAT
+        # (port-forward к LAN-устройствам). Управление роутером отвалится.
+        # LAN-only — единственно безопасный способ ловить «всё остальное».
+        # Исключаем служебные TCP (почта, SSH-22, DNS-TCP/DoT, STUN/SIP)
+        # и сам listen_port, чтобы не зацикливаться.
+        iifname "br-lan" tcp dport != {{ 22, 25, 53, 110, 143, 465, 587, 853, 993, 995, 3478, 5060, 5061, {listen_port} }} redirect to :{listen_port}
     }}
     chain input {{
         type filter hook input priority filter; policy accept;
