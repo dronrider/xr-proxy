@@ -145,10 +145,22 @@ async fn handle_connection(
     // обфусцированный поток под TLS-handshake с self.events.data.microsoft.com,
     // ssl.gstatic.com и подобными доменами для обхода DPI). Решение по такому
     // SNI = заведомо неправильный routing → direct → провайдерский RST.
-    // Поэтому всё, что не 80/443, отправляем через прокси безусловно.
+    //
+    // Для non-80/443 портов смотрим на сам первый байт: 0x16 = TLS handshake
+    // ContentType. Если это TLS — почти наверняка обфусцированный/маскированный
+    // протокол (Telegram MTProto на 5277/5993, DoT на 853 и т.п.) → Proxy.
+    // Если нет — это сырой TCP-протокол (BitTorrent peer handshake начинается с
+    // 0x13 + "BitTorrent protocol", IRC и т.д.). Проксировать его бессмысленно
+    // (IP клиента всё равно засветится в peer-listing), а вред огромный:
+    // BitTorrent открывает десятки одновременных Connect'ов к мёртвым/firewalled
+    // пирам, забивает mux writer-канал и target-семафор xr-server'а
+    // (max_connections=256), из-за чего ConnectAck для легитимного TLS-трафика
+    // (YouTube, шортсы) timeout'ит и видео фризит.
+    let looks_like_tls = peek_buf.get(0) == Some(&0x16);
     let action = match orig_dst.port() {
         80 | 443 => resolved_action,
-        _ => Action::Proxy,
+        _ if looks_like_tls => Action::Proxy,
+        _ => Action::Direct,
     };
 
     tracing::info!(
