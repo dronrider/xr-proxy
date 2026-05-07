@@ -144,16 +144,37 @@ impl MuxPool {
 
             match mux_open_stream(&mux, target).await {
                 Ok(stream) => return Ok(stream),
-                Err(e)
-                    if e.kind() == io::ErrorKind::BrokenPipe
-                        || e.kind() == io::ErrorKind::TimedOut =>
-                {
+                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                    // True death — reader/writer of this Multiplexer have
+                    // already exited (that's how BrokenPipe propagates), so
+                    // the TCP is closed. Drop the slot reference and let
+                    // the next call reconnect.
                     tracing::debug!(
-                        "mux slot {} stream failed ({}), failover to next slot",
+                        "mux slot {} broken pipe ({}), invalidating",
                         idx,
                         e
                     );
                     self.invalidate_slot(idx).await;
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                    // ConnectAck timeout under heavy concurrent load — the
+                    // slot is alive (writer task hasn't died), just busy.
+                    // Failover to the next slot WITHOUT invalidation:
+                    // dropping the slot Arc here would orphan the live
+                    // reader/writer tasks, which keep the TCP open until
+                    // MUX_MAX_LIFETIME (4h). The next stream attempt would
+                    // dial a fresh TCP, accumulating ghost mux sessions on
+                    // the server (server max_connections semaphore fills up,
+                    // new clients start seeing ConnectAck timeouts → death
+                    // spiral). Production saw 171 ghost ESTAB on a single
+                    // router from this loop.
+                    tracing::debug!(
+                        "mux slot {} connect-ack timeout ({}), failover without invalidation",
+                        idx,
+                        e
+                    );
                     last_err = Some(e);
                     continue;
                 }
