@@ -171,10 +171,27 @@ async fn handle_connection(
     let idle_timeout = Duration::from_secs(300);
     let max_lifetime = Duration::from_secs(3600);
 
+    // Hard cap on Direct TCP connect — без него default Linux SYN retry
+    // выкручивает на ~130 секунд, и при BitTorrent-нагрузке (десятки
+    // dial/сек к мёртвым/firewalled пирам) сокеты накапливаются: видели
+    // 845 open fd при единственном активном LAN-стриме, что топит tokio
+    // runtime и тормозит легитимный YouTube-трафик.
+    let direct_connect_timeout = Duration::from_secs(5);
+
     match action {
         Action::Direct => {
             // Connect directly to the original destination
-            let mut target = TcpStream::connect(orig_dst).await?;
+            let mut target = match tokio::time::timeout(
+                direct_connect_timeout,
+                TcpStream::connect(orig_dst),
+            ).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    tracing::debug!("direct connect to {} timed out", orig_dst);
+                    return Ok(());
+                }
+            };
             set_keepalive(&target);
             tunnel::relay_bidirectional(&mut client, &mut target, max_lifetime).await
         }
@@ -196,7 +213,17 @@ async fn handle_connection(
                         orig_dst, e, state.on_server_down);
                     if state.on_server_down == Action::Direct {
                         // Fallback: try direct connection.
-                        let mut target = TcpStream::connect(orig_dst).await?;
+                        let mut target = match tokio::time::timeout(
+                            direct_connect_timeout,
+                            TcpStream::connect(orig_dst),
+                        ).await {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(e)) => return Err(e),
+                            Err(_) => {
+                                tracing::debug!("direct fallback to {} timed out", orig_dst);
+                                return Ok(());
+                            }
+                        };
                         set_keepalive(&target);
                         tunnel::relay_bidirectional(&mut client, &mut target, max_lifetime).await
                     } else {
