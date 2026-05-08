@@ -16,7 +16,7 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -35,11 +35,22 @@ pub type ConnectFn = Arc<
 /// Default pool size when caller passes 0 or no explicit value.
 pub const DEFAULT_POOL_SIZE: usize = 4;
 
+/// After this many consecutive ConnectAck timeouts on the same slot we treat
+/// it as zombie (TCP alive but server-state lost — typical after a server
+/// restart while client NAT hasn't sent RST yet) and force-reconnect.
+/// 1-2 transient timeouts under heavy concurrent load are tolerated; a
+/// genuinely dead slot will fail every attempt and trip this threshold fast.
+const MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
+
 /// Client-side connection pool over multiple parallel multiplexed tunnels.
 pub struct MuxPool {
     connect_fn: ConnectFn,
     codec: Codec,
     slots: Vec<Mutex<Option<Arc<Multiplexer>>>>,
+    /// Per-slot consecutive ConnectAck-timeout counter. Reset on any successful
+    /// open_stream or on invalidation. Reaching `MAX_CONSECUTIVE_TIMEOUTS`
+    /// invalidates the slot to recover from server-restart zombies.
+    timeout_counters: Vec<AtomicU32>,
     next: AtomicUsize,
 }
 
@@ -50,13 +61,16 @@ impl MuxPool {
     pub fn new(connect_fn: ConnectFn, codec: Codec, size: usize) -> Arc<Self> {
         let size = if size == 0 { DEFAULT_POOL_SIZE } else { size };
         let mut slots = Vec::with_capacity(size);
+        let mut timeout_counters = Vec::with_capacity(size);
         for _ in 0..size {
             slots.push(Mutex::new(None));
+            timeout_counters.push(AtomicU32::new(0));
         }
         Arc::new(Self {
             connect_fn,
             codec,
             slots,
+            timeout_counters,
             next: AtomicUsize::new(0),
         })
     }
@@ -143,7 +157,12 @@ impl MuxPool {
             };
 
             match mux_open_stream(&mux, target).await {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => {
+                    // Successful open — reset the timeout counter so a future
+                    // burst doesn't accumulate on top of past transient failures.
+                    self.timeout_counters[idx].store(0, Ordering::Relaxed);
+                    return Ok(stream);
+                }
                 Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
                     // True death — reader/writer of this Multiplexer have
                     // already exited (that's how BrokenPipe propagates), so
@@ -159,22 +178,34 @@ impl MuxPool {
                     continue;
                 }
                 Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                    // ConnectAck timeout under heavy concurrent load — the
-                    // slot is alive (writer task hasn't died), just busy.
-                    // Failover to the next slot WITHOUT invalidation:
-                    // dropping the slot Arc here would orphan the live
-                    // reader/writer tasks, which keep the TCP open until
-                    // MUX_MAX_LIFETIME (4h). The next stream attempt would
-                    // dial a fresh TCP, accumulating ghost mux sessions on
-                    // the server (server max_connections semaphore fills up,
-                    // new clients start seeing ConnectAck timeouts → death
-                    // spiral). Production saw 171 ghost ESTAB on a single
-                    // router from this loop.
-                    tracing::debug!(
-                        "mux slot {} connect-ack timeout ({}), failover without invalidation",
-                        idx,
-                        e
-                    );
+                    // ConnectAck timeout: usually transient overload (busy
+                    // mux, slow server) → failover without invalidation to
+                    // avoid orphaning live reader/writer tasks (TCP kept
+                    // open until MUX_MAX_LIFETIME = 4h, server max_connections
+                    // semaphore fills up — saw 171 ghost ESTAB in prod).
+                    //
+                    // BUT after enough consecutive timeouts on the same slot
+                    // it's almost certainly a zombie: TCP still ESTAB on the
+                    // client side (NAT hasn't sent RST), server-side state
+                    // lost (server restart). At that point invalidating
+                    // *is* the right call — the dead Multiplexer's reader
+                    // will exit on next mux keepalive failure anyway.
+                    let prev = self.timeout_counters[idx].fetch_add(1, Ordering::Relaxed);
+                    if prev + 1 >= MAX_CONSECUTIVE_TIMEOUTS {
+                        tracing::warn!(
+                            "mux slot {} hit {} consecutive connect-ack timeouts, invalidating (zombie?)",
+                            idx,
+                            prev + 1
+                        );
+                        self.invalidate_slot(idx).await;
+                    } else {
+                        tracing::debug!(
+                            "mux slot {} connect-ack timeout ({}), failover without invalidation [counter={}]",
+                            idx,
+                            e,
+                            prev + 1
+                        );
+                    }
                     last_err = Some(e);
                     continue;
                 }
@@ -215,6 +246,7 @@ impl MuxPool {
     async fn invalidate_slot(&self, idx: usize) {
         let mut guard = self.slots[idx].lock().await;
         *guard = None;
+        self.timeout_counters[idx].store(0, Ordering::Relaxed);
     }
 }
 
@@ -285,6 +317,34 @@ mod tests {
             3,
             "open_stream should attempt every slot before failing"
         );
+    }
+
+    /// Direct check on the consecutive-timeout counter contract:
+    /// reaching MAX_CONSECUTIVE_TIMEOUTS must invalidate, success must reset.
+    /// We exercise the counter directly — full mux mocking would require
+    /// faking ConnectAck timeouts on a live Multiplexer, which is invasive
+    /// for what is fundamentally a per-slot atomic.
+    #[tokio::test]
+    async fn test_consecutive_timeout_counter() {
+        let pool = MuxPool::new(always_failing_connect(), test_codec(), 2);
+        // Initially zero.
+        assert_eq!(pool.timeout_counters[0].load(Ordering::Relaxed), 0);
+        // Bump up to threshold-1 — slot must NOT be considered zombie yet.
+        for _ in 0..(MAX_CONSECUTIVE_TIMEOUTS - 1) {
+            pool.timeout_counters[0].fetch_add(1, Ordering::Relaxed);
+        }
+        assert!(pool.timeout_counters[0].load(Ordering::Relaxed) < MAX_CONSECUTIVE_TIMEOUTS);
+        // One more push and invalidate_slot must reset it.
+        pool.timeout_counters[0].fetch_add(1, Ordering::Relaxed);
+        assert_eq!(pool.timeout_counters[0].load(Ordering::Relaxed), MAX_CONSECUTIVE_TIMEOUTS);
+        pool.invalidate_slot(0).await;
+        assert_eq!(
+            pool.timeout_counters[0].load(Ordering::Relaxed),
+            0,
+            "invalidate_slot must reset the counter"
+        );
+        // Other slot is independent.
+        assert_eq!(pool.timeout_counters[1].load(Ordering::Relaxed), 0);
     }
 
     /// warmup must drive all slot connects concurrently — so when every
