@@ -245,7 +245,14 @@ impl MuxPool {
 
     async fn invalidate_slot(&self, idx: usize) {
         let mut guard = self.slots[idx].lock().await;
-        *guard = None;
+        // Take the old Multiplexer out and explicitly shutdown it so the
+        // underlying TCP closes promptly. Otherwise the orphaned reader/
+        // writer tasks keep the socket ESTABLISHED on the server until
+        // MUX_MAX_LIFETIME (4h), producing ghost sessions (we saw the
+        // server accumulate 16+ ESTAB per router this way).
+        if let Some(old) = guard.take() {
+            old.shutdown();
+        }
         self.timeout_counters[idx].store(0, Ordering::Relaxed);
     }
 }

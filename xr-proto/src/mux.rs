@@ -255,6 +255,13 @@ pub struct Multiplexer {
     /// Channel for incoming Connect frames for unregistered stream_ids.
     /// Server reads from this to create target connections.
     new_stream_rx: Mutex<Option<mpsc::Receiver<NewStream>>>,
+    /// Externally-triggered shutdown signal. When the pool decides a slot
+    /// is zombie (alive=true but server-state lost), calling shutdown()
+    /// drops the write half, which propagates FIN → server closes → our
+    /// reader gets EOF → TCP fully closes. Without this the orphaned
+    /// reader/writer tasks keep the socket ESTABLISHED for up to
+    /// MUX_MAX_LIFETIME (4h), accumulating ghost connections on the server.
+    shutdown_notify: Arc<Notify>,
 }
 
 impl Multiplexer {
@@ -284,6 +291,7 @@ impl Multiplexer {
             Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let close_notify = Arc::new(Notify::new());
+        let shutdown_notify = Arc::new(Notify::new());
         let (new_stream_tx, new_stream_rx) = mpsc::channel::<NewStream>(64);
 
         let (read_half, write_half) = tokio::io::split(stream);
@@ -306,13 +314,25 @@ impl Multiplexer {
             });
         }
 
-        // Spawn writer task.
+        // Spawn writer task. select against shutdown_notify so an external
+        // shutdown() call drops write_half promptly, propagating FIN to
+        // the peer and closing the TCP cleanly.
         {
             let alive = alive.clone();
             let codec = codec.clone();
+            let shutdown_notify = shutdown_notify.clone();
             tokio::spawn(async move {
-                if let Err(e) = writer_task(write_half, codec, writer_rx).await {
-                    tracing::debug!("mux writer ended: {}", e);
+                tokio::select! {
+                    res = writer_task(write_half, codec, writer_rx) => {
+                        if let Err(e) = res {
+                            tracing::debug!("mux writer ended: {}", e);
+                        }
+                    }
+                    _ = shutdown_notify.notified() => {
+                        tracing::debug!("mux writer shutdown by request");
+                        // write_half drops here → FIN sent → reader on
+                        // other side gets EOF → its reader_task exits.
+                    }
                 }
                 alive.store(false, Ordering::Relaxed);
             });
@@ -325,6 +345,7 @@ impl Multiplexer {
             alive,
             _close_notify: close_notify,
             new_stream_rx: Mutex::new(Some(new_stream_rx)),
+            shutdown_notify,
         })
     }
 
@@ -362,6 +383,18 @@ impl Multiplexer {
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Force-shutdown this Multiplexer. Marks it dead, wakes the writer
+    /// task (which will drop write_half → TCP FIN → remote closes → our
+    /// reader gets EOF and exits). Use this when the pool decides a slot
+    /// is zombie (server-state lost while TCP still ESTABLISHED). Without
+    /// this call, orphaned reader/writer tasks keep the socket open until
+    /// MUX_MAX_LIFETIME (4h), and the server accumulates ghost ESTAB.
+    /// Idempotent; safe to call multiple times.
+    pub fn shutdown(&self) {
+        self.alive.store(false, Ordering::Relaxed);
+        self.shutdown_notify.notify_waiters();
     }
 }
 
