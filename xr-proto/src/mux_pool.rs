@@ -16,9 +16,10 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -42,6 +43,36 @@ pub const DEFAULT_POOL_SIZE: usize = 4;
 /// genuinely dead slot will fail every attempt and trip this threshold fast.
 const MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
 
+/// Circuit-breaker cooldown. Once `open_stream` has tried *every* slot and they
+/// all failed, the server is presumed down and the pool enters a cooldown: for
+/// this long, new `open_stream` calls short-circuit to a fast error instead of
+/// re-walking every dead slot. This is the fix for the fail-open P0 incident.
+///
+/// Why it matters: a *silent* server (TCP accepted by an unpaid-hosting stub,
+/// but no mux handshake reply) makes each slot's `mux_handshake_client` block
+/// the full 2s "init ack timeout". Across a 4-slot pool that is ~8s per logical
+/// stream — and the handshake never completes, so the slot is never cached and
+/// EVERY new connection pays the ~8s again. Android's connectivity probes
+/// (`connectivitycheck.gstatic.com`, `*.google.com` → proxied) then time out,
+/// the OS declares the Wi-Fi "no internet", and the user loses even the Direct
+/// (non-proxied) path. With the breaker, the first failure arms the cooldown
+/// and every subsequent connection fails open to Direct in microseconds.
+///
+/// Recovery is automatic: when the cooldown expires exactly one caller is
+/// elected (via CAS) to re-probe the server for real while others keep
+/// short-circuiting; a successful open clears the breaker, a failure re-arms it.
+const SERVER_DOWN_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Exclusivity window the elected re-probe caller reserves while it walks the
+/// slots. This MUST exceed the worst-case walk against a dead server, otherwise
+/// a second prober gets elected mid-walk: the cooldown (5s) is shorter than a
+/// full 4-slot walk against a dropped/silent server (~8s, each slot paying its
+/// connect/handshake timeout), so without a longer lease probers stack up,
+/// contend on the per-slot connect locks, and individual walks balloon to 25s+.
+/// 15s comfortably covers the common dead-server walk while keeping
+/// post-recovery latency to ~cooldown + one walk.
+const PROBE_LEASE: Duration = Duration::from_secs(15);
+
 /// Client-side connection pool over multiple parallel multiplexed tunnels.
 pub struct MuxPool {
     connect_fn: ConnectFn,
@@ -52,6 +83,14 @@ pub struct MuxPool {
     /// invalidates the slot to recover from server-restart zombies.
     timeout_counters: Vec<AtomicU32>,
     next: AtomicUsize,
+    /// Circuit-breaker deadline: `0` means healthy; any other value is a
+    /// "server presumed down until this many millis since `created`" instant.
+    /// While `now < down_until_ms`, `open_stream` short-circuits to a fast
+    /// error so the caller fails open to Direct without re-probing a dead VPS.
+    down_until_ms: AtomicU64,
+    /// Monotonic base for `down_until_ms`. `Instant` can't be stored in an
+    /// atomic, so we keep a fixed origin and measure elapsed millis against it.
+    created: Instant,
 }
 
 impl MuxPool {
@@ -72,12 +111,37 @@ impl MuxPool {
             slots,
             timeout_counters,
             next: AtomicUsize::new(0),
+            down_until_ms: AtomicU64::new(0),
+            created: Instant::now(),
         })
     }
 
     /// Number of slots in the pool.
     pub fn size(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Millis elapsed since pool construction (monotonic, never panics).
+    fn now_ms(&self) -> u64 {
+        self.created.elapsed().as_millis() as u64
+    }
+
+    /// Whether the circuit breaker currently considers the server down.
+    /// Exposed for health/monitoring surfaces (e.g. status indicator).
+    pub fn is_server_down(&self) -> bool {
+        let until = self.down_until_ms.load(Ordering::Relaxed);
+        until != 0 && self.now_ms() < until
+    }
+
+    /// Arm the breaker: server presumed down for `SERVER_DOWN_COOLDOWN`.
+    fn arm_breaker(&self) {
+        let until = self.now_ms() + SERVER_DOWN_COOLDOWN.as_millis() as u64;
+        self.down_until_ms.store(until, Ordering::Relaxed);
+    }
+
+    /// Clear the breaker after a successful open — server is reachable again.
+    fn clear_breaker(&self) {
+        self.down_until_ms.store(0, Ordering::Relaxed);
     }
 
     /// Pre-establish all mux connections concurrently. Used by the engine
@@ -90,7 +154,7 @@ impl MuxPool {
             .len())
             .map(|idx| {
                 let f: Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> =
-                    Box::pin(async move { self.acquire_or_connect(idx).await.map(|_| ()) });
+                    Box::pin(async move { self.acquire_or_connect(idx, false).await.map(|_| ()) });
                 f
             })
             .collect();
@@ -141,13 +205,63 @@ impl MuxPool {
     /// the next slot is tried. After walking all slots, the last error
     /// is returned.
     pub async fn open_stream(&self, target: &TargetAddr) -> io::Result<MuxStream> {
+        // Circuit-breaker gate. When the server is presumed down we avoid
+        // re-walking every dead slot (which costs ~8s on a silent server) and
+        // instead fail fast so the caller falls open to Direct immediately.
+        //
+        // At cooldown expiry exactly ONE caller is elected to re-probe: the CAS
+        // both detects the expiry and extends the deadline, so concurrent
+        // callers keep short-circuiting while the elected prober does the slow
+        // walk. A success clears the breaker; a failure re-arms it below.
+        let mut am_prober = false;
+        let breaker = self.down_until_ms.load(Ordering::Relaxed);
+        if breaker != 0 {
+            if self.now_ms() < breaker {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "mux pool: server in fail-open cooldown",
+                ));
+            }
+            // Cooldown expired — try to win the probe election. Reserve a lease
+            // that outlasts the whole walk so no second prober is elected while
+            // we are still probing (that would stack probers and stall them).
+            let extended = self.now_ms() + PROBE_LEASE.as_millis() as u64;
+            if self
+                .down_until_ms
+                .compare_exchange(breaker, extended, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+            {
+                // Another caller became the prober — short-circuit.
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "mux pool: server in fail-open cooldown",
+                ));
+            }
+            // We are the sole prober; fall through to a real slot walk.
+            am_prober = true;
+        }
+
         let n = self.slots.len();
         let start = self.next.fetch_add(1, Ordering::Relaxed) % n;
         let mut last_err: Option<io::Error> = None;
 
         for i in 0..n {
+            // If a *concurrent* caller has armed the breaker while we were
+            // grinding through dead slots, stop and fail open immediately
+            // rather than walking the remaining slots under mutex contention.
+            // Without this, a reconnect storm against a freshly-dead server
+            // (e.g. a watchdog restart) lets in-flight connections queue on the
+            // per-slot connect locks and stall for many multiples of one walk.
+            // The elected prober is exempt: it must finish its walk to decide
+            // whether the server has recovered.
+            if !am_prober && self.is_server_down() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "mux pool: server in fail-open cooldown",
+                ));
+            }
             let idx = (start + i) % n;
-            let mux = match self.acquire_or_connect(idx).await {
+            let mux = match self.acquire_or_connect(idx, !am_prober).await {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::debug!("mux slot {} unavailable ({}), trying next", idx, e);
@@ -161,6 +275,8 @@ impl MuxPool {
                     // Successful open — reset the timeout counter so a future
                     // burst doesn't accumulate on top of past transient failures.
                     self.timeout_counters[idx].store(0, Ordering::Relaxed);
+                    // Server reachable again — release the fail-open breaker.
+                    self.clear_breaker();
                     return Ok(stream);
                 }
                 Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
@@ -213,18 +329,41 @@ impl MuxPool {
             }
         }
 
+        // Every slot failed — arm the breaker so the next callers fail open to
+        // Direct instantly instead of each paying the full slot-walk latency.
+        self.arm_breaker();
         Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "no mux slots")))
     }
 
     /// Return the slot's live mux, reconnecting if necessary. The slot
     /// lock is held across the connect/handshake to coalesce concurrent
     /// callers landing on the same dead slot.
-    async fn acquire_or_connect(&self, idx: usize) -> io::Result<Arc<Multiplexer>> {
+    ///
+    /// `bail_if_down`: when true, after acquiring the lock we re-check the
+    /// circuit breaker and fail fast instead of spending a ~2s connect on a
+    /// known-dead server. This is what drains a reconnect storm: the lock is
+    /// held across the connect, so callers queued behind a dead slot would
+    /// otherwise each still pay a full connect timeout even after the breaker
+    /// armed. The prober passes `false` — it MUST connect to test recovery.
+    async fn acquire_or_connect(
+        &self,
+        idx: usize,
+        bail_if_down: bool,
+    ) -> io::Result<Arc<Multiplexer>> {
         let mut guard = self.slots[idx].lock().await;
         if let Some(ref mux) = *guard {
             if mux.is_alive() {
                 return Ok(mux.clone());
             }
+        }
+
+        // No live mux on this slot. If the breaker armed while we waited for the
+        // lock, don't burn a connect timeout — fail open immediately.
+        if bail_if_down && self.is_server_down() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "mux pool: server in fail-open cooldown",
+            ));
         }
 
         let mut stream = (self.connect_fn)().await?;
@@ -352,6 +491,89 @@ mod tests {
         );
         // Other slot is independent.
         assert_eq!(pool.timeout_counters[1].load(Ordering::Relaxed), 0);
+    }
+
+    /// The fail-open circuit breaker is the P0 fix: once a full slot walk
+    /// fails (server down), the breaker arms and subsequent `open_stream`
+    /// calls short-circuit WITHOUT touching `connect_fn` — so the caller falls
+    /// open to Direct in microseconds instead of re-walking every dead slot
+    /// (~8s on a silent server). This is what keeps a dead VPS from making
+    /// Android declare the whole Wi-Fi "no internet".
+    #[tokio::test]
+    async fn test_breaker_short_circuits_after_full_failure() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let counter_clone = counter.clone();
+        let connect_fn: ConnectFn = Arc::new(move || {
+            let counter = counter_clone.clone();
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Err(io::Error::new(io::ErrorKind::ConnectionRefused, "test"))
+            })
+        });
+
+        let pool = MuxPool::new(connect_fn, test_codec(), 3);
+        let target = TargetAddr::Domain("test.com".to_string(), 443);
+
+        // First call walks all 3 slots, fails, and arms the breaker.
+        let _ = pool.open_stream(&target).await.unwrap_err();
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+        assert!(pool.is_server_down(), "breaker must arm after a full failed walk");
+
+        // Second call within cooldown must short-circuit: connect_fn untouched.
+        let err = pool.open_stream(&target).await.unwrap_err();
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            3,
+            "breaker must short-circuit without re-attempting any slot"
+        );
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+    }
+
+    /// A pool that has never failed must NOT report the server down, and the
+    /// first `open_stream` must actually attempt the slots (no spurious
+    /// breaker engaged from construction).
+    #[tokio::test]
+    async fn test_breaker_starts_disarmed() {
+        let pool = MuxPool::new(always_failing_connect(), test_codec(), 2);
+        assert!(!pool.is_server_down(), "a fresh pool must not be marked down");
+    }
+
+    /// Self-healing: once the cooldown elapses, exactly one caller must be
+    /// elected to re-probe the server (so a recovered VPS is picked up without
+    /// a restart). We expire the deadline directly instead of sleeping the full
+    /// cooldown to keep the test fast and deterministic.
+    #[tokio::test]
+    async fn test_breaker_reprobes_after_cooldown_expiry() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let counter_clone = counter.clone();
+        let connect_fn: ConnectFn = Arc::new(move || {
+            let counter = counter_clone.clone();
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Err(io::Error::new(io::ErrorKind::ConnectionRefused, "test"))
+            })
+        });
+        let pool = MuxPool::new(connect_fn, test_codec(), 2);
+        let target = TargetAddr::Domain("x.com".to_string(), 443);
+
+        // Full failed walk arms the breaker (2 attempts on a 2-slot pool).
+        let _ = pool.open_stream(&target).await.unwrap_err();
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+        assert!(pool.is_server_down());
+
+        // Within cooldown: short-circuit, no new connect attempts.
+        let _ = pool.open_stream(&target).await.unwrap_err();
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+
+        // Expire the cooldown — the next caller must be elected prober and
+        // re-walk every slot (a real recovery attempt).
+        pool.down_until_ms.store(pool.now_ms(), Ordering::Relaxed);
+        let _ = pool.open_stream(&target).await.unwrap_err();
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            4,
+            "after cooldown expiry exactly one caller must re-probe all slots"
+        );
     }
 
     /// warmup must drive all slot connects concurrently — so when every
