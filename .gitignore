@@ -1,3 +1,5 @@
 .DS_Store
 target
 xr-server/.vscode/launch.json
+logs/
+tmp/
