@@ -311,6 +311,12 @@ struct ActiveSession {
 struct RelayChannels {
     to_relay: mpsc::Sender<Vec<u8>>,
     from_relay: mpsc::Receiver<Vec<u8>>,
+    /// Bytes pulled from `from_relay` but not yet fully accepted by smoltcp's
+    /// TX buffer. `send_slice` may accept only a prefix of a chunk when the TX
+    /// buffer is nearly full; the remainder lives here and is retried on the
+    /// next loop tick. Без этого хвост чанка молча терялся, и Direct-скачивание
+    /// рвалось на плавающем смещении (баг C2, mail.ru).
+    pending_download: Vec<u8>,
 }
 
 // ── Event loop ──────────────────────────────────────────────────────
@@ -452,6 +458,7 @@ async fn run_event_loop(
                 session.relay = Some(RelayChannels {
                     to_relay: to_relay_tx,
                     from_relay: from_relay_rx,
+                    pending_download: Vec::new(),
                 });
 
                 let ctx_clone = ctx.clone();
@@ -525,7 +532,11 @@ async fn run_event_loop(
                 }
 
                 // smoltcp → relay (upload).
+                // Никогда не делаем recv_slice, если канал к relay полон:
+                // consume'нутые из smoltcp байты тогда было бы некуда деть и
+                // их пришлось бы выбросить (потеря данных при больших upload'ах).
                 while socket.can_recv() {
+                    if relay.to_relay.capacity() == 0 { break; }
                     let mut buf = vec![0u8; 32768];
                     match socket.recv_slice(&mut buf) {
                         Ok(n) if n > 0 => {
@@ -538,19 +549,17 @@ async fn run_event_loop(
                 }
 
                 // relay → smoltcp (download).
-                while socket.can_send() {
-                    match relay.from_relay.try_recv() {
-                        Ok(data) => {
-                            ctx.stats.add_smol_send(data.len() as u64);
-                            let _ = socket.send_slice(&data);
-                        }
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                            // Relay sender dropped — relay task finished.
-                            socket.abort();
-                            stale_keys.push(*key);
-                            break;
-                        }
+                match drain_download_to_tx(
+                    &mut *socket,
+                    &mut relay.from_relay,
+                    &mut relay.pending_download,
+                    &ctx.stats,
+                ) {
+                    DownloadDrain::Idle => {}
+                    DownloadDrain::Disconnected => {
+                        // Relay sender dropped — relay task finished.
+                        socket.abort();
+                        stale_keys.push(*key);
                     }
                 }
             }
@@ -640,6 +649,85 @@ async fn run_event_loop(
             _ = waker.notified() => {}
             _ = tokio::time::sleep(poll_delay) => {}
             _ = shutdown_rx.changed() => {}
+        }
+    }
+}
+
+// ── Download draining (relay → smoltcp) ─────────────────────────────
+
+/// Abstraction over the smoltcp TX side so the drain logic can be unit-tested
+/// without a full TCP handshake. The real impl forwards to smoltcp; tests use
+/// a sink with a bounded accept size to exercise partial writes.
+trait TxSink {
+    fn can_send(&self) -> bool;
+    /// Enqueue as many leading bytes as fit. Returns the count accepted
+    /// (`0..=data.len()`). A short return means the TX buffer is (nearly) full.
+    fn enqueue(&mut self, data: &[u8]) -> usize;
+}
+
+impl TxSink for smoltcp::socket::tcp::Socket<'_> {
+    fn can_send(&self) -> bool {
+        smoltcp::socket::tcp::Socket::can_send(self)
+    }
+    fn enqueue(&mut self, data: &[u8]) -> usize {
+        // send_slice errors only if the socket can't send at all; treat that
+        // as "0 accepted" — `can_send()` gates the call anyway.
+        self.send_slice(data).unwrap_or(0)
+    }
+}
+
+enum DownloadDrain {
+    /// No more to do this tick (channel empty or TX buffer full).
+    Idle,
+    /// Relay sender dropped — the relay task has finished.
+    Disconnected,
+}
+
+/// Move download bytes (target → app) from the relay channel into the smoltcp
+/// TX buffer, honoring partial `send_slice` accepts.
+///
+/// **Why this exists.** `send_slice` may accept only a prefix of the offered
+/// slice when the TX buffer is nearly full. The old loop did
+/// `let _ = socket.send_slice(&data)` and dropped the unaccepted tail, which
+/// truncated fast Direct downloads at a timing-dependent offset (C2: mail.ru
+/// attachments rwали ~на 3 МБ из 5, плавало). Here the leftover is stashed in
+/// `pending` and retried next tick — no byte is ever dropped.
+fn drain_download_to_tx(
+    sink: &mut impl TxSink,
+    from_relay: &mut mpsc::Receiver<Vec<u8>>,
+    pending: &mut Vec<u8>,
+    stats: &Stats,
+) -> DownloadDrain {
+    loop {
+        // Flush leftover from a previous partial accept before pulling more.
+        if !pending.is_empty() {
+            if !sink.can_send() {
+                return DownloadDrain::Idle;
+            }
+            let sent = sink.enqueue(pending);
+            stats.add_smol_send(sent as u64);
+            if sent < pending.len() {
+                pending.drain(..sent);
+                return DownloadDrain::Idle; // TX buffer full — retry next tick.
+            }
+            pending.clear();
+        }
+
+        if !sink.can_send() {
+            return DownloadDrain::Idle;
+        }
+        match from_relay.try_recv() {
+            Ok(data) => {
+                let sent = sink.enqueue(&data);
+                stats.add_smol_send(sent as u64);
+                if sent < data.len() {
+                    *pending = data[sent..].to_vec();
+                }
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return DownloadDrain::Idle,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                return DownloadDrain::Disconnected;
+            }
         }
     }
 }
@@ -748,4 +836,113 @@ mod tests {
         assert_eq!(proto, 6); assert_eq!(ihl, 20);
     }
 
+    // ── drain_download_to_tx ─────────────────────────────────────────
+
+    /// A TX sink with a bounded total capacity and a per-call accept cap, so we
+    /// can deterministically force partial `send_slice` accepts and full-buffer
+    /// stalls — the conditions that used to drop the tail of Direct downloads.
+    struct MockSink {
+        buf: Vec<u8>,
+        capacity: usize,
+        max_accept: usize,
+    }
+
+    impl TxSink for MockSink {
+        fn can_send(&self) -> bool {
+            self.buf.len() < self.capacity
+        }
+        fn enqueue(&mut self, data: &[u8]) -> usize {
+            let room = self.capacity - self.buf.len();
+            let n = room.min(self.max_accept).min(data.len());
+            self.buf.extend_from_slice(&data[..n]);
+            n
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_download_never_drops_bytes_on_partial_send() {
+        // Reproduces the C2 bug: a fast download into a TX buffer that the app
+        // drains slowly. Every byte the relay produced must reach the app,
+        // even though the sink accepts only small partial chunks at a time.
+        let stats = Stats::new();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+
+        // ~300 KB total, sent as 1000-byte chunks (like an 8 KB Direct read
+        // sliced by the channel). Sink capacity and accept cap are far smaller,
+        // forcing both partial accepts and buffer-full stalls.
+        let total = 300_000usize;
+        let chunk = 1000usize;
+        let mut expected = Vec::with_capacity(total);
+        for i in 0..total {
+            expected.push((i % 251) as u8);
+        }
+        let producer = expected.clone();
+        tokio::spawn(async move {
+            let mut off = 0;
+            while off < producer.len() {
+                let end = (off + chunk).min(producer.len());
+                tx.send(producer[off..end].to_vec()).await.unwrap();
+                off = end;
+            }
+            // tx dropped here → eventual Disconnected.
+        });
+
+        let mut sink = MockSink { buf: Vec::new(), capacity: 2048, max_accept: 700 };
+        let mut pending = Vec::new();
+        let mut received = Vec::with_capacity(total);
+
+        // Bound iterations generously to catch a stuck loop instead of hanging.
+        for _ in 0..1_000_000 {
+            let outcome = drain_download_to_tx(&mut sink, &mut rx, &mut pending, &stats);
+            // Simulate the app reading everything currently in the TX buffer.
+            received.extend(sink.buf.drain(..));
+            match outcome {
+                DownloadDrain::Disconnected if pending.is_empty() => break,
+                _ => {
+                    // Yield so the producer task can enqueue more.
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+
+        assert_eq!(received.len(), expected.len(), "byte count mismatch — data was dropped");
+        assert_eq!(received, expected, "byte stream corrupted/reordered");
+    }
+
+    #[tokio::test]
+    async fn drain_download_reports_disconnected_when_sender_gone() {
+        let stats = Stats::new();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        drop(tx);
+        let mut sink = MockSink { buf: Vec::new(), capacity: 4096, max_accept: 4096 };
+        let mut pending = Vec::new();
+        assert!(matches!(
+            drain_download_to_tx(&mut sink, &mut rx, &mut pending, &stats),
+            DownloadDrain::Disconnected
+        ));
+    }
+
+    #[tokio::test]
+    async fn drain_download_stops_idle_when_buffer_full() {
+        // When the TX buffer is full, the drain must stop and preserve the
+        // unsent remainder in `pending` rather than discarding it.
+        let stats = Stats::new();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        tx.send(vec![7u8; 1000]).await.unwrap();
+        let mut sink = MockSink { buf: Vec::new(), capacity: 400, max_accept: 400 };
+        let mut pending = Vec::new();
+
+        assert!(matches!(
+            drain_download_to_tx(&mut sink, &mut rx, &mut pending, &stats),
+            DownloadDrain::Idle
+        ));
+        assert_eq!(sink.buf.len(), 400, "should fill exactly the available room");
+        assert_eq!(pending.len(), 600, "remainder must be preserved, not dropped");
+
+        // Drain the sink (app reads) and run again — the rest must flush.
+        sink.buf.clear();
+        let _ = drain_download_to_tx(&mut sink, &mut rx, &mut pending, &stats);
+        assert_eq!(sink.buf.len(), 400);
+        assert_eq!(pending.len(), 200);
+    }
 }
