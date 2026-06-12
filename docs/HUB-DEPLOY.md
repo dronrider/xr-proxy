@@ -36,9 +36,8 @@ cp target/release/xr-hub /usr/local/bin/
 ```bash
 mkdir -p /etc/xr-hub/tls /var/lib/xr-hub/presets /var/lib/xr-hub/invites
 
-# Сгенерировать admin-токен
-ADMIN_TOKEN=$(openssl rand -base64 32)
-echo "Сохрани admin-токен: $ADMIN_TOKEN"
+# Захешировать пароль админки (argon2id)
+ADMIN_HASH=$(xr-hub hash-password 'ВАШ_ПАРОЛЬ')
 
 cat > /etc/xr-hub/config.toml <<EOF
 [server]
@@ -49,15 +48,32 @@ data_dir = "/var/lib/xr-hub"
 cert = "/etc/xr-hub/tls/fullchain.pem"
 key  = "/etc/xr-hub/tls/privkey.pem"
 
-[admin]
-token = "$ADMIN_TOKEN"
+[[admin.users]]
+username = "admin"
+password_hash = "$ADMIN_HASH"
 
 [invites]
 dev_mode = false
 default_ttl_seconds = 86400
 max_ttl_seconds = 604800
 EOF
+chmod 600 /etc/xr-hub/config.toml
 ```
+
+### Забыли пароль админки
+
+На сервере по SSH, одной командой (спросит новый пароль дважды, ввод скрыт):
+
+```bash
+xr-hub reset-password                # сбрасывает пользователя "admin"
+xr-hub reset-password --user NAME    # другой пользователь
+systemctl restart xr-hub             # применить
+```
+
+Команда правит только строку `password_hash` в `/etc/xr-hub/config.toml`
+(комментарии и форматирование не трогает); путь к конфигу можно переопределить
+через `--config`. Альтернатива вручную: `xr-hub hash-password 'НОВЫЙ'` →
+вписать хеш в `password_hash` нужного `[[admin.users]]` → рестарт сервиса.
 
 ## 3. TLS-сертификат
 
@@ -155,7 +171,7 @@ curl -k https://localhost:8080/api/v1/presets
 
 # Admin UI — открыть в браузере:
 # https://xr-hub.example.com/
-# Ввести admin-токен
+# Войти логином/паролем из [[admin.users]]
 ```
 
 ## 7. Firewall

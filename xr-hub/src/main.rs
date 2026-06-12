@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod embed;
+mod password_reset;
 mod signing;
 mod state;
 mod storage;
@@ -30,6 +31,60 @@ enum Commands {
         /// Password to hash.
         password: String,
     },
+    /// Reset an admin user's password directly in the config file.
+    /// Run on the server over SSH, then restart the service.
+    ResetPassword {
+        /// Username whose password to reset.
+        #[arg(long, default_value = "admin")]
+        user: String,
+        /// New password. If omitted, you will be prompted (input hidden).
+        password: Option<String>,
+    },
+}
+
+/// `xr-hub reset-password`: захешировать новый пароль и хирургически
+/// заменить password_hash пользователя в конфиг-файле (см. password_reset).
+fn reset_password(config_path: &str, user: &str, password: Option<&str>) -> Result<()> {
+    let path = Path::new(config_path);
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+
+    let password = match password {
+        Some(p) => p.to_string(),
+        None => {
+            let first = rpassword::prompt_password(format!("New password for '{user}': "))
+                .context("reading password")?;
+            let second =
+                rpassword::prompt_password("Repeat password: ").context("reading password")?;
+            if first != second {
+                anyhow::bail!("passwords do not match");
+            }
+            first
+        }
+    };
+    if password.is_empty() {
+        anyhow::bail!("password must not be empty");
+    }
+
+    let hash = api::auth::hash_password(&password).map_err(|e| anyhow::anyhow!(e))?;
+    let new_content = password_reset::replace_password_hash(&content, user, &hash)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Страховка: правленый файл обязан остаться валидным конфигом.
+    toml::from_str::<config::HubConfig>(&new_content)
+        .context("edited config no longer parses — config file left untouched")?;
+
+    // Атомарная запись: temp-файл рядом + rename, права как у оригинала.
+    let perms = std::fs::metadata(path)?.permissions();
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = tempfile::NamedTempFile::new_in(dir).context("creating temp file")?;
+    std::fs::write(tmp.path(), &new_content).context("writing temp file")?;
+    std::fs::set_permissions(tmp.path(), perms)?;
+    tmp.persist(path).context("replacing config file")?;
+
+    println!("Password for '{user}' updated in {}.", path.display());
+    println!("Apply with: systemctl restart xr-hub");
+    Ok(())
 }
 
 #[tokio::main]
@@ -41,6 +96,11 @@ async fn main() -> Result<()> {
         let hash = api::auth::hash_password(password)
             .map_err(|e| anyhow::anyhow!(e))?;
         println!("{hash}");
+        return Ok(());
+    }
+
+    if let Some(Commands::ResetPassword { user, password }) = &cli.command {
+        reset_password(&cli.config, user, password.as_deref())?;
         return Ok(());
     }
 
