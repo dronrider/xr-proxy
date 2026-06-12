@@ -72,10 +72,11 @@ pub fn setup_redirect(
     listen_port: u16,
     server_ip: &str,
     bypass_ips: &[String],
+    block_quic: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match backend {
-        FirewallBackend::Nftables => setup_nftables(listen_port, server_ip, bypass_ips),
-        FirewallBackend::Iptables => setup_iptables(listen_port, server_ip, bypass_ips),
+        FirewallBackend::Nftables => setup_nftables(listen_port, server_ip, bypass_ips, block_quic),
+        FirewallBackend::Iptables => setup_iptables(listen_port, server_ip, bypass_ips, block_quic),
     }
 }
 
@@ -93,6 +94,7 @@ fn setup_nftables(
     listen_port: u16,
     server_ip: &str,
     bypass_ips: &[String],
+    block_quic: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let nft = find_nft().ok_or("nft binary not found")?;
 
@@ -110,6 +112,21 @@ fn setup_nftables(
         String::new()
     } else {
         format!("\n        # Bypass devices (game consoles, etc.)\n{}\n", bypass_rules)
+    };
+
+    // QUIC (UDP/443) от LAN дропаем, чтобы браузер fallback'нул на TCP/443
+    // и попал под redirect выше. Без этого любой сайт с h3 в HTTPS-записи
+    // DNS (alpn="h3") уходит по UDP напрямую мимо прокси — TCP-путь при
+    // этом честно проксируется, и снаружи кажется, что «всё через прокси».
+    let quic_section = if block_quic {
+        r#"
+    chain quic_block {
+        type filter hook prerouting priority dstnat; policy accept;
+        iifname "br-lan" udp dport 443 drop
+    }
+"#
+    } else {
+        ""
     };
 
     let ruleset = format!(
@@ -140,12 +157,13 @@ table ip {table} {{
         tcp dport {listen_port} ip saddr 127.0.0.0/8 accept
         tcp dport {listen_port} drop
     }}
-}}
+{quic_section}}}
 "#,
         table = NFT_TABLE,
         server_ip = server_ip,
         listen_port = listen_port,
         bypass_section = bypass_section,
+        quic_section = quic_section,
     );
 
     // Use sh -c with pipe to feed ruleset via stdin
@@ -172,6 +190,12 @@ fn cleanup_nftables() -> Result<(), Box<dyn std::error::Error>> {
         None => return Ok(()), // no nft binary — nothing to clean
     };
 
+    // Legacy: ручная таблица xr_quic_block с роутеров до того, как QUIC-блок
+    // переехал в chain quic_block внутри xr_proxy. Подчищаем, чтобы не дублировать.
+    let _ = Command::new(&nft)
+        .args(["delete", "table", "ip", "xr_quic_block"])
+        .status();
+
     let status = Command::new(&nft)
         .args(["delete", "table", "ip", NFT_TABLE])
         .status()?;
@@ -187,6 +211,7 @@ fn setup_iptables(
     listen_port: u16,
     server_ip: &str,
     bypass_ips: &[String],
+    block_quic: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = cleanup_iptables();
 
@@ -216,6 +241,15 @@ fn setup_iptables(
     // Hook into PREROUTING
     run_ipt(&["-t", "nat", "-A", "PREROUTING", "-j", IPT_CHAIN])?;
 
+    // Drop QUIC so browsers fall back to interceptable TCP/443
+    // (см. комментарий в setup_nftables).
+    if block_quic {
+        run_ipt(&[
+            "-t", "mangle", "-A", "PREROUTING",
+            "-i", "br-lan", "-p", "udp", "--dport", "443", "-j", "DROP",
+        ])?;
+    }
+
     let ipt = find_iptables().unwrap_or_else(|| "iptables".to_string());
     tracing::info!("iptables redirect rules installed (chain: {}, binary: {})", IPT_CHAIN, ipt);
     Ok(())
@@ -224,6 +258,10 @@ fn setup_iptables(
 fn cleanup_iptables() -> Result<(), Box<dyn std::error::Error>> {
     // Remove from PREROUTING
     let _ = run_ipt(&["-t", "nat", "-D", "PREROUTING", "-j", IPT_CHAIN]);
+    let _ = run_ipt(&[
+        "-t", "mangle", "-D", "PREROUTING",
+        "-i", "br-lan", "-p", "udp", "--dport", "443", "-j", "DROP",
+    ]);
     // Flush and delete chain
     let _ = run_ipt(&["-t", "nat", "-F", IPT_CHAIN]);
     let _ = run_ipt(&["-t", "nat", "-X", IPT_CHAIN]);

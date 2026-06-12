@@ -161,6 +161,21 @@ domains = [
   "bard.google.com",
 ]
 
+# ── Geo-blocked: сами блокируют запросы из РФ ─────────────────
+# Эти сайты НЕ блокирует РКН — наоборот, они отказывают российским IP
+# («app unavailable»). Отдельная категория: ресурсы, которые надо
+# проксировать ради «нероссийского» выходного IP, а не из-за блокировки.
+[[routing.rules]]
+action = "proxy"
+domains = [
+  "claude.com", "*.claude.com",
+  "claudeusercontent.com", "*.claudeusercontent.com",
+  "claude.site", "*.claude.site",
+]
+# Anthropic edge (туда резолвятся claude.ai/claude.com) — ловит и
+# соединения без читаемого SNI.
+ip_ranges = ["160.79.104.0/21"]
+
 # ── Разработка и IT ───────────────────────────────────────────
 [[routing.rules]]
 action = "proxy"

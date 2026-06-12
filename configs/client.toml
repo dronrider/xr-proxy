@@ -58,6 +58,11 @@ log_level = "info"                    # error, warn, info, debug
 # TCP no longer stalls every other stream. Set to 2 on small networks,
 # 4-8 on heavy multi-device traffic.
 # mux_pool_size = 4
+# block_quic: drop QUIC (UDP/443) from LAN so browsers fall back to TCP/443,
+# which the proxy can intercept (default true). Without it any site that
+# advertises HTTP/3 (alpn="h3" in DNS) goes out over UDP directly, bypassing
+# the proxy — geo-blocked sites then fail even though TCP is proxied.
+# block_quic = true
 
 # ─── Hub (centralized presets from xr-hub) ───────────────────────────
 # When configured, the client fetches routing presets from xr-hub on startup

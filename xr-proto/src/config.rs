@@ -76,6 +76,11 @@ pub struct ClientSettings {
     /// head-of-line blocking when one TCP enters slow-start or recovery.
     #[serde(default = "default_mux_pool_size")]
     pub mux_pool_size: usize,
+    /// Drop QUIC (UDP/443) from LAN so browsers fall back to TCP/443,
+    /// which the TPROXY redirect can intercept. Without this, any site
+    /// advertising h3 bypasses the proxy entirely over UDP.
+    #[serde(default = "default_true")]
+    pub block_quic: bool,
 }
 
 impl Default for ClientSettings {
@@ -87,6 +92,7 @@ impl Default for ClientSettings {
             log_level: default_log_level(),
             bypass_ips: vec![],
             mux_pool_size: default_mux_pool_size(),
+            block_quic: true,
         }
     }
 }
