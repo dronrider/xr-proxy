@@ -3,3 +3,6 @@ target
 xr-server/.vscode/launch.json
 logs/
 tmp/
+# Локальные доки с чувствительными данными (IP/доступы инфры) — не в git.
+local-docs/
+CLAUDE.local.md
