@@ -47,6 +47,7 @@ Integer types differ across targets (`msg_controllen`, `iov_len`). Use `as _` fo
 - **`meta l4proto udp`** must appear on the same rule as the `tproxy` statement, not on a separate line above.
 - **TPROXY source filtering in nftables, not application code** — if the proxy is down, intercepted traffic is blackholed. Filter by source IP in firewall rules so only specific devices (e.g., game consoles) are affected.
 - **Response spoofing (UDP relay)** — Switch expects UDP responses from the original server IP, not the router. The client creates per-destination sockets with `IP_TRANSPARENT` + `bind(server_ip:port)` to send spoofed-source responses.
+- **QUIC блокируется самим клиентом (`block_quic`, default true)** — TPROXY перехватывает только TCP; без drop UDP/443 из LAN любой сайт с `alpn="h3"` в DNS уходит по QUIC напрямую мимо прокси (так geo-blocked сайты «не работали» при честно проксируемом TCP). Chain `quic_block` ставится в таблицу `xr_proxy` вместе с redirect-правилами.
 - **Tokio AsyncFd for TPROXY socket** — DO NOT use `UdpSocket::from_std()` + `AsyncFd::new()` on the same fd. It causes `EEXIST` (double reactor registration). Use `AsyncFd` exclusively with raw `recvmsg`/`sendto`.
 - **procd respawn** — `respawn 3600 15 0` (threshold=3600s, interval=15s, retry=0=unlimited)
 - **Timeouts everywhere** — idle 5min, max lifetime 1h, TCP keepalive 60s. Prevents zombie connection memory leaks.
