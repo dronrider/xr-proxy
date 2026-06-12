@@ -1,6 +1,8 @@
 package com.xrproxy.app.ui.servers
 
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -46,7 +48,7 @@ import com.xrproxy.app.ui.VpnViewModel
 import java.time.OffsetDateTime
 import java.util.UUID
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun ServerEditScreen(
     initial: ServerProfile?,
@@ -76,6 +78,7 @@ fun ServerEditScreen(
     var nameError by remember { mutableStateOf(false) }
     var addressError by remember { mutableStateOf(false) }
     var keyError by remember { mutableStateOf(false) }
+    var saltError by remember { mutableStateOf(false) }
 
     val clipboardManager = LocalClipboardManager.current
 
@@ -83,7 +86,8 @@ fun ServerEditScreen(
         nameError = name.isBlank()
         addressError = address.isBlank()
         keyError = key.isBlank()
-        return !nameError && !addressError && !keyError
+        saltError = parseSalt(salt) == null
+        return !nameError && !addressError && !keyError && !saltError
     }
 
     Scaffold(
@@ -155,11 +159,33 @@ fun ServerEditScreen(
             )
             Spacer(Modifier.height(8.dp))
 
+            Text("Модификатор", style = MaterialTheme.typography.bodyMedium)
+            Spacer(Modifier.height(4.dp))
+            FlowRow(modifier = Modifier.fillMaxWidth()) {
+                for ((value, label) in MODIFIERS) {
+                    FilterChip(
+                        selected = modifier == value,
+                        onClick = { modifier = value },
+                        label = { Text(label) },
+                        leadingIcon = if (modifier == value) {
+                            { Icon(Icons.Default.Check, null, Modifier.size(16.dp)) }
+                        } else null,
+                        modifier = Modifier.padding(end = 8.dp),
+                    )
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+
             OutlinedTextField(
-                value = salt, onValueChange = { salt = it },
+                value = salt, onValueChange = { salt = it; saltError = false },
                 label = { Text("Salt") },
+                placeholder = { Text("0xDEADBEEF или 3735928559") },
                 modifier = Modifier.fillMaxWidth(), singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+                isError = saltError,
+                supportingText = if (saltError) {
+                    { Text("Число: десятичное или 0x…, диапазон 0…4294967295") }
+                } else null,
             )
             Spacer(Modifier.height(16.dp))
 
@@ -241,14 +267,15 @@ fun ServerEditScreen(
             Button(
                 onClick = {
                     if (!validate()) return@Button
-                    val autoName = name.ifBlank { address }
+                    val trimmedAddress = address.trim()
+                    val autoName = name.ifBlank { trimmedAddress }
                     val profile = base.copy(
                         name = autoName,
-                        serverAddress = address,
+                        serverAddress = trimmedAddress,
                         serverPort = port.toIntOrNull() ?: 8443,
-                        obfuscationKey = key,
+                        obfuscationKey = key.trim(),
                         modifier = modifier,
-                        salt = salt.toLongOrNull() ?: 0xDEADBEEFL,
+                        salt = parseSalt(salt) ?: DEFAULT_SALT,
                         routingPreset = preset,
                         customDomains = if (preset == "custom") customDomains else "",
                         customIpRanges = if (preset == "custom") customIpRanges else "",
@@ -268,4 +295,26 @@ fun ServerEditScreen(
             Spacer(Modifier.height(16.dp))
         }
     }
+}
+
+private const val DEFAULT_SALT = 0xDEADBEEFL
+
+/** Должен совпадать с server.toml → [obfuscation].modifier. */
+private val MODIFIERS = listOf(
+    "positional_xor_rotate" to "Positional XOR",
+    "rotating_salt" to "Rotating salt",
+    "substitution_table" to "Substitution",
+)
+
+/**
+ * Парсит salt из десятичной или hex-строки (`0x…`). Возвращает null, если ввод
+ * нечисловой или не влезает в u32 — именно столько использует ядро обфускации.
+ */
+internal fun parseSalt(input: String): Long? {
+    val t = input.trim()
+    val value = when {
+        t.startsWith("0x", ignoreCase = true) -> t.substring(2).toLongOrNull(16)
+        else -> t.toLongOrNull()
+    } ?: return null
+    return if (value in 0L..0xFFFFFFFFL) value else null
 }

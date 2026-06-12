@@ -306,6 +306,10 @@ fun MainScreen(
             servers = servers,
             activeId = activeId,
             onSelect = { id -> viewModel.selectServer(id) },
+            onEdit = { server ->
+                switcherSheetOpen = false
+                editMode = EditMode.Edit(server)
+            },
             onAddServer = { addServerDialogOpen = true },
             onDismiss = { switcherSheetOpen = false },
         )
@@ -503,6 +507,32 @@ fun ConnectionSection(
     // Statistics
     if (state.connected) {
         Spacer(Modifier.height(24.dp))
+
+        // No-traffic warning: данные уходят, но ответа нет — почти всегда
+        // означает рассогласование ключа/salt/modifier с сервером (сервер не
+        // может расшифровать запрос и закрывает соединение).
+        if (state.uptime >= 8 && state.bytesUp > 8192 && state.bytesDown == 0L) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF2A2418)),
+            ) {
+                Row(
+                    modifier = Modifier.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Default.Warning, null, tint = Color(0xFFFFA726))
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        "Трафик уходит, но ответа нет. Проверьте ключ, salt и " +
+                            "modifier — они должны точно совпадать с сервером.",
+                        color = Color(0xFFFFA726),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+        }
+
         StatsGrid(state = state)
         Spacer(Modifier.height(8.dp))
         DebugSection(
