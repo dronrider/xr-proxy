@@ -423,6 +423,21 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStop(
     }
 }
 
+/// Notify the engine that the underlying network switched (LTE↔Wi-Fi).
+/// Recycles the mux pool and drops live sessions so the tunnel re-binds onto
+/// the new uplink without a manual off/on. No-op if the engine isn't running.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeOnNetworkChanged(
+    _env: JNIEnv, _class: JClass,
+) {
+    let lock = get_engine().lock().unwrap();
+    if let Some(ref handle) = *lock {
+        // Enter the engine's runtime: on_network_changed spawns a recycle task.
+        let _guard = handle.runtime.enter();
+        handle.engine.on_network_changed();
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetState(
     env: JNIEnv, _class: JClass,

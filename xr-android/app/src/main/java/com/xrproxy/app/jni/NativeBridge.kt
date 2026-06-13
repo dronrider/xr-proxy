@@ -70,6 +70,14 @@ object NativeBridge {
     /** Start the VPN engine. Returns null on success, or an error message on failure. */
     external fun nativeStart(tunFd: Int, configJson: String): String?
     external fun nativeStop()
+
+    /**
+     * Notify the native engine that the underlying network switched
+     * (LTE↔Wi-Fi). The engine recycles the mux pool and drops live sessions so
+     * the tunnel re-binds onto the new uplink within seconds, instead of
+     * waiting for the slow consecutive-timeout detector. No-op if not running.
+     */
+    external fun nativeOnNetworkChanged()
     external fun nativeGetState(): String
     external fun nativeGetStats(): String
     /** Get full error log (newline-separated). */

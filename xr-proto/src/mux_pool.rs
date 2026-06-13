@@ -382,6 +382,26 @@ impl MuxPool {
         }
     }
 
+    /// Force every slot to reconnect and clear the fail-open breaker.
+    ///
+    /// Called when the host signals that the underlying network changed
+    /// (Android LTE↔Wi-Fi): the live mux TCP sockets are still bound to the
+    /// now-dead interface, so we drop them eagerly instead of waiting for the
+    /// slow consecutive-timeout detector (`MAX_CONSECUTIVE_TIMEOUTS`) to trip.
+    /// `protect(fd)` binds a *new* socket to the current default network, so
+    /// the reconnect on the next `open_stream` (or the explicit `warmup` the
+    /// engine kicks off) lands on the new uplink.
+    ///
+    /// Clearing the breaker matters: without it the first post-switch
+    /// `open_stream` would short-circuit on a stale `down_until_ms` cooldown
+    /// instead of actually probing the recovered path.
+    pub async fn recycle(&self) {
+        for idx in 0..self.slots.len() {
+            self.invalidate_slot(idx).await;
+        }
+        self.clear_breaker();
+    }
+
     async fn invalidate_slot(&self, idx: usize) {
         let mut guard = self.slots[idx].lock().await;
         // Take the old Multiplexer out and explicitly shutdown it so the
@@ -573,6 +593,27 @@ mod tests {
             counter.load(Ordering::Relaxed),
             4,
             "after cooldown expiry exactly one caller must re-probe all slots"
+        );
+    }
+
+    /// recycle() must clear the fail-open breaker so the first `open_stream`
+    /// after a network switch re-probes the new uplink instead of
+    /// short-circuiting on the stale cooldown. (Slots hold no live mux in this
+    /// failing-connect setup, so the observable contract is the breaker reset.)
+    #[tokio::test]
+    async fn test_recycle_clears_breaker() {
+        let pool = MuxPool::new(always_failing_connect(), test_codec(), 2);
+        let target = TargetAddr::Domain("x.com".to_string(), 443);
+
+        // Full failed walk arms the breaker.
+        let _ = pool.open_stream(&target).await.unwrap_err();
+        assert!(pool.is_server_down(), "breaker must arm after a full failed walk");
+
+        // Recycle on network change must disarm it.
+        pool.recycle().await;
+        assert!(
+            !pool.is_server_down(),
+            "recycle must clear the breaker so the next open_stream re-probes"
         );
     }
 

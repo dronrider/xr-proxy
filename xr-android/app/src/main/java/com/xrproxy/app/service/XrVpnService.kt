@@ -101,6 +101,16 @@ class XrVpnService : VpnService() {
     // down on stop. See NativeBridge.resolveDomain for the consumer side.
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
+    // Separate callback that watches only the DEFAULT (active) uplink so we
+    // can re-bind the tunnel when it switches (LTE↔Wi-Fi). Kept apart from the
+    // resolver callback above, which reports *all* matching networks — that
+    // one can't tell which uplink traffic actually uses.
+    private var defaultNetworkCallback: ConnectivityManager.NetworkCallback? = null
+    // The default network we last re-bound onto. Used to debounce: the first
+    // onAvailable is the initial uplink (the engine already came up on it), and
+    // duplicate callbacks for the same Network must not trigger a re-bind.
+    @Volatile private var currentDefaultNetwork: Network? = null
+
     // Speed tracking: previous snapshot for delta computation
     private var prevBytesUp: Long = 0
     private var prevBytesDown: Long = 0
@@ -378,13 +388,55 @@ class XrVpnService : VpnService() {
             // ACCESS_NETWORK_STATE edge cases. Swallow and let direct
             // mode fall back to UDP:53 probes — no regression vs before.
         }
+
+        registerDefaultNetworkRebindCallback(cm)
+    }
+
+    /**
+     * Watch the default uplink and re-bind the tunnel when it changes
+     * (LTE↔Wi-Fi). `registerDefaultNetworkCallback` reports exactly the network
+     * the OS routes through; for a VPN app that is the underlying physical
+     * network, not our own tunnel — so there's no resolve-loop concern here.
+     */
+    private fun registerDefaultNetworkRebindCallback(cm: ConnectivityManager) {
+        if (defaultNetworkCallback != null) return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val previous = currentDefaultNetwork
+                currentDefaultNetwork = network
+                // Only re-bind on a *real* switch. The first onAvailable
+                // (previous == null) is the initial uplink the engine already
+                // established on; a repeated callback for the same Network is
+                // not a switch either.
+                if (previous != null && previous != network) {
+                    NativeBridge.nativeOnNetworkChanged()
+                }
+            }
+        }
+        try {
+            cm.registerDefaultNetworkCallback(callback)
+            defaultNetworkCallback = callback
+        } catch (_: RuntimeException) {
+            // Best-effort: without it, a network switch still recovers via the
+            // slow native consecutive-timeout detector — just not instantly.
+        }
     }
 
     private fun unregisterUnderlyingNetworkCallback() {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        defaultNetworkCallback?.let { cb ->
+            defaultNetworkCallback = null
+            currentDefaultNetwork = null
+            try {
+                cm?.unregisterNetworkCallback(cb)
+            } catch (_: IllegalArgumentException) {
+                // Already unregistered — benign race with Android-side cleanup.
+            }
+        }
         val cb = networkCallback ?: return
         networkCallback = null
         NativeBridge.underlyingNetwork = null
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        if (cm == null) return
         try {
             cm.unregisterNetworkCallback(cb)
         } catch (_: IllegalArgumentException) {

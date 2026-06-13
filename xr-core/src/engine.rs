@@ -79,11 +79,25 @@ pub struct VpnEngine {
     state: StateHandle,
     stats: Stats,
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    /// Live mux pool, kept after `start()` so `on_network_changed` can recycle
+    /// it when the underlying network switches. `None` while not running.
+    mux_pool: Option<Arc<xr_proto::mux_pool::MuxPool>>,
+    /// Network-generation signal. Bumped on every underlying-network switch;
+    /// the event loop drops all active sessions when it changes so they
+    /// re-establish on the new uplink. `None` while not running.
+    netgen_tx: Option<tokio::sync::watch::Sender<u64>>,
 }
 
 impl VpnEngine {
     pub fn new(config: VpnConfig) -> Self {
-        Self { config, state: StateHandle::new(), stats: Stats::new(), shutdown_tx: None }
+        Self {
+            config,
+            state: StateHandle::new(),
+            stats: Stats::new(),
+            shutdown_tx: None,
+            mux_pool: None,
+            netgen_tx: None,
+        }
     }
     pub fn state(&self) -> &StateHandle { &self.state }
     pub fn stats(&self) -> &Stats { &self.stats }
@@ -175,6 +189,10 @@ impl VpnEngine {
             })
             .collect();
 
+        // Keep a handle to the pool so a later network switch can recycle it
+        // without tearing down the whole engine.
+        self.mux_pool = Some(mux_pool.clone());
+
         let ctx = Arc::new(SessionContext {
             router: std::sync::RwLock::new(Arc::new(router)),
             codec, server_addr,
@@ -188,6 +206,10 @@ impl VpnEngine {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
+        // Network-change generation: `on_network_changed` bumps it, the event
+        // loop drops live sessions when it observes the change.
+        let (netgen_tx, netgen_rx) = tokio::sync::watch::channel(0u64);
+        self.netgen_tx = Some(netgen_tx);
         let state = self.state.clone();
         let stats = self.stats.clone();
 
@@ -276,7 +298,7 @@ impl VpnEngine {
             }
 
             state.set(VpnState::Connected);
-            if let Err(e) = run_event_loop(queue, ctx, fake_dns, shutdown_rx).await {
+            if let Err(e) = run_event_loop(queue, ctx, fake_dns, shutdown_rx, netgen_rx).await {
                 state.set(VpnState::Error(e.to_string()));
             } else {
                 state.set(VpnState::Disconnected);
@@ -290,8 +312,42 @@ impl VpnEngine {
             self.state.set(VpnState::Disconnecting);
             let _ = tx.send(true);
         }
+        // Drop the post-start handles so a stray `on_network_changed` after
+        // stop is a no-op and the pool can be released.
+        self.mux_pool = None;
+        self.netgen_tx = None;
     }
     pub fn is_running(&self) -> bool { self.shutdown_tx.is_some() }
+
+    /// React to an underlying-network switch (Android LTE↔Wi-Fi).
+    ///
+    /// Eagerly recycles the mux pool — its TCP sockets are bound to the now
+    /// dead interface — and bumps the network generation so the event loop
+    /// drops every active session, forcing each to re-establish on the new
+    /// uplink. This is the in-place equivalent of the manual off/on the user
+    /// previously had to do; without it, recovery waits on the slow
+    /// consecutive-timeout detector and in-flight Direct sessions stall until
+    /// the 1h relay timeout. No-op when the engine isn't running.
+    ///
+    /// Must be called from within the engine's tokio runtime context (the JNI
+    /// layer enters it) because it spawns the recycle/warmup task.
+    pub fn on_network_changed(&self) {
+        // Signal the event loop to tear down live sessions.
+        if let Some(tx) = &self.netgen_tx {
+            tx.send_modify(|g| *g = g.wrapping_add(1));
+        }
+        // Recycle off-task: drop stale multiplexers + clear the fail-open
+        // breaker, then best-effort pre-warm so the first proxied stream after
+        // the switch opens without paying a reconnect. A warmup failure is
+        // fine — slots reconnect lazily on the next `open_stream`.
+        if let Some(pool) = &self.mux_pool {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                pool.recycle().await;
+                let _ = pool.warmup().await;
+            });
+        }
+    }
 }
 
 // ── Session ─────────────────────────────────────────────────────────
@@ -326,9 +382,14 @@ async fn run_event_loop(
     ctx: Arc<SessionContext>,
     fake_dns: Arc<FakeDns>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut netgen_rx: tokio::sync::watch::Receiver<u64>,
 ) -> io::Result<()> {
     let mut stack = IpStack::new(queue.clone());
     let waker = queue.notifier();
+
+    // Last observed network generation. When `on_network_changed` bumps it we
+    // drop every active session so it re-establishes on the new uplink.
+    let mut last_netgen = *netgen_rx.borrow();
 
     // Key: (src_addr, dst_addr) from original SYN.
     // We rewrite the SYN dst_port → ephemeral port so smoltcp can handle
@@ -343,6 +404,39 @@ async fn run_event_loop(
 
     loop {
         if *shutdown_rx.borrow() { return Ok(()); }
+
+        // ── 0. Underlying network switched? ─────────────────────────
+        // On LTE↔Wi-Fi the smoltcp sessions are backed by relay sockets bound
+        // to the now-dead interface; they'd otherwise hang until the 1h relay
+        // timeout. Abort every session here so the app reconnects fresh on the
+        // new uplink — the in-place equivalent of a manual off/on. The mux pool
+        // is recycled separately in `on_network_changed`.
+        {
+            let cur_netgen = *netgen_rx.borrow_and_update();
+            if cur_netgen != last_netgen {
+                last_netgen = cur_netgen;
+                if !sessions.is_empty() {
+                    tracing::info!(
+                        "underlying network changed (gen {}), dropping {} active session(s)",
+                        cur_netgen, sessions.len()
+                    );
+                    for session in sessions.values_mut() {
+                        stack.tcp_socket_mut(session.smol_handle).abort();
+                        // Drop the relay channels → the relay task observes the
+                        // closed channel, exits, and releases its protected
+                        // socket on the old network.
+                        session.relay = None;
+                    }
+                    // Flush the RSTs to the app so it reconnects promptly.
+                    for _ in 0..16 { if !stack.poll() { break; } }
+                    for (_key, session) in sessions.drain() {
+                        stack.remove_socket(session.smol_handle);
+                        ctx.stats.connection_closed();
+                    }
+                    port_to_key.clear();
+                }
+            }
+        }
 
         // ── 1. Intercept DNS ────────────────────────────────────────
         let mut tcp_packets = Vec::new();
@@ -649,6 +743,7 @@ async fn run_event_loop(
             _ = waker.notified() => {}
             _ = tokio::time::sleep(poll_delay) => {}
             _ = shutdown_rx.changed() => {}
+            _ = netgen_rx.changed() => {}
         }
     }
 }
