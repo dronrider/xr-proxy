@@ -78,6 +78,47 @@ pub(crate) async fn connect_protected_pub(addr: SocketAddr, protect: &ProtectSoc
     connect_protected(addr, protect).await
 }
 
+/// Advertised MSS clamp for every outbound (protected) socket — both Direct
+/// targets and the mux tunnel to the VPS.
+///
+/// **Why.** On reduced-PMTU underlays the peer's full-size inbound segments get
+/// black-holed: the connection establishes but the stream stalls (bug 3c —
+/// непроксируемые сайты вроде 3dnews.ru виснут на LTE). Two real cases:
+///   - **Mobile IPv6/NAT64 (464XLAT):** our IPv4 packets are translated to IPv6,
+///     adding 20 bytes. The kernel sizes MSS from the rmnet MTU (1300) without
+///     accounting for that overhead, so a 1300-byte IPv4 packet becomes a
+///     1320-byte IPv6 packet on a 1300-byte link → dropped. ICMPv6 PTB (PMTUD)
+///     often doesn't make it back.
+///   - **Tunnel stacking:** Android VPN over a router that itself proxies —
+///     each layer shrinks the usable MTU.
+/// Clamping the MSS we advertise caps what the peer sends us, so segments fit
+/// the narrowest path. 1220 leaves headroom under 1280 (IPv6 minimum MTU) even
+/// after the NAT64 +20 and any stacking.
+const CLAMP_MSS: libc::c_int = 1220;
+
+/// Best-effort clamp of the TCP MSS advertised in our SYN. Must be set BEFORE
+/// connect. Failures are non-fatal — without it we just risk the PMTU
+/// black-hole above, not a broken socket.
+fn clamp_tcp_maxseg(fd: std::os::fd::RawFd) {
+    let mss = CLAMP_MSS;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_MAXSEG,
+            &mss as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        tracing::debug!(
+            "TCP_MAXSEG clamp failed on fd {}: {}",
+            fd,
+            io::Error::last_os_error()
+        );
+    }
+}
+
 async fn connect_protected(addr: SocketAddr, protect: &ProtectSocketFn) -> io::Result<TcpStream> {
     let socket = match addr {
         SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
@@ -91,6 +132,10 @@ async fn connect_protected(addr: SocketAddr, protect: &ProtectSocketFn) -> io::R
         return Err(io::Error::new(io::ErrorKind::Other,
             format!("protect(fd={}) failed for {}", fd, addr)));
     }
+
+    // Clamp advertised MSS before connect so the SYN carries it — fixes the
+    // reduced-PMTU stall on mobile IPv6/NAT64 and stacked tunnels (bug 3c).
+    clamp_tcp_maxseg(fd);
 
     tokio::time::timeout(
         Duration::from_secs(5),

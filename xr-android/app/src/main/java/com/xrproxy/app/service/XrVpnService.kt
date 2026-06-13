@@ -219,7 +219,12 @@ class XrVpnService : VpnService() {
             .addAddress("10.0.0.2", 32)
             .addRoute("0.0.0.0", 0)
             .addDnsServer("10.0.0.1")
-            .setMtu(1500)
+            // 1280 = IPv6 minimum MTU. Mobile IPv6/NAT64 uplinks run MTU ~1300
+            // and tunnel stacking (VPN over a router that itself proxies) shrinks
+            // it further; a 1500 TUN advertised an MSS the underlay couldn't carry,
+            // so re-originated streams stalled (bug 3c). Pairs with the MSS clamp
+            // on outbound sockets in xr-core session.rs.
+            .setMtu(1280)
             .setBlocking(true)
             .establish()
 

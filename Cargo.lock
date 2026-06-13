@@ -3209,6 +3209,7 @@ dependencies = [
 name = "xr-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "reqwest",
  "serde_json",
  "smoltcp",
