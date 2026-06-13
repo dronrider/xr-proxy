@@ -1,7 +1,7 @@
 //! JNI bridge: Kotlin ↔ xr-core VPN engine.
 
-use jni::objects::{JClass, JString, GlobalRef};
-use jni::sys::{jint, jlong, jmethodID, jstring};
+use jni::objects::{JClass, JObjectArray, JString, GlobalRef};
+use jni::sys::{jboolean, jint, jlong, jmethodID, jstring};
 use jni::{JNIEnv, JavaVM};
 
 use std::net::Ipv4Addr;
@@ -435,6 +435,71 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeOnNetworkChan
         // Enter the engine's runtime: on_network_changed spawns a recycle task.
         let _guard = handle.runtime.enter();
         handle.engine.on_network_changed();
+    }
+}
+
+/// Read a Java `String[]` into a `Vec<String>`, skipping null/unreadable
+/// elements. Used by the trusted-network SSID bridge below.
+fn read_jstring_array(env: &mut JNIEnv, arr: &JObjectArray) -> Vec<String> {
+    let len = env.get_array_length(arr).unwrap_or(0);
+    let mut out = Vec::with_capacity(len.max(0) as usize);
+    for i in 0..len {
+        if let Ok(obj) = env.get_object_array_element(arr, i) {
+            if obj.is_null() {
+                continue;
+            }
+            let js = JString::from(obj);
+            if let Ok(s) = env.get_string(&js) {
+                out.push(s.into());
+            };
+        }
+    }
+    out
+}
+
+/// True if the raw current SSID (as returned by `WifiInfo.getSSID()`) matches
+/// any entry in the trusted list. Pure string logic — works whether or not the
+/// engine is running (the auto-pause watcher calls it while paused). See
+/// `xr_core::trusted`. Errors / unreadable args degrade to `false` (no match
+/// → never auto-pause), matching the "fail soft" contract of the feature.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSsidMatches(
+    mut env: JNIEnv,
+    _class: JClass,
+    current: JString,
+    trusted: JObjectArray,
+) -> jboolean {
+    let current_str: String = match env.get_string(&current) {
+        Ok(s) => s.into(),
+        Err(_) => return 0,
+    };
+    let trusted_vec = read_jstring_array(&mut env, &trusted);
+    if xr_core::trusted::ssid_matches(&current_str, &trusted_vec) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Normalize a raw `WifiInfo.getSSID()` value for display (strip the quote
+/// wrapping Android adds). Returns the clean SSID, or null for an
+/// unavailable/hidden network. See `xr_core::trusted::normalize_ssid`.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeNormalizeSsid(
+    mut env: JNIEnv,
+    _class: JClass,
+    raw: JString,
+) -> jstring {
+    let raw_str: String = match env.get_string(&raw) {
+        Ok(s) => s.into(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match xr_core::trusted::normalize_ssid(&raw_str) {
+        Some(clean) => env
+            .new_string(&clean)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        None => std::ptr::null_mut(),
     }
 }
 

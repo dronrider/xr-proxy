@@ -7,10 +7,12 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -51,6 +53,7 @@ import com.xrproxy.app.ui.servers.ServerSwitcherChip
 import com.xrproxy.app.ui.servers.ServerSwitcherSheet
 import com.xrproxy.app.ui.servers.ServersSection
 import com.xrproxy.app.ui.theme.XrTheme
+import com.xrproxy.app.ui.trusted.TrustedNetworksSection
 import kotlinx.coroutines.launch
 
 private val COUNT_SUFFIX_RE = Regex(" \\(\u00D7(\\d+)\\)\$")
@@ -147,6 +150,32 @@ fun MainScreen(
     val activeId by viewModel.repo.activeId.collectAsState()
     val activeServer = remember(servers, activeId) {
         servers.firstOrNull { it.id == activeId }
+    }
+    val trustedNetworks by viewModel.trustedRepo.networks.collectAsState()
+    val trustedEnabled by viewModel.trustedRepo.enabled.collectAsState()
+
+    // Location permission for reading the current Wi-Fi SSID (auto-pause,
+    // task 3b-2). FINE_LOCATION is the cross-version path that unredacts the
+    // SSID in NetworkCapabilities; NEARBY_WIFI_DEVICES is added on 33+. The
+    // feature degrades gracefully without it (never pauses).
+    val permissionContext = LocalContext.current
+    var permissionEpoch by remember { mutableIntStateOf(0) }
+    val hasSsidPermission = remember(permissionEpoch) {
+        ContextCompat.checkSelfPermission(
+            permissionContext, Manifest.permission.ACCESS_FINE_LOCATION,
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+    val ssidPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissionEpoch++ }
+    val requestSsidPermission: () -> Unit = {
+        val perms = buildList {
+            add(Manifest.permission.ACCESS_FINE_LOCATION)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                add(Manifest.permission.NEARBY_WIFI_DEVICES)
+            }
+        }.toTypedArray()
+        ssidPermissionLauncher.launch(perms)
     }
 
     var currentTab by remember { mutableIntStateOf(0) }
@@ -383,15 +412,30 @@ fun MainScreen(
                     snackbarHostState = snackbarHostState,
                 )
                 1 -> LogSection(state, viewModel)
-                2 -> ServersSection(
-                    servers = servers,
-                    activeId = activeId,
-                    isConnected = state.connected,
-                    onSetActive = { viewModel.selectServer(it) },
-                    onEdit = { editMode = EditMode.Edit(it) },
-                    onDelete = { viewModel.deleteServer(it) },
-                    onAddServer = { addServerDialogOpen = true },
-                )
+                2 -> {
+                    ServersSection(
+                        servers = servers,
+                        activeId = activeId,
+                        isConnected = state.connected,
+                        onSetActive = { viewModel.selectServer(it) },
+                        onEdit = { editMode = EditMode.Edit(it) },
+                        onDelete = { viewModel.deleteServer(it) },
+                        onAddServer = { addServerDialogOpen = true },
+                    )
+                    TrustedNetworksSection(
+                        networks = trustedNetworks,
+                        enabled = trustedEnabled,
+                        hasPermission = hasSsidPermission,
+                        onToggleEnabled = { enabled ->
+                            viewModel.setTrustedAutoPauseEnabled(enabled)
+                            if (enabled && !hasSsidPermission) requestSsidPermission()
+                        },
+                        onAdd = { viewModel.addTrustedNetwork(it) },
+                        onRemove = { viewModel.removeTrustedNetwork(it) },
+                        onRequestPermission = requestSsidPermission,
+                        suggestCurrentSsid = { viewModel.suggestCurrentSsid() },
+                    )
+                }
             }
         }
     }
@@ -430,6 +474,7 @@ fun ConnectionSection(
         ConnectPhase.Connecting -> "Подключение…"
         ConnectPhase.Finalizing -> "Проверка маршрутов…"
         ConnectPhase.Connected -> "Подключено$healthEmoji"
+        ConnectPhase.Paused -> "На паузе"
         ConnectPhase.Stopping -> "Отключение…"
     }
     val statusColor = when (state.phase) {
@@ -451,6 +496,23 @@ fun ConnectionSection(
         Spacer(Modifier.height(4.dp))
         Text(substep, style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+
+    // Paused: explain why and on which trusted network.
+    if (state.paused) {
+        Spacer(Modifier.height(4.dp))
+        val pausedDetail = state.pausedSsid?.let { "Доверенная сеть «$it» — туннель не нужен" }
+            ?: "Доверенная сеть — туннель не нужен"
+        Text(
+            pausedDetail,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            "Поднимется автоматически при уходе из сети",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.outline,
+        )
     }
 
     // Version
@@ -482,23 +544,25 @@ fun ConnectionSection(
 
     // Connect / Disconnect button
     val btnColor = when {
-        state.connected -> MaterialTheme.colorScheme.error
+        state.connected || state.paused -> MaterialTheme.colorScheme.error
         state.connecting -> MaterialTheme.colorScheme.tertiary
         else -> MaterialTheme.colorScheme.primary
     }
     val btnTextColor = when {
-        state.connected -> MaterialTheme.colorScheme.onError
+        state.connected || state.paused -> MaterialTheme.colorScheme.onError
         else -> MaterialTheme.colorScheme.onPrimary
     }
     Button(
-        onClick = { if (state.connected || state.connecting) onDisconnect() else onConnect() },
+        onClick = {
+            if (state.connected || state.connecting || state.paused) onDisconnect() else onConnect()
+        },
         modifier = Modifier.fillMaxWidth(0.7f).height(56.dp),
         shape = RoundedCornerShape(28.dp),
         colors = ButtonDefaults.buttonColors(containerColor = btnColor, contentColor = btnTextColor),
     ) {
         val btnText = when {
             state.connecting -> "Cancel"
-            state.connected -> "Disconnect"
+            state.connected || state.paused -> "Disconnect"
             else -> "Connect"
         }
         Text(btnText, style = MaterialTheme.typography.titleMedium)

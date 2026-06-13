@@ -12,11 +12,13 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.VpnService
+import android.net.wifi.WifiInfo
 import android.os.Binder
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import androidx.core.content.ContextCompat
 import com.xrproxy.app.R
+import com.xrproxy.app.data.TrustedNetworksRepository
 import com.xrproxy.app.jni.NativeBridge
 import com.xrproxy.app.model.HealthLevel
 import com.xrproxy.app.model.HealthTracker
@@ -24,6 +26,7 @@ import com.xrproxy.app.ui.MainActivity
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import org.json.JSONObject
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -33,6 +36,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Foreground VPN service. Single source of truth for connection state and
@@ -40,19 +46,34 @@ import kotlinx.coroutines.launch
  * `stateFlow` into UI state. Connection start/stop and the stats poll loop
  * live here so the UI can recover state via `bindService` after Activity
  * recreation or returning from background.
+ *
+ * Also owns the **trusted-network auto-pause** (task 3b-2): on a Wi-Fi the
+ * user marked as trusted (home network already behind an xr-client router),
+ * the tunnel pauses — engine stopped, TUN torn down, traffic falls through to
+ * the router — while the service stays foreground watching the uplink, and
+ * resumes itself when the phone leaves that network.
  */
 class XrVpnService : VpnService() {
 
     companion object {
         const val ACTION_START = "com.xrproxy.app.START"
         const val ACTION_STOP = "com.xrproxy.app.STOP"
+        const val ACTION_RESUME_OVERRIDE = "com.xrproxy.app.RESUME_OVERRIDE"
         const val ACTION_BIND_INTERNAL = "com.xrproxy.app.BIND_INTERNAL"
         const val EXTRA_CONFIG_JSON = "config_json"
         private const val CHANNEL_ID = "xr_vpn_channel"
         private const val NOTIFICATION_ID = 1
+
+        // How long startVpn waits for the first capabilities callback before
+        // deciding the initial network is untrusted and bringing the tunnel
+        // up. Capabilities for the already-connected default network are
+        // delivered almost immediately on registration, so this only bites
+        // on a genuinely slow uplink — and the post-Connected backstop in
+        // bringTunnelUp() still catches a late "trusted" verdict.
+        private const val INITIAL_TRUST_TIMEOUT_MS = 1500L
     }
 
-    enum class Phase { Idle, Preparing, Connecting, Finalizing, Connected, Stopping, Error }
+    enum class Phase { Idle, Preparing, Connecting, Finalizing, Connected, Paused, Stopping, Error }
 
     data class StatsSnapshot(
         val bytesUp: Long,
@@ -78,6 +99,8 @@ class XrVpnService : VpnService() {
         val speedUp: Long = 0,
         val speedDown: Long = 0,
         val health: HealthLevel = HealthLevel.Healthy,
+        /** SSID display name when [phase] is [Phase.Paused], else null. */
+        val pausedSsid: String? = null,
     )
 
     inner class LocalBinder : Binder() {
@@ -91,10 +114,19 @@ class XrVpnService : VpnService() {
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
+    // Serializes tunnel up/down transitions (connect, pause, resume, stop) so
+    // overlapping network callbacks can't bring the tunnel up and tear it down
+    // at the same time.
+    private val transitionMutex = Mutex()
+
     private var vpnInterface: ParcelFileDescriptor? = null
     private var tunReadThread: Thread? = null
     private var tunWriteThread: Thread? = null
     @Volatile private var running = false
+
+    // Config of the active session, kept so resumeFromPause() can rebuild the
+    // tunnel with the same parameters after a trusted-network pause.
+    @Volatile private var lastConfigJson: String? = null
 
     // Tracks the underlying (non-VPN) network so xr-core can bypass the
     // tunnel for direct-mode DNS lookups. Registered at VPN start, torn
@@ -102,14 +134,33 @@ class XrVpnService : VpnService() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     // Separate callback that watches only the DEFAULT (active) uplink so we
-    // can re-bind the tunnel when it switches (LTE↔Wi-Fi). Kept apart from the
-    // resolver callback above, which reports *all* matching networks — that
-    // one can't tell which uplink traffic actually uses.
+    // can (a) re-bind the tunnel when it switches (LTE↔Wi-Fi, task 3b-1) and
+    // (b) detect trusted-SSID transitions for auto-pause (task 3b-2). Kept
+    // apart from the resolver callback above, which reports *all* matching
+    // networks — that one can't tell which uplink traffic actually uses.
     private var defaultNetworkCallback: ConnectivityManager.NetworkCallback? = null
-    // The default network we last re-bound onto. Used to debounce: the first
-    // onAvailable is the initial uplink (the engine already came up on it), and
-    // duplicate callbacks for the same Network must not trigger a re-bind.
+    // The default network we last saw. Used to debounce re-bind (only on a
+    // real switch) and to ignore stale capabilities callbacks for a replaced
+    // network.
     @Volatile private var currentDefaultNetwork: Network? = null
+    // Raw WifiInfo.getSSID() of the current default network (quotes and all),
+    // or null when the uplink is non-Wi-Fi or the SSID is unavailable.
+    @Volatile private var currentRawSsid: String? = null
+    // Set when the default network changed and we still owe a re-bind — but
+    // only if the new network turns out NOT to be trusted (a trusted network
+    // pauses instead of re-binding; we must not do both — see maybeEvaluate).
+    @Volatile private var pendingSwitch = false
+    // The trusted network the user chose to keep the tunnel running on ("use
+    // anyway"). While the default network equals this, auto-pause is skipped.
+    // Cleared as soon as the default network changes.
+    @Volatile private var overrideNetwork: Network? = null
+    // Completed by the first capabilities callback of a session, so startVpn
+    // can wait briefly for the initial SSID before deciding to pause.
+    @Volatile private var firstCapsSignal: CompletableDeferred<Unit>? = null
+
+    private val trustedRepo: TrustedNetworksRepository by lazy {
+        TrustedNetworksRepository(getSharedPreferences("xr_proxy", Context.MODE_PRIVATE))
+    }
 
     // Speed tracking: previous snapshot for delta computation
     private var prevBytesUp: Long = 0
@@ -163,6 +214,7 @@ class XrVpnService : VpnService() {
                 scope.launch { startVpn(configJson) }
             }
             ACTION_STOP -> stopFromUi()
+            ACTION_RESUME_OVERRIDE -> resumeOverride()
         }
         return START_STICKY
     }
@@ -178,17 +230,20 @@ class XrVpnService : VpnService() {
         val current = _stateFlow.value.phase
         if (current == Phase.Idle || current == Phase.Stopping) return
         scope.launch {
-            publish(Phase.Stopping)
-            updateNotification()
-            stopInternal()
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            // Публикуем Idle ПОСЛЕ stopForeground: VM увидит Idle через
-            // stateFlow и сделает `unbindService`, что наконец-то позволит
-            // сервису реально умереть (stopSelf на bound-сервисе — no-op).
-            // Без этого следующий Connect приходит на тот же instance,
-            // где native engine уже остановлен, и туннель не поднимается.
-            publish(Phase.Idle, snapshot = null)
-            stopSelf()
+            transitionMutex.withLock {
+                if (_stateFlow.value.phase == Phase.Idle) return@withLock
+                publish(Phase.Stopping)
+                updateNotification()
+                stopInternal()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                // Публикуем Idle ПОСЛЕ stopForeground: VM увидит Idle через
+                // stateFlow и сделает `unbindService`, что наконец-то позволит
+                // сервису реально умереть (stopSelf на bound-сервисе — no-op).
+                // Без этого следующий Connect приходит на тот же instance,
+                // где native engine уже остановлен, и туннель не поднимается.
+                publish(Phase.Idle, snapshot = null)
+                stopSelf()
+            }
         }
     }
 
@@ -197,15 +252,31 @@ class XrVpnService : VpnService() {
         _stateFlow.value = _stateFlow.value.copy(snapshot = readSnapshot())
     }
 
+    /** Raw SSID of the current uplink as seen by the default-network callback
+     *  (non-redacted when the app holds location permission). Used by the UI
+     *  to pre-fill "add current network". Null when unknown / non-Wi-Fi. */
+    fun currentRawSsidOrNull(): String? = currentRawSsid
+
+    /** Notification "use anyway" action: resume from a trusted-network pause
+     *  and keep the tunnel up on this network until it changes. */
+    private fun resumeOverride() {
+        overrideNetwork = currentDefaultNetwork
+        scope.launch { requestResume() }
+    }
+
     // ── Connection flow ───────────────────────────────────────────────
 
     private suspend fun startVpn(configJson: String) {
-        // Reset speed and health tracking for new session
-        prevBytesUp = 0; prevBytesDown = 0; prevTickMs = 0
-        healthTracker.reset()
+        lastConfigJson = configJson
 
         publish(Phase.Preparing)
         startForeground(NOTIFICATION_ID, buildNotification(_stateFlow.value))
+
+        // Arm the first-capabilities signal BEFORE registering the callback so
+        // we can't miss the very first onCapabilitiesChanged (which lands almost
+        // immediately for the already-connected default network).
+        val capsSignal = CompletableDeferred<Unit>()
+        firstCapsSignal = capsSignal
 
         // Register BEFORE establish() so the underlying network is known by
         // the time xr-core starts resolving. registerNetworkCallback gives
@@ -213,6 +284,39 @@ class XrVpnService : VpnService() {
         // VPN-capable networks, otherwise we'd pick up our own tunnel after
         // it's up and get a resolve loop.
         registerUnderlyingNetworkCallback()
+
+        transitionMutex.withLock {
+            // Wait briefly for the first SSID verdict so we can pause
+            // pre-emptively on a trusted network instead of flickering through
+            // a full connect just to tear it down. Completes immediately on
+            // cellular (caps arrive with no WifiInfo) — no penalty there.
+            withTimeoutOrNull(INITIAL_TRUST_TIMEOUT_MS) { capsSignal.await() }
+            firstCapsSignal = null
+
+            val raw = currentRawSsid
+            if (raw != null && isTrusted(raw)) {
+                doPause(raw)
+                return
+            }
+            bringTunnelUp()
+        }
+    }
+
+    /**
+     * Establish the TUN, start the native engine and the I/O threads, and
+     * publish Connected. Returns false (after publishing Error + stopSelf) on
+     * failure. MUST be called holding [transitionMutex].
+     */
+    private suspend fun bringTunnelUp(): Boolean {
+        val configJson = lastConfigJson ?: run {
+            publish(Phase.Error, errorMessage = "Нет конфигурации")
+            stopSelf()
+            return false
+        }
+
+        // Reset speed and health tracking for the (re)started session.
+        prevBytesUp = 0; prevBytesDown = 0; prevTickMs = 0
+        healthTracker.reset()
 
         val iface = Builder()
             .setSession("XR Proxy")
@@ -229,11 +333,12 @@ class XrVpnService : VpnService() {
             .establish()
 
         if (iface == null) {
-            unregisterUnderlyingNetworkCallback()
             publish(Phase.Error, errorMessage = "TUN establish failed")
             updateNotification()
+            stopInternal()
+            stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
-            return
+            return false
         }
         vpnInterface = iface
 
@@ -244,14 +349,16 @@ class XrVpnService : VpnService() {
         if (startError != null) {
             iface.close()
             vpnInterface = null
-            unregisterUnderlyingNetworkCallback()
             publish(Phase.Error, errorMessage = startError)
             updateNotification()
+            stopInternal()
+            stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
-            return
+            return false
         }
 
         running = true
+        pendingSwitch = false
 
         tunReadThread = Thread {
             val input = FileInputStream(iface.fileDescriptor)
@@ -286,7 +393,18 @@ class XrVpnService : VpnService() {
         publish(Phase.Connected, snapshot = readSnapshot())
         updateNotification()
 
+        // Backstop: capabilities may have arrived after the initial-trust wait
+        // timed out, or a trusted network may have appeared during connect.
+        // Re-check now while we hold the lock — if trusted, pause instead of
+        // running. (Skipped if the user chose "use anyway" on this network.)
+        val raw = currentRawSsid
+        if (raw != null && currentDefaultNetwork != overrideNetwork && isTrusted(raw)) {
+            doPause(raw)
+            return true
+        }
+
         scope.launch { pollLoop() }
+        return true
     }
 
     private suspend fun pollLoop() {
@@ -312,6 +430,9 @@ class XrVpnService : VpnService() {
                 "Disconnecting" -> Phase.Stopping
                 else -> _stateFlow.value.phase
             }
+
+            // Don't clobber a pause that landed between ticks.
+            if (_stateFlow.value.phase == Phase.Paused || !running) return
 
             val snap = readSnapshot()
 
@@ -343,7 +464,10 @@ class XrVpnService : VpnService() {
         }
     }
 
-    private fun stopInternal() {
+    /** Tear the tunnel down (engine + TUN + I/O threads) but KEEP the network
+     *  callbacks registered — used for trusted-network pause, where we must
+     *  keep watching the uplink to resume. */
+    private fun tearTunnelDown() {
         running = false
         NativeBridge.nativeStop()
         tunReadThread?.interrupt()
@@ -352,10 +476,99 @@ class XrVpnService : VpnService() {
         tunWriteThread = null
         vpnInterface?.close()
         vpnInterface = null
+    }
+
+    /** Full stop: tear the tunnel down and unregister network callbacks. */
+    private fun stopInternal() {
+        tearTunnelDown()
         unregisterUnderlyingNetworkCallback()
     }
 
-    // ── Underlying network tracking ───────────────────────────────────
+    // ── Trusted-network pause / resume (task 3b-2) ────────────────────
+
+    /** Enter the paused state. MUST be called holding [transitionMutex].
+     *  Safe whether or not a tunnel is currently up (tearTunnelDown is a
+     *  no-op when nothing is running). */
+    private fun doPause(rawSsid: String?) {
+        tearTunnelDown()
+        val display = rawSsid?.let { NativeBridge.nativeNormalizeSsid(it) }
+        publish(Phase.Paused, snapshot = null, pausedSsid = display)
+        updateNotification()
+    }
+
+    private suspend fun requestPause(rawSsid: String?) {
+        transitionMutex.withLock {
+            val ph = _stateFlow.value.phase
+            if (ph != Phase.Connected && ph != Phase.Finalizing) return@withLock
+            doPause(rawSsid)
+        }
+    }
+
+    private suspend fun requestResume() {
+        transitionMutex.withLock {
+            if (_stateFlow.value.phase != Phase.Paused) return@withLock
+            publish(Phase.Connecting)
+            updateNotification()
+            bringTunnelUp()
+        }
+    }
+
+    // ── Network watching: SSID auto-pause + LTE↔Wi-Fi re-bind ─────────
+
+    private fun isTrusted(rawSsid: String?): Boolean {
+        if (rawSsid == null) return false
+        val trusted = trustedRepo.activeTrustedSsids()
+        if (trusted.isEmpty()) return false
+        return NativeBridge.nativeSsidMatches(rawSsid, trusted)
+    }
+
+    private fun extractRawSsid(caps: NetworkCapabilities): String? {
+        val info = caps.transportInfo
+        return if (info is WifiInfo) info.ssid else null
+    }
+
+    /**
+     * React to a default-network capabilities update. Decides between
+     * auto-pause (entered trusted SSID), auto-resume (left trusted SSID), and
+     * the LTE↔Wi-Fi re-bind from task 3b-1 — making sure pause and re-bind
+     * never both fire for the same change.
+     */
+    private fun maybeEvaluate(network: Network, caps: NetworkCapabilities) {
+        val raw = extractRawSsid(caps)
+        currentRawSsid = raw
+        // Unblock startVpn's initial-trust wait now that we have an SSID verdict.
+        firstCapsSignal?.complete(Unit)
+
+        val trusted = isTrusted(raw)
+        when (_stateFlow.value.phase) {
+            Phase.Paused -> {
+                if (!trusted) {
+                    scope.launch { requestResume() }
+                } else {
+                    // Still trusted — refresh the notification SSID if it changed.
+                    val display = raw?.let { NativeBridge.nativeNormalizeSsid(it) }
+                    if (display != null && display != _stateFlow.value.pausedSsid) {
+                        publish(Phase.Paused, snapshot = null, pausedSsid = display)
+                        updateNotification()
+                    }
+                }
+            }
+            Phase.Connected, Phase.Finalizing -> {
+                if (trusted && network != overrideNetwork) {
+                    pendingSwitch = false
+                    scope.launch { requestPause(raw) }
+                } else if (!trusted && pendingSwitch) {
+                    pendingSwitch = false
+                    NativeBridge.nativeOnNetworkChanged()
+                }
+            }
+            else -> {
+                // Preparing/Connecting/Stopping/Idle/Error: don't act. The
+                // connect path (initial-trust wait + Connected backstop)
+                // owns the trusted decision during bring-up.
+            }
+        }
+    }
 
     private fun registerUnderlyingNetworkCallback() {
         if (networkCallback != null) return
@@ -398,10 +611,12 @@ class XrVpnService : VpnService() {
     }
 
     /**
-     * Watch the default uplink and re-bind the tunnel when it changes
-     * (LTE↔Wi-Fi). `registerDefaultNetworkCallback` reports exactly the network
-     * the OS routes through; for a VPN app that is the underlying physical
-     * network, not our own tunnel — so there's no resolve-loop concern here.
+     * Watch the default uplink for re-bind (LTE↔Wi-Fi, task 3b-1) and trusted
+     * SSID transitions (task 3b-2). `registerDefaultNetworkCallback` reports
+     * exactly the network the OS routes through; for a VPN app that is the
+     * underlying physical network, not our own tunnel — so there's no
+     * resolve-loop concern here. SSID lives in the capabilities, so the actual
+     * decision happens in onCapabilitiesChanged (where we know the network).
      */
     private fun registerDefaultNetworkRebindCallback(cm: ConnectivityManager) {
         if (defaultNetworkCallback != null) return
@@ -409,13 +624,20 @@ class XrVpnService : VpnService() {
             override fun onAvailable(network: Network) {
                 val previous = currentDefaultNetwork
                 currentDefaultNetwork = network
-                // Only re-bind on a *real* switch. The first onAvailable
-                // (previous == null) is the initial uplink the engine already
-                // established on; a repeated callback for the same Network is
-                // not a switch either.
+                // A real switch — owe a re-bind (deferred until onCapabilities
+                // tells us the new network isn't trusted; see maybeEvaluate).
                 if (previous != null && previous != network) {
-                    NativeBridge.nativeOnNetworkChanged()
+                    pendingSwitch = true
+                    overrideNetwork = null
                 }
+            }
+            override fun onCapabilitiesChanged(
+                network: Network,
+                caps: NetworkCapabilities,
+            ) {
+                // Ignore stale callbacks for a network that's no longer default.
+                if (network != currentDefaultNetwork) return
+                maybeEvaluate(network, caps)
             }
         }
         try {
@@ -432,6 +654,9 @@ class XrVpnService : VpnService() {
         defaultNetworkCallback?.let { cb ->
             defaultNetworkCallback = null
             currentDefaultNetwork = null
+            currentRawSsid = null
+            pendingSwitch = false
+            overrideNetwork = null
             try {
                 cm?.unregisterNetworkCallback(cb)
             } catch (_: IllegalArgumentException) {
@@ -455,11 +680,13 @@ class XrVpnService : VpnService() {
         phase: Phase,
         snapshot: StatsSnapshot? = _stateFlow.value.snapshot,
         errorMessage: String? = null,
+        pausedSsid: String? = if (phase == Phase.Paused) _stateFlow.value.pausedSsid else null,
     ) {
         _stateFlow.value = _stateFlow.value.copy(
             phase = phase,
             snapshot = snapshot,
             errorMessage = errorMessage,
+            pausedSsid = pausedSsid,
         )
     }
 
@@ -554,6 +781,8 @@ class XrVpnService : VpnService() {
             Phase.Connected -> state.snapshot?.let { s ->
                 "↑${formatBytes(s.bytesUp)} ↓${formatBytes(s.bytesDown)} • ${formatUptime(s.uptime)}"
             } ?: "Подключено"
+            Phase.Paused -> state.pausedSsid?.let { "На паузе · доверенная сеть «$it»" }
+                ?: "На паузе · доверенная сеть"
             Phase.Stopping -> "Отключение…"
             Phase.Error -> state.errorMessage ?: "Ошибка"
         }
@@ -564,7 +793,7 @@ class XrVpnService : VpnService() {
             stopIntent,
         ).build()
 
-        return Notification.Builder(this, CHANNEL_ID)
+        val builder = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("XR Proxy")
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_notification)
@@ -575,8 +804,24 @@ class XrVpnService : VpnService() {
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setColor(ContextCompat.getColor(this, R.color.brand_primary))
             .setColorized(true)
-            .addAction(stopAction)
-            .build()
+
+        if (state.phase == Phase.Paused) {
+            // Offer a one-tap override to keep proxying on this trusted network.
+            val resumeIntent = PendingIntent.getService(
+                this, 1,
+                Intent(this, XrVpnService::class.java).apply { action = ACTION_RESUME_OVERRIDE },
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            builder.addAction(
+                Notification.Action.Builder(
+                    Icon.createWithResource(this, R.drawable.ic_notification),
+                    "Включить здесь",
+                    resumeIntent,
+                ).build()
+            )
+        }
+        builder.addAction(stopAction)
+        return builder.build()
     }
 
     private fun formatBytes(bytes: Long): String = when {

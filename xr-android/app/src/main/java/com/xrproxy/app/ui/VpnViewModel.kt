@@ -42,6 +42,7 @@ enum class ConnectPhase {
     Connecting,
     Finalizing,
     Connected,
+    Paused,
     Stopping,
     ;
 
@@ -86,11 +87,15 @@ data class VpnUiState(
     val debugMsg: String = "",
     val recentErrors: List<String> = emptyList(),
     val debugExpanded: Boolean = false,
+    /** SSID of the trusted network the tunnel is paused on, when [phase] is Paused. */
+    val pausedSsid: String? = null,
 ) {
     val connected: Boolean
         get() = phase == ConnectPhase.Connected
     val connecting: Boolean
         get() = phase.isTransitioning
+    val paused: Boolean
+        get() = phase == ConnectPhase.Paused
 }
 
 class VpnViewModel(application: Application) : AndroidViewModel(application) {
@@ -98,6 +103,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private val prefs = application.getSharedPreferences("xr_proxy", Context.MODE_PRIVATE)
 
     val repo = ServerRepository(prefs)
+
+    val trustedRepo = com.xrproxy.app.data.TrustedNetworksRepository(prefs)
 
     private val _uiState = MutableStateFlow(VpnUiState())
     val uiState: StateFlow<VpnUiState> = _uiState
@@ -236,6 +243,42 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun clearLog() { boundService?.clearLog() }
+
+    // ── Trusted networks / auto-pause (task 3b-2) ───────────────────
+
+    fun addTrustedNetwork(ssid: String) {
+        val clean = ssid.trim()
+        if (clean.isBlank()) {
+            emitMessage("Введите имя сети (SSID)", UiSeverity.Info)
+            return
+        }
+        trustedRepo.add(clean)
+    }
+
+    fun removeTrustedNetwork(ssid: String) = trustedRepo.remove(ssid)
+
+    fun setTrustedAutoPauseEnabled(enabled: Boolean) = trustedRepo.setEnabled(enabled)
+
+    /**
+     * Best-effort current Wi-Fi SSID for the "add current network" shortcut.
+     * Prefers the running service's non-redacted value; otherwise queries the
+     * active network's capabilities (which may be redacted to "<unknown ssid>"
+     * without location permission — returns null then, and the user types it
+     * manually). Normalized through the Rust bridge.
+     */
+    fun suggestCurrentSsid(): String? {
+        val fromService = boundService?.currentRawSsidOrNull()
+        val raw = fromService ?: run {
+            val cm = getApplication<Application>()
+                .getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return null
+            val net = cm.activeNetwork ?: return null
+            val caps = cm.getNetworkCapabilities(net) ?: return null
+            val info = caps.transportInfo
+            if (info is android.net.wifi.WifiInfo) info.ssid else null
+        } ?: return null
+        return NativeBridge.nativeNormalizeSsid(raw)
+    }
 
     fun toggleDebug() {
         _uiState.value = _uiState.value.copy(debugExpanded = !_uiState.value.debugExpanded)
@@ -452,6 +495,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             XrVpnService.Phase.Connecting -> ConnectPhase.Connecting
             XrVpnService.Phase.Finalizing -> ConnectPhase.Finalizing
             XrVpnService.Phase.Connected -> ConnectPhase.Connected
+            XrVpnService.Phase.Paused -> ConnectPhase.Paused
             XrVpnService.Phase.Stopping -> ConnectPhase.Stopping
             XrVpnService.Phase.Error -> ConnectPhase.Idle
         }
@@ -461,6 +505,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             XrVpnService.Phase.Connecting -> "Connecting..."
             XrVpnService.Phase.Finalizing -> "Finalizing..."
             XrVpnService.Phase.Connected -> "Connected"
+            XrVpnService.Phase.Paused -> "Paused"
             XrVpnService.Phase.Stopping -> "Disconnecting..."
             XrVpnService.Phase.Error -> "Error"
         }
@@ -483,6 +528,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             relayErrors = snap?.relayErrors ?: 0,
             debugMsg = snap?.debugMsg ?: "",
             recentErrors = snap?.recentErrors ?: emptyList(),
+            pausedSsid = svcState.pausedSsid,
         )
         if (svcState.phase == XrVpnService.Phase.Error && svcState.errorMessage != null) {
             emitMessage(svcState.errorMessage, UiSeverity.Error)

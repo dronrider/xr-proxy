@@ -78,6 +78,23 @@ object NativeBridge {
      * waiting for the slow consecutive-timeout detector. No-op if not running.
      */
     external fun nativeOnNetworkChanged()
+
+    /**
+     * True if the raw current SSID (as returned by `WifiInfo.getSSID()`,
+     * quotes and all) matches any entry in `trusted`. Pure string logic in
+     * Rust (`xr_core::trusted`) — case-insensitive, quote/whitespace-tolerant,
+     * and treats unavailable/hidden SSIDs (`<unknown ssid>`, empty) as
+     * non-matching. Safe to call whether or not the engine is running.
+     */
+    external fun nativeSsidMatches(currentRawSsid: String, trusted: Array<String>): Boolean
+
+    /**
+     * Normalize a raw `WifiInfo.getSSID()` value for display — strips the
+     * surrounding quotes Android adds. Returns null for an unavailable/hidden
+     * network (so the caller can fall back to a generic label).
+     */
+    external fun nativeNormalizeSsid(raw: String): String?
+
     external fun nativeGetState(): String
     external fun nativeGetStats(): String
     /** Get full error log (newline-separated). */
