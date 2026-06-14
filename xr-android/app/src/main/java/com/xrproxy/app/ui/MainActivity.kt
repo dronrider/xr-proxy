@@ -25,13 +25,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
-import java.io.File
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
@@ -51,6 +48,9 @@ import com.xrproxy.app.ui.servers.AddServerDialog
 import com.xrproxy.app.ui.servers.ServerEditScreen
 import com.xrproxy.app.ui.servers.ServerSwitcherChip
 import com.xrproxy.app.ui.servers.ServerSwitcherSheet
+import com.xrproxy.app.ui.logs.LogList
+import com.xrproxy.app.ui.logs.LogToolbar
+import com.xrproxy.app.ui.logs.filterLog
 import com.xrproxy.app.ui.servers.ServersSection
 import com.xrproxy.app.ui.theme.XrTheme
 import com.xrproxy.app.ui.trusted.TrustedNetworksSection
@@ -168,6 +168,14 @@ fun MainScreen(
     val ssidPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissionEpoch++ }
+
+    // SAF document picker for downloading the log (LLD-03 §3.5). Writes the
+    // full log to the user-chosen location; no storage permission needed.
+    val downloadLogLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri ->
+        if (uri != null) viewModel.writeLogTo(uri, permissionContext.contentResolver)
+    }
     val requestSsidPermission: () -> Unit = {
         val perms = buildList {
             add(Manifest.permission.ACCESS_FINE_LOCATION)
@@ -393,16 +401,19 @@ fun MainScreen(
             }
         }
     ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .padding(horizontal = 24.dp)
-                .verticalScroll(rememberScrollState()),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            when (currentTab) {
-                0 -> ConnectionSection(
+        // The Log tab hosts its own LazyColumn (sticky toolbar + virtualized
+        // list, LLD-03), so it must NOT sit inside a verticalScroll parent —
+        // each tab picks the container it needs.
+        when (currentTab) {
+            0 -> Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .padding(horizontal = 24.dp)
+                    .verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                ConnectionSection(
                     state = state,
                     activeServer = activeServer,
                     onConnect = { viewModel.onConnectClicked() },
@@ -411,31 +422,43 @@ fun MainScreen(
                     onSwitcherClick = { switcherSheetOpen = true },
                     snackbarHostState = snackbarHostState,
                 )
-                1 -> LogSection(state, viewModel)
-                2 -> {
-                    ServersSection(
-                        servers = servers,
-                        activeId = activeId,
-                        isConnected = state.connected,
-                        onSetActive = { viewModel.selectServer(it) },
-                        onEdit = { editMode = EditMode.Edit(it) },
-                        onDelete = { viewModel.deleteServer(it) },
-                        onAddServer = { addServerDialogOpen = true },
-                    )
-                    TrustedNetworksSection(
-                        networks = trustedNetworks,
-                        enabled = trustedEnabled,
-                        hasPermission = hasSsidPermission,
-                        onToggleEnabled = { enabled ->
-                            viewModel.setTrustedAutoPauseEnabled(enabled)
-                            if (enabled && !hasSsidPermission) requestSsidPermission()
-                        },
-                        onAdd = { viewModel.addTrustedNetwork(it) },
-                        onRemove = { viewModel.removeTrustedNetwork(it) },
-                        onRequestPermission = requestSsidPermission,
-                        suggestCurrentSsid = { viewModel.suggestCurrentSsid() },
-                    )
-                }
+            }
+            1 -> LogSection(
+                state = state,
+                viewModel = viewModel,
+                onDownload = { name -> downloadLogLauncher.launch(name) },
+                modifier = Modifier.fillMaxSize().padding(padding),
+            )
+            2 -> Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .padding(horizontal = 24.dp)
+                    .verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                ServersSection(
+                    servers = servers,
+                    activeId = activeId,
+                    isConnected = state.connected,
+                    onSetActive = { viewModel.selectServer(it) },
+                    onEdit = { editMode = EditMode.Edit(it) },
+                    onDelete = { viewModel.deleteServer(it) },
+                    onAddServer = { addServerDialogOpen = true },
+                )
+                TrustedNetworksSection(
+                    networks = trustedNetworks,
+                    enabled = trustedEnabled,
+                    hasPermission = hasSsidPermission,
+                    onToggleEnabled = { enabled ->
+                        viewModel.setTrustedAutoPauseEnabled(enabled)
+                        if (enabled && !hasSsidPermission) requestSsidPermission()
+                    },
+                    onAdd = { viewModel.addTrustedNetwork(it) },
+                    onRemove = { viewModel.removeTrustedNetwork(it) },
+                    onRequestPermission = requestSsidPermission,
+                    suggestCurrentSsid = { viewModel.suggestCurrentSsid() },
+                )
             }
         }
     }
@@ -622,85 +645,46 @@ fun ConnectionSection(
     Spacer(Modifier.height(16.dp))
 }
 
-// ── Log tab ─────────────────────────────────────────────────────────
+// ── Log tab (LLD-03) ────────────────────────────────────────────────
 
 @Composable
-fun LogSection(state: VpnUiState, viewModel: VpnViewModel) {
-    val clipboardManager = LocalClipboardManager.current
+fun LogSection(
+    state: VpnUiState,
+    viewModel: VpnViewModel,
+    onDownload: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val context = LocalContext.current
-
-    val logText = state.recentErrors.joinToString("\n")
-    val warns = state.recentErrors.warnCount
-    val errs = state.recentErrors.errorCount
-
-    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-        horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-        val header = when {
-            errs > 0 && warns > 0 -> "Log ($errs errors, $warns warnings)"
-            errs > 0 -> "Log ($errs errors)"
-            warns > 0 -> "Log ($warns warnings)"
-            else -> "Log"
-        }
-        Text(header, style = MaterialTheme.typography.titleMedium)
-        Row {
-            IconButton(onClick = {
-                clipboardManager.setText(AnnotatedString(logText))
-            }) { Icon(Icons.Default.ContentCopy, "Copy") }
-            IconButton(onClick = {
-                try {
-                    val file = File(context.cacheDir, "xr-proxy.log")
-                    file.writeText(logText)
-                    val uri = androidx.core.content.FileProvider.getUriForFile(
-                        context, "${context.packageName}.fileprovider", file
-                    )
-                    val intent = Intent(Intent.ACTION_SEND).apply {
-                        type = "text/plain"
-                        putExtra(Intent.EXTRA_STREAM, uri)
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    }
-                    context.startActivity(Intent.createChooser(intent, "Share log"))
-                } catch (_: Exception) {
-                    clipboardManager.setText(AnnotatedString(logText))
-                }
-            }) { Icon(Icons.Default.Share, "Share") }
-            IconButton(onClick = { viewModel.clearLog() }) {
-                Icon(Icons.Default.Delete, "Clear")
-            }
-        }
+    val filter = remember(state.recentErrors, state.logQuery, state.logRegexMode) {
+        filterLog(state.recentErrors, state.logQuery, state.logRegexMode)
     }
+    val totalWarn = state.recentErrors.warnCount
+    val matchedWarn = filter.entries.warnCount
 
-    if (state.recentErrors.isEmpty()) {
-        Spacer(Modifier.height(32.dp))
-        Text("No entries", style = MaterialTheme.typography.bodyLarge,
-            color = MaterialTheme.colorScheme.onSurfaceVariant)
-    } else {
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        ) {
-            Text(
-                text = colorizeLog(logText),
-                modifier = Modifier.padding(12.dp),
-                style = MaterialTheme.typography.bodySmall,
-                fontSize = 11.sp, lineHeight = 16.sp,
-            )
-        }
+    Column(modifier) {
+        LogToolbar(
+            matchedWarn = matchedWarn,
+            totalWarn = totalWarn,
+            query = state.logQuery,
+            regexMode = state.logRegexMode,
+            invalidRegex = filter.invalidRegex,
+            onQueryChange = viewModel::updateLogQuery,
+            onToggleRegex = viewModel::toggleLogRegexMode,
+            onCopy = viewModel::copyLog,
+            onDownload = { onDownload(defaultLogFileName()) },
+            onShare = { viewModel.shareLog(context) },
+            onClear = viewModel::clearLog,
+        )
+        LogList(
+            entries = filter.entries,
+            queryActive = state.logQuery.isNotBlank(),
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+        )
     }
-    Spacer(Modifier.height(16.dp))
 }
 
-@Composable
-fun colorizeLog(log: String): AnnotatedString {
-    val errColor = MaterialTheme.colorScheme.error
-    val warnColor = Color(0xFFFFA726)
-    return buildAnnotatedString {
-        for (line in log.lines()) {
-            when {
-                line.contains(" ERROR ") -> withStyle(SpanStyle(color = errColor)) { append(line) }
-                line.contains(" WARN ") -> withStyle(SpanStyle(color = warnColor)) { append(line) }
-                else -> append(line)
-            }
-            append("\n")
-        }
-    }
+private fun defaultLogFileName(): String {
+    val ts = java.time.LocalDateTime.now()
+        .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd-HHmmss"))
+    return "xr-proxy-log-$ts.txt"
 }

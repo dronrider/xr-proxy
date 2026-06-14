@@ -1,6 +1,6 @@
 # LLD-03 — Android Logs UX
 
-**Статус:** Draft
+**Статус:** Implemented
 **Область:** `xr-android` (вкладка Log)
 **Зависимости:** [LLD-02](02-android-reliability.md) — предполагаем, что `recentErrors: List<String>` уже единственный источник лога, обновляется polling'ом в `XrVpnService`, бадж считается как `recentErrors.warnCount`, поле `errorLog` и `refreshLog()` удалены. [LLD-06](06-android-visual.md) — палитра и компоненты.
 **Связанные документы:** [ARCHITECTURE.md §4.6, §8](../ARCHITECTURE.md)

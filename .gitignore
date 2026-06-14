@@ -1,7 +1,7 @@
 .DS_Store
 target
 xr-server/.vscode/launch.json
-logs/
+/logs/
 tmp/
 # Локальные доки с чувствительными данными (IP/доступы инфры) — не в git.
 local-docs/

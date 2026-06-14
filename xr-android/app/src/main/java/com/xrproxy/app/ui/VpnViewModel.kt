@@ -89,6 +89,9 @@ data class VpnUiState(
     val debugExpanded: Boolean = false,
     /** SSID of the trusted network the tunnel is paused on, when [phase] is Paused. */
     val pausedSsid: String? = null,
+    /** Log tab search query (LLD-03). Lives in VM so it survives tab switches. */
+    val logQuery: String = "",
+    val logRegexMode: Boolean = false,
 ) {
     val connected: Boolean
         get() = phase == ConnectPhase.Connected
@@ -243,6 +246,67 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun clearLog() { boundService?.clearLog() }
+
+    // ── Log tab (LLD-03) ────────────────────────────────────────────
+
+    fun updateLogQuery(q: String) {
+        _uiState.value = _uiState.value.copy(logQuery = q)
+    }
+
+    fun toggleLogRegexMode() {
+        _uiState.value = _uiState.value.copy(logRegexMode = !_uiState.value.logRegexMode)
+    }
+
+    /** Full, unfiltered log — toolbar actions always operate on this, the
+     *  search field is only a visual filter (LLD-03 §2.4). */
+    private fun buildFullLog(): String = _uiState.value.recentErrors.joinToString("\n")
+
+    fun copyLog() {
+        val cm = getApplication<Application>()
+            .getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+        if (cm == null) {
+            emitMessage("Буфер обмена недоступен", UiSeverity.Warn)
+            return
+        }
+        cm.setPrimaryClip(android.content.ClipData.newPlainText("xr-proxy log", buildFullLog()))
+        emitMessage("Скопировано", UiSeverity.Info)
+    }
+
+    fun shareLog(context: Context) {
+        try {
+            val file = File(context.cacheDir, "xr-proxy.log")
+            file.writeText(buildFullLog())
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                context, "${context.packageName}.fileprovider", file,
+            )
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(Intent.createChooser(intent, "Share log"))
+        } catch (e: Exception) {
+            emitMessage("Не удалось поделиться: ${e.message}", UiSeverity.Error)
+        }
+    }
+
+    /** Write the full log to a user-chosen SAF document (LLD-03 §3.5). */
+    fun writeLogTo(uri: android.net.Uri, resolver: android.content.ContentResolver) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                resolver.openOutputStream(uri)?.use { out ->
+                    out.writer(Charsets.UTF_8).use { w ->
+                        _uiState.value.recentErrors.forEach { line ->
+                            w.write(line); w.write("\n")
+                        }
+                    }
+                }
+                emitMessage("Лог сохранён", UiSeverity.Info)
+            } catch (e: Exception) {
+                emitMessage("Не удалось сохранить: ${e.message}", UiSeverity.Error)
+            }
+        }
+    }
 
     // ── Trusted networks / auto-pause (task 3b-2) ───────────────────
 
