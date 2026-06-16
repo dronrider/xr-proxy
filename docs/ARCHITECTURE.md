@@ -446,10 +446,22 @@ GeoIP (за feature-flag).
 | 3 | [06-android-visual.md](lld/06-android-visual.md) | Иконка «щит со стрелой-молнией», тёмная палитра navy + cyan, анимация `ShieldArrowIcon` по фазам, перекомпоновка статистики с live-скоростью, Debug за аккордеоном. Параллелится с шагом 2. | Шаг 1 | Implemented |
 | 4 | [04-onboarding-qr-uri.md](lld/04-onboarding-qr-uri.md) | Welcome-экран, Google Code Scanner, HTTPS deep link, экран подтверждения инвайта, TOFU public key. | Шаги 1-3 | Implemented |
 | 5 | [03-android-logs-ux.md](lld/03-android-logs-ux.md) | Sticky toolbar, substring + regex поиск, auto-follow, скачивание через SAF. | Шаг 1 | Implemented |
-| 6 | [05-android-rules-editor.md](lld/05-android-rules-editor.md) | Четвёртая вкладка Rules, read-only пресет + упорядоченные user overrides, TOML-preview модал, удаление хардкода `PRESET_RUSSIA`. Закрывает всю пачку. | Шаги 1, 2, 4 | Draft |
+| 6 | [05-android-rules-editor.md](lld/05-android-rules-editor.md) | Четвёртая вкладка Rules, read-only пресет + упорядоченные user overrides, TOML-preview модал, удаление хардкода `PRESET_RUSSIA`. Закрывает всю пачку. **Единая модель правил с LLD-14** (`RuleFragment` в `xr-proto`). | Шаги 1, 2, 4 | Draft |
 | 7 | [07-android-per-app-tunnel.md](lld/07-android-per-app-tunnel.md) | Per-app split tunneling: `VpnService.Builder.addAllowed/DisallowedApplication`. Три режима (all/exclude/include), picker приложений, QUERY_ALL_PACKAGES. Фикс жалоб приложений на «вы используете VPN», когда их трафик идёт direct. | Шаг 1 | Draft |
 | 8 | [08-android-multi-server.md](lld/08-android-multi-server.md) | Мультисерверная модель: `ServerProfile` + `ServerRepository`, переключатель серверов (chip + BottomSheet) на главном экране, вкладка Servers (CRUD), Edit с реконнектом, Delete с disconnect, миграция из flat-prefs, интеграция с LLD-04 (Apply = добавить профиль). | Шаги 1, 4 | Draft |
 | 9 | [09-multi-mux-pool.md](lld/09-multi-mux-pool.md) | Multi-mux pool: `MuxPool` ведёт N (default 4) параллельных TCP-туннелей к VPS, стримы балансируются round-robin, failover при разрыве слота. Устраняет HoL-blocking одного TCP — главный bottleneck по медленному старту стримов (5-7с/Mac, 20с/Android) после фиксов 104c268/dde442b/3a56e89. | — | Implemented |
+| 10 | [10-router-multi-vps-failover.md](lld/10-router-multi-vps-failover.md) | Multi-VPS failover на роутере: `ServerPool` поверх нескольких `MuxPool` (по одному на сервер), primary/backup по приоритету, пассивный (breaker C1) + активный health-check, sticky-to-primary с failback hold-down. Обобщает LLD-09 от пула TCP до пула серверов. | Шаг 9 (LLD-09) | Draft |
+| 11 | [11-monitoring-health-panel.md](lld/11-monitoring-health-panel.md) | Мониторинг + уведомления + панель здоровья: классификация сбоя (`ServerUnreachable`/`HandshakeReset`/`AuthFailed`) в breaker, слои индикатора вместо смайлика, локальные уведомления падение/восстановление, напоминание об оплате (`paidUntil` в профиле). Объединяет задачи 6 и 10. | Шаги 3, 8 (LLD-08), 10 | Draft |
+| 12 | [12-android-apk-self-update.md](lld/12-android-apk-self-update.md) | Самообновление APK: xr-hub раздаёт APK + подписанный манифест версии, приложение проверяет подпись **отдельным release-ключом** (pinned в сборке, ≠ серверный ключ) + SHA-256, ставит через `PackageInstaller`. VPS-compromise ≠ RCE. | Шаг 2 (LLD-01) | Draft |
+| 13 | [13-zero-touch-provisioning.md](lld/13-zero-touch-provisioning.md) | Zero-touch provisioning: идемпотентный `xr-bootstrap` (VPS: xr-server+xr-hub; роутер: xr-client) + Android SSH-обёртка. Один движок, два профиля. Заканчивается выдачей инвайта (LLD-04). Этап 1 (bootstrap) — MVP, этап 2 (SSH из приложения) — поверх. | Шаги 2, 4, 8 (LLD-08), 10 | Draft |
+| 14 | [14-hub-hybrid-rules-editor.md](lld/14-hub-hybrid-rules-editor.md) | Гибридный редактор правил в xr-hub: TOML — источник правды (комментарии-категории), JSON — derived; фрагмент-мастер + сырой TOML, line-surgical правки. **Единая модель `RuleFragment` с LLD-05.** | Шаг 2 + LLD-05 | Draft |
+
+**Предварительный порядок реализации второго пакета (C6+):** LLD-03 ✓ →
+**LLD-10** (failover-движок) → **LLD-08** (Android мультисервер) → **LLD-11**
+(панель здоровья поверх 10+08) → **LLD-05 + LLD-14** связкой (общий `RuleFragment`)
+→ **LLD-12** (self-update) → **LLD-13** (provisioning) → **LLD-07** (per-app, по
+ситуации). Номера шагов в таблице — историческая нумерация (порядок появления
+LLD); фактическую очередь задаёт этот список и колонка «Зависит от».
 
 ## 10. Как поддерживать этот документ
 
