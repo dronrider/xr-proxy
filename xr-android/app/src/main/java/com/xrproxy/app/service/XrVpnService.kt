@@ -14,6 +14,7 @@ import android.net.NetworkRequest
 import android.net.VpnService
 import android.net.wifi.WifiInfo
 import android.os.Binder
+import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import androidx.core.content.ContextCompat
@@ -651,24 +652,25 @@ class XrVpnService : VpnService() {
      */
     private fun registerDefaultNetworkRebindCallback(cm: ConnectivityManager) {
         if (defaultNetworkCallback != null) return
-        val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                val previous = currentDefaultNetwork
-                currentDefaultNetwork = network
-                // A real switch — owe a re-bind (deferred until onCapabilities
-                // tells us the new network isn't trusted; see maybeEvaluate).
-                if (previous != null && previous != network) {
-                    pendingSwitch = true
-                    overrideNetwork = null
-                }
-            }
-            override fun onCapabilitiesChanged(
-                network: Network,
-                caps: NetworkCapabilities,
+        // CRITICAL for SSID detection: on API 31+ the SSID inside
+        // NetworkCapabilities.transportInfo is redacted to "<unknown ssid>"
+        // unless the callback is registered with FLAG_INCLUDE_LOCATION_INFO
+        // (even with ACCESS_FINE_LOCATION granted and location services on).
+        // Without it, trusted-network matching silently never fires. The flag
+        // constructor only exists on API 31+, so branch by SDK.
+        val callback = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            object : ConnectivityManager.NetworkCallback(
+                ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO,
             ) {
-                // Ignore stale callbacks for a network that's no longer default.
-                if (network != currentDefaultNetwork) return
-                maybeEvaluate(network, caps)
+                override fun onAvailable(network: Network) = onDefaultAvailable(network)
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
+                    onDefaultCaps(network, caps)
+            }
+        } else {
+            object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) = onDefaultAvailable(network)
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
+                    onDefaultCaps(network, caps)
             }
         }
         try {
@@ -678,6 +680,23 @@ class XrVpnService : VpnService() {
             // Best-effort: without it, a network switch still recovers via the
             // slow native consecutive-timeout detector — just not instantly.
         }
+    }
+
+    private fun onDefaultAvailable(network: Network) {
+        val previous = currentDefaultNetwork
+        currentDefaultNetwork = network
+        // A real switch — owe a re-bind (deferred until onCapabilities tells us
+        // the new network isn't trusted; see maybeEvaluate).
+        if (previous != null && previous != network) {
+            pendingSwitch = true
+            overrideNetwork = null
+        }
+    }
+
+    private fun onDefaultCaps(network: Network, caps: NetworkCapabilities) {
+        // Ignore stale callbacks for a network that's no longer default.
+        if (network != currentDefaultNetwork) return
+        maybeEvaluate(network, caps)
     }
 
     private fun unregisterUnderlyingNetworkCallback() {
