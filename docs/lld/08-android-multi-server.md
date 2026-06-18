@@ -1,6 +1,6 @@
 # LLD-08 — Android: мультисерверная модель
 
-**Статус:** Draft
+**Статус:** Implemented (коммит `f02fa36`; ServerProfile/ServerRepository, switcher, вкладка Servers CRUD, миграция — всё в коде)
 **Область:** `xr-android` — модель хранения подключений, переключатель
 серверов на главном экране, вкладка Servers (CRUD), миграция со
 single-server prefs, интеграция с onboarding'ом из LLD-04.

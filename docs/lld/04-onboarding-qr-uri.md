@@ -1,6 +1,6 @@
 # LLD-04 — Onboarding: QR / URI / одноразовые инвайты
 
-**Статус:** Draft
+**Статус:** Implemented
 **Область:** `xr-android` (новые экраны, deep link, QR-сканер, применение инвайта)
 **Зависимости:** [LLD-01](01-control-plane.md) — использует `Invite`, `InvitePayload`, эндпоинт `/api/v1/invite/:token`. [LLD-02](02-android-reliability.md) — работает поверх `VpnViewModel` / `XrVpnService` binder-архитектуры. [LLD-06](06-android-visual.md) — использует `XrTheme` и общие компоненты.
 **Связанные документы:** [ARCHITECTURE.md §4.6](../ARCHITECTURE.md)
