@@ -418,6 +418,7 @@ fun MainScreen(
                     activeServer = activeServer,
                     onConnect = { viewModel.onConnectClicked() },
                     onDisconnect = viewModel::disconnect,
+                    onResumeHere = { viewModel.resumeOnTrustedNetwork() },
                     onToggleDebug = viewModel::toggleDebug,
                     onSwitcherClick = { switcherSheetOpen = true },
                     snackbarHostState = snackbarHostState,
@@ -457,7 +458,7 @@ fun MainScreen(
                     onAdd = { viewModel.addTrustedNetwork(it) },
                     onRemove = { viewModel.removeTrustedNetwork(it) },
                     onRequestPermission = requestSsidPermission,
-                    suggestCurrentSsid = { viewModel.suggestCurrentSsid() },
+                    availableSsids = { viewModel.availableSsids() },
                 )
             }
         }
@@ -472,6 +473,7 @@ fun ConnectionSection(
     activeServer: ServerProfile?,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
+    onResumeHere: () -> Unit,
     onToggleDebug: () -> Unit,
     onSwitcherClick: () -> Unit,
     snackbarHostState: SnackbarHostState,
@@ -519,23 +521,6 @@ fun ConnectionSection(
         Spacer(Modifier.height(4.dp))
         Text(substep, style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
-    }
-
-    // Paused: explain why and on which trusted network.
-    if (state.paused) {
-        Spacer(Modifier.height(4.dp))
-        val pausedDetail = state.pausedSsid?.let { "Доверенная сеть «$it» — туннель не нужен" }
-            ?: "Доверенная сеть — туннель не нужен"
-        Text(
-            pausedDetail,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Text(
-            "Поднимется автоматически при уходе из сети",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.outline,
-        )
     }
 
     // Version
@@ -589,6 +574,62 @@ fun ConnectionSection(
             else -> "Connect"
         }
         Text(btnText, style = MaterialTheme.typography.titleMedium)
+    }
+
+    // Paused on a trusted network: explicit "tunnel intentionally off" block
+    // with the restriction warning and an override (task 3b-2 §1.1, §2).
+    if (state.paused) {
+        Spacer(Modifier.height(24.dp))
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant,
+            ),
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Shield, null, tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.width(12.dp))
+                    Column {
+                        Text(
+                            state.pausedSsid?.let { "Доверенная сеть «$it»" } ?: "Доверенная сеть",
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Text(
+                            "VPN на паузе — трафик идёт напрямую через эту сеть",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+
+                if (state.restrictedNetwork) {
+                    Spacer(Modifier.height(12.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Warning, null, tint = Color(0xFFFFA726))
+                        Spacer(Modifier.width(12.dp))
+                        Text(
+                            "В этой сети есть ограничения — часть ресурсов сейчас " +
+                                "недоступна. Включите VPN здесь, если что-то не " +
+                                "открывается.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color(0xFFFFA726),
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
+                OutlinedButton(onClick = onResumeHere, modifier = Modifier.fillMaxWidth()) {
+                    Text("Включить здесь")
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Поднимется сам при уходе из сети",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+            }
+        }
     }
 
     // Statistics

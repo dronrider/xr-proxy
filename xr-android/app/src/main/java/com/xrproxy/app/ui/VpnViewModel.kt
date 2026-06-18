@@ -89,6 +89,8 @@ data class VpnUiState(
     val debugExpanded: Boolean = false,
     /** SSID of the trusted network the tunnel is paused on, when [phase] is Paused. */
     val pausedSsid: String? = null,
+    /** While paused: this trusted network failed the restriction probe (task 3b-2 §2). */
+    val restrictedNetwork: Boolean = false,
     /** Log tab search query (LLD-03). Lives in VM so it survives tab switches. */
     val logQuery: String = "",
     val logRegexMode: Boolean = false,
@@ -344,6 +346,39 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         return NativeBridge.nativeNormalizeSsid(raw)
     }
 
+    /**
+     * Best-effort list of nearby Wi-Fi SSIDs for the "add network" picker:
+     * the current network first, then cached scan results. Empty when location
+     * permission/services are off (the picker falls back to manual entry).
+     * Uses cached scanResults (no startScan) to avoid scan throttling.
+     */
+    @Suppress("DEPRECATION")
+    fun availableSsids(): List<String> {
+        val out = LinkedHashSet<String>()
+        suggestCurrentSsid()?.let { out.add(it) }
+        val wifi = getApplication<Application>()
+            .getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+        if (wifi != null) {
+            try {
+                for (sr in wifi.scanResults) {
+                    val raw = sr.SSID
+                    if (raw.isNullOrBlank()) continue
+                    NativeBridge.nativeNormalizeSsid(raw)?.let { out.add(it) }
+                }
+            } catch (_: SecurityException) {
+                // No location permission — leave whatever we have.
+            } catch (_: Exception) {
+                // OEM quirks — ignore, manual entry still works.
+            }
+        }
+        return out.toList()
+    }
+
+    /** Keep the tunnel running on the current trusted network ("Включить здесь"). */
+    fun resumeOnTrustedNetwork() {
+        boundService?.resumeOnTrustedNetwork()
+    }
+
     fun toggleDebug() {
         _uiState.value = _uiState.value.copy(debugExpanded = !_uiState.value.debugExpanded)
     }
@@ -593,6 +628,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             debugMsg = snap?.debugMsg ?: "",
             recentErrors = snap?.recentErrors ?: emptyList(),
             pausedSsid = svcState.pausedSsid,
+            restrictedNetwork = svcState.restrictedNetwork,
         )
         if (svcState.phase == XrVpnService.Phase.Error && svcState.errorMessage != null) {
             emitMessage(svcState.errorMessage, UiSeverity.Error)

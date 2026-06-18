@@ -1,14 +1,18 @@
 package com.xrproxy.app.ui.trusted
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Warning
@@ -52,7 +56,7 @@ fun TrustedNetworksSection(
     onAdd: (String) -> Unit,
     onRemove: (String) -> Unit,
     onRequestPermission: () -> Unit,
-    suggestCurrentSsid: () -> String?,
+    availableSsids: () -> List<String>,
 ) {
     var addDialogOpen by remember { mutableStateOf(false) }
 
@@ -140,7 +144,8 @@ fun TrustedNetworksSection(
 
     if (addDialogOpen) {
         AddTrustedNetworkDialog(
-            initialSsid = suggestCurrentSsid().orEmpty(),
+            available = availableSsids,
+            alreadyAdded = networks,
             onDismiss = { addDialogOpen = false },
             onConfirm = { ssid ->
                 addDialogOpen = false
@@ -152,39 +157,86 @@ fun TrustedNetworksSection(
 
 @Composable
 private fun AddTrustedNetworkDialog(
-    initialSsid: String,
+    available: () -> List<String>,
+    alreadyAdded: List<String>,
     onDismiss: () -> Unit,
     onConfirm: (String) -> Unit,
 ) {
-    var text by remember { mutableStateOf(initialSsid) }
+    // Read the scan/current-network list once when the dialog opens; exclude
+    // SSIDs already in the trusted list (case-insensitive).
+    val networks = remember {
+        available().filterNot { cand -> alreadyAdded.any { it.equals(cand, ignoreCase = true) } }
+    }
+    var manual by remember { mutableStateOf("") }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Добавить доверенную сеть") },
         text = {
             Column {
+                if (networks.isEmpty()) {
+                    Text(
+                        "Доступные сети не найдены. Нужны разрешение на " +
+                            "местоположение и включённая геолокация — или введите " +
+                            "имя сети вручную.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    Text(
+                        "Выберите сеть поблизости:",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 240.dp)
+                            .verticalScroll(rememberScrollState()),
+                    ) {
+                        for (ssid in networks) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onConfirm(ssid) }
+                                    .padding(vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    Icons.Default.Wifi, null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                )
+                                Spacer(Modifier.width(12.dp))
+                                Text(ssid, style = MaterialTheme.typography.bodyLarge)
+                            }
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
                 Text(
-                    "Имя Wi-Fi-сети (SSID), в которой туннель будет на паузе.",
+                    "Или вручную (например, скрытая сеть):",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
-                    value = text,
-                    onValueChange = { text = it },
+                    value = manual,
+                    onValueChange = { manual = it },
                     label = { Text("SSID") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    trailingIcon = {
+                        TextButton(onClick = { onConfirm(manual) }, enabled = manual.isNotBlank()) {
+                            Text("Добавить")
+                        }
+                    },
                     modifier = Modifier.fillMaxWidth(),
                 )
             }
         },
-        confirmButton = {
-            TextButton(
-                onClick = { onConfirm(text) },
-                enabled = text.isNotBlank(),
-            ) { Text("Добавить") }
-        },
+        confirmButton = {},
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Отмена") }
         },

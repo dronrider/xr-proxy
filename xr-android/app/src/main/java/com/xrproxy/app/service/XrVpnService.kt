@@ -38,6 +38,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
@@ -101,6 +102,10 @@ class XrVpnService : VpnService() {
         val health: HealthLevel = HealthLevel.Healthy,
         /** SSID display name when [phase] is [Phase.Paused], else null. */
         val pausedSsid: String? = null,
+        /** While paused: the trusted network failed the restriction probe —
+         *  blocked resources aren't reachable direct, so the pause risks
+         *  cutting access (task 3b-2 §2). */
+        val restrictedNetwork: Boolean = false,
     )
 
     inner class LocalBinder : Binder() {
@@ -157,6 +162,8 @@ class XrVpnService : VpnService() {
     // Completed by the first capabilities callback of a session, so startVpn
     // can wait briefly for the initial SSID before deciding to pause.
     @Volatile private var firstCapsSignal: CompletableDeferred<Unit>? = null
+    // Rotates which hosts the restriction probe picks across pauses.
+    @Volatile private var probeSeed = 0
 
     private val trustedRepo: TrustedNetworksRepository by lazy {
         TrustedNetworksRepository(getSharedPreferences("xr_proxy", Context.MODE_PRIVATE))
@@ -494,7 +501,31 @@ class XrVpnService : VpnService() {
         val display = rawSsid?.let { NativeBridge.nativeNormalizeSsid(it) }
         publish(Phase.Paused, snapshot = null, pausedSsid = display)
         updateNotification()
+        launchRestrictionProbe()
     }
+
+    /**
+     * While paused, check whether blocked resources are actually reachable on
+     * this network (tunnel is down → probe goes direct over the uplink). If a
+     * quorum is blocked, flag it so the UI/notification can warn that pausing
+     * here cuts access (task 3b-2 §2).
+     */
+    private fun launchRestrictionProbe() {
+        val seed = probeSeed++
+        scope.launch {
+            val net = NativeBridge.underlyingNetwork
+            val result = withContext(Dispatchers.IO) { RestrictionProbe.probe(net, seed) }
+            // Only apply if we're still paused (network may have changed).
+            if (_stateFlow.value.phase == Phase.Paused) {
+                _stateFlow.value = _stateFlow.value.copy(restrictedNetwork = result.restricted)
+                updateNotification()
+            }
+        }
+    }
+
+    /** UI ("Включить здесь") / notification action to keep the tunnel running
+     *  on the current trusted network until it changes. */
+    fun resumeOnTrustedNetwork() = resumeOverride()
 
     private suspend fun requestPause(rawSsid: String?) {
         transitionMutex.withLock {
@@ -681,12 +712,16 @@ class XrVpnService : VpnService() {
         snapshot: StatsSnapshot? = _stateFlow.value.snapshot,
         errorMessage: String? = null,
         pausedSsid: String? = if (phase == Phase.Paused) _stateFlow.value.pausedSsid else null,
+        // Reset the restriction flag whenever we leave the paused state; the
+        // probe re-sets it on the next pause.
+        restrictedNetwork: Boolean = if (phase == Phase.Paused) _stateFlow.value.restrictedNetwork else false,
     ) {
         _stateFlow.value = _stateFlow.value.copy(
             phase = phase,
             snapshot = snapshot,
             errorMessage = errorMessage,
             pausedSsid = pausedSsid,
+            restrictedNetwork = restrictedNetwork,
         )
     }
 
@@ -781,8 +816,11 @@ class XrVpnService : VpnService() {
             Phase.Connected -> state.snapshot?.let { s ->
                 "↑${formatBytes(s.bytesUp)} ↓${formatBytes(s.bytesDown)} • ${formatUptime(s.uptime)}"
             } ?: "Подключено"
-            Phase.Paused -> state.pausedSsid?.let { "На паузе · доверенная сеть «$it»" }
-                ?: "На паузе · доверенная сеть"
+            Phase.Paused -> {
+                val base = state.pausedSsid?.let { "На паузе · доверенная сеть «$it»" }
+                    ?: "На паузе · доверенная сеть"
+                if (state.restrictedNetwork) "$base · ⚠ в сети ограничения" else base
+            }
             Phase.Stopping -> "Отключение…"
             Phase.Error -> state.errorMessage ?: "Ошибка"
         }
