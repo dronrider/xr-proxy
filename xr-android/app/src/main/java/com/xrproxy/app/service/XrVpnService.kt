@@ -514,6 +514,9 @@ class XrVpnService : VpnService() {
     private fun launchRestrictionProbe() {
         val seed = probeSeed++
         scope.launch {
+            // Let routing settle after the TUN teardown before probing direct.
+            delay(1200)
+            if (_stateFlow.value.phase != Phase.Paused) return@launch
             val net = NativeBridge.underlyingNetwork
             val result = withContext(Dispatchers.IO) { RestrictionProbe.probe(net, seed) }
             // Only apply if we're still paused (network may have changed).

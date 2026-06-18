@@ -33,7 +33,7 @@ object RestrictionProbe {
         "www.facebook.com",
     )
     private const val PROBE_COUNT = 3
-    private const val TIMEOUT_MS = 3000
+    private const val TIMEOUT_MS = 4000
     private const val FAIL_THRESHOLD = 2 // >= this many unreachable → restricted
 
     data class Result(val restricted: Boolean, val checked: Int, val failed: Int)
@@ -56,13 +56,18 @@ object RestrictionProbe {
     }
 
     private fun reachable(network: Network?, host: String): Boolean {
-        // 1) DNS. RKN DNS-MITM answers 127.0.0.1 for blocked hosts (see
-        //    routers.md §4.2); a loopback/any-local answer == blocked.
         val addr: InetAddress = try {
             val answers = if (network != null) network.getAllByName(host)
             else InetAddress.getAllByName(host)
-            answers.firstOrNull { !it.isLoopbackAddress && !it.isAnyLocalAddress }
-                ?: return false
+            // RKN DNS-MITM poisons blocked hosts to 127.0.0.1 / 0.0.0.0 — treat
+            // a loopback/any-local answer as blocked.
+            if (answers.any { it.isLoopbackAddress || it.isAnyLocalAddress }) return false
+            // Force IPv4: the router's transparent proxy (TPROXY) is IPv4-only,
+            // and home networks frequently advertise AAAA without working IPv6,
+            // so an IPv6 attempt falsely times out (mirrors the engine's
+            // resolver, which is IPv4-only downstream). A host with no A record
+            // (IPv6-only, not poisoned) we can't fairly judge → not blocked.
+            answers.firstOrNull { it is java.net.Inet4Address } ?: return true
         } catch (_: Exception) {
             return false
         }
