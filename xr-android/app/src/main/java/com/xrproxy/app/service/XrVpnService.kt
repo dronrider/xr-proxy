@@ -568,13 +568,39 @@ class XrVpnService : VpnService() {
     }
 
     /**
+     * Raw SSID of the currently associated Wi-Fi via WifiManager. Unlike the
+     * NetworkCapabilities path, this is independent of our own VPN being up —
+     * which is exactly the case (return to a trusted network while the tunnel
+     * is running) where the caps SSID comes back empty. Needs location
+     * permission + services, like every SSID read; null otherwise.
+     */
+    @Suppress("DEPRECATION")
+    private fun currentWifiSsidRaw(): String? {
+        val wifi = getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+            ?: return null
+        return try {
+            wifi.connectionInfo?.ssid
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
      * React to a default-network capabilities update. Decides between
      * auto-pause (entered trusted SSID), auto-resume (left trusted SSID), and
      * the LTE↔Wi-Fi re-bind from task 3b-1 — making sure pause and re-bind
      * never both fire for the same change.
      */
     private fun maybeEvaluate(network: Network, caps: NetworkCapabilities) {
-        val raw = extractRawSsid(caps)
+        var raw = extractRawSsid(caps)
+        // While our own VPN is up, the default-network caps often come back
+        // without the Wi-Fi SSID, which would hide a return to a trusted
+        // network (tunnel stays up instead of pausing). WifiManager reports the
+        // associated Wi-Fi regardless of VPN state — use it as a fallback when
+        // the uplink is Wi-Fi but the caps SSID is missing.
+        if (raw == null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+            raw = currentWifiSsidRaw()
+        }
         currentRawSsid = raw
         // Unblock startVpn's initial-trust wait now that we have an SSID verdict.
         firstCapsSignal?.complete(Unit)
