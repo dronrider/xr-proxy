@@ -152,6 +152,10 @@ class XrVpnService : VpnService() {
     // Raw WifiInfo.getSSID() of the current default network (quotes and all),
     // or null when the uplink is non-Wi-Fi or the SSID is unavailable.
     @Volatile private var currentRawSsid: String? = null
+    // The default network we were on when we paused. Auto-resume keys on a
+    // change of THIS network — never on a transient SSID read glitch on the
+    // same network (which previously caused spurious resumes).
+    @Volatile private var pausedNetwork: Network? = null
     // Set when the default network changed and we still owe a re-bind — but
     // only if the new network turns out NOT to be trusted (a trusted network
     // pauses instead of re-binding; we must not do both — see maybeEvaluate).
@@ -499,6 +503,7 @@ class XrVpnService : VpnService() {
      *  no-op when nothing is running). */
     private fun doPause(rawSsid: String?) {
         tearTunnelDown()
+        pausedNetwork = currentDefaultNetwork
         val display = rawSsid?.let { NativeBridge.nativeNormalizeSsid(it) }
         publish(Phase.Paused, snapshot = null, pausedSsid = display)
         updateNotification()
@@ -577,14 +582,38 @@ class XrVpnService : VpnService() {
         val trusted = isTrusted(raw)
         when (_stateFlow.value.phase) {
             Phase.Paused -> {
-                if (!trusted) {
-                    scope.launch { requestResume() }
-                } else {
-                    // Still trusted — refresh the notification SSID if it changed.
-                    val display = raw?.let { NativeBridge.nativeNormalizeSsid(it) }
-                    if (display != null && display != _stateFlow.value.pausedSsid) {
+                when {
+                    network == pausedNetwork -> {
+                        // Still on the network we paused on. NEVER resume on a
+                        // transient capability update (incl. a momentary
+                        // <unknown ssid>) — only an actual move resumes. This is
+                        // the spurious-resume fix. Refresh the SSID label if it
+                        // resolved/changed while staying trusted.
+                        if (trusted) {
+                            val display = raw?.let { NativeBridge.nativeNormalizeSsid(it) }
+                            if (display != null && display != _stateFlow.value.pausedSsid) {
+                                publish(Phase.Paused, snapshot = null, pausedSsid = display)
+                                updateNotification()
+                            }
+                        }
+                    }
+                    trusted -> {
+                        // Moved to a different but still trusted network — stay
+                        // paused, retarget and re-probe restrictions.
+                        pausedNetwork = network
+                        val display = raw?.let { NativeBridge.nativeNormalizeSsid(it) }
                         publish(Phase.Paused, snapshot = null, pausedSsid = display)
                         updateNotification()
+                        launchRestrictionProbe()
+                    }
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) && raw == null -> {
+                        // New Wi-Fi but its SSID hasn't resolved yet — wait for
+                        // the next caps update instead of resuming prematurely
+                        // (avoids churn on a Wi-Fi reconnect).
+                    }
+                    else -> {
+                        // Left to a non-trusted network (cellular / other Wi-Fi).
+                        scope.launch { requestResume() }
                     }
                 }
             }
@@ -708,6 +737,7 @@ class XrVpnService : VpnService() {
             defaultNetworkCallback = null
             currentDefaultNetwork = null
             currentRawSsid = null
+            pausedNetwork = null
             pendingSwitch = false
             overrideNetwork = null
             try {
