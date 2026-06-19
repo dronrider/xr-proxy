@@ -15,3 +15,4 @@ pub mod session;
 pub mod state;
 pub mod stats;
 pub mod trusted;
+pub mod update;

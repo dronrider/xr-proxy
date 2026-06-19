@@ -3209,9 +3209,12 @@ dependencies = [
 name = "xr-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "ed25519-dalek",
  "libc",
  "reqwest",
  "serde_json",
+ "sha2",
  "smoltcp",
  "tokio",
  "tracing",
@@ -3239,9 +3242,11 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml 0.8.23",
  "tower",
  "tower-http",

@@ -1,3 +1,4 @@
+pub mod app_update;
 pub mod config;
 pub mod invite_url;
 pub mod mux;
