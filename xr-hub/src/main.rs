@@ -2,6 +2,7 @@ mod api;
 mod config;
 mod embed;
 mod password_reset;
+mod release;
 mod signing;
 mod state;
 mod storage;
@@ -39,6 +40,45 @@ enum Commands {
         user: String,
         /// New password. If omitted, you will be prompted (input hidden).
         password: Option<String>,
+    },
+    /// Generate a fresh ed25519 release keypair for APK self-update (LLD-12).
+    /// Keep the private key OFFLINE; the public key goes into the app build.
+    GenReleaseKey,
+    /// Sign and stage a release APK (LLD-12). Run OFFLINE where the private
+    /// release key lives — NOT on the VPS. Writes manifest.json + manifest.sig
+    /// (+ a <version>.apk copy) into the output dir for upload to releases/.
+    SignRelease {
+        /// Path to the built APK.
+        #[arg(long)]
+        apk: String,
+        /// Human version name, e.g. "0.2.0" (also the download path / filename).
+        #[arg(long)]
+        version: String,
+        /// Android versionCode — monotonic; clients offer the update only when
+        /// this exceeds the installed code.
+        #[arg(long = "version-code")]
+        version_code: u64,
+        /// Path to the release PRIVATE key file (base64, 32 bytes).
+        #[arg(long)]
+        key: String,
+        /// Hub base URL for the download link, e.g. https://xr-hub.example.com.
+        #[arg(long = "base-url")]
+        base_url: Option<String>,
+        /// Explicit APK URL (overrides the one derived from --base-url).
+        #[arg(long = "apk-url")]
+        apk_url: Option<String>,
+        /// Minimum supported Android SDK.
+        #[arg(long = "min-sdk", default_value_t = 29)]
+        min_sdk: u32,
+        /// Release notes shown in the in-app banner.
+        #[arg(long, default_value = "")]
+        notes: String,
+        /// Release date (default: today, UTC).
+        #[arg(long = "released-at")]
+        released_at: Option<String>,
+        /// Output directory (default: the APK's directory).
+        #[arg(long)]
+        out: Option<String>,
     },
 }
 
@@ -101,6 +141,42 @@ async fn main() -> Result<()> {
 
     if let Some(Commands::ResetPassword { user, password }) = &cli.command {
         reset_password(&cli.config, user, password.as_deref())?;
+        return Ok(());
+    }
+
+    if let Some(Commands::GenReleaseKey) = &cli.command {
+        release::gen_release_key();
+        return Ok(());
+    }
+
+    if let Some(Commands::SignRelease {
+        apk,
+        version,
+        version_code,
+        key,
+        base_url,
+        apk_url,
+        min_sdk,
+        notes,
+        released_at,
+        out,
+    }) = &cli.command
+    {
+        let released_at = released_at
+            .clone()
+            .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+        release::sign_release(release::SignReleaseArgs {
+            apk: apk.clone(),
+            version: version.clone(),
+            version_code: *version_code,
+            key: key.clone(),
+            base_url: base_url.clone(),
+            apk_url: apk_url.clone(),
+            min_sdk: *min_sdk,
+            notes: notes.clone(),
+            released_at,
+            out: out.clone(),
+        })?;
         return Ok(());
     }
 

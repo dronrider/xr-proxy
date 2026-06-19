@@ -1,3 +1,4 @@
+pub mod app;
 pub mod auth;
 pub mod invites;
 pub mod presets;
@@ -37,7 +38,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/invite/{token}", get(invites::get_invite_info))
         .route("/invite/{token}/view", get(invites::view_invite))
         .route("/invite/{token}/claim", post(invites::claim_invite))
-        .route("/public-key", get(presets::get_public_key));
+        .route("/public-key", get(presets::get_public_key))
+        .route("/app/latest", get(app::get_latest))
+        .route("/app/download/{ver}", get(app::download));
 
     // Auth (no session required).
     let auth_routes = Router::new()

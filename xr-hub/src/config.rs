@@ -18,6 +18,22 @@ pub struct ServerConfig {
     pub bind: String,
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
+    /// Directory the APK self-update files (`<version>.apk`, `manifest.json`,
+    /// `manifest.sig`) are served from (LLD-12 §3.4). Defaults to
+    /// `<data_dir>/releases`.
+    #[serde(default)]
+    pub releases_dir: Option<String>,
+}
+
+impl ServerConfig {
+    /// Resolved path to the releases directory (config override or
+    /// `<data_dir>/releases`).
+    pub fn releases_path(&self) -> std::path::PathBuf {
+        match &self.releases_dir {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => std::path::Path::new(&self.data_dir).join("releases"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
