@@ -1,6 +1,9 @@
 # LLD-12 — Самообновление Android-APK
 
-**Статус:** Draft
+**Статус:** Implemented (2026-06-18; `xr-core/update.rs` +6 тестов, эндпоинты
+`/api/v1/app/{latest,download/:ver}`, CLI `xr-hub sign-release`/`gen-release-key`,
+`UpdateManager.kt` + UI-баннер + JNI `nativeCheckUpdate`/`nativeVerifyApk`. Rust
+зелёный, 0 warnings; Android-сборка/device-verify §6 — за владельцем на Mac.)
 **Область:** `xr-hub` (раздача APK + подписанного манифеста версии, отдельный
 release-ключ), `xr-core` (загрузка/проверка манифеста и APK — переиспользуем
 reqwest-клиент онбординга), `xr-android` (UI обновления, `PackageInstaller`,
