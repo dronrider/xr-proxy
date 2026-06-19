@@ -13,6 +13,7 @@ use xr_core::engine::{VpnConfig, VpnEngine};
 use xr_core::ip_stack::PacketQueue;
 use xr_core::onboarding;
 use xr_core::session::{ProtectSocketFn, SystemResolverFn};
+use xr_core::update;
 use xr_proto::config::RoutingConfig;
 use xr_proto::invite_url;
 
@@ -731,6 +732,104 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeApplyInvite(
         .to_string(),
     };
     jstring_into_raw(&mut env, json)
+}
+
+// ── APK self-update bridge (LLD-12) ─────────────────────────────────
+
+/// Check the hub for a newer signed release. The manifest signature is
+/// verified with the **pinned** release public key (passed in from
+/// `BuildConfig.RELEASE_PUBLIC_KEY` — never fetched from the network) inside
+/// Rust before anything is reported. Returns JSON:
+///   newer available → `{"available":true,"manifest":{...}}`
+///   up-to-date/older → `{"available":false}`
+///   any failure      → `{"available":false,"error":".."}`
+///   (network, bad signature, wrong key, unparseable manifest)
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeCheckUpdate(
+    mut env: JNIEnv,
+    _class: JClass,
+    hub_url: JString,
+    current_code: jlong,
+    pinned_key: JString,
+    timeout_ms: jlong,
+) -> jstring {
+    let unavailable = |env: &mut JNIEnv, error: Option<String>| -> jstring {
+        let json = match error {
+            Some(e) => serde_json::json!({ "available": false, "error": e }),
+            None => serde_json::json!({ "available": false }),
+        };
+        jstring_into_raw(env, json.to_string())
+    };
+
+    let hub_url = match read_jstring(&mut env, &hub_url) {
+        Ok(s) => s,
+        Err(e) => return unavailable(&mut env, Some(e)),
+    };
+    let pinned_key = match read_jstring(&mut env, &pinned_key) {
+        Ok(s) => s,
+        Err(e) => return unavailable(&mut env, Some(e)),
+    };
+    if hub_url.trim().is_empty() {
+        return unavailable(&mut env, Some("no_hub".into()));
+    }
+    if pinned_key.trim().is_empty() {
+        // No release key compiled into this build — feature disabled.
+        return unavailable(&mut env, Some("no_release_key".into()));
+    }
+    let current = current_code.max(0) as u64;
+    let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+
+    let fetched = with_onboarding_runtime(update::fetch_manifest(&hub_url, timeout));
+    let signed = match fetched {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return unavailable(&mut env, Some(e)),
+        Err(e) => return unavailable(&mut env, Some(e)),
+    };
+
+    let manifest = match update::verify_manifest(&signed, &pinned_key) {
+        Ok(m) => m,
+        // A failed signature/SHA is a security event — log WARN (§2.2).
+        Err(e) => {
+            tracing::warn!("update manifest rejected: {e}");
+            return unavailable(&mut env, Some(format!("verify: {e}")));
+        }
+    };
+
+    if !update::manifest_offers_update(&manifest, current) {
+        return unavailable(&mut env, None);
+    }
+
+    let manifest_value = serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null);
+    let json = serde_json::json!({
+        "available": true,
+        "manifest": manifest_value,
+    });
+    jstring_into_raw(&mut env, json.to_string())
+}
+
+/// Verify a downloaded APK's SHA-256 against `sha256_hex` (from the already
+/// signature-verified manifest). Returns `false` on any I/O error or mismatch
+/// — a truncated download is rejected and the file must be deleted.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeVerifyApk(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    sha256_hex: JString,
+) -> jboolean {
+    let path = match read_jstring(&mut env, &path) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let sha = match read_jstring(&mut env, &sha256_hex) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    if update::verify_apk_sha256(std::path::Path::new(&path), &sha) {
+        1
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]
