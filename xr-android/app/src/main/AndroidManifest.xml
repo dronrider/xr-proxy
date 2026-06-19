@@ -8,6 +8,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- APK self-update (LLD-12): hand the downloaded APK to the system
+         installer via PackageInstaller. If not granted/revoked, the system
+         shows its "allow install from this source" gate — we never crash. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <!-- Trusted-network auto-pause (task 3b-2): reading the current Wi-Fi SSID.
          FINE_LOCATION is the cross-version path that unredacts the SSID in
          NetworkCapabilities (API 29+); on Android 13+ NEARBY_WIFI_DEVICES is

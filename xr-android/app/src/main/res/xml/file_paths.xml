@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
     <cache-path name="logs" path="." />
+    <!-- APK self-update downloads (LLD-12): used by the ACTION_VIEW install
+         fallback to grant the system installer read access. -->
+    <cache-path name="updates" path="updates/" />
 </paths>

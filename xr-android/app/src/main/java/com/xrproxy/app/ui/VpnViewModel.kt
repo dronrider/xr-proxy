@@ -19,6 +19,7 @@ import com.xrproxy.app.data.ServerSource
 import com.xrproxy.app.jni.NativeBridge
 import com.xrproxy.app.model.HealthLevel
 import com.xrproxy.app.service.XrVpnService
+import com.xrproxy.app.update.UpdateManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -66,6 +67,18 @@ sealed interface OnboardingState {
         val applyInProgress: Boolean = false,
     ) : OnboardingState
     object Completed : OnboardingState
+}
+
+/** APK self-update UI state (LLD-12 §2.3). */
+sealed interface UpdateUiState {
+    object Idle : UpdateUiState
+    object Checking : UpdateUiState
+    /** Transient: shown only after a *manual* check that found nothing newer. */
+    object UpToDate : UpdateUiState
+    data class Available(val release: UpdateManager.Release) : UpdateUiState
+    data class Downloading(val release: UpdateManager.Release, val progress: Float) : UpdateUiState
+    data class ReadyToInstall(val release: UpdateManager.Release, val file: java.io.File) : UpdateUiState
+    data class Error(val message: String) : UpdateUiState
 }
 
 data class VpnUiState(
@@ -123,6 +136,17 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private val _messages = MutableSharedFlow<UiMessage>(extraBufferCapacity = 4)
     val messages: SharedFlow<UiMessage> = _messages
 
+    // ── APK self-update (LLD-12) ────────────────────────────────────
+    private val updateManager = UpdateManager(application)
+
+    private val _updateState = MutableStateFlow<UpdateUiState>(UpdateUiState.Idle)
+    val updateState: StateFlow<UpdateUiState> = _updateState
+
+    /** Intents the Activity should `startActivity` (e.g. the "allow install
+     *  from this source" system screen). One-shot, like [permissionRequest]. */
+    private val _openIntent = MutableSharedFlow<Intent>(extraBufferCapacity = 1)
+    val openIntent: SharedFlow<Intent> = _openIntent
+
     private val presetCacheDir: File by lazy {
         File(getApplication<Application>().filesDir, "presets").also { it.mkdirs() }
     }
@@ -170,6 +194,20 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     init {
         _onboardingState.value = initialOnboardingState()
         tryBind(autoCreate = false)
+        updateManager.onInstallStatus = { status ->
+            when (status) {
+                is UpdateManager.InstallStatus.Success ->
+                    emitMessage("Обновление установлено", UiSeverity.Info)
+                is UpdateManager.InstallStatus.Failed -> {
+                    emitMessage("Установка не удалась: ${status.message}", UiSeverity.Error)
+                    _updateState.value = UpdateUiState.Error("install: ${status.message}")
+                }
+            }
+        }
+        // Проверяем при каждом холодном старте, чтобы доступное обновление
+        // всплывало баннером на главном экране, а не пряталось в Servers
+        // (запрос манифеста крошечный; при сбое — тихо, без навязывания).
+        checkForUpdates(manual = false)
     }
 
     private fun initialOnboardingState(): OnboardingState =
@@ -182,6 +220,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             try { getApplication<Application>().unbindService(bindConnection) } catch (_: Exception) {}
             isBound = false
         }
+        updateManager.release()
         super.onCleared()
     }
 
@@ -377,6 +416,99 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     /** Keep the tunnel running on the current trusted network ("Включить здесь"). */
     fun resumeOnTrustedNetwork() {
         boundService?.resumeOnTrustedNetwork()
+    }
+
+    // ── APK self-update (LLD-12) ────────────────────────────────────
+
+    /** Hub of the active server, or null when none is configured. */
+    private fun activeHubUrl(): String? =
+        repo.activeServer()?.hubUrl?.takeIf { it.isNotBlank() }
+
+    /**
+     * Check the hub for a newer signed release. [manual] checks surface
+     * "up to date" / errors to the user; background checks stay silent on
+     * failure and only pop the banner when something newer is verified.
+     */
+    fun checkForUpdates(manual: Boolean) {
+        val hubUrl = activeHubUrl()
+        if (hubUrl == null) {
+            if (manual) emitMessage("Для проверки обновлений нужен сервер с хабом", UiSeverity.Info)
+            return
+        }
+        // Never interrupt an in-flight download / install.
+        when (_updateState.value) {
+            is UpdateUiState.Downloading, is UpdateUiState.ReadyToInstall -> return
+            else -> {}
+        }
+        // Spinner only for an explicit user check; the launch check is silent.
+        if (manual) _updateState.value = UpdateUiState.Checking
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { updateManager.check(hubUrl) }
+            when (result) {
+                is UpdateManager.CheckResult.Available ->
+                    _updateState.value = UpdateUiState.Available(result.release)
+                is UpdateManager.CheckResult.UpToDate ->
+                    _updateState.value = if (manual) UpdateUiState.UpToDate else UpdateUiState.Idle
+                is UpdateManager.CheckResult.Failed ->
+                    // Manual: surface the error. Background: stay silent and keep
+                    // the current state — a flaky network must not nag on launch.
+                    if (manual) _updateState.value =
+                        UpdateUiState.Error(friendlyUpdateError(result.error))
+            }
+        }
+    }
+
+    /** Download + Rust-verify the available release, then hand off to install. */
+    fun startUpdateDownload() {
+        val release = (_updateState.value as? UpdateUiState.Available)?.release ?: return
+        _updateState.value = UpdateUiState.Downloading(release, 0f)
+        viewModelScope.launch {
+            try {
+                val file = withContext(Dispatchers.IO) {
+                    updateManager.download(release) { p ->
+                        _updateState.value = UpdateUiState.Downloading(release, p)
+                    }
+                }
+                _updateState.value = UpdateUiState.ReadyToInstall(release, file)
+                installReadyUpdate()
+            } catch (e: Exception) {
+                _updateState.value =
+                    UpdateUiState.Error(friendlyUpdateError(e.message ?: "download"))
+            }
+        }
+    }
+
+    /** Launch the system installer for the verified APK. If install-from-this
+     *  source isn't granted yet, lead the user to the system screen first. */
+    fun installReadyUpdate() {
+        val s = _updateState.value as? UpdateUiState.ReadyToInstall ?: return
+        if (!updateManager.canRequestInstall()) {
+            emitMessage(
+                "Разрешите установку из этого источника, затем нажмите «Установить»",
+                UiSeverity.Info,
+            )
+            viewModelScope.launch { _openIntent.emit(updateManager.unknownSourcesSettingsIntent()) }
+            return
+        }
+        // The PackageInstaller session copies the (multi-MB) APK — keep it off
+        // the main thread. The system confirm dialog is launched later from the
+        // install-result receiver, so nothing UI-blocking happens here.
+        viewModelScope.launch { withContext(Dispatchers.IO) { updateManager.install(s.file) } }
+    }
+
+    fun dismissUpdate() {
+        _updateState.value = UpdateUiState.Idle
+    }
+
+    private fun friendlyUpdateError(code: String): String = when {
+        code == "no_release" -> "На хабе пока нет опубликованных релизов"
+        code == "no_hub" -> "Для сервера не задан хаб"
+        code == "no_release_key" -> "В этой сборке обновление по воздуху отключено"
+        code == "sha_mismatch" -> "Загруженный файл повреждён — попробуйте ещё раз"
+        code.startsWith("verify") -> "Подпись обновления неверна — установка отклонена"
+        code.startsWith("network") || code.startsWith("http") ->
+            "Хаб недоступен. Проверьте интернет"
+        else -> "Не удалось обновить: $code"
     }
 
     fun toggleDebug() {

@@ -127,4 +127,31 @@ object NativeBridge {
         cacheDir: String,
         timeoutMs: Long,
     ): String
+
+    // ── APK self-update (LLD-12) ────────────────────────────────────
+
+    /**
+     * Ask the hub for a newer signed release. The manifest signature is
+     * verified in Rust with the **pinned** release public key
+     * ([pinnedKeyB64], compiled in via `BuildConfig.RELEASE_PUBLIC_KEY`,
+     * never fetched) before anything is reported. Returns JSON:
+     *  - newer available → `{"available":true,"manifest":{version_code,
+     *    version_name,apk_url,apk_sha256,size_bytes,release_notes,...}}`
+     *  - up-to-date / older / any failure → `{"available":false[,"error":..]}`.
+     * A tampered manifest from a compromised VPS fails verification here, so
+     * a forged update is never offered.
+     */
+    external fun nativeCheckUpdate(
+        hubUrl: String,
+        currentCode: Long,
+        pinnedKeyB64: String,
+        timeoutMs: Long,
+    ): String
+
+    /**
+     * Verify a downloaded APK's SHA-256 against the value from the (already
+     * signature-verified) manifest. True only on exact match; a truncated or
+     * swapped download returns false and the caller deletes the file.
+     */
+    external fun nativeVerifyApk(path: String, sha256Hex: String): Boolean
 }

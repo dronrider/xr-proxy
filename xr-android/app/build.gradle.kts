@@ -15,7 +15,12 @@ android {
         applicationId = "com.xrproxy.app"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
+        // versionCode гейтит самообновление (LLD-12): приложение предлагает
+        // апдейт только если version_code манифеста строго больше
+        // установленного. Бампать на каждый релиз; переопределяется проперти
+        // `xrVersionCode` (или env ORG_GRADLE_PROJECT_xrVersionCode) без правки
+        // файла. Дефолт 1.
+        versionCode = (project.findProperty("xrVersionCode") as String?)?.toIntOrNull() ?: 1
         // `git describe --always --dirty` даёт короткий хеш HEAD плюс "-dirty",
         // если в рабочем дереве есть не-закоммиченные правки. buildStamp (HHmm)
         // делает versionName уникальным между сборками одного и того же коммита
@@ -30,6 +35,17 @@ android {
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }
+
+        // Pinned ed25519 release public key for APK self-update (LLD-12 §2.2).
+        // The PRIVATE half lives offline with the owner; only the PUBLIC half
+        // is compiled in here, via the gradle property `xrReleasePublicKey`
+        // (set in gradle.properties / ~/.gradle/gradle.properties or
+        // `-PxrReleasePublicKey=...`). Empty ⇒ self-update is disabled (the
+        // check returns `no_release_key` and the UI stays silent). The public
+        // key is NOT a secret, so committing it to a properties file is fine;
+        // signing with the matching private key is what gates an update.
+        val releasePublicKey = (project.findProperty("xrReleasePublicKey") as String?) ?: ""
+        buildConfigField("String", "RELEASE_PUBLIC_KEY", "\"$releasePublicKey\"")
     }
 
     buildTypes {
@@ -55,6 +71,9 @@ android {
 
     buildFeatures {
         compose = true
+        // Required by AGP 8 to emit custom buildConfigField entries
+        // (RELEASE_PUBLIC_KEY above).
+        buildConfig = true
     }
 }
 

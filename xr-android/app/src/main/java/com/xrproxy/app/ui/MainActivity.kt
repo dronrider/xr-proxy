@@ -54,6 +54,8 @@ import com.xrproxy.app.ui.logs.filterLog
 import com.xrproxy.app.ui.servers.ServersSection
 import com.xrproxy.app.ui.theme.XrTheme
 import com.xrproxy.app.ui.trusted.TrustedNetworksSection
+import com.xrproxy.app.ui.update.UpdateBanner
+import com.xrproxy.app.ui.update.UpdateCheckControls
 import kotlinx.coroutines.launch
 
 private val COUNT_SUFFIX_RE = Regex(" \\(\u00D7(\\d+)\\)\$")
@@ -153,6 +155,7 @@ fun MainScreen(
     }
     val trustedNetworks by viewModel.trustedRepo.networks.collectAsState()
     val trustedEnabled by viewModel.trustedRepo.enabled.collectAsState()
+    val updateState by viewModel.updateState.collectAsState()
 
     // Location permission for reading the current Wi-Fi SSID (auto-pause,
     // task 3b-2). FINE_LOCATION is the cross-version path that unredacts the
@@ -198,6 +201,9 @@ fun MainScreen(
 
     LaunchedEffect(Unit) {
         viewModel.permissionRequest.collect { intent -> launchVpnPermission(intent) }
+    }
+    LaunchedEffect(Unit) {
+        viewModel.openIntent.collect { intent -> activity.startActivity(intent) }
     }
     LaunchedEffect(Unit) {
         viewModel.messages.collect { msg ->
@@ -413,6 +419,14 @@ fun MainScreen(
                     .verticalScroll(rememberScrollState()),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
+                UpdateBanner(
+                    state = updateState,
+                    onUpdate = { viewModel.startUpdateDownload() },
+                    onInstall = { viewModel.installReadyUpdate() },
+                    onDismiss = { viewModel.dismissUpdate() },
+                    onRetry = { viewModel.checkForUpdates(manual = true) },
+                    modifier = Modifier.padding(top = 16.dp),
+                )
                 ConnectionSection(
                     state = state,
                     activeServer = activeServer,
@@ -460,6 +474,22 @@ fun MainScreen(
                     onRequestPermission = requestSsidPermission,
                     availableSsids = { viewModel.availableSsids() },
                 )
+                Spacer(Modifier.height(8.dp))
+                val appVersion = remember {
+                    try {
+                        permissionContext.packageManager
+                            .getPackageInfo(permissionContext.packageName, 0).versionName ?: ""
+                    } catch (_: Exception) { "" }
+                }
+                UpdateCheckControls(
+                    state = updateState,
+                    currentVersionName = appVersion,
+                    onCheck = { viewModel.checkForUpdates(manual = true) },
+                    onUpdate = { viewModel.startUpdateDownload() },
+                    onInstall = { viewModel.installReadyUpdate() },
+                    onDismiss = { viewModel.dismissUpdate() },
+                )
+                Spacer(Modifier.height(16.dp))
             }
         }
     }

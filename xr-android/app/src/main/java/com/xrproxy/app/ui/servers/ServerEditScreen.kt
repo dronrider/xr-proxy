@@ -74,6 +74,10 @@ fun ServerEditScreen(
     var preset by remember { mutableStateOf(base.routingPreset) }
     var customDomains by remember { mutableStateOf(base.customDomains) }
     var customIpRanges by remember { mutableStateOf(base.customIpRanges) }
+    var hubUrl by remember { mutableStateOf(base.hubUrl) }
+    // Once the user edits the hub field (or it was inherited from an invite),
+    // stop auto-deriving it from the server address.
+    var hubTouched by remember { mutableStateOf(base.hubUrl.isNotBlank()) }
 
     var nameError by remember { mutableStateOf(false) }
     var addressError by remember { mutableStateOf(false) }
@@ -120,7 +124,13 @@ fun ServerEditScreen(
             Spacer(Modifier.height(8.dp))
 
             OutlinedTextField(
-                value = address, onValueChange = { address = it; addressError = false },
+                value = address,
+                onValueChange = {
+                    address = it; addressError = false
+                    // Default the hub URL to the server address (https) until
+                    // the user overrides it — see the Hub field below.
+                    if (!hubTouched) hubUrl = if (it.isBlank()) "" else "https://${it.trim()}"
+                },
                 label = { Text("Адрес сервера") },
                 placeholder = { Text("1.2.3.4") },
                 modifier = Modifier.fillMaxWidth(), singleLine = true,
@@ -245,22 +255,38 @@ fun ServerEditScreen(
                 )
             }
 
-            if (base.hubUrl.isNotBlank()) {
-                Spacer(Modifier.height(16.dp))
-                Text("Hub", style = MaterialTheme.typography.titleSmall)
-                Spacer(Modifier.height(4.dp))
+            Spacer(Modifier.height(16.dp))
+            Text("Хаб", style = MaterialTheme.typography.titleSmall)
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = hubUrl,
+                onValueChange = { hubUrl = it; hubTouched = true },
+                label = { Text("Адрес хаба") },
+                placeholder = { Text("https://hub.example.com") },
+                modifier = Modifier.fillMaxWidth(), singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                supportingText = {
+                    Text(
+                        "Централизованный сервер конфигурации (HTTPS): хранит правила " +
+                            "маршрутизации (пресеты) и обновления приложения. По умолчанию — " +
+                            "адрес сервера; можно оставить пустым.",
+                    )
+                },
+            )
+            Spacer(Modifier.height(4.dp))
+            if (base.hubPreset.isNotBlank()) {
                 Text(
-                    "URL: ${base.hubUrl}",
+                    "Правила маршрутизации берутся из хаба (пресет: ${base.hubPreset}).",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                if (base.hubPreset.isNotBlank()) {
-                    Text(
-                        "Preset: ${base.hubPreset}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
+            } else {
+                Text(
+                    "У этого сервера правила берутся из пресета выше; адрес хаба " +
+                        "используется для проверки обновлений.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
 
             Spacer(Modifier.height(24.dp))
@@ -279,6 +305,10 @@ fun ServerEditScreen(
                         routingPreset = preset,
                         customDomains = if (preset == "custom") customDomains else "",
                         customIpRanges = if (preset == "custom") customIpRanges else "",
+                        // hubPreset intentionally left as-is: a manual server keeps
+                        // it blank, so the hub URL drives only the update check
+                        // (preset refresh needs both hubUrl AND hubPreset set).
+                        hubUrl = normalizeHubUrl(hubUrl),
                     )
                     onSave(profile)
                 },
@@ -295,6 +325,17 @@ fun ServerEditScreen(
             Spacer(Modifier.height(16.dp))
         }
     }
+}
+
+/**
+ * Нормализует введённый адрес хаба к URL: пустой → "" (хаб не задан), без
+ * схемы → префиксуем `https://`. Хвостовой `/` убираем — Rust-клиент его
+ * добавляет сам при сборке `/api/v1/...`.
+ */
+internal fun normalizeHubUrl(input: String): String {
+    val t = input.trim().trimEnd('/')
+    if (t.isEmpty()) return ""
+    return if (t.contains("://")) t else "https://$t"
 }
 
 private const val DEFAULT_SALT = 0xDEADBEEFL
