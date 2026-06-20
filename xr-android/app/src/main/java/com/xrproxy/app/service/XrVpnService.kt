@@ -169,6 +169,9 @@ class XrVpnService : VpnService() {
     @Volatile private var firstCapsSignal: CompletableDeferred<Unit>? = null
     // Rotates which hosts the restriction probe picks across pauses.
     @Volatile private var probeSeed = 0
+    // Whether the current default uplink is Wi-Fi. Lets the poll-loop trusted
+    // re-check skip pausing on cellular when a stale Wi-Fi is still associated.
+    @Volatile private var currentDefaultIsWifi = false
 
     private val trustedRepo: TrustedNetworksRepository by lazy {
         TrustedNetworksRepository(getSharedPreferences("xr_proxy", Context.MODE_PRIVATE))
@@ -436,6 +439,23 @@ class XrVpnService : VpnService() {
                 return
             }
 
+            // Periodic trusted-network re-check. The event-driven auto-pause in
+            // maybeEvaluate can miss a return to a trusted Wi-Fi: while the
+            // tunnel is up the network-callback SSID is often redacted, and once
+            // the re-bind for the switch has fired nothing re-evaluates. Re-read
+            // the SSID via WifiManager (VPN-independent) each tick and pause if
+            // it resolves to a trusted network. Gated on the default uplink being
+            // Wi-Fi so a stale association can't pause us on cellular.
+            if (_stateFlow.value.phase == Phase.Connected && currentDefaultIsWifi &&
+                currentDefaultNetwork != overrideNetwork
+            ) {
+                val wifiSsid = usableSsid(currentWifiSsidRaw())
+                if (wifiSsid != null && isTrusted(wifiSsid)) {
+                    requestPause(wifiSsid)
+                    return
+                }
+            }
+
             val phase = when (native) {
                 "Connected" -> Phase.Connected
                 "Connecting" -> Phase.Connecting
@@ -519,8 +539,9 @@ class XrVpnService : VpnService() {
     private fun launchRestrictionProbe() {
         val seed = probeSeed++
         scope.launch {
-            // Let routing settle after the TUN teardown before probing direct.
-            delay(1200)
+            // Let routing settle after the TUN teardown — and give the router's
+            // transparent-proxy path a moment to warm — before probing direct.
+            delay(2000)
             if (_stateFlow.value.phase != Phase.Paused) return@launch
             val net = NativeBridge.underlyingNetwork
             val result = withContext(Dispatchers.IO) { RestrictionProbe.probe(net, seed) }
@@ -567,6 +588,17 @@ class XrVpnService : VpnService() {
         return if (info is WifiInfo) info.ssid else null
     }
 
+    /** Returns [raw] when it is a usable SSID, or null when it is absent or one
+     *  of Android's redacted sentinels (`<unknown ssid>`, `0x`, empty). Mirrors
+     *  the Rust `normalize_ssid` so Kotlin-level "no SSID" checks agree with the
+     *  matcher. CRITICAL: while our own VPN is up, the caps SSID comes back as
+     *  the literal string `"<unknown ssid>"` — non-null — so a plain `== null`
+     *  check misreads it as a distinct, untrusted network and (a) skips the
+     *  WifiManager fallback below and (b) defeats the "wait for SSID" guard in
+     *  the paused branch, leaving the tunnel stuck up on a trusted network. */
+    private fun usableSsid(raw: String?): String? =
+        raw?.takeIf { NativeBridge.nativeNormalizeSsid(it) != null }
+
     /**
      * Raw SSID of the currently associated Wi-Fi via WifiManager. Unlike the
      * NetworkCapabilities path, this is independent of our own VPN being up —
@@ -592,15 +624,20 @@ class XrVpnService : VpnService() {
      * never both fire for the same change.
      */
     private fun maybeEvaluate(network: Network, caps: NetworkCapabilities) {
-        var raw = extractRawSsid(caps)
-        // While our own VPN is up, the default-network caps often come back
-        // without the Wi-Fi SSID, which would hide a return to a trusted
-        // network (tunnel stays up instead of pausing). WifiManager reports the
+        // usableSsid() folds the redacted "<unknown ssid>" literal (returned by
+        // the caps path while our VPN is up) into null, so the fallback and the
+        // paused-branch guards below behave correctly instead of treating it as
+        // a real untrusted network.
+        var raw = usableSsid(extractRawSsid(caps))
+        // While our own VPN is up, the default-network caps come back without a
+        // usable Wi-Fi SSID, which would hide a return to a trusted network
+        // (tunnel stays up instead of pausing). WifiManager reports the
         // associated Wi-Fi regardless of VPN state — use it as a fallback when
-        // the uplink is Wi-Fi but the caps SSID is missing.
+        // the uplink is Wi-Fi but the caps SSID is unusable.
         if (raw == null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-            raw = currentWifiSsidRaw()
+            raw = usableSsid(currentWifiSsidRaw())
         }
+        currentDefaultIsWifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
         currentRawSsid = raw
         // Unblock startVpn's initial-trust wait now that we have an SSID verdict.
         firstCapsSignal?.complete(Unit)
@@ -763,6 +800,7 @@ class XrVpnService : VpnService() {
             defaultNetworkCallback = null
             currentDefaultNetwork = null
             currentRawSsid = null
+            currentDefaultIsWifi = false
             pausedNetwork = null
             pendingSwitch = false
             overrideNetwork = null
