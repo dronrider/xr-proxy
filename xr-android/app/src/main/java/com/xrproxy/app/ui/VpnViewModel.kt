@@ -12,6 +12,9 @@ import android.net.VpnService
 import android.os.IBinder
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
 import com.xrproxy.app.data.ServerProfile
 import com.xrproxy.app.data.ServerRepository
@@ -146,11 +149,25 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private val _updateState = MutableStateFlow<UpdateUiState>(UpdateUiState.Idle)
     val updateState: StateFlow<UpdateUiState> = _updateState
 
-    // Floor between *automatic* update checks (driven by app-foreground and a
-    // fresh connect). Manual checks bypass it. Keeps the hub from being hit on
-    // every app open while staying event-driven, not polled.
-    private val autoUpdateCheckIntervalMs = 3L * 60 * 60 * 1000
+    // Small de-dup window between *automatic* checks, NOT a throttle: the
+    // triggers are already rare key events (app brought to foreground, fresh
+    // connect), so we check on each one. This only coalesces a near-simultaneous
+    // double-fire (e.g. foreground + auto-connect on open). Manual checks bypass
+    // it. A deliberate re-open minutes later still checks — that was the bug with
+    // the old multi-hour floor (it ate the very event the user cares about).
+    private val autoUpdateCheckDedupMs = 60L * 1000
     private val keyLastUpdateCheck = "last_update_check_ms"
+
+    // Checks for updates on a real app foreground (background→foreground) — the
+    // key "user opened the app" event, fired once per transition, NOT on rotation
+    // or internal navigation (unlike Activity.onStart). Registering while the app
+    // is already STARTED delivers onStart immediately, so the initial open is
+    // covered too. Removed in onCleared.
+    private val foregroundObserver = object : DefaultLifecycleObserver {
+        override fun onStart(owner: LifecycleOwner) {
+            checkForUpdates(manual = false)
+        }
+    }
 
     /** Intents the Activity should `startActivity` (e.g. the "allow install
      *  from this source" system screen). One-shot, like [permissionRequest]. */
@@ -224,11 +241,13 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
-        // Проверка обновлений — событийная: при выходе на передний план
-        // (MainActivity.onStart) и при свежем переходе в Connected (см.
-        // applyServiceState), обе через checkForUpdates с полом по времени.
-        // init-проверки больше нет: foreground-сервис держит процесс живым, и
-        // проверка «только на холодном старте» почти не перезапускалась.
+        // Проверка обновлений — событийная, на КЛЮЧЕВЫЕ события: выход
+        // приложения на передний план (ProcessLifecycleOwner, реальный
+        // background→foreground) и свежий переход в Connected (applyServiceState).
+        // Оба редкие, поэтому без большого пола — только 60с дедуп от двойного
+        // срабатывания. addObserver при уже STARTED сразу дёргает onStart →
+        // первый открыв тоже покрыт.
+        ProcessLifecycleOwner.get().lifecycle.addObserver(foregroundObserver)
     }
 
     private fun initialOnboardingState(): OnboardingState =
@@ -236,6 +255,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         else OnboardingState.Completed
 
     override fun onCleared() {
+        ProcessLifecycleOwner.get().lifecycle.removeObserver(foregroundObserver)
         serviceObserverJob?.cancel()
         if (isBound) {
             try { getApplication<Application>().unbindService(bindConnection) } catch (_: Exception) {}
@@ -462,12 +482,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             is UpdateUiState.Installing -> return
             else -> {}
         }
-        // Rate-limit automatic checks (foreground / connect) so we never hit the
-        // hub on every app open; manual checks bypass the floor. The timestamp is
-        // stamped on every real attempt — a failed request still counts; the next
-        // foreground/connect past the floor (or a manual tap) recovers.
+        // Coalesce only a near-simultaneous double-fire (foreground + connect on
+        // open); otherwise every key event checks. Manual bypasses. Stamp on each
+        // real attempt — a failed request still counts; the next event recovers.
         val now = System.currentTimeMillis()
-        if (!manual && now - prefs.getLong(keyLastUpdateCheck, 0L) < autoUpdateCheckIntervalMs) return
+        if (!manual && now - prefs.getLong(keyLastUpdateCheck, 0L) < autoUpdateCheckDedupMs) return
         prefs.edit().putLong(keyLastUpdateCheck, now).apply()
         // Spinner only for an explicit user check; the launch check is silent.
         if (manual) _updateState.value = UpdateUiState.Checking
