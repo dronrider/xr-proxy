@@ -115,6 +115,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        // App brought to foreground (incl. cold start). Event-driven update
+        // check; VpnViewModel rate-limits it so frequent opens don't hit the hub.
+        viewModel.checkForUpdates(manual = false)
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleIntent(intent)
