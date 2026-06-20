@@ -33,8 +33,14 @@ object RestrictionProbe {
         "www.facebook.com",
     )
     private const val PROBE_COUNT = 3
-    private const val TIMEOUT_MS = 4000
-    private const val FAIL_THRESHOLD = 2 // >= this many unreachable → restricted
+    // Generous timeout: the probe runs right after the tunnel pauses, when the
+    // phone has just dropped its own VPN and the router's transparent-proxy mux
+    // to the VPS is cold. The first proxied connection is slow; a tight 4s
+    // budget read that as "blocked" on a network that actually proxies fine.
+    private const val TIMEOUT_MS = 7000
+    // Retry once: a single timeout on the first (cold) connection is not enough
+    // to call a reliably-blocked host unreachable.
+    private const val ATTEMPTS = 2
 
     data class Result(val restricted: Boolean, val checked: Int, val failed: Int)
 
@@ -42,11 +48,29 @@ object RestrictionProbe {
      * Probe [PROBE_COUNT] blocked hosts over [network] (the physical uplink;
      * the tunnel is paused). [seed] rotates which hosts are picked. Blocking,
      * call off the main thread.
+     *
+     * The network is flagged restricted only if **every** probed host is
+     * unreachable (after retries). On a network that proxies for us at least one
+     * reliably-blocked host connects, so we short-circuit to "not restricted" on
+     * the first success — which also keeps the healthy-network case fast. The
+     * old 2-of-3 quorum cried wolf whenever the freshly-resumed direct path was
+     * merely slow to warm up.
      */
     fun probe(network: Network?, seed: Int): Result {
         val hosts = pick(seed)
-        val failed = hosts.count { !reachable(network, it) }
-        return Result(restricted = failed >= FAIL_THRESHOLD, checked = hosts.size, failed = failed)
+        var failed = 0
+        for (host in hosts) {
+            if (reachableWithRetry(network, host)) {
+                return Result(restricted = false, checked = hosts.size, failed = failed)
+            }
+            failed++
+        }
+        return Result(restricted = hosts.isNotEmpty(), checked = hosts.size, failed = failed)
+    }
+
+    private fun reachableWithRetry(network: Network?, host: String): Boolean {
+        repeat(ATTEMPTS) { if (reachable(network, host)) return true }
+        return false
     }
 
     private fun pick(seed: Int): List<String> {
