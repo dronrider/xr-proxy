@@ -54,6 +54,8 @@ class UpdateManager(private val context: Context) {
 
     sealed interface InstallStatus {
         object Success : InstallStatus
+        /** User dismissed the system installer — not an error, just "not now". */
+        object Cancelled : InstallStatus
         data class Failed(val message: String) : InstallStatus
     }
 
@@ -168,6 +170,19 @@ class UpdateManager(private val context: Context) {
         return target
     }
 
+    /**
+     * If the APK for [release] was already downloaded in a previous session and
+     * still matches the manifest SHA-256, return it — so a relaunch can offer
+     * "Установить" straight away instead of re-downloading. Re-hashes in Rust
+     * (single source of truth shared with the manifest). Blocking — call off
+     * the main thread.
+     */
+    fun cachedVerifiedApk(release: Release): File? {
+        val file = File(File(context.cacheDir, "updates"), "${release.versionName}.apk")
+        if (!file.isFile) return null
+        return if (NativeBridge.nativeVerifyApk(file.absolutePath, release.sha256)) file else null
+    }
+
     // ── Install ──────────────────────────────────────────────────────
 
     /** True if the user has granted "install unknown apps" to this app. */
@@ -257,6 +272,9 @@ class UpdateManager(private val context: Context) {
                 }
                 PackageInstaller.STATUS_SUCCESS ->
                     onInstallStatus?.invoke(InstallStatus.Success)
+                PackageInstaller.STATUS_FAILURE_ABORTED ->
+                    // User backed out of / cancelled the system confirm dialog.
+                    onInstallStatus?.invoke(InstallStatus.Cancelled)
                 else -> {
                     val msg = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE)
                     onInstallStatus?.invoke(InstallStatus.Failed(msg ?: "install_failed"))

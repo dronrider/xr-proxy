@@ -78,6 +78,10 @@ sealed interface UpdateUiState {
     data class Available(val release: UpdateManager.Release) : UpdateUiState
     data class Downloading(val release: UpdateManager.Release, val progress: Float) : UpdateUiState
     data class ReadyToInstall(val release: UpdateManager.Release, val file: java.io.File) : UpdateUiState
+    /** The system installer has been launched for [file]; the in-app banner
+     *  hides while the OS confirm dialog is up. Carries enough to fall back to
+     *  [ReadyToInstall] (offer "Установить" again) if the user dismisses it. */
+    data class Installing(val release: UpdateManager.Release, val file: java.io.File) : UpdateUiState
     data class Error(val message: String) : UpdateUiState
 }
 
@@ -196,8 +200,18 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         tryBind(autoCreate = false)
         updateManager.onInstallStatus = { status ->
             when (status) {
-                is UpdateManager.InstallStatus.Success ->
+                is UpdateManager.InstallStatus.Success -> {
                     emitMessage("Обновление установлено", UiSeverity.Info)
+                    _updateState.value = UpdateUiState.Idle
+                }
+                is UpdateManager.InstallStatus.Cancelled -> {
+                    // User dismissed the system installer (no error). Fall back
+                    // to the ready banner so "Установить" is offered again — both
+                    // now and on the next launch (the verified APK is cached).
+                    (_updateState.value as? UpdateUiState.Installing)?.let {
+                        _updateState.value = UpdateUiState.ReadyToInstall(it.release, it.file)
+                    }
+                }
                 is UpdateManager.InstallStatus.Failed -> {
                     emitMessage("Установка не удалась: ${status.message}", UiSeverity.Error)
                     _updateState.value = UpdateUiState.Error("install: ${status.message}")
@@ -437,7 +451,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         }
         // Never interrupt an in-flight download / install.
         when (_updateState.value) {
-            is UpdateUiState.Downloading, is UpdateUiState.ReadyToInstall -> return
+            is UpdateUiState.Downloading, is UpdateUiState.ReadyToInstall,
+            is UpdateUiState.Installing -> return
             else -> {}
         }
         // Spinner only for an explicit user check; the launch check is silent.
@@ -445,8 +460,18 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) { updateManager.check(hubUrl) }
             when (result) {
-                is UpdateManager.CheckResult.Available ->
-                    _updateState.value = UpdateUiState.Available(result.release)
+                is UpdateManager.CheckResult.Available -> {
+                    // If this APK was already downloaded and verified in a prior
+                    // session, offer "Установить" directly instead of making the
+                    // user re-download. Re-hashing the cached file stays on IO.
+                    val cached = withContext(Dispatchers.IO) {
+                        updateManager.cachedVerifiedApk(result.release)
+                    }
+                    _updateState.value = if (cached != null)
+                        UpdateUiState.ReadyToInstall(result.release, cached)
+                    else
+                        UpdateUiState.Available(result.release)
+                }
                 is UpdateManager.CheckResult.UpToDate ->
                     _updateState.value = if (manual) UpdateUiState.UpToDate else UpdateUiState.Idle
                 is UpdateManager.CheckResult.Failed ->
@@ -490,6 +515,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             viewModelScope.launch { _openIntent.emit(updateManager.unknownSourcesSettingsIntent()) }
             return
         }
+        // Hide the in-app banner while the system installer is up: the OS shows
+        // its own confirm dialog, so a duplicate "Установить" card is confusing.
+        // If the user dismisses that dialog we drop back to ReadyToInstall.
+        _updateState.value = UpdateUiState.Installing(s.release, s.file)
         // The PackageInstaller session copies the (multi-MB) APK — keep it off
         // the main thread. The system confirm dialog is launched later from the
         // install-result receiver, so nothing UI-blocking happens here.
