@@ -15,6 +15,7 @@
 | ID | Задача | Тип | P | Ссылка |
 |--------|--------|-----|---|--------|
 | XR-007 | Доверенные Wi-Fi: авто-пауза по SSID (фича готова, идёт полировка пробы ограничений и device-verify) | task | P1 | [docs/lld/15-android-trusted-networks.md](lld/15-android-trusted-networks.md) |
+| XR-021 | Авто-пауза не встаёт, пока телефон спит (Doze): туннель висит Connected на доверенной сети, статус обновляется только при пробуждении/открытии приложения. Фикс: re-eval на SCREEN_ON + app-foreground (собрано+выложено 0.14.0/code14, ждёт device-verify) | bug | P1 | [docs/lld/15-android-trusted-networks.md](lld/15-android-trusted-networks.md) |
 
 ## Backlog
 
