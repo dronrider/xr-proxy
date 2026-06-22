@@ -166,6 +166,16 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private val foregroundObserver = object : DefaultLifecycleObserver {
         override fun onStart(owner: LifecycleOwner) {
             checkForUpdates(manual = false)
+            // Re-run the restriction probe when the user opens the app while
+            // paused, so a stale "network restricted" warning doesn't linger
+            // until the next periodic re-probe.
+            boundService?.reprobeRestrictionsIfPaused()
+            // Re-evaluate the trusted-network decision: while the device is idle
+            // the auto-pause can be missed (network callbacks coalesced in Doze,
+            // the service poll-loop frozen with the CPU asleep), so the tunnel
+            // can sit up on a trusted Wi-Fi until the app is opened. Doing it
+            // here makes opening the app deterministically land the pause.
+            boundService?.reevaluateTrustedNetwork()
         }
     }
 
@@ -821,7 +831,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             relayWarnings = snap?.relayWarnings ?: 0,
             relayErrors = snap?.relayErrors ?: 0,
             debugMsg = snap?.debugMsg ?: "",
-            recentErrors = snap?.recentErrors ?: emptyList(),
+            // Native engine errors + restriction-probe diagnostics (the latter
+            // run while paused with the engine down, so they ride in svcState).
+            recentErrors = (snap?.recentErrors ?: emptyList()) + svcState.probeLog,
             pausedSsid = svcState.pausedSsid,
             restrictedNetwork = svcState.restrictedNetwork,
         )

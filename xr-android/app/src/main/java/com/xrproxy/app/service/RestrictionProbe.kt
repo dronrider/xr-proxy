@@ -44,10 +44,16 @@ object RestrictionProbe {
 
     data class Result(val restricted: Boolean, val checked: Int, val failed: Int)
 
+    /** Outcome of a single connectivity attempt, with a human-readable reason
+     *  for the log (which stage failed and how). */
+    private data class Attempt(val ok: Boolean, val reason: String)
+
     /**
      * Probe [PROBE_COUNT] blocked hosts over [network] (the physical uplink;
-     * the tunnel is paused). [seed] rotates which hosts are picked. Blocking,
-     * call off the main thread.
+     * the tunnel is paused). [seed] rotates which hosts are picked. [log]
+     * receives a line per attempt + the verdict so the user can see WHY a
+     * network was flagged restricted (the app Log tab). Blocking, call off the
+     * main thread.
      *
      * The network is flagged restricted only if **every** probed host is
      * unreachable (after retries). On a network that proxies for us at least one
@@ -56,21 +62,25 @@ object RestrictionProbe {
      * old 2-of-3 quorum cried wolf whenever the freshly-resumed direct path was
      * merely slow to warm up.
      */
-    fun probe(network: Network?, seed: Int): Result {
+    fun probe(network: Network?, seed: Int, log: (String) -> Unit = {}): Result {
         val hosts = pick(seed)
+        log("Проба ограничений: ${hosts.joinToString(", ")} · таймаут ${TIMEOUT_MS}мс · попыток $ATTEMPTS")
         var failed = 0
         for (host in hosts) {
-            if (reachableWithRetry(network, host)) {
+            var ok = false
+            for (i in 1..ATTEMPTS) {
+                val a = attempt(network, host)
+                log("  $host [$i/$ATTEMPTS] ${if (a.ok) "✓" else "✗"} ${a.reason}")
+                if (a.ok) { ok = true; break }
+            }
+            if (ok) {
+                log("Итог: ограничений нет (доступен $host)")
                 return Result(restricted = false, checked = hosts.size, failed = failed)
             }
             failed++
         }
+        log("Итог: все $failed хоста недоступны напрямую → сеть помечена как ограниченная")
         return Result(restricted = hosts.isNotEmpty(), checked = hosts.size, failed = failed)
-    }
-
-    private fun reachableWithRetry(network: Network?, host: String): Boolean {
-        repeat(ATTEMPTS) { if (reachable(network, host)) return true }
-        return false
     }
 
     private fun pick(seed: Int): List<String> {
@@ -79,21 +89,26 @@ object RestrictionProbe {
         return (0 until PROBE_COUNT).map { CANDIDATES[(start + it) % CANDIDATES.size] }
     }
 
-    private fun reachable(network: Network?, host: String): Boolean {
+    private fun attempt(network: Network?, host: String): Attempt {
+        val t0 = System.currentTimeMillis()
         val addr: InetAddress = try {
             val answers = if (network != null) network.getAllByName(host)
             else InetAddress.getAllByName(host)
             // RKN DNS-MITM poisons blocked hosts to 127.0.0.1 / 0.0.0.0 — treat
             // a loopback/any-local answer as blocked.
-            if (answers.any { it.isLoopbackAddress || it.isAnyLocalAddress }) return false
+            val poisoned = answers.firstOrNull { it.isLoopbackAddress || it.isAnyLocalAddress }
+            if (poisoned != null) {
+                return Attempt(false, "DNS-подмена → ${poisoned.hostAddress} (заблокировано)")
+            }
             // Force IPv4: the router's transparent proxy (TPROXY) is IPv4-only,
             // and home networks frequently advertise AAAA without working IPv6,
             // so an IPv6 attempt falsely times out (mirrors the engine's
             // resolver, which is IPv4-only downstream). A host with no A record
             // (IPv6-only, not poisoned) we can't fairly judge → not blocked.
-            answers.firstOrNull { it is java.net.Inet4Address } ?: return true
-        } catch (_: Exception) {
-            return false
+            answers.firstOrNull { it is java.net.Inet4Address }
+                ?: return Attempt(true, "нет A-записи (только IPv6) — не сужу")
+        } catch (e: Exception) {
+            return Attempt(false, "DNS-ошибка: ${e.javaClass.simpleName} ${e.message ?: ""}".trim())
         }
 
         // 2) TCP + TLS handshake with SNI = host. DPI SNI-blocking resets or
@@ -107,9 +122,13 @@ object RestrictionProbe {
                 .createSocket(socket, host, 443, true) as SSLSocket
             ssl.startHandshake()
             ssl.close()
-            true
-        } catch (_: Exception) {
-            false
+            Attempt(true, "TLS ок ${addr.hostAddress} (${System.currentTimeMillis() - t0}мс)")
+        } catch (e: Exception) {
+            Attempt(
+                false,
+                "${e.javaClass.simpleName}: ${e.message ?: ""} @${addr.hostAddress} " +
+                    "(${System.currentTimeMillis() - t0}мс)",
+            )
         } finally {
             try { socket?.close() } catch (_: Exception) {}
         }

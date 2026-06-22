@@ -30,6 +30,7 @@ import org.json.JSONObject
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -73,6 +74,13 @@ class XrVpnService : VpnService() {
         // on a genuinely slow uplink — and the post-Connected backstop in
         // bringTunnelUp() still catches a late "trusted" verdict.
         private const val INITIAL_TRUST_TIMEOUT_MS = 1500L
+
+        // While paused on a trusted network, re-run the restriction probe on
+        // this cadence so a transient false "restricted" (cold proxy path, a
+        // one-off timeout) self-heals — and a network that genuinely degrades
+        // later still gets flagged. The probe only runs while paused (engine
+        // down), so the cost is a few TLS connects per interval.
+        private const val PROBE_INTERVAL_MS = 90_000L
     }
 
     enum class Phase { Idle, Preparing, Connecting, Finalizing, Connected, Paused, Stopping, Error }
@@ -107,6 +115,11 @@ class XrVpnService : VpnService() {
          *  blocked resources aren't reachable direct, so the pause risks
          *  cutting access (task 3b-2 §2). */
         val restrictedNetwork: Boolean = false,
+        /** Diagnostic lines from the restriction probe (per-host DNS/connect/TLS
+         *  outcome + verdict), surfaced in the app Log tab. The probe runs while
+         *  paused with the engine stopped, so these can't go through the native
+         *  error log — they ride here instead. */
+        val probeLog: List<String> = emptyList(),
     )
 
     inner class LocalBinder : Binder() {
@@ -173,6 +186,23 @@ class XrVpnService : VpnService() {
     // re-check skip pausing on cellular when a stale Wi-Fi is still associated.
     @Volatile private var currentDefaultIsWifi = false
 
+    // Re-evaluates the trusted-network decision when the screen turns on. The
+    // event-driven auto-pause can be missed while the device is idle (network
+    // callbacks coalesced in Doze, the poll-loop's delay() frozen with the CPU
+    // asleep), leaving the tunnel up on a trusted Wi-Fi until something wakes
+    // it. Screen-on is a reliable wake signal — re-run the same evaluation the
+    // default-network callback would, so the pause lands as soon as the user
+    // looks at the phone instead of only after they open the app.
+    private var screenOnReceiver: android.content.BroadcastReceiver? = null
+
+    // Bounded buffer of restriction-probe diagnostic lines (guarded by itself).
+    // Surfaced in ServiceState.probeLog → app Log tab.
+    private val probeLogBuf = ArrayDeque<String>()
+    private val probeLogTime = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+    // The running restriction-probe loop (one per pause). Cancelled when the
+    // pause ends or a re-probe restarts it.
+    @Volatile private var probeJob: Job? = null
+
     private val trustedRepo: TrustedNetworksRepository by lazy {
         TrustedNetworksRepository(getSharedPreferences("xr_proxy", Context.MODE_PRIVATE))
     }
@@ -191,6 +221,7 @@ class XrVpnService : VpnService() {
         super.onCreate()
         NativeBridge.current = this
         createNotificationChannel()
+        registerScreenOnReceiver()
     }
 
     override fun onDestroy() {
@@ -200,6 +231,10 @@ class XrVpnService : VpnService() {
         // петлёй (VPN→TUN→VPN→…) → connect timeout на всё.
         if (NativeBridge.current === this) {
             NativeBridge.current = null
+        }
+        screenOnReceiver?.let {
+            try { unregisterReceiver(it) } catch (_: Exception) {}
+            screenOnReceiver = null
         }
         scope.cancel()
         super.onDestroy()
@@ -264,7 +299,8 @@ class XrVpnService : VpnService() {
 
     fun clearLog() {
         NativeBridge.nativeClearErrorLog()
-        _stateFlow.value = _stateFlow.value.copy(snapshot = readSnapshot())
+        synchronized(probeLogBuf) { probeLogBuf.clear() }
+        _stateFlow.value = _stateFlow.value.copy(snapshot = readSnapshot(), probeLog = emptyList())
     }
 
     /** Raw SSID of the current uplink as seen by the default-network callback
@@ -500,6 +536,8 @@ class XrVpnService : VpnService() {
      *  callbacks registered — used for trusted-network pause, where we must
      *  keep watching the uplink to resume. */
     private fun tearTunnelDown() {
+        probeJob?.cancel()
+        probeJob = null
         running = false
         NativeBridge.nativeStop()
         tunReadThread?.interrupt()
@@ -531,25 +569,53 @@ class XrVpnService : VpnService() {
     }
 
     /**
-     * While paused, check whether blocked resources are actually reachable on
-     * this network (tunnel is down → probe goes direct over the uplink). If a
-     * quorum is blocked, flag it so the UI/notification can warn that pausing
-     * here cuts access (task 3b-2 §2).
+     * While paused, repeatedly check whether blocked resources are actually
+     * reachable on this network (tunnel is down → probe goes direct over the
+     * uplink) and flag it so the UI/notification can warn that pausing here cuts
+     * access (task 3b-2 §2). Runs as a LOOP, not a one-shot: a transient failure
+     * (cold proxy path, one-off timeout) would otherwise pin the "restricted"
+     * warning for the whole pause — re-probing every [PROBE_INTERVAL_MS] lets it
+     * self-heal (and catches a network that degrades later). Restarts on each
+     * call (cancels the previous loop), so a re-target or a foreground re-probe
+     * re-evaluates immediately.
      */
     private fun launchRestrictionProbe() {
-        val seed = probeSeed++
-        scope.launch {
+        probeJob?.cancel()
+        probeJob = scope.launch {
             // Let routing settle after the TUN teardown — and give the router's
-            // transparent-proxy path a moment to warm — before probing direct.
+            // transparent-proxy path a moment to warm — before the first probe.
             delay(2000)
-            if (_stateFlow.value.phase != Phase.Paused) return@launch
-            val net = NativeBridge.underlyingNetwork
-            val result = withContext(Dispatchers.IO) { RestrictionProbe.probe(net, seed) }
-            // Only apply if we're still paused (network may have changed).
-            if (_stateFlow.value.phase == Phase.Paused) {
+            while (isActive && _stateFlow.value.phase == Phase.Paused) {
+                val seed = probeSeed++
+                val net = NativeBridge.underlyingNetwork
+                val ssid = _stateFlow.value.pausedSsid
+                logProbe("── Доверенная сеть «${ssid ?: "?"}» — проверка доступности ресурсов")
+                val result = withContext(Dispatchers.IO) { RestrictionProbe.probe(net, seed, ::logProbe) }
+                // Network may have changed during the probe — only apply if still paused.
+                if (_stateFlow.value.phase != Phase.Paused) break
                 _stateFlow.value = _stateFlow.value.copy(restrictedNetwork = result.restricted)
                 updateNotification()
+                delay(PROBE_INTERVAL_MS)
             }
+        }
+    }
+
+    /** Re-run the restriction probe now if we're paused — called when the app
+     *  returns to the foreground (the moment the warning is actually looked at),
+     *  so a stale "restricted" flag doesn't linger until the next interval. */
+    fun reprobeRestrictionsIfPaused() {
+        if (_stateFlow.value.phase == Phase.Paused) launchRestrictionProbe()
+    }
+
+    /** Append a restriction-probe diagnostic line to the app log (see
+     *  [ServiceState.probeLog]). Called from the probe's IO thread; the same
+     *  read-modify-write on _stateFlow as the rest of the service. */
+    private fun logProbe(line: String) {
+        val stamped = "${probeLogTime.format(java.util.Date())} $line"
+        synchronized(probeLogBuf) {
+            probeLogBuf.addLast(stamped)
+            while (probeLogBuf.size > 120) probeLogBuf.removeFirst()
+            _stateFlow.value = _stateFlow.value.copy(probeLog = probeLogBuf.toList())
         }
     }
 
@@ -568,6 +634,8 @@ class XrVpnService : VpnService() {
     private suspend fun requestResume() {
         transitionMutex.withLock {
             if (_stateFlow.value.phase != Phase.Paused) return@withLock
+            probeJob?.cancel()
+            probeJob = null
             publish(Phase.Connecting)
             updateNotification()
             bringTunnelUp()
@@ -792,6 +860,40 @@ class XrVpnService : VpnService() {
         // Ignore stale callbacks for a network that's no longer default.
         if (network != currentDefaultNetwork) return
         maybeEvaluate(network, caps)
+    }
+
+    private fun registerScreenOnReceiver() {
+        if (screenOnReceiver != null) return
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action == Intent.ACTION_SCREEN_ON) reevaluateTrustedNetwork()
+            }
+        }
+        try {
+            registerReceiver(receiver, android.content.IntentFilter(Intent.ACTION_SCREEN_ON))
+            screenOnReceiver = receiver
+        } catch (_: Exception) {
+            // Best-effort: without it, the trusted re-check still recovers on the
+            // next event callback or poll tick once the device is fully awake.
+        }
+    }
+
+    /**
+     * Re-run the trusted-network decision now against the current default
+     * uplink — pause if we're Connected on a trusted Wi-Fi, resume if we left
+     * one. Called on a wake signal (screen-on, app-foreground) to recover the
+     * pause/resume the idle event path can miss: while the device is dozing the
+     * network callbacks are coalesced and the poll-loop's delay() is frozen with
+     * the CPU asleep, so the tunnel can sit up on a trusted network until the
+     * phone wakes. Reuses [maybeEvaluate] so the decision stays identical to the
+     * callback path (incl. the WifiManager SSID fallback for the redacted caps
+     * SSID while our VPN is up).
+     */
+    fun reevaluateTrustedNetwork() {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        val net = currentDefaultNetwork ?: return
+        val caps = try { cm.getNetworkCapabilities(net) } catch (_: Exception) { null } ?: return
+        maybeEvaluate(net, caps)
     }
 
     private fun unregisterUnderlyingNetworkCallback() {
