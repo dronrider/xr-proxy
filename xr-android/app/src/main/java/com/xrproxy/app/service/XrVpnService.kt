@@ -81,6 +81,13 @@ class XrVpnService : VpnService() {
         // later still gets flagged. The probe only runs while paused (engine
         // down), so the cost is a few TLS connects per interval.
         private const val PROBE_INTERVAL_MS = 90_000L
+        // Confirm a "restricted" verdict across two consecutive probes before
+        // raising the warning, and recheck quickly while it is unconfirmed. Kills
+        // the transient banner flash when the first probe runs on a not-yet-warm
+        // uplink right after a pause (notably one that fires on screen-wake,
+        // XR-021/XR-022); any reachable host still clears the flag at once.
+        private const val RESTRICT_CONFIRM_PROBES = 2
+        private const val RESTRICT_CONFIRM_DELAY_MS = 8_000L
     }
 
     enum class Phase { Idle, Preparing, Connecting, Finalizing, Connected, Paused, Stopping, Error }
@@ -585,6 +592,7 @@ class XrVpnService : VpnService() {
             // Let routing settle after the TUN teardown — and give the router's
             // transparent-proxy path a moment to warm — before the first probe.
             delay(2000)
+            var restrictedStreak = 0
             while (isActive && _stateFlow.value.phase == Phase.Paused) {
                 val seed = probeSeed++
                 val net = NativeBridge.underlyingNetwork
@@ -593,9 +601,18 @@ class XrVpnService : VpnService() {
                 val result = withContext(Dispatchers.IO) { RestrictionProbe.probe(net, seed, ::logProbe) }
                 // Network may have changed during the probe — only apply if still paused.
                 if (_stateFlow.value.phase != Phase.Paused) break
-                _stateFlow.value = _stateFlow.value.copy(restrictedNetwork = result.restricted)
-                updateNotification()
-                delay(PROBE_INTERVAL_MS)
+                restrictedStreak = if (result.restricted) restrictedStreak + 1 else 0
+                val confirmed = restrictedStreak >= RESTRICT_CONFIRM_PROBES
+                if (_stateFlow.value.restrictedNetwork != confirmed) {
+                    _stateFlow.value = _stateFlow.value.copy(restrictedNetwork = confirmed)
+                    updateNotification()
+                }
+                if (result.restricted && !confirmed) {
+                    logProbe("  одиночный сбой, баннер не показываю — перепроверю через ${RESTRICT_CONFIRM_DELAY_MS / 1000}с")
+                }
+                // Recheck soon while a lone restricted result is unconfirmed (cold
+                // uplink self-heals); otherwise settle to the normal interval.
+                delay(if (result.restricted && !confirmed) RESTRICT_CONFIRM_DELAY_MS else PROBE_INTERVAL_MS)
             }
         }
     }
