@@ -1,0 +1,18 @@
+# xr-proxy: сделано
+
+Append-only журнал закрытых задач, растёт свободно. Фундаментальные LLD первого пакета
+(шаги 1-9 в [ARCHITECTURE.md §9](ARCHITECTURE.md): 01-02, 04, 06, 09) велись до этой
+доски и зафиксированы в §9 и git-истории, сюда не дублируются. Дата закрытия и коммит
+взяты из git log.
+
+| ID | Задача | Тип | P | Закрыто | Ссылка |
+|--------|--------|-----|---|---------|--------|
+| XR-001 | Fail-open на роутере при мёртвом VPS (circuit-breaker в MuxPool) | bug | P0 | 2026-06-12 | `6888d79`, `local-docs/problems.md` (1a) |
+| XR-002 | Обрыв скачивания на Direct-пути (потеря хвоста чанка на partial send) | bug | P1 | 2026-06-12 | `72975ca`, `local-docs/problems.md` (2) |
+| XR-003 | Geo-blocked сайты через роутер: block_quic плюс пресет geo-blocked | bug | P1 | 2026-06-13 | `ff06399`, `local-docs/problems.md` (5a) |
+| XR-004 | xr-hub reset-password одной командой по SSH | task | P1 | 2026-06-13 | `35cbc39`, `local-docs/problems.md` (9) |
+| XR-005 | Re-bind туннеля при смене сети LTE и Wi-Fi | bug | P1 | 2026-06-13 | `3840f6c`, `local-docs/problems.md` (3b-1) |
+| XR-006 | Direct виснет на IPv6/NAT64 LTE: MSS-кламп плюс TUN MTU 1280 | bug | P1 | 2026-06-13 | `aa90a12`, `local-docs/problems.md` (3c) |
+| XR-008 | Logs UX: sticky toolbar, поиск, auto-follow, скачивание через SAF | LLD | P1 | 2026-06-14 | [docs/lld/03-android-logs-ux.md](lld/03-android-logs-ux.md), `828ec86` |
+| XR-011 | Android: мультисерверная модель, CRUD, переключатель серверов | LLD | P2 | 2026-04-17 | [docs/lld/08-android-multi-server.md](lld/08-android-multi-server.md), `f02fa36` |
+| XR-014 | Самообновление APK (подписанный манифест плюс PackageInstaller) | LLD | P2 | 2026-06-19 | [docs/lld/12-android-apk-self-update.md](lld/12-android-apk-self-update.md), `b9fa3b7` |
