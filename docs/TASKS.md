@@ -14,18 +14,18 @@
 
 | ID | Задача | Тип | P | Ссылка |
 |--------|--------|-----|---|--------|
-| XR-007 | Доверенные Wi-Fi: авто-пауза по SSID (фича готова, идёт полировка пробы ограничений и device-verify) | task | P1 | [docs/lld/15-android-trusted-networks.md](lld/15-android-trusted-networks.md) |
-| XR-021 | Авто-пауза не встаёт, пока телефон спит (Doze): туннель висит Connected на доверенной сети, статус обновляется только при пробуждении/открытии приложения. Фикс: re-eval на SCREEN_ON + app-foreground (собрано+выложено 0.14.0/code14, ждёт device-verify) | bug | P1 | [docs/lld/15-android-trusted-networks.md](lld/15-android-trusted-networks.md) |
+| XR-007 | Доверенные Wi-Fi: авто-пауза по SSID | task | P1 | [docs/lld/15-android-trusted-networks.md](lld/15-android-trusted-networks.md) |
+| XR-021 | Авто-пауза не встаёт в Doze, пока телефон спит | bug | P1 | [docs/lld/15-android-trusted-networks.md](lld/15-android-trusted-networks.md), `75ae881` |
 
 ## Backlog
 
 | ID | Задача | Тип | P | Ссылка |
 |--------|--------|-----|---|--------|
-| XR-009 | Мульти-VPS failover на роутере (ServerPool поверх нескольких MuxPool, primary/backup) | LLD | P1 | [docs/lld/10-router-multi-vps-failover.md](lld/10-router-multi-vps-failover.md) |
-| XR-010 | Мониторинг, уведомления и панель здоровья (объединяет задачи 6 и 10) | LLD | P1 | [docs/lld/11-monitoring-health-panel.md](lld/11-monitoring-health-panel.md) |
-| XR-012 | Информативный индикатор соединения вместо смайлика (может слиться с XR-010) | task/LLD | P2 | `local-docs/problems.md` (10) |
-| XR-013 | Гибридный редактор правил xr-hub плюс Android rules editor (общий RuleFragment) | LLD | P2 | [docs/lld/14-hub-hybrid-rules-editor.md](lld/14-hub-hybrid-rules-editor.md), [docs/lld/05-android-rules-editor.md](lld/05-android-rules-editor.md) |
-| XR-015 | Zero-touch provisioning VPS и роутера (xr-bootstrap плюс SSH-обёртка) | LLD | P2 | [docs/lld/13-zero-touch-provisioning.md](lld/13-zero-touch-provisioning.md) |
+| XR-009 | Мульти-VPS failover на роутере | LLD | P1 | [docs/lld/10-router-multi-vps-failover.md](lld/10-router-multi-vps-failover.md) |
+| XR-010 | Мониторинг, уведомления и панель здоровья | LLD | P1 | [docs/lld/11-monitoring-health-panel.md](lld/11-monitoring-health-panel.md) |
+| XR-012 | Информативный индикатор соединения вместо смайлика | task/LLD | P2 | `local-docs/problems.md` (10) |
+| XR-013 | Гибридный редактор правил xr-hub плюс Android rules editor | LLD | P2 | [docs/lld/14-hub-hybrid-rules-editor.md](lld/14-hub-hybrid-rules-editor.md), [docs/lld/05-android-rules-editor.md](lld/05-android-rules-editor.md) |
+| XR-015 | Zero-touch provisioning VPS и роутера | LLD | P2 | [docs/lld/13-zero-touch-provisioning.md](lld/13-zero-touch-provisioning.md) |
 | XR-016 | Per-app split tunneling | LLD | P2 | [docs/lld/07-android-per-app-tunnel.md](lld/07-android-per-app-tunnel.md) |
 | XR-020 | Живые правила из хаба для серверов, добавленных вручную | LLD | P2 | [docs/lld/16-manual-server-hub-rules.md](lld/16-manual-server-hub-rules.md) |
 | XR-017 | Клиент под macOS | LLD | P3 | `local-docs/problems.md` (12) |
