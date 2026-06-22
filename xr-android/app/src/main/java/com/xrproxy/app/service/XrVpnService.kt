@@ -891,6 +891,49 @@ class XrVpnService : VpnService() {
      */
     fun reevaluateTrustedNetwork() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        // CRITICAL (XR-021): a synchronous getNetworkCapabilities() returns the
+        // SSID redacted to "<unknown ssid>" — FLAG_INCLUDE_LOCATION_INFO applies
+        // only to a registered callback, never to a direct query — and the
+        // WifiManager SSID fallback is blocked while we are backgrounded. So a
+        // wake-time re-check fired from the SCREEN_ON receiver (screen on, app
+        // still in background) could never read the SSID: the decision fell to
+        // "untrusted" and the tunnel sat Connected on a trusted network until the
+        // app was foregrounded, where WifiManager unblocks. That is exactly the
+        // "shade updates only on app entry" symptom. Pull one fresh caps delivery
+        // through a short-lived default callback carrying location info, so the
+        // trusted decision sees the real SSID in the background too.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val probe = object : ConnectivityManager.NetworkCallback(
+                ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO,
+            ) {
+                private var fired = false
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                    if (fired) return
+                    fired = true
+                    try { cm.unregisterNetworkCallback(this) } catch (_: Exception) {}
+                    currentDefaultNetwork = network
+                    maybeEvaluate(network, caps)
+                }
+            }
+            try {
+                cm.registerDefaultNetworkCallback(probe)
+                // Leak guard: drop the one-shot if no caps ever arrive (no default
+                // network, or the platform never calls back).
+                scope.launch {
+                    delay(3000)
+                    try { cm.unregisterNetworkCallback(probe) } catch (_: Exception) {}
+                }
+            } catch (_: RuntimeException) {
+                reevaluateViaDirectQuery(cm)
+            }
+        } else {
+            // Pre-31 the caps SSID isn't location-redacted the same way; the
+            // direct query plus WifiManager fallback is the callback path's source.
+            reevaluateViaDirectQuery(cm)
+        }
+    }
+
+    private fun reevaluateViaDirectQuery(cm: ConnectivityManager) {
         val net = currentDefaultNetwork ?: return
         val caps = try { cm.getNetworkCapabilities(net) } catch (_: Exception) { null } ?: return
         maybeEvaluate(net, caps)
