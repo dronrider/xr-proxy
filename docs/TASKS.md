@@ -20,6 +20,7 @@
 |--------|--------|-----|---|--------|
 | XR-007 | Доверенные Wi-Fi: авто-пауза по SSID | task | P1 | [docs/lld/15-android-trusted-networks.md](lld/15-android-trusted-networks.md), `local-docs/problems.md` (3b-2) |
 | XR-021 | Авто-пауза не встаёт в Doze, пока телефон спит | bug | P1 | [docs/lld/15-android-trusted-networks.md](lld/15-android-trusted-networks.md), `local-docs/xr-021-verify.md`, `15c6d53` |
+| XR-022 | Баннер «в сети есть ограничения» проскакивает при авто-паузе, хотя ограничений нет | bug | P2 | [docs/lld/15-android-trusted-networks.md](lld/15-android-trusted-networks.md) |
 
 ## Backlog
 
