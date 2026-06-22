@@ -12,14 +12,15 @@
 
 ## In progress
 
-Нет.
+| ID | Задача | Тип | P | Ссылка |
+|--------|--------|-----|---|--------|
+| XR-021 | Авто-пауза не встаёт в Doze, пока телефон спит | bug | P1 | [docs/lld/15-android-trusted-networks.md](lld/15-android-trusted-networks.md), `local-docs/xr-021-verify.md`, `75ae881` |
 
 ## Check (готово, ждёт проверки пользователем)
 
 | ID | Задача | Тип | P | Ссылка |
 |--------|--------|-----|---|--------|
 | XR-007 | Доверенные Wi-Fi: авто-пауза по SSID | task | P1 | [docs/lld/15-android-trusted-networks.md](lld/15-android-trusted-networks.md), `local-docs/problems.md` (3b-2) |
-| XR-021 | Авто-пауза не встаёт в Doze, пока телефон спит | bug | P1 | [docs/lld/15-android-trusted-networks.md](lld/15-android-trusted-networks.md), `local-docs/xr-021-verify.md`, `75ae881` |
 
 ## Backlog
 
