@@ -157,6 +157,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     // the old multi-hour floor (it ate the very event the user cares about).
     private val autoUpdateCheckDedupMs = 60L * 1000
     private val keyLastUpdateCheck = "last_update_check_ms"
+    // One background check at a time: it retries with backoff, so a second
+    // trigger arriving mid-retry must not launch a parallel run (XR-024).
+    @Volatile private var updateCheckInFlight = false
 
     // Checks for updates on a real app foreground (background→foreground) — the
     // key "user opened the app" event, fired once per transition, NOT on rotation
@@ -492,36 +495,63 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             is UpdateUiState.Installing -> return
             else -> {}
         }
-        // Coalesce only a near-simultaneous double-fire (foreground + connect on
-        // open); otherwise every key event checks. Manual bypasses. Stamp on each
-        // real attempt — a failed request still counts; the next event recovers.
+        // A background check already retrying covers this trigger.
+        if (!manual && updateCheckInFlight) return
+        // Rate-limit only CONCLUSIVE background checks (60s) so a burst of events
+        // doesn't spam the hub. A FAILED attempt must not count: the cold-start
+        // trigger often fires before connectivity is up, and stamping on a failure
+        // used to poison the window so the banner never appeared until much later
+        // (XR-024). So we stamp on Available/UpToDate only, inside the loop.
         val now = System.currentTimeMillis()
         if (!manual && now - prefs.getLong(keyLastUpdateCheck, 0L) < autoUpdateCheckDedupMs) return
-        prefs.edit().putLong(keyLastUpdateCheck, now).apply()
         // Spinner only for an explicit user check; the launch check is silent.
         if (manual) _updateState.value = UpdateUiState.Checking
         viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) { updateManager.check(hubUrl) }
-            when (result) {
-                is UpdateManager.CheckResult.Available -> {
-                    // If this APK was already downloaded and verified in a prior
-                    // session, offer "Установить" directly instead of making the
-                    // user re-download. Re-hashing the cached file stays on IO.
-                    val cached = withContext(Dispatchers.IO) {
-                        updateManager.cachedVerifiedApk(result.release)
+            updateCheckInFlight = true
+            try {
+                // Background checks retry with backoff: a single silent failure on
+                // a not-yet-ready network used to leave the user without the banner
+                // until a later trigger happened to succeed.
+                val backoffMs = longArrayOf(0L, 4_000L, 12_000L, 30_000L)
+                val attempts = if (manual) 1 else backoffMs.size
+                for (i in 0 until attempts) {
+                    if (i > 0) delay(backoffMs[i])
+                    val result = withContext(Dispatchers.IO) { updateManager.check(hubUrl) }
+                    when (result) {
+                        is UpdateManager.CheckResult.Available -> {
+                            prefs.edit().putLong(keyLastUpdateCheck, System.currentTimeMillis()).apply()
+                            // If this APK was already downloaded and verified in a
+                            // prior session, offer "Установить" directly instead of
+                            // re-downloading. Re-hashing the cached file stays on IO.
+                            val cached = withContext(Dispatchers.IO) {
+                                updateManager.cachedVerifiedApk(result.release)
+                            }
+                            _updateState.value = if (cached != null)
+                                UpdateUiState.ReadyToInstall(result.release, cached)
+                            else
+                                UpdateUiState.Available(result.release)
+                            return@launch
+                        }
+                        is UpdateManager.CheckResult.UpToDate -> {
+                            prefs.edit().putLong(keyLastUpdateCheck, System.currentTimeMillis()).apply()
+                            _updateState.value =
+                                if (manual) UpdateUiState.UpToDate else UpdateUiState.Idle
+                            return@launch
+                        }
+                        is UpdateManager.CheckResult.Failed -> {
+                            // Manual: surface the error now. Background: keep retrying
+                            // and do NOT stamp the rate-limit, so the next trigger is
+                            // free to try too.
+                            if (manual) {
+                                _updateState.value =
+                                    UpdateUiState.Error(friendlyUpdateError(result.error))
+                                return@launch
+                            }
+                        }
                     }
-                    _updateState.value = if (cached != null)
-                        UpdateUiState.ReadyToInstall(result.release, cached)
-                    else
-                        UpdateUiState.Available(result.release)
                 }
-                is UpdateManager.CheckResult.UpToDate ->
-                    _updateState.value = if (manual) UpdateUiState.UpToDate else UpdateUiState.Idle
-                is UpdateManager.CheckResult.Failed ->
-                    // Manual: surface the error. Background: stay silent and keep
-                    // the current state — a flaky network must not nag on launch.
-                    if (manual) _updateState.value =
-                        UpdateUiState.Error(friendlyUpdateError(result.error))
+            } finally {
+                updateCheckInFlight = false
             }
         }
     }
