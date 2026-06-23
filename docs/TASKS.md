@@ -16,10 +16,7 @@
 
 ## Check (готово, ждёт проверки пользователем)
 
-| ID | Задача | Тип | P | Ссылка |
-|--------|--------|-----|---|--------|
-| XR-021 | Авто-пауза не встаёт в Doze, пока телефон спит | bug | P1 | [docs/lld/15-android-trusted-networks.md](lld/15-android-trusted-networks.md), `local-docs/xr-021-verify.md`, `15c6d53` |
-| XR-022 | Баннер «в сети есть ограничения» проскакивает при авто-паузе, хотя ограничений нет | bug | P2 | [docs/lld/15-android-trusted-networks.md](lld/15-android-trusted-networks.md), `local-docs/xr-021-verify.md`, `fc8b6e8` |
+Нет.
 
 ## Backlog
 
