@@ -328,7 +328,7 @@ class XrVpnService : VpnService() {
         lastConfigJson = configJson
 
         publish(Phase.Preparing)
-        startForeground(NOTIFICATION_ID, buildNotification(_stateFlow.value))
+        startForegroundWithLocationType()
 
         // Arm the first-capabilities signal BEFORE registering the callback so
         // we can't miss the very first onCapabilitiesChanged (which lands almost
@@ -1041,6 +1041,38 @@ class XrVpnService : VpnService() {
     }
 
     // ── Notification ──────────────────────────────────────────────────
+
+    /**
+     * Go foreground, declaring the `location` FGS type when (and only when)
+     * location permission is actually granted. A location-typed foreground
+     * service keeps foreground-level location access for as long as the tunnel
+     * runs, which is what lets the trusted-network check read the Wi-Fi SSID
+     * while the app UI is backgrounded (XR-023): without it the SSID is redacted
+     * off the foreground and auto-pause only fired after opening the app. The
+     * type MUST be omitted when location is not granted — on Android 14+ starting
+     * a location-typed FGS without the permission throws and would kill the VPN.
+     */
+    private fun startForegroundWithLocationType() {
+        val notif = buildNotification(_stateFlow.value)
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, notif)
+            return
+        }
+        var types = 0
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            types = types or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED
+        }
+        val locGranted = checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (locGranted) {
+            types = types or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+        }
+        if (types != 0) {
+            startForeground(NOTIFICATION_ID, notif, types)
+        } else {
+            startForeground(NOTIFICATION_ID, notif)
+        }
+    }
 
     private fun updateNotification() {
         val nm = getSystemService(NotificationManager::class.java)
