@@ -29,9 +29,11 @@
 | XR-015 | Zero-touch provisioning VPS и роутера | LLD | P2 | [docs/lld/13-zero-touch-provisioning.md](lld/13-zero-touch-provisioning.md) |
 | XR-016 | Per-app split tunneling | LLD | P2 | [docs/lld/07-android-per-app-tunnel.md](lld/07-android-per-app-tunnel.md) |
 | XR-020 | Живые правила из хаба для серверов, добавленных вручную | LLD | P2 | [docs/lld/16-manual-server-hub-rules.md](lld/16-manual-server-hub-rules.md) |
+| XR-025 | Хаб-реестр роутеров и удалённое управление (pull control-plane) | LLD | P2 | [docs/lld/17-hub-router-registry.md](lld/17-hub-router-registry.md) |
 | XR-017 | Клиент под macOS | LLD | P3 | `local-docs/problems.md` (12) |
 | XR-018 | Автопополнение правил проксирования из community-фидов | LLD | P3 | `local-docs/problems.md` (13) |
 | XR-019 | Браузерное расширение | LLD | P3 | `local-docs/problems.md` (5b) |
+| XR-026 | Fleet-метрики и Grafana-дашборды | LLD | P3 | [docs/lld/18-fleet-metrics-grafana.md](lld/18-fleet-metrics-grafana.md) |
 
 ## Blocked
 

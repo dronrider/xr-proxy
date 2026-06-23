@@ -12,6 +12,9 @@ ed25519-ключи, формат пресетов. [LLD-04](04-onboarding-qr-uri
 `ServerProfile`: свежеподнятый сервер добавляется как профиль.
 [LLD-10](10-router-multi-vps-failover.md) — поднятый сервер попадает в пул как
 backup/primary; конфиг роутера генерируется в формате `[[servers]]`.
+[LLD-17](17-hub-router-registry.md) — после установки роутера bootstrap
+**регистрирует** его на хабе одноразовым enrollment-токеном и пишет `[control]`
+(per-router ключ) в конфиг: это шов «установка → реестр и удалённое управление».
 **Связанные документы:** `local-docs/routers.md` (реальный путь деплоя, доступы),
 memory [[reference_deploy_handoff]] (SSH, cross-build, ловушки nftables/sysctl),
 [ARCHITECTURE.md §3](../ARCHITECTURE.md).
@@ -73,6 +76,19 @@ xr-bootstrap router --server <addr:port> --key <b64> [--preset russia]
   сервера/ключа/пресета, в формате `[[servers]]` LLD-10), procd init + watchdog,
   nftables (auto_redirect/QUIC-block — xr-client ставит сам), fd-limit, переключает
   dnsmasq на Quad9 (`routers.md §4.2`), `enable`+`start`.
+  - **Раздаваемый Wi-Fi SSID** (`--ssid <name> [--wifi-pass <psk>]`): задаёт имя
+    домашней сети, которую роутер вещает (`uci set wireless...; commit`). Цель
+    пользователя — «роутер начал раздавать интернет с обходом», для чего и нужно
+    имя сети. **Применяется отложенно/последним шагом** (`uci commit; wifi reload`
+    в фоне с задержкой), иначе смена SSID оборвёт ту самую Wi-Fi-сессию, через
+    которую приложение настраивает роутер (§5.9). Опционально (`--ssid` не задан —
+    Wi-Fi не трогаем).
+  - **Enrollment в хаб (шов с LLD-17):** при наличии `--enroll-token` bootstrap
+    после старта клиента регистрирует роутер на хабе (`POST /api/v1/enroll`),
+    получает `{router_id, secret, command_pubkey}` и пишет секцию `[control]` в
+    `config.toml` → роутер появляется в реестре хаба и открывает исходящий
+    control-канал. Без токена — роутер работает автономно (как сегодня), без
+    удалённого управления.
 
 ### 2.2 Этап 2 — обёртка в Android по SSH
 
@@ -153,7 +169,7 @@ TOFU-защищённый онбординг-путь, и SSH-канал не с
 
 | Файл | Что меняется |
 |---|---|
-| `xr-bootstrap/` (новый крейт) или подкоманда в существующем бинаре | Каркас идемпотентных шагов `Step { check, apply, verify }`; профили `server`/`router`; рендер `server.toml`/`config.toml` (чистые функции); установка сервис-менеджера, sysctl, nftables-хуков (через xr-client auto-setup), watchdog, fd-limit, dnsmasq. Подкоманды `server`/`router`. Выдача инвайта через хаб для `server`. |
+| `xr-bootstrap/` (новый крейт) или подкоманда в существующем бинаре | Каркас идемпотентных шагов `Step { check, apply, verify }`; профили `server`/`router`; рендер `server.toml`/`config.toml` (чистые функции); установка сервис-менеджера, sysctl, nftables-хуков (через xr-client auto-setup), watchdog, fd-limit, dnsmasq. Подкоманды `server`/`router`. Выдача инвайта через хаб для `server`. Для `router`: шаг `wifi-ssid` (uci wireless, отложенный apply §5.9) и шаг `enroll` (LLD-17: `--enroll-token` → запись `[control]` в конфиг). |
 | `scripts/bootstrap.sh` (новый) | Тонкая `curl|sh`-обёртка: определить арку, скачать `xr-bootstrap` с хаба, запустить с переданными флагами. Для ручного сценария владельца. |
 | `xr-hub/src/...` | Раздача `xr-bootstrap`-бинарей по арке (`GET /api/v1/bootstrap/:arch`), как APK в LLD-12 (файлы на диске). Эндпоинт/CLI создания инвайта уже есть (LLD-01) — bootstrap его дёргает. |
 | `xr-android/.../provisioning/SshProvisioner.kt` (новый) | SSH-клиент (sshj/JSch): connect (пароль/ключ, TOFU host-key), deliver bootstrap, exec с прогрессом, teardown (стереть креды). |
@@ -192,6 +208,11 @@ TOFU-защищённый онбординг-путь, и SSH-канал не с
    полноценный TLS — ручной follow-up (не блокирует сервер-часть).
 8. **Серый IP VPS / firewall.** Сервер-bootstrap по SSH к публичному VPS; если
    порты 8443/443 закрыты провайдером — verify это поймает, сообщит.
+9. **Смена SSID обрывает сессию настройки.** Приложение настраивает роутер по его
+   же Wi-Fi; `wifi reload` с новым SSID рвёт это соединение на полпути. Поэтому
+   SSID применяется **последним**, отложенно (`commit` + фоновый `wifi reload`
+   через задержку), уже после `enable`/`start`/enrollment; verify-пинг — до смены
+   SSID. UI предупреждает «сеть переименуется, переподключитесь к <name>».
 
 ## 6. План проверки
 
@@ -199,8 +220,11 @@ TOFU-защищённый онбординг-путь, и SSH-канал не с
    → за <2 мин поднят xr-server+xr-hub, выдан инвайт. Повторный запуск —
    идемпотентен (ничего не сломал, ключ тот же).
 2. **Этап 1, router (ручной).** На свежем OpenWRT: `xr-bootstrap router --server
-   <aeza>` → xr-client стоит, procd enabled, nft-таблица `xr_proxy` есть, QUIC-block
-   есть, dnsmasq на Quad9, трафик за роутером проксируется (curl geo-blocked → 200).
+   <aeza> --ssid HomeNet --enroll-token <t>` → xr-client стоит, procd enabled,
+   nft-таблица `xr_proxy` есть, QUIC-block есть, dnsmasq на Quad9, трафик за
+   роутером проксируется (curl geo-blocked → 200); роутер **вещает SSID `HomeNet`**
+   (применён последним, сессия не оборвалась раньше времени) и **виден в реестре
+   хаба** `online` (LLD-17).
 3. **Этап 2, server из приложения.** «Добавить сервер с нуля» → ввод host/пароль
    → степпер до verify → инвайт принят → `ServerProfile` добавлен и активен →
    Connect работает. Креды не в prefs (проверить).
