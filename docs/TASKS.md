@@ -34,6 +34,7 @@
 | XR-018 | Автопополнение правил проксирования из community-фидов | LLD | P3 | `local-docs/problems.md` (13) |
 | XR-019 | Браузерное расширение | LLD | P3 | `local-docs/problems.md` (5b) |
 | XR-026 | Fleet-метрики и Grafana-дашборды | LLD | P3 | [docs/lld/18-fleet-metrics-grafana.md](lld/18-fleet-metrics-grafana.md) |
+| XR-027 | Файлообмен: агент-шара + хаб-индекс адресов, скачивание и one-way sync на Android | LLD | P3 | [docs/lld/19-file-sharing-agent.md](lld/19-file-sharing-agent.md) |
 
 ## Blocked
 
