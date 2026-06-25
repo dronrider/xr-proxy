@@ -59,6 +59,26 @@ pub struct ShareToken {
     pub signature: String,
 }
 
+/// A long-lived **bearer mandate** the hub issues to an agent once at install
+/// time (§9.2), so the agent can self-register shares and mint access tokens
+/// without an admin action each time. It is the hub's ed25519 signature over
+/// `{agent_pubkey, exp}`; the hub verifies it **statelessly** (its own key) and
+/// keeps no trusted-agent store. Bearer semantics: whoever holds it can register
+/// shares under `agent_pubkey`, so the agent stores it `0600`. Expiry (~1 year)
+/// is the only revocation lever, same as a [`ShareToken`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCredential {
+    /// Base64 (standard) ed25519 public key this mandate binds to — the identity
+    /// the agent's shares will pin (TOFU). Shares created with this credential
+    /// carry exactly this key.
+    pub agent_pubkey: String,
+    /// Expiry, unix seconds (the hub sets it ~1 year out).
+    pub exp: u64,
+    /// Base64 (standard) of the 64-byte ed25519 signature over
+    /// [`agent_credential_signing_bytes`].
+    pub signature: String,
+}
+
 /// What the hub stores for a registered share: a name and an address, nothing
 /// more. **No file listing, no bytes** — that lives on the agent (§3.1, the
 /// legal-cleanliness requirement). `test_share_record_has_no_content` guards
@@ -123,6 +143,15 @@ pub fn token_signing_bytes(share_id: &str, exp: u64) -> Vec<u8> {
     format!("xr-share-token\nv1\n{share_id}\n{exp}").into_bytes()
 }
 
+/// The exact bytes an [`AgentCredential`] signature covers. As with
+/// [`token_signing_bytes`], a single definition shared by signer and verifier.
+/// A distinct domain prefix (`xr-share-agent-cred`) keeps an agent credential
+/// from ever being confused with a share token, even though both are hub
+/// signatures over a `(string, exp)` pair.
+pub fn agent_credential_signing_bytes(agent_pubkey: &str, exp: u64) -> Vec<u8> {
+    format!("xr-share-agent-cred\nv1\n{agent_pubkey}\n{exp}").into_bytes()
+}
+
 /// Why a [`verify_share_token`] check failed. Distinct variants so the agent can
 /// log/diagnose without leaking the token itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,9 +181,37 @@ impl core::fmt::Display for ShareTokenError {
 
 impl std::error::Error for ShareTokenError {}
 
+/// Why a [`verify_agent_credential`] check failed. Mirrors [`ShareTokenError`]
+/// but without a share-binding variant (a credential is not share-scoped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentCredentialError {
+    /// `signature` was not valid base64 or not 64 bytes.
+    MalformedSignature,
+    /// Signature did not verify against the hub key (tampered or wrong signer).
+    BadSignature,
+    /// `exp` is at or before `now` — the mandate has lapsed.
+    Expired,
+}
+
+impl core::fmt::Display for AgentCredentialError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = match self {
+            Self::MalformedSignature => "malformed agent-credential signature",
+            Self::BadSignature => "agent-credential signature does not verify",
+            Self::Expired => "agent-credential has expired",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::error::Error for AgentCredentialError {}
+
 #[cfg(any(feature = "share", test))]
 mod crypto {
-    use super::{token_signing_bytes, ShareToken, ShareTokenError};
+    use super::{
+        agent_credential_signing_bytes, token_signing_bytes, AgentCredential,
+        AgentCredentialError, ShareToken, ShareTokenError,
+    };
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 
@@ -199,10 +256,50 @@ mod crypto {
             .verify(&token_signing_bytes(&token.share_id, token.exp), &signature)
             .map_err(|_| ShareTokenError::BadSignature)
     }
+
+    /// Issue an agent mandate: sign `(agent_pubkey, exp)` with the hub key. The
+    /// hub calls this once per agent at install time (the reg-token exchange).
+    pub fn sign_agent_credential(key: &SigningKey, agent_pubkey: &str, exp: u64) -> AgentCredential {
+        let sig = key.sign(&agent_credential_signing_bytes(agent_pubkey, exp));
+        AgentCredential {
+            agent_pubkey: agent_pubkey.to_string(),
+            exp,
+            signature: base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()),
+        }
+    }
+
+    /// Verify an agent mandate against the hub key at wall-clock `now_unix`.
+    /// Stateless: a valid hub signature over a non-expired `{agent_pubkey, exp}`
+    /// is the whole proof — no trusted-agent store. Fails closed. Expiry is
+    /// checked before the signature (cheap first), but every path still rejects.
+    pub fn verify_agent_credential(
+        cred: &AgentCredential,
+        hub_key: &VerifyingKey,
+        now_unix: u64,
+    ) -> Result<(), AgentCredentialError> {
+        if cred.exp <= now_unix {
+            return Err(AgentCredentialError::Expired);
+        }
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(cred.signature.trim())
+            .map_err(|_| AgentCredentialError::MalformedSignature)?;
+        let sig_arr: [u8; 64] = sig_bytes
+            .try_into()
+            .map_err(|_| AgentCredentialError::MalformedSignature)?;
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        hub_key
+            .verify(
+                &agent_credential_signing_bytes(&cred.agent_pubkey, cred.exp),
+                &signature,
+            )
+            .map_err(|_| AgentCredentialError::BadSignature)
+    }
 }
 
 #[cfg(any(feature = "share", test))]
-pub use crypto::{sign_share_token, verify_share_token};
+pub use crypto::{
+    sign_agent_credential, sign_share_token, verify_agent_credential, verify_share_token,
+};
 
 #[cfg(test)]
 mod tests {
@@ -285,6 +382,63 @@ mod tests {
         assert_eq!(
             verify_share_token(&token, &vk, "share-1", 4999),
             Err(ShareTokenError::MalformedSignature)
+        );
+    }
+
+    #[test]
+    fn test_agent_credential_verify() {
+        let key = hub_key();
+        let vk = key.verifying_key();
+        let agent_pk = "QQ=="; // opaque label here; real callers pass a 32-byte key
+        let cred = sign_agent_credential(&key, agent_pk, 5000);
+
+        // Valid: right hub key, not expired.
+        assert!(verify_agent_credential(&cred, &vk, 4999).is_ok());
+        assert_eq!(cred.agent_pubkey, agent_pk);
+
+        // Expired (now == exp and now > exp) → Expired.
+        assert_eq!(
+            verify_agent_credential(&cred, &vk, 5000),
+            Err(AgentCredentialError::Expired)
+        );
+        assert_eq!(
+            verify_agent_credential(&cred, &vk, 6000),
+            Err(AgentCredentialError::Expired)
+        );
+
+        // Wrong signer → BadSignature.
+        let other = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        assert_eq!(
+            verify_agent_credential(&cred, &other, 4999),
+            Err(AgentCredentialError::BadSignature)
+        );
+
+        // Tampered pubkey without re-signing → BadSignature (the signed bytes
+        // bind the key, so swapping it invalidates the mandate).
+        let mut forged = cred.clone();
+        forged.agent_pubkey = "WW==".into();
+        assert_eq!(
+            verify_agent_credential(&forged, &vk, 4999),
+            Err(AgentCredentialError::BadSignature)
+        );
+
+        // Malformed signature → MalformedSignature, not a panic.
+        let mut bad = cred.clone();
+        bad.signature = "@@@".into();
+        assert_eq!(
+            verify_agent_credential(&bad, &vk, 4999),
+            Err(AgentCredentialError::MalformedSignature)
+        );
+    }
+
+    #[test]
+    fn agent_credential_domain_separated_from_token() {
+        // A share token and an agent credential are both hub signatures over a
+        // (string, exp) pair; the distinct domain prefixes must keep their signed
+        // bytes disjoint so one can never be replayed as the other.
+        assert_ne!(
+            agent_credential_signing_bytes("x", 1),
+            token_signing_bytes("x", 1)
         );
     }
 
