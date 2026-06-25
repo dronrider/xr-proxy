@@ -8,7 +8,7 @@ default = []
 dev-ui = ["tower-http/fs"]
 
 [dependencies]
-xr-proto = { path = "../xr-proto" }
+xr-proto = { path = "../xr-proto", features = ["share"] }
 axum = { version = "0.8", features = ["json"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = "0.5"

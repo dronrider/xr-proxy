@@ -1,7 +1,10 @@
 pub mod app;
 pub mod auth;
+pub mod dist;
 pub mod invites;
 pub mod presets;
+pub mod register;
+pub mod shares;
 
 use std::sync::Arc;
 
@@ -40,7 +43,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/invite/{token}/claim", post(invites::claim_invite))
         .route("/public-key", get(presets::get_public_key))
         .route("/app/latest", get(app::get_latest))
-        .route("/app/download/{ver}", get(app::download));
+        .route("/app/download/{ver}", get(app::download))
+        .route("/shares", get(shares::list_shares))
+        .route("/share/register", post(register::register));
 
     // Auth (no session required).
     let auth_routes = Router::new()
@@ -55,6 +60,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/invites", post(invites::create_invite))
         .route("/invites/{token}", delete(invites::revoke_invite))
         .route("/invite-defaults", get(invites::get_invite_defaults))
+        .route("/shares", get(shares::admin_list_shares))
+        .route("/shares", post(shares::create_share))
+        .route("/shares/{id}", delete(shares::delete_share))
+        .route("/shares/{id}/token", post(shares::mint_token))
+        .route("/shares/reg-token", post(register::create_reg_token))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_admin,
@@ -64,6 +74,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .nest("/api/v1", public)
         .nest("/api/v1", auth_routes)
         .nest("/api/v1/admin", admin)
+        // Top-level so the install one-liner is a clean URL (xr-share dist).
+        .route("/share/{file}", get(dist::serve))
         .with_state(state)
         .layer(cors)
         .layer(TraceLayer::new_for_http());

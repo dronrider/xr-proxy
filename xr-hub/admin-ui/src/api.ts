@@ -78,6 +78,26 @@ export const api = {
     }),
   revokeInvite: (token: string) =>
     request<void>(`/admin/invites/${token}`, { method: 'DELETE' }),
+
+  // Admin shares (LLD-19)
+  listShares: () => request<ShareRecord[]>('/admin/shares'),
+  createShare: (data: CreateShareRequest) =>
+    request<ShareRecord>('/admin/shares', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  deleteShare: (id: string) =>
+    request<void>(`/admin/shares/${id}`, { method: 'DELETE' }),
+  mintShareToken: (id: string, ttlSeconds: number) =>
+    request<ShareToken>(`/admin/shares/${id}/token`, {
+      method: 'POST',
+      body: JSON.stringify({ ttl_seconds: ttlSeconds }),
+    }),
+  createRegToken: (ttlSeconds: number) =>
+    request<RegTokenResponse>('/admin/shares/reg-token', {
+      method: 'POST',
+      body: JSON.stringify({ ttl_seconds: ttlSeconds }),
+    }),
 }
 
 // Types
@@ -164,4 +184,36 @@ export interface CreateInviteRequest {
   comment: string
   preset?: string
   payload?: InvitePayload
+}
+
+// Shares (LLD-19): the hub stores address + identity only, never file bytes.
+export interface ShareRecord {
+  share_id: string
+  name: string
+  owner: string
+  addr: string
+  port: number
+  agent_pubkey: string
+  created_at: string
+  comment: string
+}
+
+export interface CreateShareRequest {
+  name: string
+  owner: string
+  addr: string
+  port: number
+  agent_pubkey: string
+  comment: string
+}
+
+export interface ShareToken {
+  share_id: string
+  exp: number
+  signature: string
+}
+
+export interface RegTokenResponse {
+  token: string
+  exp: number
 }

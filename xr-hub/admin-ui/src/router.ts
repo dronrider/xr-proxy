@@ -33,6 +33,11 @@ const router = createRouter({
       name: 'InvitesList',
       component: () => import('./pages/InvitesList.vue'),
     },
+    {
+      path: '/shares',
+      name: 'SharesList',
+      component: () => import('./pages/SharesList.vue'),
+    },
   ],
 })
 
