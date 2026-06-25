@@ -20,13 +20,14 @@ use ed25519_dalek::{Signer, Verifier};
 use serde::{Deserialize, Serialize};
 use xr_proto::share::ShareRecord;
 
+use crate::signing::SigningContext;
 use crate::state::AppState;
 use crate::storage;
 
 const DEFAULT_REG_TTL: u64 = 3600; // 1h — enough to run the installer
 const MAX_REG_TTL: u64 = 7 * 24 * 3600;
 
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -43,6 +44,37 @@ fn reg_signing_bytes(exp: u64) -> Vec<u8> {
 struct RegToken {
     exp: u64,
     signature: String,
+}
+
+/// Verify a registration-token blob (signature + expiry) against the hub key.
+/// Shared by `register` (v1) and the v2 `share/exchange` endpoint so the
+/// reg-token check has exactly one implementation.
+pub(crate) fn verify_reg_token(
+    signing: &SigningContext,
+    token: &str,
+    now: u64,
+) -> Result<(), (StatusCode, String)> {
+    let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token.trim())
+        .map_err(|_| (StatusCode::BAD_REQUEST, "malformed registration token".into()))?;
+    let rt: RegToken = serde_json::from_slice(&blob)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "malformed registration token".into()))?;
+    if rt.exp <= now {
+        return Err((StatusCode::FORBIDDEN, "registration token expired".into()));
+    }
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(rt.signature.trim())
+        .map_err(|_| (StatusCode::BAD_REQUEST, "malformed token signature".into()))?;
+    let sig_arr: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "malformed token signature".into()))?;
+    signing
+        .verifying_key()
+        .verify(
+            &reg_signing_bytes(rt.exp),
+            &ed25519_dalek::Signature::from_bytes(&sig_arr),
+        )
+        .map_err(|_| (StatusCode::FORBIDDEN, "invalid registration token".into()))
 }
 
 // ── Admin: mint a registration token ────────────────────────────────
@@ -119,24 +151,7 @@ pub async fn register(
     ))?;
 
     // Verify the registration token (signature + expiry) against the hub key.
-    let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(req.token.trim())
-        .map_err(|_| (StatusCode::BAD_REQUEST, "malformed registration token".into()))?;
-    let rt: RegToken = serde_json::from_slice(&blob)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "malformed registration token".into()))?;
-    if rt.exp <= now_unix() {
-        return Err((StatusCode::FORBIDDEN, "registration token expired".into()));
-    }
-    let sig_bytes = base64::engine::general_purpose::STANDARD
-        .decode(rt.signature.trim())
-        .map_err(|_| (StatusCode::BAD_REQUEST, "malformed token signature".into()))?;
-    let sig_arr: [u8; 64] = sig_bytes
-        .try_into()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "malformed token signature".into()))?;
-    signing
-        .verifying_key()
-        .verify(&reg_signing_bytes(rt.exp), &ed25519_dalek::Signature::from_bytes(&sig_arr))
-        .map_err(|_| (StatusCode::FORBIDDEN, "invalid registration token".into()))?;
+    verify_reg_token(signing, &req.token, now_unix())?;
 
     // Validate agent identity + port.
     validate_ed25519_pubkey(&req.agent_pubkey)?;
@@ -180,7 +195,7 @@ pub async fn register(
 }
 
 /// Source IP from the reverse proxy headers (nginx) or X-Forwarded-For.
-fn client_ip(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn client_ip(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-real-ip")
         .and_then(|v| v.to_str().ok())
@@ -196,7 +211,7 @@ fn client_ip(headers: &HeaderMap) -> Option<String> {
         })
 }
 
-fn validate_ed25519_pubkey(b64: &str) -> Result<(), (StatusCode, String)> {
+pub(crate) fn validate_ed25519_pubkey(b64: &str) -> Result<(), (StatusCode, String)> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
         .map_err(|_| (StatusCode::BAD_REQUEST, "agent_pubkey must be valid base64".into()))?;

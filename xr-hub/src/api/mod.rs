@@ -4,6 +4,7 @@ pub mod dist;
 pub mod invites;
 pub mod presets;
 pub mod register;
+pub mod share_v2;
 pub mod shares;
 
 use std::sync::Arc;
@@ -45,7 +46,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/app/latest", get(app::get_latest))
         .route("/app/download/{ver}", get(app::download))
         .route("/shares", get(shares::list_shares))
-        .route("/share/register", post(register::register));
+        .route("/share/register", post(register::register))
+        // v2 self-service multishare (agent-authenticated by reg-token/credential).
+        .route("/share/exchange", post(share_v2::exchange))
+        .route("/share/add", post(share_v2::add))
+        .route("/share/mint", post(share_v2::mint))
+        .route("/share/unshare", post(share_v2::unshare));
 
     // Auth (no session required).
     let auth_routes = Router::new()
