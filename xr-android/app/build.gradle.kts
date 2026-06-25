@@ -98,6 +98,11 @@ dependencies {
     // Security (encrypted preferences)
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
+    // WorkManager — periodic background file-sharing sync (LLD-19)
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
+    // DocumentFile — read/write the user-chosen SAF tree (LLD-19 storage)
+    implementation("androidx.documentfile:documentfile:1.0.1")
+
     // Google Code Scanner (system-UI QR scanner, no CAMERA permission needed)
     implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
 

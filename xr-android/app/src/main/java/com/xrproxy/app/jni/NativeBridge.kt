@@ -154,4 +154,48 @@ object NativeBridge {
      * swapped download returns false and the caller deletes the file.
      */
     external fun nativeVerifyApk(path: String, sha256Hex: String): Boolean
+
+    // ── File sharing (LLD-19) ───────────────────────────────────────
+    // All functions return JSON strings — parse on Kotlin side. The mirror /
+    // diff / download logic lives entirely in Rust (xr-core::sync); Kotlin only
+    // supplies storage paths and a schedule. The token is a ShareToken JSON the
+    // owner handed out (out-of-band); the agent verifies it offline.
+
+    /** GET the hub's public share index. Returns
+     *  `{"shares":[{share_id,name,addr,port,agent_pubkey}...]}` or `{"error":..}`. */
+    external fun nativeListShares(hubUrl: String, timeoutMs: Long): String
+
+    /** Fetch a share's manifest from the agent (presents [tokenJson]). Returns
+     *  `{"entries":[{path,size,mtime,sha256}...]}` or `{"error":".."}`. Used to
+     *  populate the file picker for one-time download. */
+    external fun nativeFetchManifest(agentUrl: String, tokenJson: String, timeoutMs: Long): String
+
+    /** Pure diff for SAF storage. [manifestJson] is the agent manifest;
+     *  [localJson] is `[{"path":..,"sha256":..}...]` the caller enumerated from
+     *  the SAF tree. Returns the plan `{"fetch":[...],"delete":[...]}`. No I/O —
+     *  the caller then downloads fetches and applies deletes against the tree. */
+    external fun nativePlanSync(manifestJson: String, localJson: String): String
+
+    /** Download one manifest entry ([entryJson]) to [destDir], SHA-256-verified
+     *  before it is published. Returns `{"ok":true}` or `{"error":".."}`. */
+    external fun nativeDownloadFile(
+        agentUrl: String,
+        tokenJson: String,
+        entryJson: String,
+        destDir: String,
+        timeoutMs: Long,
+    ): String
+
+    /** Mirror a share into [destDir] (background sync). With [dryRun] true,
+     *  returns only the plan (`{"plan":{"fetch":[...],"delete":[...]}}`) so the UI
+     *  can warn about deletions; with [dryRun] false it applies and also returns
+     *  `{"plan":..,"report":{"fetched":[...],"deleted":[...],"failed":[...]}}`.
+     *  Mirror is true-mirror: files gone on the server are deleted locally. */
+    external fun nativeSyncShare(
+        agentUrl: String,
+        tokenJson: String,
+        destDir: String,
+        dryRun: Boolean,
+        timeoutMs: Long,
+    ): String
 }

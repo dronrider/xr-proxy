@@ -40,6 +40,7 @@ import com.xrproxy.app.ui.components.StatsGrid
 import com.xrproxy.app.ui.components.XrSnackbarHost
 import com.xrproxy.app.ui.components.formatBytes
 import com.xrproxy.app.ui.components.formatUptime
+import com.xrproxy.app.ui.files.FilesScreen
 import com.xrproxy.app.ui.onboarding.InviteConfirmScreen
 import com.xrproxy.app.ui.onboarding.PasteLinkDialog
 import com.xrproxy.app.ui.onboarding.WelcomeScreen
@@ -404,6 +405,12 @@ fun MainScreen(
                     icon = { Icon(Icons.Default.Dns, null) },
                     label = { Text("Servers") },
                 )
+                NavigationBarItem(
+                    selected = currentTab == 3,
+                    onClick = { currentTab = 3 },
+                    icon = { Icon(Icons.Default.Folder, null) },
+                    label = { Text("Files") },
+                )
             }
         }
     ) { padding ->
@@ -491,6 +498,10 @@ fun MainScreen(
                 )
                 Spacer(Modifier.height(16.dp))
             }
+            3 -> FilesScreen(
+                hubUrl = activeServer?.hubUrl,
+                modifier = Modifier.fillMaxSize().padding(padding),
+            )
         }
     }
 }
