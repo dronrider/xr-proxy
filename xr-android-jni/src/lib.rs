@@ -13,9 +13,12 @@ use xr_core::engine::{VpnConfig, VpnEngine};
 use xr_core::ip_stack::PacketQueue;
 use xr_core::onboarding;
 use xr_core::session::{ProtectSocketFn, SystemResolverFn};
+use xr_core::sync;
 use xr_core::update;
 use xr_proto::config::RoutingConfig;
 use xr_proto::invite_url;
+use xr_core::sync::LocalFile;
+use xr_proto::share::{ShareManifest, ShareManifestEntry, ShareToken};
 
 /// Global engine instance.
 static ENGINE: OnceLock<Mutex<Option<EngineHandle>>> = OnceLock::new();
@@ -830,6 +833,192 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeVerifyApk(
     } else {
         0
     }
+}
+
+// ── File-sharing bridge (LLD-19) ────────────────────────────────────
+//
+// The Kotlin "Files" screen drives the one-way mirror engine in xr-core: list
+// shares from the hub, browse a share's manifest, download selected files, or
+// run a full mirror sync. All file/diff logic lives in Rust (`xr_core::sync`);
+// Kotlin only supplies storage paths and a schedule. The token (a ShareToken
+// JSON the owner handed out) is verified by the agent offline — never here.
+//
+// NOTE: token blobs are never logged. TLS pinning of a self-signed agent
+// identity is an Android-side follow-up; today the engine works over HTTP and
+// CA-valid HTTPS.
+
+/// Parse a ShareToken JSON string into the typed token.
+fn parse_token(json: &str) -> Result<ShareToken, String> {
+    serde_json::from_str::<ShareToken>(json).map_err(|e| format!("bad token json: {e}"))
+}
+
+/// GET the hub's public share index. Returns `{"shares":[{name,addr,port,
+/// agent_pubkey,share_id}...]}` or `{"error":".."}`.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeListShares(
+    mut env: JNIEnv,
+    _class: JClass,
+    hub_url: JString,
+    timeout_ms: jlong,
+) -> jstring {
+    let hub_url = match read_jstring(&mut env, &hub_url) {
+        Ok(s) => s,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+
+    let json = match with_onboarding_runtime(sync::list_shares(&hub_url, timeout)) {
+        Ok(Ok(shares)) => serde_json::json!({ "shares": shares }).to_string(),
+        Ok(Err(e)) | Err(e) => json_error(&e),
+    };
+    jstring_into_raw(&mut env, json)
+}
+
+/// Fetch a share's manifest from the agent (presenting the token). Returns the
+/// ShareManifest JSON (`{"entries":[{path,size,mtime,sha256}...]}`) or
+/// `{"error":".."}`. Used to populate the file picker for one-time download.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeFetchManifest(
+    mut env: JNIEnv,
+    _class: JClass,
+    agent_url: JString,
+    token_json: JString,
+    timeout_ms: jlong,
+) -> jstring {
+    let agent_url = match read_jstring(&mut env, &agent_url) {
+        Ok(s) => s,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let token = match read_jstring(&mut env, &token_json).and_then(|s| parse_token(&s)) {
+        Ok(t) => t,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+
+    let json = match with_onboarding_runtime(sync::fetch_manifest(&agent_url, &token, timeout)) {
+        Ok(Ok(manifest)) => serde_json::to_string(&manifest)
+            .unwrap_or_else(|e| json_error(&format!("serialize: {e}"))),
+        Ok(Err(e)) | Err(e) => json_error(&e),
+    };
+    jstring_into_raw(&mut env, json)
+}
+
+/// Download a single manifest entry to `dest_dir` (one-time download). The
+/// entry is a ShareManifestEntry JSON; the file is SHA-256-verified before being
+/// published. Returns `{"ok":true}` or `{"error":".."}`.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeDownloadFile(
+    mut env: JNIEnv,
+    _class: JClass,
+    agent_url: JString,
+    token_json: JString,
+    entry_json: JString,
+    dest_dir: JString,
+    timeout_ms: jlong,
+) -> jstring {
+    let agent_url = match read_jstring(&mut env, &agent_url) {
+        Ok(s) => s,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let token = match read_jstring(&mut env, &token_json).and_then(|s| parse_token(&s)) {
+        Ok(t) => t,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let entry = match read_jstring(&mut env, &entry_json) {
+        Ok(s) => match serde_json::from_str::<ShareManifestEntry>(&s) {
+            Ok(e) => e,
+            Err(e) => return jstring_into_raw(&mut env, json_error(&format!("bad entry json: {e}"))),
+        },
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let dest = match read_jstring(&mut env, &dest_dir) {
+        Ok(s) => PathBuf::from(s),
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+
+    let json =
+        match with_onboarding_runtime(sync::download_entry(&agent_url, &token, &entry, &dest, timeout)) {
+            Ok(Ok(())) => serde_json::json!({ "ok": true }).to_string(),
+            Ok(Err(e)) | Err(e) => json_error(&e),
+        };
+    jstring_into_raw(&mut env, json)
+}
+
+/// Pure diff for SAF storage: the consumer enumerates its local copy from the
+/// SAF tree (in Kotlin) and passes it as `local_json` (a `[{path,sha256}...]`
+/// array) along with the agent's `manifest_json`. Returns the plan JSON
+/// (`{"fetch":[...],"delete":[...]}`). No network, no filesystem — Kotlin then
+/// downloads fetches (via `nativeDownloadFile` to a temp file) and applies the
+/// deletes against the SAF tree.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePlanSync(
+    mut env: JNIEnv,
+    _class: JClass,
+    manifest_json: JString,
+    local_json: JString,
+) -> jstring {
+    let manifest = match read_jstring(&mut env, &manifest_json) {
+        Ok(s) => match serde_json::from_str::<ShareManifest>(&s) {
+            Ok(m) => m,
+            Err(e) => return jstring_into_raw(&mut env, json_error(&format!("bad manifest json: {e}"))),
+        },
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let local = match read_jstring(&mut env, &local_json) {
+        Ok(s) => match serde_json::from_str::<Vec<LocalFile>>(&s) {
+            Ok(v) => v,
+            Err(e) => return jstring_into_raw(&mut env, json_error(&format!("bad local json: {e}"))),
+        },
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+
+    let plan = sync::plan_sync(&manifest, &local);
+    let json =
+        serde_json::to_string(&plan).unwrap_or_else(|e| json_error(&format!("serialize: {e}")));
+    jstring_into_raw(&mut env, json)
+}
+
+/// Mirror a share into `dest_dir` (background sync). With `dry_run` true, returns
+/// only the plan (`{"plan":{"fetch":[...],"delete":[...]}}`) so the UI can warn
+/// about deletions; with `dry_run` false it applies and also returns the report
+/// (`{"plan":..,"report":{"fetched":[...],"deleted":[...],"failed":[...]}}`).
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
+    mut env: JNIEnv,
+    _class: JClass,
+    agent_url: JString,
+    token_json: JString,
+    dest_dir: JString,
+    dry_run: jboolean,
+    timeout_ms: jlong,
+) -> jstring {
+    let agent_url = match read_jstring(&mut env, &agent_url) {
+        Ok(s) => s,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let token = match read_jstring(&mut env, &token_json).and_then(|s| parse_token(&s)) {
+        Ok(t) => t,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let dest = match read_jstring(&mut env, &dest_dir) {
+        Ok(s) => PathBuf::from(s),
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+
+    let json = match with_onboarding_runtime(sync::sync_share(
+        &agent_url,
+        &token,
+        &dest,
+        dry_run != 0,
+        timeout,
+    )) {
+        Ok(Ok(result)) => serde_json::to_string(&result)
+            .unwrap_or_else(|e| json_error(&format!("serialize: {e}"))),
+        Ok(Err(e)) | Err(e) => json_error(&e),
+    };
+    jstring_into_raw(&mut env, json)
 }
 
 #[cfg(test)]
