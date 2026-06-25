@@ -1,17 +1,19 @@
 #!/bin/sh
-# xr-share installer (XR-028). Downloads the agent, verifies its SHA-256, and
-# — given a registration token — configures it and starts the service. One
-# command, no hands:
+# xr-share installer (XR-028/029). Downloads the agent, verifies its SHA-256,
+# and, given a registration token, installs it as a service with a long-lived
+# hub mandate so you can then share any number of paths. One command:
 #
 #   curl -fsSL https://xr-hub.zoobr.top/share/install.sh \
-#     | sudo sh -s -- --dir /srv/share --token <REG-TOKEN-FROM-HUB>
+#     | sudo sh -s -- --token <REG-TOKEN-FROM-HUB>
 #
-# Generate <REG-TOKEN> in the hub admin (Shares → "Команда установки"). Without
-# --dir/--token it just installs the binary; configure later with `xr-share init`.
+# Generate <REG-TOKEN> in the hub admin (Shares, "Команда установки"). Then,
+# anytime:  sudo xr-share share /srv/photos   (a folder OR a single file).
+# Pass --dir to also share one path right after install. Without --token it just
+# installs the binary; set up later with `xr-share install --token <reg-token>`.
 #
-# Flags (or env): --dir/XR_DIR, --token/XR_TOKEN, --hub/XR_HUB,
+# Flags (or env): --token/XR_TOKEN, --hub/XR_HUB, --dir/XR_DIR (share now),
 #                 --addr/XR_ADDR (advertised address; default = source IP),
-#                 --name/XR_NAME (share name; default = hostname).
+#                 --name/XR_NAME (share name; default = path's file name).
 set -eu
 
 BASE="${XR_SHARE_BASE:-https://xr-hub.zoobr.top/share}"
@@ -40,7 +42,7 @@ arch=$(uname -m 2>/dev/null || echo unknown)
 case "$os" in
   Linux)  os=linux ;;
   Darwin) os=macos ;;
-  *) die "unsupported OS '$os' — on Windows use install.ps1 in PowerShell" ;;
+  *) die "unsupported OS '$os' (on Windows use install.ps1 in PowerShell)" ;;
 esac
 case "$arch" in
   x86_64|amd64)  arch=x86_64 ;;
@@ -73,25 +75,30 @@ if [ -w /usr/local/bin ]; then dir=/usr/local/bin; else dir="$HOME/.local/bin"; 
 mv "$tmp/$bin" "$dir/xr-share"
 say "Installed: $dir/xr-share"
 
-# ── No-hands: configure + start the service ─────────────────────────
-if [ -n "$DIR" ] && [ -n "$TOKEN" ]; then
+# ── No-hands: install the service with a hub mandate ────────────────
+if [ -n "$TOKEN" ]; then
   if [ "$(id -u)" != 0 ]; then
     say ""
-    say "To self-register + start the service, re-run as root, e.g.:"
-    say "  curl -fsSL $BASE/install.sh | sudo sh -s -- --dir \"$DIR\" --token <token>"
+    say "Installing the service needs root, re-run as:"
+    say "  curl -fsSL $BASE/install.sh | sudo sh -s -- --token <token>"
     exit 0
   fi
-  say "Registering with the hub and starting the service ..."
-  set -- init --non-interactive --dir "$DIR" --hub "$HUB" --token "$TOKEN"
-  [ -n "$ADDR" ] && set -- "$@" --addr "$ADDR"
-  [ -n "$NAME" ] && set -- "$@" --name "$NAME"
-  "$dir/xr-share" "$@"
-  "$dir/xr-share" service install
+  say "Installing the service and exchanging the token for a hub mandate ..."
+  "$dir/xr-share" install --non-interactive --hub "$HUB" --token "$TOKEN"
+  if [ -n "$DIR" ]; then
+    say "Sharing $DIR ..."
+    set -- share "$DIR"
+    [ -n "$ADDR" ] && set -- "$@" --addr "$ADDR"
+    [ -n "$NAME" ] && set -- "$@" --name "$NAME"
+    "$dir/xr-share" "$@"
+  fi
   say ""
-  say "Done — xr-share is running and registered. Files in $DIR are now shareable."
+  say "Done. Share any path anytime (folder or file):"
+  say "  sudo xr-share share /srv/photos"
+  say "  sudo xr-share list"
 else
   say ""
-  say "Next: configure + enable the service"
-  say "  sudo xr-share init --dir /path/to/share --token <reg-token-from-hub>"
-  say "  sudo xr-share service install"
+  say "Next: install the service, then share paths"
+  say "  sudo xr-share install --hub $HUB --token <reg-token-from-hub>"
+  say "  sudo xr-share share /path/to/share"
 fi

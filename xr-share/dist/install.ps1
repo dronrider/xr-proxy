@@ -1,12 +1,15 @@
-# xr-share installer for Windows (XR-028). Downloads the agent, verifies its
-# SHA-256, and — given a registration token — configures it and starts the
-# service. One command, no hands (run PowerShell as Administrator):
+# xr-share installer for Windows (XR-028/029). Downloads the agent, verifies its
+# SHA-256, and, given a registration token, installs it as a service with a
+# long-lived hub mandate so you can then share any number of paths. One command
+# (run PowerShell as Administrator):
 #
-#   $env:XR_DIR="C:\share"; $env:XR_TOKEN="<REG-TOKEN-FROM-HUB>"
+#   $env:XR_TOKEN="<REG-TOKEN-FROM-HUB>"
 #   irm https://xr-hub.zoobr.top/share/install.ps1 | iex
 #
-# Generate <REG-TOKEN> in the hub admin (Shares → "Команда установки"). Without
-# XR_DIR/XR_TOKEN it just installs the binary; configure later with `xr-share init`.
+# Generate <REG-TOKEN> in the hub admin (Shares, "Команда установки"). Then share
+# any path:  xr-share share C:\photos   (a folder OR a single file). Set XR_DIR to
+# also share one path right away. Without XR_TOKEN it just installs the binary;
+# set up later with `xr-share install --token <reg-token>`.
 # Optional: $env:XR_HUB, $env:XR_ADDR (advertised address), $env:XR_NAME.
 $ErrorActionPreference = 'Stop'
 
@@ -40,19 +43,25 @@ if ($userPath -notlike "*$dir*") {
 if ($env:Path -notlike "*$dir*") { $env:Path = "$env:Path;$dir" }
 Write-Host "Installed: $dest"
 
-# ── No-hands: configure + start the service ─────────────────────────
-if ($env:XR_DIR -and $env:XR_TOKEN) {
-    Write-Host "Registering with the hub and starting the service ..."
-    $initArgs = @('init', '--non-interactive', '--dir', $env:XR_DIR, '--hub', $hub, '--token', $env:XR_TOKEN)
-    if ($env:XR_ADDR) { $initArgs += @('--addr', $env:XR_ADDR) }
-    if ($env:XR_NAME) { $initArgs += @('--name', $env:XR_NAME) }
-    & $dest @initArgs
-    & $dest service install   # needs an elevated (Administrator) PowerShell
+# ── No-hands: install the service with a hub mandate ────────────────
+if ($env:XR_TOKEN) {
+    Write-Host "Installing the service and exchanging the token for a hub mandate ..."
+    $installArgs = @('install', '--non-interactive', '--hub', $hub, '--token', $env:XR_TOKEN)
+    & $dest @installArgs           # needs an elevated (Administrator) PowerShell
+    if ($env:XR_DIR) {
+        Write-Host "Sharing $($env:XR_DIR) ..."
+        $shareArgs = @('share', $env:XR_DIR)
+        if ($env:XR_ADDR) { $shareArgs += @('--addr', $env:XR_ADDR) }
+        if ($env:XR_NAME) { $shareArgs += @('--name', $env:XR_NAME) }
+        & $dest @shareArgs
+    }
     Write-Host ""
-    Write-Host "Done — xr-share is running and registered. Files in $($env:XR_DIR) are now shareable."
+    Write-Host "Done. Share any path anytime (folder or file):"
+    Write-Host "  xr-share share C:\photos"
+    Write-Host "  xr-share list"
 } else {
     Write-Host ""
-    Write-Host "Next: configure + enable the service"
-    Write-Host "  xr-share init --dir C:\path\to\share --token <reg-token-from-hub>"
-    Write-Host "  xr-share service install      # run PowerShell as Administrator"
+    Write-Host "Next: install the service, then share paths"
+    Write-Host "  xr-share install --hub $hub --token <reg-token-from-hub>"
+    Write-Host "  xr-share share C:\path\to\share"
 }

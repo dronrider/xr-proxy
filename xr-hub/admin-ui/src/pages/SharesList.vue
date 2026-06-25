@@ -58,10 +58,10 @@ async function generateInstall() {
 }
 
 function linuxCmd(): string {
-  return `curl -fsSL ${hubBase}/share/install.sh | sudo sh -s -- --dir /srv/share --token ${regToken.value}`
+  return `curl -fsSL ${hubBase}/share/install.sh | sudo sh -s -- --token ${regToken.value}`
 }
 function windowsCmd(): string {
-  return `$env:XR_DIR="C:\\share"; $env:XR_TOKEN="${regToken.value}"; irm ${hubBase}/share/install.ps1 | iex`
+  return `$env:XR_TOKEN="${regToken.value}"; irm ${hubBase}/share/install.ps1 | iex`
 }
 function copyText(t: string) {
   navigator.clipboard.writeText(t)
@@ -73,7 +73,7 @@ function shortKey(key: string): string {
 }
 
 function formatDate(iso: string): string {
-  return iso ? new Date(iso).toLocaleString() : '—'
+  return iso ? new Date(iso).toLocaleString() : '-'
 }
 
 function resetForm() {
@@ -111,7 +111,7 @@ async function handleCreate() {
 }
 
 async function handleDelete(share: ShareRecord) {
-  if (confirm(`Unregister "${share.name}"? The agent and its files are untouched — only the hub index entry is removed.`)) {
+  if (confirm(`Unregister "${share.name}"? The agent and its files are untouched, only the hub index entry is removed.`)) {
     await sharesStore.remove(share.share_id)
     showToast('Share unregistered')
   }
@@ -154,7 +154,7 @@ function copyPubkey(key: string) {
     </div>
 
     <p class="hint">
-      The hub stores only the agent's <strong>address and identity key</strong> — never any files.
+      The hub stores only the agent's <strong>address and identity key</strong>, never any files.
       Consumers fetch the listing and bytes straight from the agent; access is gated by a
       hub-signed token the agent verifies offline.
     </p>
@@ -164,9 +164,10 @@ function copyPubkey(key: string) {
       <div class="dialog">
         <h3>Установка агента одной командой</h3>
         <p class="hint">
-          Запусти команду на машине, которая будет раздавать файлы — агент сам
-          зарегистрируется в хабе и поднимет службу. Подставь свою папку вместо
-          <code>/srv/share</code>.
+          Запусти команду на машине, которая будет раздавать файлы. Агент поставит
+          службу и получит долгоживущий мандат хаба. После этого шарь любые пути
+          (папки или отдельные файлы) командой
+          <code>sudo xr-share share &lt;путь&gt;</code>.
         </p>
         <div v-if="!regToken">
           <button class="btn-primary" :disabled="regLoading" @click="generateInstall">
@@ -184,7 +185,7 @@ function copyPubkey(key: string) {
             <code class="token-json">{{ windowsCmd() }}</code>
             <button class="btn-sm" @click="copyText(windowsCmd())">Копировать (Windows)</button>
           </div>
-          <p class="hint">Токен живёт 1 час — для другой машины выдай новый.</p>
+          <p class="hint">Токен живёт 1 час, для другой машины выдай новый.</p>
         </div>
         <div class="dialog-actions">
           <button class="btn-sm" @click="showInstallModal = false">Закрыть</button>
@@ -289,7 +290,7 @@ function copyPubkey(key: string) {
               {{ shortKey(s.agent_pubkey) }}
             </code>
           </td>
-          <td>{{ s.owner || '—' }}</td>
+          <td>{{ s.owner || '-' }}</td>
           <td>{{ formatDate(s.created_at) }}</td>
           <td>{{ s.comment }}</td>
           <td class="actions">
