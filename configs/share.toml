@@ -1,0 +1,38 @@
+# xr-share — file-sharing agent configuration (LLD-19)
+# Place at /etc/xr-share/config.toml (Linux) or next to the binary (Windows).
+#
+# The agent serves ONE directory read-only and verifies hub-minted access
+# tokens offline. The hub only indexes the address — bytes flow straight from
+# this agent to the consumer.
+
+# Address to listen on. Must be reachable by consumers: a public IP, a
+# forwarded port, or an already-public machine (MVP is direct-access only —
+# CGNAT/relay is out of scope).
+listen = "0.0.0.0:8443"
+
+# Directory to share, read-only. Serving is strictly confined to this path
+# (anti-traversal: no "..", no symlinks escaping it).
+dir = "/srv/share"
+
+# The share id this agent serves — copy it from the hub after registering the
+# share (the `share_id` field of the created record). A token is only accepted
+# if it is bound to exactly this id.
+share_id = "REPLACE_WITH_SHARE_ID_FROM_HUB"
+
+# The hub's ed25519 PUBLIC key (base64), pinned here. Fetch it once from
+#   GET https://<hub>/api/v1/public-key
+# Tokens are verified against this offline; the hub is never contacted at
+# access time.
+hub_pubkey = "REPLACE_WITH_HUB_PUBLIC_KEY"
+
+# Optional TLS. Without it the agent serves plain HTTP (dev, or behind a TLS
+# terminator). The consumer pins the agent's identity (TOFU), so a self-signed
+# certificate is fine for app clients; browsers will warn on self-signed.
+# [tls]
+# cert = "/etc/xr-share/cert.pem"
+# key  = "/etc/xr-share/key.pem"
+
+# ── Generating the agent identity ────────────────────────────────────────
+# Run once:   xr-share keygen
+# Register the printed PUBLIC key in the hub as the share's `agent_pubkey`
+# (the consumer pins it). Keep the private key safe.

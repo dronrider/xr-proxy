@@ -1,0 +1,23 @@
+[Unit]
+Description=xr-share file-sharing agent (LLD-19)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xr-share -c /etc/xr-share/config.toml
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+# Security hardening. The agent only ever reads the share directory, so lock
+# the rest of the filesystem down. ReadWritePaths is intentionally empty.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Allow read access to the share dir explicitly if it lives under a protected
+# path (e.g. a user home); adjust to your dir or drop if it's elsewhere:
+# ReadOnlyPaths=/srv/share
+
+[Install]
+WantedBy=multi-user.target

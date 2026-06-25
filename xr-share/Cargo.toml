@@ -1,0 +1,41 @@
+[package]
+name = "xr-share"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Direct HTTPS serving via axum-server/rustls. Optional because it pulls the
+# aws-lc C crypto backend, which doesn't cross-compile to Windows. The default
+# build is HTTP-only (ring-only deps) and cross-compiles everywhere; ureq (for
+# `init`) already uses ring. Enable on Linux when you want the agent to
+# terminate TLS itself instead of running behind a terminator.
+tls = ["dep:axum-server"]
+
+[dependencies]
+xr-proto = { path = "../xr-proto", features = ["share"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "fs"] }
+axum = { version = "0.8", features = ["json"] }
+axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+sha2 = "0.10"
+walkdir = "2"
+mime_guess = "2"
+# Lightweight blocking HTTP client — only for `init` to fetch the hub's public
+# key once. Keeps the agent off the heavy reqwest stack.
+ureq = { version = "2", features = ["tls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
