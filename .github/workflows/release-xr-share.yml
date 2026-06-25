@@ -1,0 +1,91 @@
+name: release-xr-share
+
+# Builds the xr-share agent for Linux (static musl, x86_64 + aarch64) and
+# Windows on a current Rust toolchain (avoids the old-Rust musl-cross friction),
+# then publishes the binaries + install scripts + SHA256SUMS to the hub's
+# share-dist over SSH. The one-liner installer pulls from there (XR-028).
+#
+# Trigger: push a tag `xr-share-v*` (e.g. `xr-share-v0.1.0`), or run manually.
+#
+# Required repo secrets:
+#   HUB_SSH_KEY  — private SSH key authorized as root on the hub
+#   HUB_HOST     — hub host/IP (e.g. 201.51.16.159)
+#   HUB_PORT     — SSH port (e.g. 8822)
+# Optional repo variable:
+#   HUB_DIR      — target dir (default /var/lib/xr-hub/share-dist)
+
+on:
+  push:
+    tags: ['xr-share-v*']
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # zig as the cross-linker → musl for any arch with the current rustc.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build
+        run: cargo zigbuild --release -p xr-share --target ${{ matrix.target }}
+      - name: Name artifact
+        run: |
+          arch="${{ matrix.target }}"; arch="${arch%%-*}"
+          cp "target/${{ matrix.target }}/release/xr-share" "xr-share-linux-${arch}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-linux-${{ matrix.target }}
+          path: xr-share-linux-*
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release -p xr-share
+      - name: Name artifact
+        run: copy target\release\xr-share.exe xr-share-windows-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-windows
+          path: xr-share-windows-x86_64.exe
+
+  publish:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+          merge-multiple: true
+      - name: Stage dist (binaries + scripts + checksums)
+        run: |
+          mkdir -p dist
+          cp dl/xr-share-* dist/
+          cp xr-share/dist/install.sh xr-share/dist/install.ps1 dist/
+          ( cd dist && sha256sum xr-share-* > SHA256SUMS && cat SHA256SUMS )
+      - name: Upload to hub
+        env:
+          HUB_SSH_KEY: ${{ secrets.HUB_SSH_KEY }}
+          HUB_HOST: ${{ secrets.HUB_HOST }}
+          HUB_PORT: ${{ secrets.HUB_PORT }}
+          HUB_DIR: ${{ vars.HUB_DIR || '/var/lib/xr-hub/share-dist' }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$HUB_SSH_KEY" > ~/.ssh/hub_key
+          chmod 600 ~/.ssh/hub_key
+          ssh -i ~/.ssh/hub_key -p "$HUB_PORT" -o StrictHostKeyChecking=accept-new \
+            "root@${HUB_HOST}" "mkdir -p '${HUB_DIR}'"
+          scp -i ~/.ssh/hub_key -P "$HUB_PORT" -o StrictHostKeyChecking=accept-new \
+            dist/* "root@${HUB_HOST}:${HUB_DIR}/"
+          echo "Published. Install: curl -fsSL https://xr-hub.zoobr.top/share/install.sh | sh"
