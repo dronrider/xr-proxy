@@ -7,6 +7,7 @@ pub mod obfuscation;
 pub mod preset;
 pub mod protocol;
 pub mod routing;
+pub mod share;
 pub mod sni;
 pub mod tunnel;
 pub mod udp_relay;

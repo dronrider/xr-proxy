@@ -6,6 +6,10 @@ edition.workspace = true
 [features]
 default = []
 geoip = ["maxminddb"]
+# Token sign/verify for file-sharing (LLD-19). Gated so the size-constrained
+# OpenWRT xr-client never links ed25519; xr-hub and xr-share opt in. Tests
+# compile the crypto unconditionally via the ed25519-dalek dev-dependency.
+share = ["dep:ed25519-dalek"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -14,8 +18,18 @@ base64 = "0.22"
 rand = "0.8"
 tracing = "0.1"
 maxminddb = { version = "0.24", optional = true }
+ed25519-dalek = { version = "2", optional = true }
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros", "sync"] }
 url = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+ed25519-dalek = "2"
+serde_json = "1"
+
+# Demo of the share types + token sign/verify (LLD-19). Uses the gated crypto,
+# so it only builds with the `share` feature — keeps `cargo test --workspace`
+# (feature off) from trying to compile it.
+[[example]]
+name = "share_demo"
+required-features = ["share"]
