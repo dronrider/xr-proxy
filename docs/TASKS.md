@@ -16,7 +16,30 @@
 
 ## Check (готово, ждёт проверки пользователем)
 
-Нет.
+| ID | Задача | Тип | P | Ссылка |
+|--------|--------|-----|---|--------|
+| XR-027 | Файлообмен: агент-шара + хаб-индекс адресов, скачивание и one-way sync на Android | LLD | P3 | [docs/lld/19-file-sharing-agent.md](lld/19-file-sharing-agent.md) |
+| XR-028 | Дистрибуция xr-share: install.sh/install.ps1 (one-liner с хаба) + `init`/`service` сабкоманды | task | P2 | — |
+
+XR-027: весь Rust (xr-proto/xr-hub/xr-share/xr-core/JNI) собран, протестирован,
+прогнан вживую (hub→agent→sync). Осталась **проверка пользователем**: сборка APK
+на маке (cargo-ndk + Gradle; добавлены deps work-runtime + documentfile) и
+device-verify экрана «Файлы» (SAF-папка, токен, разовое скачивание, фоновый
+mirror). После устройства — перенести факты xr-share в ARCHITECTURE.md §3 и в архив.
+
+XR-028: **Linux И Windows — В ПРОДЕ на обоих хабах** (Timeweb+Aeza). Проверено
+end-to-end: `curl -fsSL https://xr-hub.zoobr.top/share/install.sh | sh` ставит
+Linux-бинарь (sha256-сверка), Windows-`.exe` раздаётся с совпадающим хешем
+(`irm …/share/install.ps1 | iex`). `xr-share init`/`service` рабочие. Бинари —
+статический musl + windows-gnu через **cargo-zigbuild** (свежий rustc + zig);
+Windows завёлся после перевода rustls на **ring** (TLS-раздача агента — теперь
+опциональная фича `tls`, дефолт HTTP-only; aws-lc не кросс-компилится под Windows).
+xr-hub тоже собран статическим musl-zigbuild и разложен на оба VPS (бэкап
+`xr-hub.bak-pre-xr028`). Остаётся проверка пользователем: запуск `.exe` на реальной
+Windows. CI-workflow (`.github/workflows/release-xr-share.yml`) — для будущих
+релизов (нужен секрет HUB_SSH_KEY). ⚠️ `cross`/musl в окружении не годится (старый
+Rust → icu/zerofrom; вероятно и `xr-client` cross — проверить до деплоя роутера);
+рабочий путь — zig+cargo-zigbuild.
 
 ## Backlog
 
@@ -34,7 +57,6 @@
 | XR-018 | Автопополнение правил проксирования из community-фидов | LLD | P3 | `local-docs/problems.md` (13) |
 | XR-019 | Браузерное расширение | LLD | P3 | `local-docs/problems.md` (5b) |
 | XR-026 | Fleet-метрики и Grafana-дашборды | LLD | P3 | [docs/lld/18-fleet-metrics-grafana.md](lld/18-fleet-metrics-grafana.md) |
-| XR-027 | Файлообмен: агент-шара + хаб-индекс адресов, скачивание и one-way sync на Android | LLD | P3 | [docs/lld/19-file-sharing-agent.md](lld/19-file-sharing-agent.md) |
 
 ## Blocked
 
