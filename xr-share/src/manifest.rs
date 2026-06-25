@@ -55,6 +55,34 @@ pub fn build_manifest(root: &Path) -> Result<ShareManifest> {
     Ok(ShareManifest { entries })
 }
 
+/// Build a one-entry manifest for a **single-file** share (§9.1): the entry path
+/// is the file's own name, so the consumer fetches `/file/{name}`. The file is
+/// the share root; there is no directory to walk.
+pub fn build_manifest_for_file(path: &Path) -> Result<ShareManifest> {
+    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!("share path is not a regular file: {}", path.display());
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .context("file share has no file name")?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Ok(ShareManifest {
+        entries: vec![ShareManifestEntry {
+            path: name,
+            size: meta.len(),
+            mtime,
+            sha256: sha256_file(path)?,
+        }],
+    })
+}
+
 /// Streaming SHA-256 of a file → lowercase hex. Reads in 64 KiB chunks so a
 /// large file is never held in memory at once (mirrors `xr-core::update`).
 fn sha256_file(path: &Path) -> Result<String> {
@@ -104,6 +132,23 @@ mod tests {
         assert_eq!(m.entries[0].size, 5);
         assert_eq!(m.entries[0].sha256, HELLO_SHA);
         assert_eq!(m.entries[1].path, "sub/b.bin");
+    }
+
+    #[test]
+    fn file_share_manifest_has_one_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("report.pdf");
+        fs::write(&file, b"hello").unwrap();
+
+        let m = build_manifest_for_file(&file).unwrap();
+        assert_eq!(m.entries.len(), 1);
+        // Path is the file's own name, not an absolute path.
+        assert_eq!(m.entries[0].path, "report.pdf");
+        assert_eq!(m.entries[0].size, 5);
+        assert_eq!(m.entries[0].sha256, HELLO_SHA);
+
+        // A directory is rejected by the file-share builder.
+        assert!(build_manifest_for_file(dir.path()).is_err());
     }
 
     #[test]

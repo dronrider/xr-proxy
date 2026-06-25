@@ -4,6 +4,7 @@
 //! here to the consumer.
 
 mod auth;
+mod cli;
 mod config;
 mod manifest;
 mod safepath;
@@ -12,7 +13,8 @@ mod setup;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -44,6 +46,19 @@ enum Commands {
     /// Interactively create a config (and agent identity) for this machine:
     /// pick a directory, fetch the hub's key, and write the config file.
     Init(InitArgs),
+    /// Install the agent (binary already in place) without binding to a folder;
+    /// with `--token`, immediately exchange the reg-token for an agent mandate
+    /// so you can `share` any number of paths afterwards (§9.3).
+    Install(cli::InstallArgs),
+    /// Share a path (a directory or a single file) and print a link for it.
+    Share(cli::ShareArgs),
+    /// List the shares this agent currently serves.
+    List,
+    /// Stop sharing a path, by its share_id or its path.
+    Unshare {
+        /// share_id or path to remove.
+        target: String,
+    },
     /// Manage OS autostart (systemd on Linux, Scheduled Task on Windows).
     Service {
         #[command(subcommand)]
@@ -76,6 +91,10 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Some(Commands::Init(args)) => return setup::init(&config_path, args),
+        Some(Commands::Install(args)) => return cli::install(&config_path, args),
+        Some(Commands::Share(args)) => return cli::share(&config_path, args),
+        Some(Commands::List) => return cli::list(&config_path),
+        Some(Commands::Unshare { target }) => return cli::unshare(&config_path, &target),
         Some(Commands::Service { action }) => {
             return match action {
                 ServiceAction::Install => setup::service_install(&config_path),
@@ -104,9 +123,10 @@ async fn run(path: &Path) -> Result<()> {
         eprintln!();
         eprintln!("Run `xr-share init` to create one, or write it by hand:");
         eprintln!("  listen = \"0.0.0.0:8443\"");
-        eprintln!("  dir = \"/srv/share\"");
-        eprintln!("  share_id = \"<id from hub>\"");
         eprintln!("  hub_pubkey = \"<base64 from GET /api/v1/public-key>\"");
+        eprintln!("  [[share]]");
+        eprintln!("  share_id = \"<id from hub>\"");
+        eprintln!("  path = \"/srv/share\"   # a directory or a single file");
         std::process::exit(2);
     }
 
@@ -116,25 +136,26 @@ async fn run(path: &Path) -> Result<()> {
     .context("parsing config")?;
 
     let hub_key = cfg.hub_verifying_key()?;
+    let bind_addr: SocketAddr = cfg.listen.parse().context("invalid listen address")?;
 
-    // Canonicalize the share root up front: fail fast on a bad path and give
-    // safepath a stable, symlink-resolved base to compare against.
-    let root = Path::new(&cfg.dir)
-        .canonicalize()
-        .with_context(|| format!("share dir does not exist or is unreadable: {}", cfg.dir))?;
-    if !root.is_dir() {
-        anyhow::bail!("share dir is not a directory: {}", cfg.dir);
+    // Resolve the configured shares. An empty set is allowed (the agent runs and
+    // waits for `xr-share share <path>` to add one, picked up by hot-reload).
+    let shares = server::build_shares(&cfg.resolved_shares());
+    if shares.is_empty() {
+        tracing::warn!("no shares configured yet — add one with `xr-share share <path>`");
+    } else {
+        tracing::info!("serving {} share(s)", shares.len());
     }
 
-    let bind_addr: SocketAddr = cfg.listen.parse().context("invalid listen address")?;
     let state = Arc::new(AgentState {
-        root: root.clone(),
-        share_id: cfg.share_id.clone(),
+        shares: RwLock::new(Arc::new(shares)),
         hub_key,
     });
-    let app = server::router(state);
 
-    tracing::info!("serving share '{}' from {}", cfg.share_id, root.display());
+    // Hot reload: pick up `share`/`unshare` edits to the config without restart.
+    spawn_config_watcher(state.clone(), path.to_path_buf());
+
+    let app = server::router(state);
 
     match &cfg.tls {
         #[cfg(feature = "tls")]
@@ -164,6 +185,42 @@ async fn run(path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Poll the config file's mtime and swap in the new share set when it changes,
+/// so `xr-share share`/`unshare` take effect without a restart (§9.1).
+fn spawn_config_watcher(state: Arc<AgentState>, path: PathBuf) {
+    tokio::spawn(async move {
+        let mut last = mtime_of(&path);
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let cur = mtime_of(&path);
+            if cur == last {
+                continue;
+            }
+            last = cur;
+            match reload_share_entries(&path) {
+                Ok(entries) => {
+                    let map = server::build_shares(&entries);
+                    let n = map.len();
+                    *state.shares.write().expect("shares lock poisoned") = Arc::new(map);
+                    tracing::info!("config changed, {n} share(s) now served");
+                }
+                Err(e) => tracing::warn!("config reload failed, keeping current shares: {e:#}"),
+            }
+        }
+    });
+}
+
+fn mtime_of(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn reload_share_entries(path: &Path) -> Result<Vec<config::ShareEntry>> {
+    let cfg: AgentConfig =
+        toml::from_str(&std::fs::read_to_string(path).context("reading config")?)
+            .context("parsing config")?;
+    Ok(cfg.resolved_shares())
 }
 
 /// Generate and print an ed25519 identity keypair (base64).

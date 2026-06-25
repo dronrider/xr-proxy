@@ -1,37 +1,70 @@
-//! Agent configuration (LLD-19 §2.7).
+//! Agent configuration (LLD-19 §2.7, §9.1).
 //!
-//! The agent serves exactly one share. It needs the directory to expose, the
-//! `share_id` that token must be bound to, and the **hub's** public key — pinned
-//! into the config — so it can verify access tokens offline without ever talking
-//! to the hub. TLS is optional (provided PEM); the consumer pins the agent's own
-//! identity (TOFU), so a self-signed cert is acceptable.
+//! v2 makes the agent a **multishare**: it serves an unbounded list of shares,
+//! each a `share_id` plus a path that is **either a directory or a single file**.
+//! The config pins the **hub's** public key so access tokens are verified offline
+//! (the agent never calls the hub at access time), and optionally holds the
+//! agent's `agent_credential` + `hub_url` + identity so the `share`/`list`/
+//! `unshare` subcommands can talk to the hub on the operator's behalf.
+//!
+//! The legacy single-share form (`dir` + `share_id` at top level) is still
+//! accepted and folded into the share list, so a v1 config keeps working.
 
 use anyhow::{Context, Result};
 use base64::Engine;
 use ed25519_dalek::VerifyingKey;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentConfig {
     /// Listen address, e.g. `0.0.0.0:8443`.
     pub listen: String,
-    /// Directory served read-only.
-    pub dir: String,
-    /// The share this agent serves; a token must be bound to this id.
-    pub share_id: String,
     /// Base64 (standard) ed25519 public key of the hub — pinned. Tokens are
     /// verified against this offline.
     pub hub_pubkey: String,
-    /// Optional TLS (provided cert + key PEM). Without it the agent serves
-    /// plain HTTP (dev / behind a TLS terminator).
-    #[serde(default)]
+    /// Hub base URL, used only by the `share`/`list`/`unshare` subcommands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_url: Option<String>,
+    /// The long-lived bearer mandate from the hub (base64url blob), obtained once
+    /// at install. Lets `xr-share share` register shares without admin action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_credential: Option<String>,
+    /// This agent's own ed25519 private key (base64 standard). Identity the hub
+    /// bound the credential to; kept for future proof-of-possession.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_key: Option<String>,
+    /// Optional TLS (provided cert + key PEM). Without it the agent serves plain
+    /// HTTP (dev / behind a TLS terminator).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
+    /// The shares this agent serves. Each `[[share]]` is a `share_id` + path.
+    #[serde(default, rename = "share")]
+    pub shares: Vec<ShareEntry>,
+
+    // ── legacy single-share (v1) ──────────────────────────────────────
+    /// Legacy single served directory. Folded into [`AgentConfig::resolved_shares`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+    /// Legacy single share id paired with `dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_id: Option<String>,
+}
+
+/// One share entry: an opaque `share_id` (the token binding) and a path that is
+/// either a directory (serve its tree) or a single file (a one-entry manifest).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ShareEntry {
+    pub share_id: String,
+    pub path: String,
+    /// Optional human label (echoed back to the operator by `list`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Read only by the `tls` feature; kept parseable in HTTP-only builds so a
 /// `[tls]` block produces a clear error rather than an unknown-field failure.
 #[cfg_attr(not(feature = "tls"), allow(dead_code))]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TlsConfig {
     pub cert: String,
     pub key: String,
@@ -47,5 +80,84 @@ impl AgentConfig {
             .try_into()
             .map_err(|v: Vec<u8>| anyhow::anyhow!("hub_pubkey must be 32 bytes, got {}", v.len()))?;
         VerifyingKey::from_bytes(&arr).context("invalid hub_pubkey")
+    }
+
+    /// The full share list: `[[share]]` entries plus the legacy `dir`+`share_id`
+    /// pair (if present and not already listed), so v1 and v2 configs both work.
+    pub fn resolved_shares(&self) -> Vec<ShareEntry> {
+        let mut shares = self.shares.clone();
+        if let (Some(dir), Some(id)) = (&self.dir, &self.share_id) {
+            if !shares.iter().any(|s| &s.share_id == id) {
+                shares.push(ShareEntry {
+                    share_id: id.clone(),
+                    path: dir.clone(),
+                    name: None,
+                });
+            }
+        }
+        shares
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_multishare_config() {
+        let toml = r#"
+            listen = "0.0.0.0:8443"
+            hub_pubkey = "QQ=="
+            agent_credential = "blob"
+            [[share]]
+            share_id = "a"
+            path = "/srv/photos"
+            [[share]]
+            share_id = "b"
+            path = "/srv/report.pdf"
+        "#;
+        let cfg: AgentConfig = toml::from_str(toml).unwrap();
+        let shares = cfg.resolved_shares();
+        assert_eq!(shares.len(), 2);
+        assert_eq!(shares[0].share_id, "a");
+        assert_eq!(shares[1].path, "/srv/report.pdf");
+        assert_eq!(cfg.agent_credential.as_deref(), Some("blob"));
+    }
+
+    #[test]
+    fn folds_legacy_single_share() {
+        let toml = r#"
+            listen = "0.0.0.0:8443"
+            hub_pubkey = "QQ=="
+            dir = "/srv/share"
+            share_id = "legacy"
+        "#;
+        let cfg: AgentConfig = toml::from_str(toml).unwrap();
+        let shares = cfg.resolved_shares();
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].share_id, "legacy");
+        assert_eq!(shares[0].path, "/srv/share");
+    }
+
+    #[test]
+    fn roundtrips_through_serialization() {
+        // `xr-share share`/`unshare` rewrite the config, so it must survive a
+        // serialize → parse cycle without losing or inventing fields.
+        let cfg = AgentConfig {
+            listen: "0.0.0.0:8443".into(),
+            hub_pubkey: "QQ==".into(),
+            hub_url: Some("https://hub".into()),
+            agent_credential: Some("blob".into()),
+            identity_key: Some("priv".into()),
+            tls: None,
+            shares: vec![ShareEntry { share_id: "a".into(), path: "/srv/x".into(), name: Some("X".into()) }],
+            dir: None,
+            share_id: None,
+        };
+        let text = toml::to_string(&cfg).unwrap();
+        let back: AgentConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.resolved_shares().len(), 1);
+        assert_eq!(back.hub_url.as_deref(), Some("https://hub"));
+        assert!(back.dir.is_none());
     }
 }

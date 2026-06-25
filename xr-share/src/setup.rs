@@ -129,7 +129,7 @@ pub fn init(config_path: &Path, args: InitArgs) -> Result<()> {
 }
 
 /// GET `{hub}/api/v1/public-key`, validating it's a 32-byte ed25519 key.
-fn fetch_hub_pubkey(hub: &str) -> Result<String> {
+pub(crate) fn fetch_hub_pubkey(hub: &str) -> Result<String> {
     let url = format!("{}/api/v1/public-key", hub.trim_end_matches('/'));
     let body = ureq::get(&url)
         .timeout(Duration::from_secs(10))
@@ -186,7 +186,7 @@ fn self_register(
 }
 
 /// Best-effort machine hostname for the default share name.
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok()
@@ -306,7 +306,7 @@ fn run(cmd: &str, args: &[&str]) -> Result<()> {
 
 // ── prompt helpers ──────────────────────────────────────────────────
 
-fn resolve(flag: Option<String>, non_interactive: bool, label: &str, default: Option<&str>) -> Result<String> {
+pub(crate) fn resolve(flag: Option<String>, non_interactive: bool, label: &str, default: Option<&str>) -> Result<String> {
     if let Some(v) = flag {
         return Ok(v);
     }
@@ -343,13 +343,13 @@ fn read_line() -> Result<String> {
     Ok(s.trim().to_string())
 }
 
-fn b64(bytes: &[u8]) -> String {
+pub(crate) fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// Write a file with owner-only permissions (0600 on Unix) — config and
 /// identity hold secrets and addresses.
-fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     std::fs::write(path, data).with_context(|| format!("запись {}", path.display()))?;
     #[cfg(unix)]
     {
@@ -361,6 +361,6 @@ fn write_private(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 /// Best-effort port extraction from a `host:port` listen string (for the hint).
-fn port_of(listen: &str) -> &str {
+pub(crate) fn port_of(listen: &str) -> &str {
     listen.rsplit(':').next().unwrap_or("8443")
 }
