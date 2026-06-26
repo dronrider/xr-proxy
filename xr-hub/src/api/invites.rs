@@ -270,6 +270,7 @@ pub async fn create_invite(
         one_time: req.one_time,
         comment: req.comment,
         payload,
+        share_ids: Vec::new(),
     };
 
     let data_dir = Path::new(&state.config.server.data_dir);

@@ -51,7 +51,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/share/exchange", post(share_v2::exchange))
         .route("/share/add", post(share_v2::add))
         .route("/share/mint", post(share_v2::mint))
-        .route("/share/unshare", post(share_v2::unshare));
+        .route("/share/unshare", post(share_v2::unshare))
+        // XR-031: shares attach to invites; consumer lists its shares by invite.
+        .route("/share/attach", post(share_v2::attach))
+        .route("/share/detach", post(share_v2::detach))
+        .route("/invite/{token}/shares", get(share_v2::invite_shares));
 
     // Auth (no session required).
     let auth_routes = Router::new()

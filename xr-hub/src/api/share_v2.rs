@@ -20,7 +20,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path as AxPath, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use base64::Engine;
@@ -269,4 +269,139 @@ pub async fn unshare(
     storage::delete_share_file(Path::new(&state.config.server.data_dir), &req.share_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── attach / detach a share to an invite (access anchor, §9.5) ──────
+
+#[derive(Debug, Deserialize)]
+pub struct AttachReq {
+    pub credential: String,
+    pub share_id: String,
+    pub invite_token: String,
+}
+
+/// Confirm the presenting agent owns `share_id` (the share's pinned key matches
+/// the mandate). Shared by attach/detach.
+async fn assert_owns_share(
+    state: &AppState,
+    cred: &AgentCredential,
+    share_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let shares = state.shares.read().await;
+    let rec = shares
+        .get(share_id)
+        .ok_or((StatusCode::NOT_FOUND, "share not found".into()))?;
+    if rec.agent_pubkey != cred.agent_pubkey {
+        return Err((StatusCode::FORBIDDEN, "share belongs to another agent".into()));
+    }
+    Ok(())
+}
+
+/// `POST /api/v1/share/attach` — hang one of the agent's shares on an invite, so
+/// everyone holding that invite reaches it. Idempotent.
+pub async fn attach(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AttachReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let signing = signing_or_503(&state)?;
+    let cred = verify_credential_blob(signing, &req.credential, now_unix())?;
+    assert_owns_share(&state, &cred, &req.share_id).await?;
+
+    let mut invites = state.invites.write().await;
+    let invite = invites
+        .get_mut(&req.invite_token)
+        .ok_or((StatusCode::NOT_FOUND, "invite not found".into()))?;
+    if !invite.share_ids.contains(&req.share_id) {
+        invite.share_ids.push(req.share_id.clone());
+        storage::save_invite(Path::new(&state.config.server.data_dir), invite)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/v1/share/detach` — remove the share from the invite.
+pub async fn detach(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AttachReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let signing = signing_or_503(&state)?;
+    let cred = verify_credential_blob(signing, &req.credential, now_unix())?;
+    assert_owns_share(&state, &cred, &req.share_id).await?;
+
+    let mut invites = state.invites.write().await;
+    let invite = invites
+        .get_mut(&req.invite_token)
+        .ok_or((StatusCode::NOT_FOUND, "invite not found".into()))?;
+    let before = invite.share_ids.len();
+    invite.share_ids.retain(|s| s != &req.share_id);
+    if invite.share_ids.len() != before {
+        storage::save_invite(Path::new(&state.config.server.data_dir), invite)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── consumer: list the shares on my invite (auth = the invite) ──────
+
+/// One reachable share for the invite holder: where the agent is, the key to pin,
+/// and a freshly minted offline-verifiable access token.
+#[derive(Serialize)]
+pub struct InviteShare {
+    pub share_id: String,
+    pub name: String,
+    pub addr: String,
+    pub port: u16,
+    pub agent_pubkey: String,
+    pub token: String,
+    pub exp: u64,
+}
+
+/// `GET /api/v1/invite/{token}/shares` — authenticate by the invite (today mere
+/// possession; later OIDC/JWT, XR-030) and return every attached share with a
+/// minted access token. Not consuming: share access is durable. The hub stays
+/// off the data-path; the token is verified by the agent offline.
+pub async fn invite_shares(
+    State(state): State<Arc<AppState>>,
+    AxPath(token): AxPath<String>,
+) -> Result<Json<Vec<InviteShare>>, (StatusCode, String)> {
+    let signing = signing_or_503(&state)?;
+
+    let share_ids = {
+        let invites = state.invites.read().await;
+        let invite = invites
+            .get(&token)
+            .ok_or((StatusCode::NOT_FOUND, "invite not found".into()))?;
+        let now_rfc = chrono::Utc::now().to_rfc3339();
+        if invite.expires_at <= now_rfc {
+            return Err((StatusCode::GONE, "invite expired".into()));
+        }
+        // consumed_at is set both by a one-time onboarding claim and by revoke;
+        // for durable share access use a non-one-time invite, so a set value
+        // here means revoked.
+        if invite.consumed_at.is_some() {
+            return Err((StatusCode::GONE, "invite revoked".into()));
+        }
+        invite.share_ids.clone()
+    };
+
+    let now = now_unix();
+    let exp = now.saturating_add(DEFAULT_TOKEN_TTL);
+    let shares = state.shares.read().await;
+    let mut out = Vec::new();
+    for sid in &share_ids {
+        // Skip shares that were unregistered after being attached.
+        if let Some(rec) = shares.get(sid) {
+            let token = sign_share_token(&signing.signing_key, sid, exp);
+            out.push(InviteShare {
+                share_id: rec.share_id.clone(),
+                name: rec.name.clone(),
+                addr: rec.addr.clone(),
+                port: rec.port,
+                agent_pubkey: rec.agent_pubkey.clone(),
+                token: encode_blob(&token),
+                exp,
+            });
+        }
+    }
+    Ok(Json(out))
 }
