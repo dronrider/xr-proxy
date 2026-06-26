@@ -17,11 +17,106 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use xr_proto::share::{ShareGrant, ShareInfo, ShareManifest, ShareManifestEntry, ShareToken};
+
+// ── Transfer control (progress + cancel) ─────────────────────────────
+//
+// One process-wide controller: the consumer (Android) drives a single transfer
+// at a time, polls [`transfer_snapshot`] for a progress bar, and calls
+// [`transfer_cancel`] to abort. The download loop checks the cancel flag between
+// chunks and reports bytes, so a multi-GB transfer can be stopped promptly. Kept
+// global to avoid threading a handle through every signature.
+
+struct TransferControl {
+    active: AtomicBool,
+    cancel: AtomicBool,
+    bytes_done: AtomicU64,
+    bytes_total: AtomicU64,
+    files_done: AtomicU64,
+    files_total: AtomicU64,
+    file: Mutex<String>,
+}
+
+impl TransferControl {
+    const fn new() -> Self {
+        Self {
+            active: AtomicBool::new(false),
+            cancel: AtomicBool::new(false),
+            bytes_done: AtomicU64::new(0),
+            bytes_total: AtomicU64::new(0),
+            files_done: AtomicU64::new(0),
+            files_total: AtomicU64::new(0),
+            file: Mutex::new(String::new()),
+        }
+    }
+}
+
+static TRANSFER: TransferControl = TransferControl::new();
+
+/// Begin a transfer: reset counters, clear cancel, set totals, mark active.
+pub fn transfer_start(files_total: usize, bytes_total: u64) {
+    TRANSFER.cancel.store(false, Ordering::Relaxed);
+    TRANSFER.bytes_done.store(0, Ordering::Relaxed);
+    TRANSFER.bytes_total.store(bytes_total, Ordering::Relaxed);
+    TRANSFER.files_done.store(0, Ordering::Relaxed);
+    TRANSFER.files_total.store(files_total as u64, Ordering::Relaxed);
+    *TRANSFER.file.lock().expect("transfer lock") = String::new();
+    TRANSFER.active.store(true, Ordering::Relaxed);
+}
+
+/// Mark the current file (and how many are already done).
+pub fn transfer_file(path: &str, index: usize) {
+    *TRANSFER.file.lock().expect("transfer lock") = path.to_string();
+    TRANSFER.files_done.store(index as u64, Ordering::Relaxed);
+}
+
+/// Request cancellation of the running transfer.
+pub fn transfer_cancel() {
+    TRANSFER.cancel.store(true, Ordering::Relaxed);
+}
+
+/// Mark the transfer finished (success, failure, or cancel).
+pub fn transfer_stop() {
+    TRANSFER.active.store(false, Ordering::Relaxed);
+}
+
+fn transfer_cancelled() -> bool {
+    TRANSFER.cancel.load(Ordering::Relaxed)
+}
+
+fn transfer_add_bytes(n: u64) {
+    TRANSFER.bytes_done.fetch_add(n, Ordering::Relaxed);
+}
+
+/// A poll-able snapshot of transfer progress for the UI.
+#[derive(Debug, Clone, Serialize)]
+pub struct TransferSnapshot {
+    pub active: bool,
+    pub cancelled: bool,
+    pub file: String,
+    pub files_done: u64,
+    pub files_total: u64,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+}
+
+pub fn transfer_snapshot() -> TransferSnapshot {
+    TransferSnapshot {
+        active: TRANSFER.active.load(Ordering::Relaxed),
+        cancelled: TRANSFER.cancel.load(Ordering::Relaxed),
+        file: TRANSFER.file.lock().expect("transfer lock").clone(),
+        files_done: TRANSFER.files_done.load(Ordering::Relaxed),
+        files_total: TRANSFER.files_total.load(Ordering::Relaxed),
+        bytes_done: TRANSFER.bytes_done.load(Ordering::Relaxed),
+        bytes_total: TRANSFER.bytes_total.load(Ordering::Relaxed),
+    }
+}
 
 /// A file we already hold locally, keyed by share-relative path + its hash.
 /// (De)serializable so an Android consumer using SAF storage — where file I/O
@@ -281,7 +376,10 @@ pub async fn sync_share_selected(
     if dry_run {
         return Ok(SyncResult { plan, report: None });
     }
+    let bytes_total: u64 = plan.fetch.iter().map(|e| e.size).sum();
+    transfer_start(plan.fetch.len(), bytes_total);
     let report = apply_plan(agent_url, token, &plan, dest_root, timeout).await;
+    transfer_stop();
     Ok(SyncResult { plan, report: Some(report) })
 }
 
@@ -346,8 +444,14 @@ pub async fn download_entry(
         .map_err(|e| format!("create: {e}"))?;
     let mut hasher = Sha256::new();
     while let Some(chunk) = resp.chunk().await.map_err(|e| format!("read: {e}"))? {
+        if transfer_cancelled() {
+            drop(file);
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err("cancelled".into());
+        }
         hasher.update(&chunk);
         file.write_all(&chunk).await.map_err(|e| format!("write: {e}"))?;
+        transfer_add_bytes(chunk.len() as u64);
     }
     file.flush().await.map_err(|e| format!("flush: {e}"))?;
     drop(file);
@@ -373,7 +477,12 @@ pub async fn apply_plan(
 ) -> ApplyReport {
     let mut report = ApplyReport::default();
 
-    for entry in &plan.fetch {
+    for (i, entry) in plan.fetch.iter().enumerate() {
+        if transfer_cancelled() {
+            report.failed.push((entry.path.clone(), "cancelled".into()));
+            break;
+        }
+        transfer_file(&entry.path, i);
         match download_entry(agent_url, token, entry, dest_root, timeout).await {
             Ok(()) => report.fetched.push(entry.path.clone()),
             Err(e) => report.failed.push((entry.path.clone(), e)),

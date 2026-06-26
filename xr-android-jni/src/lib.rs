@@ -994,11 +994,16 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeDownloadFile(
     };
     let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
 
-    let json =
-        match with_onboarding_runtime(sync::download_entry(&agent_url, &token, &entry, &dest, timeout)) {
-            Ok(Ok(())) => serde_json::json!({ "ok": true }).to_string(),
-            Ok(Err(e)) | Err(e) => json_error(&e),
-        };
+    // Drive the shared progress/cancel controller so the UI can show a bar and
+    // stop a large single-file download too.
+    sync::transfer_start(1, entry.size);
+    sync::transfer_file(&entry.path, 0);
+    let result = with_onboarding_runtime(sync::download_entry(&agent_url, &token, &entry, &dest, timeout));
+    sync::transfer_stop();
+    let json = match result {
+        Ok(Ok(())) => serde_json::json!({ "ok": true }).to_string(),
+        Ok(Err(e)) | Err(e) => json_error(&e),
+    };
     jstring_into_raw(&mut env, json)
 }
 
@@ -1094,6 +1099,29 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
         Ok(Err(e)) | Err(e) => json_error(&e),
     };
     jstring_into_raw(&mut env, json)
+}
+
+/// Poll the running transfer's progress as JSON (`{active,cancelled,file,
+/// files_done,files_total,bytes_done,bytes_total}`); `active:false` when idle.
+/// The UI polls this for a progress bar and computes speed from the byte delta.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeTransferProgress(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let json = serde_json::to_string(&sync::transfer_snapshot())
+        .unwrap_or_else(|e| json_error(&format!("serialize: {e}")));
+    jstring_into_raw(&mut env, json)
+}
+
+/// Request cancellation of the running sync/download. It aborts at the next
+/// chunk and discards any half-written file.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeCancelTransfer(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    sync::transfer_cancel();
 }
 
 #[cfg(test)]
