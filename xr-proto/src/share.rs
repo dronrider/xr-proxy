@@ -119,6 +119,21 @@ pub struct ShareInfo {
     pub agent_pubkey: String,
 }
 
+/// One reachable share granted to an invite holder (LLD-19 §9.5, XR-031): where
+/// the agent is, the key to pin, and a hub-minted access token the agent verifies
+/// offline. Returned by `GET /api/v1/invite/{token}/shares`. The `token` here is
+/// the URL-safe base64 blob the agent expects as a bearer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareGrant {
+    pub share_id: String,
+    pub name: String,
+    pub addr: String,
+    pub port: u16,
+    pub agent_pubkey: String,
+    pub token: String,
+    pub exp: u64,
+}
+
 impl ShareRecord {
     /// Project to the consumer-facing [`ShareInfo`] (drops owner/comment/time).
     pub fn info(&self) -> ShareInfo {

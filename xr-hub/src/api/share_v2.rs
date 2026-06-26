@@ -26,7 +26,8 @@ use axum::Json;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use xr_proto::share::{
-    sign_agent_credential, sign_share_token, verify_agent_credential, AgentCredential, ShareRecord,
+    sign_agent_credential, sign_share_token, verify_agent_credential, AgentCredential, ShareGrant,
+    ShareRecord,
 };
 
 use crate::api::register::{client_ip, now_unix, validate_ed25519_pubkey, verify_reg_token};
@@ -343,27 +344,15 @@ pub async fn detach(
 
 // ── consumer: list the shares on my invite (auth = the invite) ──────
 
-/// One reachable share for the invite holder: where the agent is, the key to pin,
-/// and a freshly minted offline-verifiable access token.
-#[derive(Serialize)]
-pub struct InviteShare {
-    pub share_id: String,
-    pub name: String,
-    pub addr: String,
-    pub port: u16,
-    pub agent_pubkey: String,
-    pub token: String,
-    pub exp: u64,
-}
-
 /// `GET /api/v1/invite/{token}/shares` — authenticate by the invite (today mere
-/// possession; later OIDC/JWT, XR-030) and return every attached share with a
-/// minted access token. Not consuming: share access is durable. The hub stays
-/// off the data-path; the token is verified by the agent offline.
+/// possession; later OIDC/JWT, XR-030) and return every attached share as a
+/// [`ShareGrant`] with a minted access token. Not consuming: share access is
+/// durable. The hub stays off the data-path; the token is verified by the agent
+/// offline.
 pub async fn invite_shares(
     State(state): State<Arc<AppState>>,
     AxPath(token): AxPath<String>,
-) -> Result<Json<Vec<InviteShare>>, (StatusCode, String)> {
+) -> Result<Json<Vec<ShareGrant>>, (StatusCode, String)> {
     let signing = signing_or_503(&state)?;
 
     let share_ids = {
@@ -392,7 +381,7 @@ pub async fn invite_shares(
         // Skip shares that were unregistered after being attached.
         if let Some(rec) = shares.get(sid) {
             let token = sign_share_token(&signing.signing_key, sid, exp);
-            out.push(InviteShare {
+            out.push(ShareGrant {
                 share_id: rec.share_id.clone(),
                 name: rec.name.clone(),
                 addr: rec.addr.clone(),
