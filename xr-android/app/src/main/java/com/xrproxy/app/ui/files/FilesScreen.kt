@@ -200,6 +200,17 @@ private fun ExplorerView(
     var detailsFor by remember { mutableStateOf<ManifestEntry?>(null) }
     val level = explorerLevel(ui.manifest, ui.currentPath)
 
+    // Resolve the selection to actual files: total selected, and how many are not
+    // yet downloaded (what a sync would fetch). Folders expand to their files.
+    var totalFiles = 0
+    var newFiles = 0
+    ui.manifest.forEach { e ->
+        if (isSelected(e.path, cfg.selection)) {
+            totalFiles++
+            if (e.path !in ui.localPaths) newFiles++
+        }
+    }
+
     Column(modifier = modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
@@ -210,23 +221,22 @@ private fun ExplorerView(
                 contentPadding = PaddingValues(horizontal = 8.dp),
             ) { Text("‹ Назад") }
             Spacer(Modifier.weight(1f))
-            // Sync the selected subset; the icon + count light up once something
-            // is ticked, so it is obvious there is a selection to push.
-            val selCount = cfg.selection.size
+            // Sync the selected subset; the icon + count light up once something is
+            // ticked. The count is "<to download> / <total selected files>".
             IconButton(onClick = { vm.syncNow(cfg) }) {
                 Icon(
                     Icons.Default.Sync,
                     contentDescription = "Синкать выбранное",
-                    tint = if (selCount > 0) MaterialTheme.colorScheme.primary
+                    tint = if (totalFiles > 0) MaterialTheme.colorScheme.primary
                     else MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            if (selCount > 0) {
-                Text(
-                    "$selCount", color = MaterialTheme.colorScheme.primary,
-                    fontSize = 13.sp, fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(end = 4.dp),
-                )
+            if (totalFiles > 0) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(end = 4.dp)) {
+                    Text("$newFiles", color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    Text("/$totalFiles", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
+                }
             }
             Spacer(Modifier.width(6.dp))
             Text("Синк", fontSize = 12.sp)
@@ -403,6 +413,10 @@ private fun coveredByAncestor(path: String, selection: Set<String>): Boolean {
         if (selection.contains(p)) return true
     }
 }
+
+/** A file is selected if it is ticked itself or sits under a ticked folder. */
+private fun isSelected(path: String, selection: Set<String>): Boolean =
+    selection.contains(path) || coveredByAncestor(path, selection)
 
 private fun openLocalFile(context: Context, file: File) {
     try {
