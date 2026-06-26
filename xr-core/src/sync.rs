@@ -56,12 +56,24 @@ pub fn plan_sync(manifest: &ShareManifest, local: &[LocalFile]) -> SyncPlan {
     plan_with_selection(manifest, local, None)
 }
 
+/// True if `path` is covered by `selection`: either listed exactly, or sitting
+/// under a selected **folder prefix** (so ticking a folder mirrors everything in
+/// it, including files added later). `None` selection covers everything.
+fn path_selected(path: &str, selection: Option<&HashSet<String>>) -> bool {
+    match selection {
+        None => true,
+        Some(sel) => sel
+            .iter()
+            .any(|s| path == s.as_str() || path.starts_with(&format!("{s}/"))),
+    }
+}
+
 /// Like [`plan_sync`], but restricted to a **selected subset** of the share
-/// (§9.6). `selection` is the set of manifest paths the consumer chose to mirror;
-/// the desired local state is `manifest ∩ selection`. A file present locally but
-/// not in the desired set is deleted, so unticking a file (or its removal on the
-/// server) drops the local copy. `None` selects the whole tree, i.e. exactly
-/// [`plan_sync`].
+/// (§9.6). `selection` is a set of manifest paths and/or folder prefixes the
+/// consumer chose to mirror; the desired local state is `manifest ∩ selection`. A
+/// file present locally but not in the desired set is deleted, so unticking
+/// something (or its removal on the server) drops the local copy. `None` selects
+/// the whole tree, i.e. exactly [`plan_sync`].
 pub fn plan_with_selection(
     manifest: &ShareManifest,
     local: &[LocalFile],
@@ -72,11 +84,11 @@ pub fn plan_with_selection(
         .map(|f| (f.path.as_str(), f.sha256.as_str()))
         .collect();
 
-    // Desired = manifest entries that are selected (everything, if no selection).
+    // Desired = manifest entries the selection covers (everything, if no selection).
     let desired: Vec<&ShareManifestEntry> = manifest
         .entries
         .iter()
-        .filter(|e| selection.map_or(true, |sel| sel.contains(e.path.as_str())))
+        .filter(|e| path_selected(&e.path, selection))
         .collect();
     let desired_paths: HashSet<&str> = desired.iter().map(|e| e.path.as_str()).collect();
 
@@ -403,6 +415,10 @@ fn prune_empty_dirs(root: &Path, file: &Path) {
 
 fn http_client(timeout: Duration) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
+        // Fail fast if the agent is unreachable, but let the overall timeout be
+        // generous so a large file download is not cut off mid-transfer (callers
+        // pass a long total for sync, a short one for the manifest/listing).
+        .connect_timeout(Duration::from_secs(10))
         .timeout(timeout)
         .build()
         .map_err(|e| format!("http client: {e}"))
@@ -556,6 +572,26 @@ mod tests {
         let m2 = manifest(vec![entry("a.txt", "NEW"), entry("c.txt", "c")]);
         let plan2 = plan_with_selection(&m2, &[local("a.txt", "old")], Some(&sel));
         assert_eq!(plan2.fetch.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), vec!["a.txt", "c.txt"]);
+    }
+
+    #[test]
+    fn test_plan_folder_prefix_selection() {
+        let m = manifest(vec![
+            entry("docs/a.txt", "a"),
+            entry("docs/sub/b.txt", "b"),
+            entry("other/c.txt", "c"),
+        ]);
+        // Ticking the "docs" folder mirrors everything under it, not "other".
+        let sel: HashSet<String> = ["docs".to_string()].into_iter().collect();
+        let plan = plan_with_selection(&m, &[], Some(&sel));
+        assert_eq!(
+            plan.fetch.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            vec!["docs/a.txt", "docs/sub/b.txt"]
+        );
+        // A "docs"-prefixed name that is not actually under the folder is excluded.
+        let m2 = manifest(vec![entry("docs2/x", "x"), entry("docs/y", "y")]);
+        let plan2 = plan_with_selection(&m2, &[], Some(&sel));
+        assert_eq!(plan2.fetch.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), vec!["docs/y"]);
     }
 
     #[test]

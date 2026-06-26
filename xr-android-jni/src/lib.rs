@@ -1056,6 +1056,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
     agent_url: JString,
     token_json: JString,
     dest_dir: JString,
+    selection_json: JString,
     dry_run: jboolean,
     timeout_ms: jlong,
 ) -> jstring {
@@ -1071,12 +1072,20 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
         Ok(s) => PathBuf::from(s),
         Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
     };
+    // Selection: JSON array of chosen paths / folder prefixes; empty = whole share.
+    let selection: Option<HashSet<String>> = match read_jstring(&mut env, &selection_json) {
+        Ok(s) if !s.trim().is_empty() && s.trim() != "[]" => {
+            serde_json::from_str::<Vec<String>>(&s).ok().map(|v| v.into_iter().collect())
+        }
+        _ => None,
+    };
     let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
 
-    let json = match with_onboarding_runtime(sync::sync_share(
+    let json = match with_onboarding_runtime(sync::sync_share_selected(
         &agent_url,
         &token,
         &dest,
+        selection.as_ref(),
         dry_run != 0,
         timeout,
     )) {
