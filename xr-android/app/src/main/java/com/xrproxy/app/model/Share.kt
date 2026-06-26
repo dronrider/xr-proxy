@@ -156,15 +156,15 @@ data class ShareConfig(
     val port: Int,
     val agentPubkey: String,
     val tokenJson: String? = null,
-    val treeUri: String? = null,
     val syncEnabled: Boolean = false,
-    /** Chosen manifest paths to mirror (§9.6). Empty = the whole share. */
+    /** Chosen manifest paths and/or folder prefixes to mirror (§9.6). Empty =
+     *  the whole share; downloads land in the app's own directory. */
     val selection: Set<String> = emptySet(),
 ) {
     val agentBaseUrl: String get() = "http://$addr:$port"
     val hasToken: Boolean get() = !tokenJson.isNullOrBlank()
 
-    /** Selection as the JSON array `nativePlanSync` expects (`[]` = whole share). */
+    /** Selection as the JSON array the native sync/plan calls expect. */
     fun selectionJson(): String = JSONArray().apply { selection.forEach { put(it) } }.toString()
 
     fun toJson(): JSONObject = JSONObject()
@@ -174,19 +174,10 @@ data class ShareConfig(
         .put("port", port)
         .put("agent_pubkey", agentPubkey)
         .put("token_json", tokenJson ?: JSONObject.NULL)
-        .put("tree_uri", treeUri ?: JSONObject.NULL)
         .put("sync_enabled", syncEnabled)
         .put("selection", JSONArray().apply { selection.forEach { put(it) } })
 
     companion object {
-        fun fromInfo(info: ShareInfo) = ShareConfig(
-            shareId = info.shareId,
-            name = info.name,
-            addr = info.addr,
-            port = info.port,
-            agentPubkey = info.agentPubkey,
-        )
-
         /** Build a configured share from an invite grant — the token comes with it. */
         fun fromGrant(g: ShareGrant) = ShareConfig(
             shareId = g.shareId,
@@ -204,11 +195,51 @@ data class ShareConfig(
             port = o.getInt("port"),
             agentPubkey = o.getString("agent_pubkey"),
             tokenJson = o.optString("token_json").takeIf { it.isNotBlank() && it != "null" },
-            treeUri = o.optString("tree_uri").takeIf { it.isNotBlank() && it != "null" },
             syncEnabled = o.optBoolean("sync_enabled", false),
             selection = (o.optJSONArray("selection") ?: JSONArray()).let { arr ->
                 (0 until arr.length()).map { arr.getString(it) }.toSet()
             },
         )
     }
+}
+
+/** One row in the explorer: a sub-folder (navigable) or a file (downloadable). */
+sealed interface TreeNode {
+    val name: String
+    val path: String
+
+    /** A sub-folder at the current level; [path] is its full share-relative path. */
+    data class Folder(override val name: String, override val path: String, val fileCount: Int) : TreeNode
+    /** A file at the current level. */
+    data class FileNode(override val name: String, val entry: ManifestEntry) : TreeNode {
+        override val path: String get() = entry.path
+    }
+}
+
+/**
+ * Compute the immediate children of folder [dir] (`""` = root) from a flat
+ * manifest: sub-folders first (alphabetical), then files. Folder-relative names
+ * only, so the explorer shows one level at a time (Windows-Explorer style).
+ */
+fun explorerLevel(entries: List<ManifestEntry>, dir: String): List<TreeNode> {
+    val prefix = if (dir.isEmpty()) "" else "$dir/"
+    val folders = LinkedHashMap<String, Int>() // sub-folder name -> file count under it
+    val files = ArrayList<TreeNode.FileNode>()
+    for (e in entries) {
+        if (!e.path.startsWith(prefix)) continue
+        val rest = e.path.substring(prefix.length)
+        val slash = rest.indexOf('/')
+        if (slash < 0) {
+            files.add(TreeNode.FileNode(rest, e))
+        } else {
+            val folderName = rest.substring(0, slash)
+            folders[folderName] = (folders[folderName] ?: 0) + 1
+        }
+    }
+    val out = ArrayList<TreeNode>(folders.size + files.size)
+    folders.entries.sortedBy { it.key.lowercase() }.forEach { (n, c) ->
+        out.add(TreeNode.Folder(n, if (dir.isEmpty()) n else "$dir/$n", c))
+    }
+    files.sortedBy { it.name.lowercase() }.forEach { out.add(it) }
+    return out
 }

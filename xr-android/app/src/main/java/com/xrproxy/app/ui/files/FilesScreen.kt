@@ -1,9 +1,10 @@
 package com.xrproxy.app.ui.files
 
+import android.content.Context
 import android.content.Intent
 import android.widget.Toast
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -11,9 +12,14 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.Checkbox
@@ -26,31 +32,28 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateMapOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
+import com.xrproxy.app.model.TreeNode
+import com.xrproxy.app.model.explorerLevel
+import java.io.File
 
 /**
- * The "Files" tab (LLD-19): list shares from the hub, configure each (token +
- * SAF folder), download files one-time, or enable background mirror sync. All
- * diff/download logic is in Rust via [FilesViewModel]; this is purely UI.
+ * Files tab (LLD-19, XR-031). A list of shares ("drives"); tapping one opens an
+ * Explorer that navigates its folders one level at a time, like a file manager.
+ * Tick files or whole folders to mirror; tap a downloaded file to open it.
  */
 @Composable
 fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modifier) {
@@ -59,7 +62,6 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
     val configs by vm.configs.collectAsState()
     val context = LocalContext.current
 
-    // List the invite's shares + run a foreground mirror when the tab opens.
     LaunchedEffect(Unit) {
         vm.refreshHub(hubUrl, inviteToken)
         vm.syncAllNow()
@@ -71,26 +73,27 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
         }
     }
 
-    // SAF folder picker — assigns the chosen tree to the pending share.
-    var pendingFolderFor by remember { mutableStateOf<String?>(null) }
-    val folderPicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocumentTree()
-    ) { uri ->
-        val shareId = pendingFolderFor
-        pendingFolderFor = null
-        if (uri != null && shareId != null) {
-            context.contentResolver.takePersistableUriPermission(
-                uri,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
-            )
-            vm.setFolder(shareId, uri)
-        }
-    }
-    val pickFolder: (String) -> Unit = { shareId ->
-        pendingFolderFor = shareId
-        folderPicker.launch(null)
-    }
+    val openConfig = configs.firstOrNull { it.shareId == ui.openShareId }
+    BackHandler(enabled = openConfig != null) { vm.navigateUp() }
 
+    if (openConfig != null) {
+        ExplorerView(vm, ui, openConfig, context, modifier)
+    } else {
+        ShareListView(vm, ui, configs, hubUrl, inviteToken, modifier)
+    }
+}
+
+// ── Share list (the "drives") ───────────────────────────────────────
+
+@Composable
+private fun ShareListView(
+    vm: FilesViewModel,
+    ui: FilesViewModel.UiState,
+    configs: List<ShareConfig>,
+    hubUrl: String?,
+    inviteToken: String?,
+    modifier: Modifier,
+) {
     val knownIds = configs.map { it.shareId }.toSet()
     val addable = ui.hubShares.filter { it.shareId !in knownIds }
 
@@ -110,209 +113,209 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
                 }
             }
         }
+        if (ui.loadingHub) item { CircularProgressIndicator(modifier = Modifier.padding(8.dp)) }
 
-        if (ui.loadingHub) {
-            item { CircularProgressIndicator(modifier = Modifier.padding(8.dp)) }
-        }
-
-        // ── Shares available on the hub but not yet added ──
         if (addable.isNotEmpty()) {
             item { SectionLabel("Доступно по инвайту") }
-            items(addable, key = { it.shareId }) { info ->
+            items(addable, key = { it.shareId }) { g ->
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(12.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(info.name, style = MaterialTheme.typography.titleMedium)
-                            Text("${info.addr}:${info.port}", fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                        Button(onClick = { vm.addShare(info) }) { Text("Добавить") }
+                        Text(g.name, modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                        Button(onClick = { vm.addShare(g) }) { Text("Добавить") }
                     }
                 }
             }
         }
 
-        // ── Configured shares ──
         item { SectionLabel("Мои шары") }
         if (configs.isEmpty()) {
             item {
                 Text(
-                    "Пока нет шар. Обновите список из хаба и добавьте нужные.",
+                    "Пока нет шар. Обнови список и добавь нужные.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(8.dp),
                 )
             }
         }
         items(configs, key = { it.shareId }) { cfg ->
-            ShareCard(
-                cfg = cfg,
-                busy = ui.busyShareId == cfg.shareId,
-                isOpen = ui.openShareId == cfg.shareId,
-                onPickFolder = { pickFolder(cfg.shareId) },
-                onToggleSync = { vm.setSyncEnabled(cfg.shareId, it) },
-                onOpen = { if (ui.openShareId == cfg.shareId) vm.closeShare() else vm.openShare(cfg) },
-                onSyncNow = { vm.syncNow(cfg) },
-                onRemove = { vm.removeShare(cfg.shareId) },
-            )
-        }
-
-        // ── Manifest (one-time download) for the opened share ──
-        val open = configs.firstOrNull { it.shareId == ui.openShareId }
-        if (open != null) {
-            item { SectionLabel("Файлы шары «${open.name}»") }
-            if (ui.manifestLoading) {
-                item { CircularProgressIndicator(modifier = Modifier.padding(8.dp)) }
-            } else {
-                manifestPicker(
-                    cfg = open,
-                    entries = ui.manifest,
-                    onDownload = { entries ->
-                        val tree = open.treeUri
-                        if (tree == null) pickFolder(open.shareId)
-                        else vm.downloadSelected(open, entries, android.net.Uri.parse(tree))
-                    },
-                    onSaveSelection = { paths -> vm.setSelection(open.shareId, paths) },
-                )
+            Card(
+                modifier = Modifier.fillMaxWidth().clickable { vm.openShare(cfg) },
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(28.dp))
+                    Spacer(Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(cfg.name, style = MaterialTheme.typography.titleMedium, maxLines = 2,
+                            overflow = TextOverflow.Ellipsis)
+                        Text(
+                            if (cfg.selection.isEmpty()) "вся шара" else "выбрано: ${cfg.selection.size}",
+                            fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (ui.busyShareId == cfg.shareId)
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp))
+                    Switch(checked = cfg.syncEnabled, onCheckedChange = { vm.setSyncEnabled(cfg.shareId, it) })
+                    IconButton(onClick = { vm.removeShare(cfg.shareId) }) {
+                        Icon(Icons.Default.Delete, contentDescription = "Удалить")
+                    }
+                }
             }
         }
-
         item { Spacer(Modifier.height(24.dp)) }
     }
 }
 
+// ── Explorer (one share's folders) ──────────────────────────────────
+
 @Composable
-private fun ShareCard(
+private fun ExplorerView(
+    vm: FilesViewModel,
+    ui: FilesViewModel.UiState,
     cfg: ShareConfig,
-    busy: Boolean,
-    isOpen: Boolean,
-    onPickFolder: () -> Unit,
-    onToggleSync: (Boolean) -> Unit,
-    onOpen: () -> Unit,
-    onSyncNow: () -> Unit,
-    onRemove: () -> Unit,
+    context: Context,
+    modifier: Modifier,
 ) {
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(12.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(cfg.name, style = MaterialTheme.typography.titleMedium)
-                    Text("${cfg.addr}:${cfg.port}", fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                if (busy) CircularProgressIndicator(modifier = Modifier.width(22.dp).height(22.dp))
-                IconButton(onClick = onRemove) {
-                    Icon(Icons.Default.Delete, contentDescription = "Удалить")
-                }
+    val level = explorerLevel(ui.manifest, ui.currentPath)
+    Column(modifier = modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
+        // Breadcrumbs + back.
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            TextButton(onClick = { vm.navigateUp() }) { Text("‹ Назад") }
+            Spacer(Modifier.weight(1f))
+            Text("Синк", fontSize = 12.sp)
+            Switch(checked = cfg.syncEnabled, onCheckedChange = { vm.setSyncEnabled(cfg.shareId, it) })
+        }
+        Breadcrumbs(cfg.name, ui.currentPath) { vm.navigateTo(it) }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(onClick = { vm.syncNow(cfg) }, enabled = ui.busyShareId != cfg.shareId) {
+                Text("Синкать выбранное сейчас")
             }
-
-            Spacer(Modifier.height(6.dp))
-            // Status: folder + what is selected for sync (the token came with the
-            // invite grant, so there is nothing to paste).
-            Text(
-                buildString {
-                    append(if (cfg.treeUri != null) "✓ папка" else "✗ нет папки")
-                    append("   ")
-                    append(if (cfg.selection.isEmpty()) "вся шара" else "файлов: ${cfg.selection.size}")
-                },
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-
-            Spacer(Modifier.height(8.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                OutlinedButton(onClick = onPickFolder) {
-                    Text(if (cfg.treeUri != null) "Папка" else "Выбрать папку")
-                }
-                OutlinedButton(onClick = onOpen) {
-                    Text(if (isOpen) "Скрыть" else "Выбрать файлы")
-                }
-                OutlinedButton(onClick = onSyncNow, enabled = cfg.treeUri != null) {
-                    Text("Синк")
-                }
-                Spacer(Modifier.weight(1f))
-                Switch(checked = cfg.syncEnabled, onCheckedChange = onToggleSync)
+            if (ui.busyShareId == cfg.shareId) {
+                Spacer(Modifier.width(8.dp))
+                CircularProgressIndicator(modifier = Modifier.size(20.dp))
             }
+        }
+        HorizontalDivider(modifier = Modifier.padding(vertical = 6.dp))
+
+        if (ui.manifestLoading) {
+            CircularProgressIndicator(modifier = Modifier.padding(16.dp))
+            return@Column
+        }
+        if (level.isEmpty()) {
+            Text("Папка пуста", modifier = Modifier.padding(16.dp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            return@Column
+        }
+
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            items(level, key = { it.path }) { node ->
+                when (node) {
+                    is TreeNode.Folder -> FolderRow(node, cfg, vm)
+                    is TreeNode.FileNode -> FileRow(node, cfg, ui, vm, context)
+                }
+                HorizontalDivider()
+            }
+            item { Spacer(Modifier.height(24.dp)) }
         }
     }
 }
 
-/** Manifest rows with checkboxes (pre-ticked from the share's saved selection):
- *  download the ticked files once, or save them as the subset to mirror.
- *  An empty saved selection means "the whole share". */
-private fun androidx.compose.foundation.lazy.LazyListScope.manifestPicker(
-    cfg: ShareConfig,
-    entries: List<ManifestEntry>,
-    onDownload: (List<ManifestEntry>) -> Unit,
-    onSaveSelection: (Set<String>) -> Unit,
-) {
-    if (entries.isEmpty()) {
-        item { Text("Файлов нет", modifier = Modifier.padding(8.dp)) }
-        return
-    }
-    item {
-        // Pre-tick the currently-synced selection (empty selection ticks nothing).
-        val checked = remember(cfg.shareId, cfg.selection) {
-            mutableStateMapOf<String, Boolean>().apply {
-                entries.forEach { put(it.path, cfg.selection.contains(it.path)) }
-            }
+@Composable
+private fun FolderRow(node: TreeNode.Folder, cfg: ShareConfig, vm: FilesViewModel) {
+    val coveredByParent = coveredByAncestor(node.path, cfg.selection)
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable { vm.navigateTo(node.path) }.padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Checkbox(
+            checked = cfg.selection.contains(node.path) || coveredByParent,
+            enabled = !coveredByParent,
+            onCheckedChange = { vm.setSelected(cfg.shareId, node.path, it) },
+        )
+        Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(26.dp))
+        Spacer(Modifier.width(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(node.name, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            Text("${node.fileCount} файл(ов)", fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        Card(modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(8.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    val allChecked = entries.all { checked[it.path] == true }
-                    Checkbox(
-                        checked = allChecked,
-                        onCheckedChange = { on -> entries.forEach { checked[it.path] = on } },
-                    )
-                    Text("Выбрать всё", modifier = Modifier.weight(1f))
-                }
-                HorizontalDivider()
-                entries.forEach { e ->
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Checkbox(
-                            checked = checked[e.path] == true,
-                            onCheckedChange = { checked[e.path] = it },
-                        )
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(e.path, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text(humanSize(e.size), fontSize = 11.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
-                    HorizontalDivider()
-                }
-                Spacer(Modifier.height(8.dp))
-                val selected = entries.filter { checked[it.path] == true }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(
-                        onClick = { onDownload(selected) },
-                        enabled = selected.isNotEmpty(),
-                        modifier = Modifier.weight(1f),
-                    ) { Text("Скачать (${selected.size})") }
-                    Button(
-                        onClick = { onSaveSelection(selected.map { it.path }.toSet()) },
-                        modifier = Modifier.weight(1f),
-                    ) { Text("Синкать выбор (${selected.size})") }
-                }
+        Text("›", fontSize = 22.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.width(6.dp))
+    }
+}
+
+@Composable
+private fun FileRow(
+    node: TreeNode.FileNode,
+    cfg: ShareConfig,
+    ui: FilesViewModel.UiState,
+    vm: FilesViewModel,
+    context: Context,
+) {
+    val downloaded = ui.localPaths.contains(node.entry.path)
+    val coveredByParent = coveredByAncestor(node.entry.path, cfg.selection)
+    Row(
+        modifier = Modifier.fillMaxWidth()
+            .clickable(enabled = downloaded) {
+                vm.localFile(cfg.shareId, node.entry.path)?.let { openLocalFile(context, it) }
             }
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Checkbox(
+            checked = cfg.selection.contains(node.entry.path) || coveredByParent,
+            enabled = !coveredByParent,
+            onCheckedChange = { vm.setSelected(cfg.shareId, node.entry.path, it) },
+        )
+        Column(modifier = Modifier.weight(1f).padding(start = 4.dp)) {
+            Text(node.name, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            Text(
+                humanSize(node.entry.size) + if (downloaded) " · скачано" else "",
+                fontSize = 11.sp,
+                color = if (downloaded) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (!downloaded) {
+            TextButton(onClick = { vm.download(cfg, node.entry) }) { Text("Скачать") }
+        } else {
+            Text("Открыть", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(end = 8.dp))
+        }
+    }
+}
+
+@Composable
+private fun Breadcrumbs(shareName: String, currentPath: String, onJump: (String) -> Unit) {
+    val segments = if (currentPath.isEmpty()) emptyList() else currentPath.split('/')
+    Row(modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            shareName,
+            fontSize = 13.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.clickable { onJump("") }.weight(1f, fill = false),
+        )
+        var acc = ""
+        segments.forEach { seg ->
+            acc = if (acc.isEmpty()) seg else "$acc/$seg"
+            val target = acc
+            Text(" / ", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                seg, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.clickable { onJump(target) },
+            )
         }
     }
 }
@@ -327,7 +330,36 @@ private fun SectionLabel(text: String) {
     )
 }
 
+// ── helpers ─────────────────────────────────────────────────────────
+
+/** True if any ancestor folder of [path] is in [selection] (so the item is
+ *  covered top-down and managed at the folder level). */
+private fun coveredByAncestor(path: String, selection: Set<String>): Boolean {
+    var p = path
+    while (true) {
+        val i = p.lastIndexOf('/')
+        if (i < 0) return false
+        p = p.substring(0, i)
+        if (selection.contains(p)) return true
+    }
+}
+
+private fun openLocalFile(context: Context, file: File) {
+    try {
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        val mime = context.contentResolver.getType(uri) ?: "*/*"
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mime)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(Intent.createChooser(intent, "Открыть файл"))
+    } catch (_: Exception) {
+        Toast.makeText(context, "Нет приложения, чтобы открыть этот файл", Toast.LENGTH_SHORT).show()
+    }
+}
+
 private fun humanSize(bytes: Long): String = when {
+    bytes >= 1L shl 30 -> "%.1f ГБ".format(bytes / (1L shl 30).toDouble())
     bytes >= 1 shl 20 -> "%.1f МБ".format(bytes / (1 shl 20).toDouble())
     bytes >= 1 shl 10 -> "%.1f КБ".format(bytes / (1 shl 10).toDouble())
     else -> "$bytes Б"

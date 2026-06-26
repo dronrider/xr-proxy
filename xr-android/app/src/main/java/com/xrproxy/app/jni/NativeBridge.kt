@@ -205,6 +205,7 @@ object NativeBridge {
         agentUrl: String,
         tokenJson: String,
         destDir: String,
+        selectionJson: String,
         dryRun: Boolean,
         timeoutMs: Long,
     ): String

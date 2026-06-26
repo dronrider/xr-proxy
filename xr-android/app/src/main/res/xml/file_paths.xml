@@ -4,4 +4,7 @@
     <!-- APK self-update downloads (LLD-12): used by the ACTION_VIEW install
          fallback to grant the system installer read access. -->
     <cache-path name="updates" path="updates/" />
+    <!-- Downloaded share files (XR-031): opened via ACTION_VIEW from the
+         app's own external-files dir (getExternalFilesDir("shares")). -->
+    <external-files-path name="shares" path="shares/" />
 </paths>

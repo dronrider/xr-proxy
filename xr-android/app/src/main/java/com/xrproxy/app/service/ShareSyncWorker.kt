@@ -45,8 +45,8 @@ class ShareSyncWorker(appContext: Context, params: WorkerParameters) :
                 continue
             }
             if (outcome.ok) {
-                Log.i(TAG, "synced '${config.name}': +${outcome.fetched.size} -${outcome.deleted.size}")
-                if (outcome.failed.isNotEmpty()) anyFailed = true
+                Log.i(TAG, "synced '${config.name}': +${outcome.fetched} -${outcome.deleted}")
+                if (outcome.failed > 0) anyFailed = true
             } else {
                 Log.w(TAG, "sync '${config.name}' failed: ${outcome.error}")
                 anyFailed = true

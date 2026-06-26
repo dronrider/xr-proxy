@@ -57,9 +57,9 @@ class ShareStore(private val prefs: SharedPreferences) {
         persist(_shares.value.filterNot { it.shareId == shareId })
     }
 
-    /** Shares with background mirror enabled and a usable token + tree. */
+    /** Shares with background mirror enabled and a usable token. */
     fun enabledShares(): List<ShareConfig> =
-        _shares.value.filter { it.syncEnabled && it.hasToken && it.treeUri != null }
+        _shares.value.filter { it.syncEnabled && it.hasToken }
 
     companion object {
         private const val KEY = "shares_v1"

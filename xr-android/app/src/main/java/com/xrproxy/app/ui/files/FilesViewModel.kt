@@ -1,7 +1,6 @@
 package com.xrproxy.app.ui.files
 
 import android.app.Application
-import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xrproxy.app.data.ShareRepository
@@ -16,12 +15,12 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 
 /**
- * Drives the Files screen (LLD-19). Owns the configured-share store and the
- * repository; all blocking native/SAF work runs on [Dispatchers.IO]. Mirror /
- * diff / download logic lives in Rust — this only sequences it and tracks UI
- * state.
+ * Drives the Files screen (LLD-19, XR-031): a list of shares ("drives"), and an
+ * Explorer that navigates one share's folders. Files mirror into the app's own
+ * directory; selection (files / folder prefixes) drives the background mirror.
  */
 class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -33,10 +32,13 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     data class UiState(
         val hubShares: List<ShareGrant> = emptyList(),
         val loadingHub: Boolean = false,
-        val busyShareId: String? = null,
+        // Explorer
         val openShareId: String? = null,
+        val currentPath: String = "",
         val manifest: List<ManifestEntry> = emptyList(),
         val manifestLoading: Boolean = false,
+        val localPaths: Set<String> = emptySet(),
+        val busyShareId: String? = null,
         val message: String? = null,
     )
 
@@ -45,8 +47,9 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
     fun consumeMessage() = _ui.update { it.copy(message = null) }
 
-    /** Pull the shares attached to this server's invite so the user can add them
-     *  (the access anchor, §9.5). The token rides along, so nothing to paste. */
+    // ── share list ──────────────────────────────────────────────────
+
+    /** List the shares attached to this server's invite (the token rides along). */
     fun refreshHub(hubUrl: String?, inviteToken: String?) {
         if (hubUrl.isNullOrBlank() || inviteToken.isNullOrBlank()) {
             _ui.update { it.copy(message = "Нет инвайта — добавьте сервер по инвайту") }
@@ -66,109 +69,120 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
     fun addShare(grant: ShareGrant) {
         store.upsert(ShareConfig.fromGrant(grant))
-        _ui.update { it.copy(message = "Шара «${grant.name}» добавлена — выберите папку и файлы") }
-    }
-
-    /** Persist which manifest paths to mirror (empty = the whole share). */
-    fun setSelection(shareId: String, selection: Set<String>) {
-        store.update(shareId) { it.copy(selection = selection) }
-        _ui.update {
-            it.copy(message = if (selection.isEmpty()) "Выбрана вся шара" else "Выбрано файлов: ${selection.size}")
-        }
+        _ui.update { it.copy(message = "Шара «${grant.name}» добавлена") }
     }
 
     fun removeShare(shareId: String) {
         store.remove(shareId)
         rescheduleIfNeeded()
-        if (_ui.value.openShareId == shareId) {
-            _ui.update { it.copy(openShareId = null, manifest = emptyList()) }
-        }
+        if (_ui.value.openShareId == shareId) closeShare()
     }
 
-    fun setToken(shareId: String, tokenJson: String) {
-        store.update(shareId) { it.copy(tokenJson = tokenJson.trim()) }
-        _ui.update { it.copy(message = "Токен сохранён") }
-    }
+    // ── explorer ────────────────────────────────────────────────────
 
-    /** Persist the SAF folder choice (caller already took persistable permission). */
-    fun setFolder(shareId: String, treeUri: Uri) {
-        store.update(shareId) { it.copy(treeUri = treeUri.toString()) }
-        _ui.update { it.copy(message = "Папка выбрана") }
-    }
-
-    /** Browse a share's files (one-time download picker). */
+    /** Enter a share: load its manifest + what is already downloaded. */
     fun openShare(config: ShareConfig) {
-        _ui.update { it.copy(openShareId = config.shareId, manifest = emptyList(), manifestLoading = true) }
+        _ui.update {
+            it.copy(
+                openShareId = config.shareId, currentPath = "",
+                manifest = emptyList(), manifestLoading = true,
+            )
+        }
         viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) { repo.fetchManifest(config) }
+            val (result, local) = withContext(Dispatchers.IO) {
+                repo.fetchManifest(config) to repo.localPaths(config.shareId)
+            }
             _ui.update { st ->
+                if (st.openShareId != config.shareId) return@update st
                 result.fold(
-                    onSuccess = { st.copy(manifest = it, manifestLoading = false) },
+                    onSuccess = { st.copy(manifest = it, manifestLoading = false, localPaths = local) },
                     onFailure = { st.copy(manifestLoading = false, message = "Манифест: ${it.message}") },
                 )
             }
         }
     }
 
-    fun closeShare() = _ui.update { it.copy(openShareId = null, manifest = emptyList()) }
+    fun closeShare() = _ui.update {
+        it.copy(openShareId = null, currentPath = "", manifest = emptyList(), localPaths = emptySet())
+    }
 
-    /** One-time download of [entries] into [treeUri]. */
-    fun downloadSelected(config: ShareConfig, entries: List<ManifestEntry>, treeUri: Uri) {
-        if (entries.isEmpty()) return
+    fun navigateTo(path: String) = _ui.update { it.copy(currentPath = path) }
+
+    /** Up one level; at the root, leave the share. */
+    fun navigateUp() {
+        val p = _ui.value.currentPath
+        if (p.isEmpty()) closeShare()
+        else _ui.update { it.copy(currentPath = p.substringBeforeLast('/', "")) }
+    }
+
+    /** Tick/untick a file or folder for sync. Selecting a folder subsumes (and
+     *  clears) any individually-selected descendants; deselecting clears them. */
+    fun setSelected(shareId: String, path: String, selected: Boolean) {
+        store.update(shareId) { cfg ->
+            val sel = cfg.selection.toMutableSet()
+            sel.removeAll { it == path || it.startsWith("$path/") }
+            if (selected) sel.add(path)
+            cfg.copy(selection = sel)
+        }
+    }
+
+    /** One-time download of a single file. */
+    fun download(config: ShareConfig, entry: ManifestEntry) {
         _ui.update { it.copy(busyShareId = config.shareId) }
         viewModelScope.launch {
-            val failed = withContext(Dispatchers.IO) { repo.downloadInto(config, entries, treeUri) }
+            val ok = withContext(Dispatchers.IO) { repo.downloadOne(config, entry) }
+            val local = withContext(Dispatchers.IO) { repo.localPaths(config.shareId) }
             _ui.update {
                 it.copy(
-                    busyShareId = null,
-                    message = if (failed.isEmpty()) "Скачано: ${entries.size}"
-                    else "Скачано ${entries.size - failed.size}/${entries.size}, ошибок: ${failed.size}",
+                    busyShareId = null, localPaths = local,
+                    message = if (ok) "Скачано: ${entry.path.substringAfterLast('/')}" else "Не удалось скачать",
                 )
             }
         }
     }
 
-    /**
-     * Turn background mirror on/off. Enabling requires a token and a folder;
-     * the user is warned that mirror deletes locally what's gone on the server.
-     */
+    /** Local file for a share-relative path, if it is downloaded (for opening). */
+    fun localFile(shareId: String, relPath: String): File? =
+        repo.fileFor(shareId, relPath).takeIf { it.isFile }
+
+    // ── sync ────────────────────────────────────────────────────────
+
     fun setSyncEnabled(shareId: String, enabled: Boolean) {
         val cfg = store.get(shareId) ?: return
-        if (enabled && (!cfg.hasToken || cfg.treeUri == null)) {
-            _ui.update { it.copy(message = "Для синка нужны токен и папка") }
+        if (enabled && !cfg.hasToken) {
+            _ui.update { it.copy(message = "Нет токена доступа") }
             return
         }
         store.update(shareId) { it.copy(syncEnabled = enabled) }
         rescheduleIfNeeded()
         if (enabled) {
             ShareSyncScheduler.syncNow(getApplication())
-            _ui.update { it.copy(message = "Синк включён (зеркало: удаляет локально пропавшее на сервере)") }
+            _ui.update { it.copy(message = "Синк включён (зеркалит выбранное, удаляет лишнее)") }
         }
     }
 
-    /** Run a mirror cycle for one share immediately. */
     fun syncNow(config: ShareConfig) {
         _ui.update { it.copy(busyShareId = config.shareId) }
         viewModelScope.launch {
             val outcome = withContext(Dispatchers.IO) { repo.syncOnce(config) }
+            val local = withContext(Dispatchers.IO) { repo.localPaths(config.shareId) }
             _ui.update {
                 it.copy(
-                    busyShareId = null,
+                    busyShareId = null, localPaths = local,
                     message = if (outcome.ok)
-                        "Синк «${config.name}»: +${outcome.fetched.size} −${outcome.deleted.size}"
+                        "Синк «${config.name}»: +${outcome.fetched} −${outcome.deleted}" +
+                            if (outcome.failed > 0) " (ошибок ${outcome.failed})" else ""
                     else "Синк «${config.name}»: ${outcome.error}",
                 )
             }
         }
     }
 
-    /** Schedule or cancel the periodic worker based on whether any share is enabled. */
     private fun rescheduleIfNeeded() {
         if (store.enabledShares().isNotEmpty()) ShareSyncScheduler.schedulePeriodic(getApplication())
         else ShareSyncScheduler.cancelPeriodic(getApplication())
     }
 
-    /** Sync all enabled shares now — called when the screen comes to foreground. */
     fun syncAllNow() {
         if (store.enabledShares().isNotEmpty()) ShareSyncScheduler.syncNow(getApplication())
     }
