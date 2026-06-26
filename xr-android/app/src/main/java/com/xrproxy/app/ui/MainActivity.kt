@@ -500,6 +500,7 @@ fun MainScreen(
             }
             3 -> FilesScreen(
                 hubUrl = activeServer?.hubUrl,
+                inviteToken = activeServer?.inviteToken,
                 modifier = Modifier.fillMaxSize().padding(padding),
             )
         }

@@ -723,6 +723,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 hubUrl = hubFromPayload,
                 hubPreset = presetName,
                 trustedPublicKey = publicKey,
+                inviteToken = current.token,
                 createdAt = OffsetDateTime.now().toString(),
                 source = ServerSource.Invite,
             )

@@ -23,14 +23,12 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material3.AlertDialog
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -55,15 +53,15 @@ import com.xrproxy.app.model.ShareConfig
  * diff/download logic is in Rust via [FilesViewModel]; this is purely UI.
  */
 @Composable
-fun FilesScreen(hubUrl: String?, modifier: Modifier = Modifier) {
+fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modifier) {
     val vm: FilesViewModel = viewModel()
     val ui by vm.ui.collectAsState()
     val configs by vm.configs.collectAsState()
     val context = LocalContext.current
 
-    // Refresh hub index + run a foreground mirror when the tab opens.
+    // List the invite's shares + run a foreground mirror when the tab opens.
     LaunchedEffect(Unit) {
-        vm.refreshHub(hubUrl)
+        vm.refreshHub(hubUrl, inviteToken)
         vm.syncAllNow()
     }
     LaunchedEffect(ui.message) {
@@ -93,8 +91,6 @@ fun FilesScreen(hubUrl: String?, modifier: Modifier = Modifier) {
         folderPicker.launch(null)
     }
 
-    var tokenDialogFor by remember { mutableStateOf<ShareConfig?>(null) }
-
     val knownIds = configs.map { it.shareId }.toSet()
     val addable = ui.hubShares.filter { it.shareId !in knownIds }
 
@@ -109,8 +105,8 @@ fun FilesScreen(hubUrl: String?, modifier: Modifier = Modifier) {
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text("Файлы", style = MaterialTheme.typography.titleLarge)
-                IconButton(onClick = { vm.refreshHub(hubUrl) }) {
-                    Icon(Icons.Default.Refresh, contentDescription = "Обновить из хаба")
+                IconButton(onClick = { vm.refreshHub(hubUrl, inviteToken) }) {
+                    Icon(Icons.Default.Refresh, contentDescription = "Обновить по инвайту")
                 }
             }
         }
@@ -121,7 +117,7 @@ fun FilesScreen(hubUrl: String?, modifier: Modifier = Modifier) {
 
         // ── Shares available on the hub but not yet added ──
         if (addable.isNotEmpty()) {
-            item { SectionLabel("Доступно на хабе") }
+            item { SectionLabel("Доступно по инвайту") }
             items(addable, key = { it.shareId }) { info ->
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Row(
@@ -156,7 +152,6 @@ fun FilesScreen(hubUrl: String?, modifier: Modifier = Modifier) {
                 cfg = cfg,
                 busy = ui.busyShareId == cfg.shareId,
                 isOpen = ui.openShareId == cfg.shareId,
-                onPasteToken = { tokenDialogFor = cfg },
                 onPickFolder = { pickFolder(cfg.shareId) },
                 onToggleSync = { vm.setSyncEnabled(cfg.shareId, it) },
                 onOpen = { if (ui.openShareId == cfg.shareId) vm.closeShare() else vm.openShare(cfg) },
@@ -172,48 +167,20 @@ fun FilesScreen(hubUrl: String?, modifier: Modifier = Modifier) {
             if (ui.manifestLoading) {
                 item { CircularProgressIndicator(modifier = Modifier.padding(8.dp)) }
             } else {
-                manifestPicker(open, ui.manifest, onDownload = { entries ->
-                    val tree = open.treeUri
-                    if (tree == null) pickFolder(open.shareId)
-                    else vm.downloadSelected(open, entries, android.net.Uri.parse(tree))
-                })
+                manifestPicker(
+                    cfg = open,
+                    entries = ui.manifest,
+                    onDownload = { entries ->
+                        val tree = open.treeUri
+                        if (tree == null) pickFolder(open.shareId)
+                        else vm.downloadSelected(open, entries, android.net.Uri.parse(tree))
+                    },
+                    onSaveSelection = { paths -> vm.setSelection(open.shareId, paths) },
+                )
             }
         }
 
         item { Spacer(Modifier.height(24.dp)) }
-    }
-
-    // ── Paste-token dialog ──
-    tokenDialogFor?.let { cfg ->
-        var text by remember { mutableStateOf(cfg.tokenJson ?: "") }
-        AlertDialog(
-            onDismissRequest = { tokenDialogFor = null },
-            title = { Text("Токен доступа") },
-            text = {
-                Column {
-                    Text(
-                        "Вставьте токен, который выдал владелец шары (JSON из хаба).",
-                        fontSize = 13.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = text,
-                        onValueChange = { text = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        placeholder = { Text("{\"share_id\":...,\"exp\":...,\"signature\":...}") },
-                        minLines = 3,
-                    )
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    vm.setToken(cfg.shareId, text)
-                    tokenDialogFor = null
-                }) { Text("Сохранить") }
-            },
-            dismissButton = { TextButton(onClick = { tokenDialogFor = null }) { Text("Отмена") } },
-        )
     }
 }
 
@@ -222,7 +189,6 @@ private fun ShareCard(
     cfg: ShareConfig,
     busy: Boolean,
     isOpen: Boolean,
-    onPasteToken: () -> Unit,
     onPickFolder: () -> Unit,
     onToggleSync: (Boolean) -> Unit,
     onOpen: () -> Unit,
@@ -248,57 +214,74 @@ private fun ShareCard(
             }
 
             Spacer(Modifier.height(6.dp))
-            // Status chips: token + folder.
+            // Status: folder + what is selected for sync (the token came with the
+            // invite grant, so there is nothing to paste).
             Text(
                 buildString {
-                    append(if (cfg.hasToken) "✓ токен" else "✗ нет токена")
-                    append("   ")
                     append(if (cfg.treeUri != null) "✓ папка" else "✗ нет папки")
+                    append("   ")
+                    append(if (cfg.selection.isEmpty()) "вся шара" else "файлов: ${cfg.selection.size}")
                 },
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
             Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = onPasteToken) { Text(if (cfg.hasToken) "Токен" else "Вставить токен") }
-                OutlinedButton(onClick = onPickFolder) { Text(if (cfg.treeUri != null) "Папка" else "Выбрать папку") }
-            }
-            Spacer(Modifier.height(4.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                OutlinedButton(onClick = onOpen, enabled = cfg.hasToken) {
-                    Text(if (isOpen) "Скрыть" else "Файлы")
+                OutlinedButton(onClick = onPickFolder) {
+                    Text(if (cfg.treeUri != null) "Папка" else "Выбрать папку")
                 }
-                OutlinedButton(onClick = onSyncNow, enabled = cfg.hasToken && cfg.treeUri != null) {
+                OutlinedButton(onClick = onOpen) {
+                    Text(if (isOpen) "Скрыть" else "Выбрать файлы")
+                }
+                OutlinedButton(onClick = onSyncNow, enabled = cfg.treeUri != null) {
                     Text("Синк")
                 }
                 Spacer(Modifier.weight(1f))
-                Text("Синк", fontSize = 12.sp)
                 Switch(checked = cfg.syncEnabled, onCheckedChange = onToggleSync)
             }
         }
     }
 }
 
-/** Manifest rows with checkboxes + a download button. Returns nothing; calls
- *  [onDownload] with the selected entries. */
+/** Manifest rows with checkboxes (pre-ticked from the share's saved selection):
+ *  download the ticked files once, or save them as the subset to mirror.
+ *  An empty saved selection means "the whole share". */
 private fun androidx.compose.foundation.lazy.LazyListScope.manifestPicker(
     cfg: ShareConfig,
     entries: List<ManifestEntry>,
     onDownload: (List<ManifestEntry>) -> Unit,
+    onSaveSelection: (Set<String>) -> Unit,
 ) {
     if (entries.isEmpty()) {
         item { Text("Файлов нет", modifier = Modifier.padding(8.dp)) }
         return
     }
     item {
-        val checked = remember(cfg.shareId) { mutableStateMapOf<String, Boolean>() }
+        // Pre-tick the currently-synced selection (empty selection ticks nothing).
+        val checked = remember(cfg.shareId, cfg.selection) {
+            mutableStateMapOf<String, Boolean>().apply {
+                entries.forEach { put(it.path, cfg.selection.contains(it.path)) }
+            }
+        }
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(8.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    val allChecked = entries.all { checked[it.path] == true }
+                    Checkbox(
+                        checked = allChecked,
+                        onCheckedChange = { on -> entries.forEach { checked[it.path] = on } },
+                    )
+                    Text("Выбрать всё", modifier = Modifier.weight(1f))
+                }
+                HorizontalDivider()
                 entries.forEach { e ->
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -318,11 +301,17 @@ private fun androidx.compose.foundation.lazy.LazyListScope.manifestPicker(
                 }
                 Spacer(Modifier.height(8.dp))
                 val selected = entries.filter { checked[it.path] == true }
-                Button(
-                    onClick = { onDownload(selected) },
-                    enabled = selected.isNotEmpty(),
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("Скачать выбранное (${selected.size})") }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = { onDownload(selected) },
+                        enabled = selected.isNotEmpty(),
+                        modifier = Modifier.weight(1f),
+                    ) { Text("Скачать (${selected.size})") }
+                    Button(
+                        onClick = { onSaveSelection(selected.map { it.path }.toSet()) },
+                        modifier = Modifier.weight(1f),
+                    ) { Text("Синкать выбор (${selected.size})") }
+                }
             }
         }
     }

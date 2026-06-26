@@ -6,6 +6,7 @@ import android.util.Log
 import com.xrproxy.app.jni.NativeBridge
 import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
+import com.xrproxy.app.model.ShareGrant
 import com.xrproxy.app.model.ShareInfo
 import com.xrproxy.app.model.SyncPlan
 import com.xrproxy.app.model.parseManifest
@@ -34,6 +35,11 @@ class ShareRepository(private val context: Context) {
     /** Hub index of available shares. */
     fun listShares(hubUrl: String): Result<List<ShareInfo>> =
         ShareInfo.listFrom(NativeBridge.nativeListShares(hubUrl, TIMEOUT_MS))
+
+    /** Shares attached to the user's invite (the access anchor, §9.5). Each grant
+     *  carries its own access token, so no out-of-band paste is needed. */
+    fun inviteShares(hubUrl: String, inviteToken: String): Result<List<ShareGrant>> =
+        ShareGrant.listFrom(NativeBridge.nativeInviteShares(hubUrl, inviteToken, TIMEOUT_MS))
 
     /** A share's file listing from the agent (token-gated). */
     fun fetchManifest(config: ShareConfig): Result<List<ManifestEntry>> {
@@ -79,7 +85,7 @@ class ShareRepository(private val context: Context) {
         val localJson = runCatching { SafMirror.enumerateJson(context, treeUri) }
             .getOrElse { return SyncOutcome(emptyList(), emptyList(), emptyList(), "tree error: ${it.message}") }
 
-        val plan = SyncPlan.parse(NativeBridge.nativePlanSync(manifestJson, localJson))
+        val plan = SyncPlan.parse(NativeBridge.nativePlanSync(manifestJson, localJson, config.selectionJson()))
             .getOrElse { return SyncOutcome(emptyList(), emptyList(), emptyList(), it.message ?: "plan error") }
 
         val tmpDir = File(context.cacheDir, "share-sync/${config.shareId}").apply { mkdirs() }

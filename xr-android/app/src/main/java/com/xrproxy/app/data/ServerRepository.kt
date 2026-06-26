@@ -140,6 +140,7 @@ class ServerRepository(private val prefs: SharedPreferences) {
         put("hub_url", p.hubUrl)
         put("hub_preset", p.hubPreset)
         put("trusted_public_key", p.trustedPublicKey)
+        put("invite_token", p.inviteToken)
         put("created_at", p.createdAt)
         put("source", p.source.name)
     }
@@ -158,6 +159,7 @@ class ServerRepository(private val prefs: SharedPreferences) {
         hubUrl = j.optString("hub_url", ""),
         hubPreset = j.optString("hub_preset", ""),
         trustedPublicKey = j.optString("trusted_public_key", ""),
+        inviteToken = j.optString("invite_token", ""),
         createdAt = j.optString("created_at", OffsetDateTime.now().toString()),
         source = try {
             ServerSource.valueOf(j.optString("source", "Manual"))

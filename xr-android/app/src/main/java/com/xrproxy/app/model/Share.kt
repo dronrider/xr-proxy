@@ -46,6 +46,41 @@ data class ShareInfo(
     }
 }
 
+/**
+ * A share granted to an invite holder (`GET /api/v1/invite/{token}/shares`,
+ * §9.5). Unlike [ShareInfo], it carries the access [tokenJson] (minted by the
+ * hub, verified by the agent offline) so no token paste is needed.
+ */
+data class ShareGrant(
+    val shareId: String,
+    val name: String,
+    val addr: String,
+    val port: Int,
+    val agentPubkey: String,
+    val tokenJson: String,
+) {
+    companion object {
+        fun listFrom(json: String): Result<List<ShareGrant>> = runCatching {
+            val obj = JSONObject(json)
+            obj.optString("error").takeIf { it.isNotBlank() && it != "null" }?.let {
+                throw IllegalStateException(it)
+            }
+            val arr = obj.optJSONArray("shares") ?: JSONArray()
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                ShareGrant(
+                    shareId = o.getString("share_id"),
+                    name = o.getString("name"),
+                    addr = o.getString("addr"),
+                    port = o.getInt("port"),
+                    agentPubkey = o.getString("agent_pubkey"),
+                    tokenJson = o.getString("token"),
+                )
+            }
+        }
+    }
+}
+
 /** One file in a share manifest. [sha256] is lowercase hex. */
 data class ManifestEntry(
     val path: String,
@@ -123,9 +158,14 @@ data class ShareConfig(
     val tokenJson: String? = null,
     val treeUri: String? = null,
     val syncEnabled: Boolean = false,
+    /** Chosen manifest paths to mirror (§9.6). Empty = the whole share. */
+    val selection: Set<String> = emptySet(),
 ) {
     val agentBaseUrl: String get() = "http://$addr:$port"
     val hasToken: Boolean get() = !tokenJson.isNullOrBlank()
+
+    /** Selection as the JSON array `nativePlanSync` expects (`[]` = whole share). */
+    fun selectionJson(): String = JSONArray().apply { selection.forEach { put(it) } }.toString()
 
     fun toJson(): JSONObject = JSONObject()
         .put("share_id", shareId)
@@ -136,6 +176,7 @@ data class ShareConfig(
         .put("token_json", tokenJson ?: JSONObject.NULL)
         .put("tree_uri", treeUri ?: JSONObject.NULL)
         .put("sync_enabled", syncEnabled)
+        .put("selection", JSONArray().apply { selection.forEach { put(it) } })
 
     companion object {
         fun fromInfo(info: ShareInfo) = ShareConfig(
@@ -144,6 +185,16 @@ data class ShareConfig(
             addr = info.addr,
             port = info.port,
             agentPubkey = info.agentPubkey,
+        )
+
+        /** Build a configured share from an invite grant — the token comes with it. */
+        fun fromGrant(g: ShareGrant) = ShareConfig(
+            shareId = g.shareId,
+            name = g.name,
+            addr = g.addr,
+            port = g.port,
+            agentPubkey = g.agentPubkey,
+            tokenJson = g.tokenJson,
         )
 
         fun fromJson(o: JSONObject) = ShareConfig(
@@ -155,6 +206,9 @@ data class ShareConfig(
             tokenJson = o.optString("token_json").takeIf { it.isNotBlank() && it != "null" },
             treeUri = o.optString("tree_uri").takeIf { it.isNotBlank() && it != "null" },
             syncEnabled = o.optBoolean("sync_enabled", false),
+            selection = (o.optJSONArray("selection") ?: JSONArray()).let { arr ->
+                (0 until arr.length()).map { arr.getString(it) }.toSet()
+            },
         )
     }
 }

@@ -165,6 +165,13 @@ object NativeBridge {
      *  `{"shares":[{share_id,name,addr,port,agent_pubkey}...]}` or `{"error":..}`. */
     external fun nativeListShares(hubUrl: String, timeoutMs: Long): String
 
+    /** GET the shares attached to an invite (the access anchor, §9.5). Returns
+     *  `{"shares":[{share_id,name,addr,port,agent_pubkey,token,exp}...]}` where
+     *  `token` is the decoded ShareToken JSON ready for the manifest/download
+     *  calls below. `{"error":".."}` on failure (a 410-style error = invite
+     *  expired/revoked). */
+    external fun nativeInviteShares(hubUrl: String, inviteToken: String, timeoutMs: Long): String
+
     /** Fetch a share's manifest from the agent (presents [tokenJson]). Returns
      *  `{"entries":[{path,size,mtime,sha256}...]}` or `{"error":".."}`. Used to
      *  populate the file picker for one-time download. */
@@ -172,9 +179,12 @@ object NativeBridge {
 
     /** Pure diff for SAF storage. [manifestJson] is the agent manifest;
      *  [localJson] is `[{"path":..,"sha256":..}...]` the caller enumerated from
-     *  the SAF tree. Returns the plan `{"fetch":[...],"delete":[...]}`. No I/O —
-     *  the caller then downloads fetches and applies deletes against the tree. */
-    external fun nativePlanSync(manifestJson: String, localJson: String): String
+     *  the SAF tree. [selectionJson] is a JSON array of chosen manifest paths;
+     *  empty/`"[]"` means the whole share. Returns the plan
+     *  `{"fetch":[...],"delete":[...]}` restricted to the selection (unticked or
+     *  server-gone files land in `delete`). No I/O — the caller then downloads
+     *  fetches and applies deletes against the tree. */
+    external fun nativePlanSync(manifestJson: String, localJson: String, selectionJson: String): String
 
     /** Download one manifest entry ([entryJson]) to [destDir], SHA-256-verified
      *  before it is published. Returns `{"ok":true}` or `{"error":".."}`. */

@@ -8,7 +8,7 @@ import com.xrproxy.app.data.ShareRepository
 import com.xrproxy.app.data.ShareStore
 import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
-import com.xrproxy.app.model.ShareInfo
+import com.xrproxy.app.model.ShareGrant
 import com.xrproxy.app.service.ShareSyncScheduler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -31,7 +31,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     val configs: StateFlow<List<ShareConfig>> = store.shares
 
     data class UiState(
-        val hubShares: List<ShareInfo> = emptyList(),
+        val hubShares: List<ShareGrant> = emptyList(),
         val loadingHub: Boolean = false,
         val busyShareId: String? = null,
         val openShareId: String? = null,
@@ -45,27 +45,36 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
     fun consumeMessage() = _ui.update { it.copy(message = null) }
 
-    /** Pull the hub's share index so the user can add shares. */
-    fun refreshHub(hubUrl: String?) {
-        if (hubUrl.isNullOrBlank()) {
-            _ui.update { it.copy(message = "Хаб не настроен — добавьте сервер с hub_url") }
+    /** Pull the shares attached to this server's invite so the user can add them
+     *  (the access anchor, §9.5). The token rides along, so nothing to paste. */
+    fun refreshHub(hubUrl: String?, inviteToken: String?) {
+        if (hubUrl.isNullOrBlank() || inviteToken.isNullOrBlank()) {
+            _ui.update { it.copy(message = "Нет инвайта — добавьте сервер по инвайту") }
             return
         }
         _ui.update { it.copy(loadingHub = true) }
         viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) { repo.listShares(hubUrl) }
+            val result = withContext(Dispatchers.IO) { repo.inviteShares(hubUrl, inviteToken) }
             _ui.update { st ->
                 result.fold(
                     onSuccess = { st.copy(hubShares = it, loadingHub = false) },
-                    onFailure = { st.copy(loadingHub = false, message = "Список шар: ${it.message}") },
+                    onFailure = { st.copy(loadingHub = false, message = "Шары по инвайту: ${it.message}") },
                 )
             }
         }
     }
 
-    fun addShare(info: ShareInfo) {
-        store.upsert(ShareConfig.fromInfo(info))
-        _ui.update { it.copy(message = "Шара «${info.name}» добавлена — вставьте токен") }
+    fun addShare(grant: ShareGrant) {
+        store.upsert(ShareConfig.fromGrant(grant))
+        _ui.update { it.copy(message = "Шара «${grant.name}» добавлена — выберите папку и файлы") }
+    }
+
+    /** Persist which manifest paths to mirror (empty = the whole share). */
+    fun setSelection(shareId: String, selection: Set<String>) {
+        store.update(shareId) { it.copy(selection = selection) }
+        _ui.update {
+            it.copy(message = if (selection.isEmpty()) "Выбрана вся шара" else "Выбрано файлов: ${selection.size}")
+        }
     }
 
     fun removeShare(shareId: String) {
