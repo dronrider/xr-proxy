@@ -426,27 +426,55 @@ pub async fn download_entry(
         dest.file_name().and_then(|n| n.to_str()).unwrap_or("download")
     ));
 
+    use tokio::io::AsyncWriteExt;
+
+    // Resume: if a shorter-than-expected partial is on disk, ask for the rest
+    // with a Range request rather than re-downloading from byte zero (a 20 GB
+    // file should not restart after a blip). A complete/oversized stale partial
+    // is discarded. Integrity is still the final SHA-256 over the whole file.
+    let mut resume_from: u64 = 0;
+    if let Ok(meta) = tokio::fs::metadata(&part).await {
+        let n = meta.len();
+        if n > 0 && n < entry.size {
+            resume_from = n;
+        } else {
+            let _ = tokio::fs::remove_file(&part).await;
+        }
+    }
+
     let client = http_client(timeout)?;
     let url = format!("{}/file/{}", agent_url.trim_end_matches('/'), encode_path(&entry.path));
-    let mut resp = client
-        .get(&url)
-        .bearer_auth(token_blob(token))
-        .send()
-        .await
-        .map_err(|e| format!("network: {e}"))?;
+    let mut req = client.get(&url).bearer_auth(token_blob(token));
+    if resume_from > 0 {
+        req = req.header("Range", format!("bytes={resume_from}-"));
+    }
+    let mut resp = req.send().await.map_err(|e| format!("network: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("http_{}", resp.status().as_u16()));
     }
 
-    use tokio::io::AsyncWriteExt;
-    let mut file = tokio::fs::File::create(&part)
-        .await
-        .map_err(|e| format!("create: {e}"))?;
+    // The agent honoured the range only if it answered 206; on a plain 200 the
+    // body is the whole file, so we must restart to avoid corrupting the partial.
+    let appending = resume_from > 0 && resp.status().as_u16() == 206;
+
     let mut hasher = Sha256::new();
+    let mut file = if appending {
+        // Re-hash the bytes already on disk so the final check covers them.
+        read_into_hasher(&part, &mut hasher).await.map_err(|e| format!("read part: {e}"))?;
+        transfer_add_bytes(resume_from);
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&part)
+            .await
+            .map_err(|e| format!("open part: {e}"))?
+    } else {
+        tokio::fs::File::create(&part).await.map_err(|e| format!("create: {e}"))?
+    };
+
     while let Some(chunk) = resp.chunk().await.map_err(|e| format!("read: {e}"))? {
         if transfer_cancelled() {
-            drop(file);
-            let _ = tokio::fs::remove_file(&part).await;
+            // Keep the partial so the next attempt resumes from here.
+            let _ = file.flush().await;
             return Err("cancelled".into());
         }
         hasher.update(&chunk);
@@ -458,12 +486,28 @@ pub async fn download_entry(
 
     let got = hex_lower(&hasher.finalize());
     if !got.eq_ignore_ascii_case(&entry.sha256) {
+        // A corrupt result is discarded so the next attempt starts clean.
         let _ = tokio::fs::remove_file(&part).await;
         return Err(format!("sha256 mismatch (want {}, got {got})", entry.sha256));
     }
     tokio::fs::rename(&part, &dest)
         .await
         .map_err(|e| format!("rename: {e}"))
+}
+
+/// Stream a file's existing bytes through a hasher (for resuming a partial).
+async fn read_into_hasher(path: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt;
+    let mut f = tokio::fs::File::open(path).await?;
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(())
 }
 
 /// Apply a plan against a live agent: download fetches (verified), then delete
