@@ -53,14 +53,34 @@ impl SyncPlan {
 /// → fetch; present only on server → fetch; present only locally → delete.
 /// Output is sorted for determinism.
 pub fn plan_sync(manifest: &ShareManifest, local: &[LocalFile]) -> SyncPlan {
+    plan_with_selection(manifest, local, None)
+}
+
+/// Like [`plan_sync`], but restricted to a **selected subset** of the share
+/// (§9.6). `selection` is the set of manifest paths the consumer chose to mirror;
+/// the desired local state is `manifest ∩ selection`. A file present locally but
+/// not in the desired set is deleted, so unticking a file (or its removal on the
+/// server) drops the local copy. `None` selects the whole tree, i.e. exactly
+/// [`plan_sync`].
+pub fn plan_with_selection(
+    manifest: &ShareManifest,
+    local: &[LocalFile],
+    selection: Option<&HashSet<String>>,
+) -> SyncPlan {
     let local_by_path: HashMap<&str, &str> = local
         .iter()
         .map(|f| (f.path.as_str(), f.sha256.as_str()))
         .collect();
-    let server_paths: HashSet<&str> = manifest.entries.iter().map(|e| e.path.as_str()).collect();
 
-    let mut fetch: Vec<ShareManifestEntry> = manifest
+    // Desired = manifest entries that are selected (everything, if no selection).
+    let desired: Vec<&ShareManifestEntry> = manifest
         .entries
+        .iter()
+        .filter(|e| selection.map_or(true, |sel| sel.contains(e.path.as_str())))
+        .collect();
+    let desired_paths: HashSet<&str> = desired.iter().map(|e| e.path.as_str()).collect();
+
+    let mut fetch: Vec<ShareManifestEntry> = desired
         .iter()
         .filter(|e| match local_by_path.get(e.path.as_str()) {
             // Identical hash → already have it.
@@ -68,12 +88,14 @@ pub fn plan_sync(manifest: &ShareManifest, local: &[LocalFile]) -> SyncPlan {
             // Not present locally → new.
             None => true,
         })
-        .cloned()
+        .map(|e| (*e).clone())
         .collect();
 
+    // Delete anything local that is not in the desired set: server-deleted files
+    // and files the consumer unticked both leave the desired set.
     let mut delete: Vec<String> = local
         .iter()
-        .filter(|f| !server_paths.contains(f.path.as_str()))
+        .filter(|f| !desired_paths.contains(f.path.as_str()))
         .map(|f| f.path.clone())
         .collect();
 
@@ -200,9 +222,22 @@ pub async fn sync_share(
     dry_run: bool,
     timeout: Duration,
 ) -> Result<SyncResult, String> {
+    sync_share_selected(agent_url, token, dest_root, None, dry_run, timeout).await
+}
+
+/// [`sync_share`] limited to a selected subset of the share (§9.6). `selection`
+/// is the set of manifest paths to mirror; `None` mirrors the whole tree.
+pub async fn sync_share_selected(
+    agent_url: &str,
+    token: &ShareToken,
+    dest_root: &Path,
+    selection: Option<&HashSet<String>>,
+    dry_run: bool,
+    timeout: Duration,
+) -> Result<SyncResult, String> {
     let manifest = fetch_manifest(agent_url, token, timeout).await?;
     let local = scan_local_dir(dest_root).map_err(|e| format!("scan: {e}"))?;
-    let plan = plan_sync(&manifest, &local);
+    let plan = plan_with_selection(&manifest, &local, selection);
     if dry_run {
         return Ok(SyncResult { plan, report: None });
     }
@@ -468,6 +503,31 @@ mod tests {
             vec!["m.txt", "z.txt"]
         );
         assert_eq!(plan.delete, vec!["old.txt".to_string()]);
+    }
+
+    #[test]
+    fn test_plan_selection_subset() {
+        let m = manifest(vec![entry("a.txt", "a"), entry("b.txt", "b"), entry("c.txt", "c")]);
+        let sel: HashSet<String> = ["a.txt".to_string(), "c.txt".to_string()].into_iter().collect();
+        // have a.txt (current) and b.txt (unselected → must be removed).
+        let have = vec![local("a.txt", "a"), local("b.txt", "b")];
+
+        let plan = plan_with_selection(&m, &have, Some(&sel));
+        // fetch: only c.txt (new + selected); a.txt is identical, b.txt unselected.
+        assert_eq!(
+            plan.fetch.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            vec!["c.txt"]
+        );
+        // delete: b.txt (present locally but outside the selection).
+        assert_eq!(plan.delete, vec!["b.txt".to_string()]);
+
+        // No selection is identical to plan_sync (whole tree).
+        assert_eq!(plan_with_selection(&m, &have, None), plan_sync(&m, &have));
+
+        // A changed hash inside the selection is re-fetched.
+        let m2 = manifest(vec![entry("a.txt", "NEW"), entry("c.txt", "c")]);
+        let plan2 = plan_with_selection(&m2, &[local("a.txt", "old")], Some(&sel));
+        assert_eq!(plan2.fetch.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), vec!["a.txt", "c.txt"]);
     }
 
     #[test]
