@@ -11,6 +11,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -24,6 +25,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -34,7 +36,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -167,8 +168,8 @@ private fun ShareListView(
                     Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(28.dp))
                     Spacer(Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
-                        Text(cfg.name, style = MaterialTheme.typography.titleMedium, maxLines = 2,
-                            overflow = TextOverflow.Ellipsis)
+                        Text(cfg.name, style = MaterialTheme.typography.titleMedium, maxLines = 1,
+                            modifier = Modifier.basicMarquee())
                         Text(
                             if (cfg.selection.isEmpty()) "вся шара" else "выбрано: ${cfg.selection.size}",
                             fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -200,22 +201,32 @@ private fun ExplorerView(
 
     Column(modifier = modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 2.dp),
+            modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            TextButton(onClick = { vm.navigateUp() }) { Text("‹ Назад") }
+            TextButton(
+                onClick = { vm.navigateUp() },
+                contentPadding = PaddingValues(horizontal = 8.dp),
+            ) { Text("‹ Назад") }
             Spacer(Modifier.weight(1f))
+            // Sync the selected subset; the icon lights up once something is ticked.
+            IconButton(onClick = { vm.syncNow(cfg) }) {
+                Icon(
+                    Icons.Default.Sync,
+                    contentDescription = "Синкать выбранное",
+                    tint = if (cfg.selection.isNotEmpty()) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.width(6.dp))
             Text("Синк", fontSize = 12.sp)
+            Spacer(Modifier.width(4.dp))
             Switch(checked = cfg.syncEnabled, onCheckedChange = { vm.setSyncEnabled(cfg.shareId, it) })
         }
         Breadcrumbs(cfg.name, ui.currentPath) { vm.navigateTo(it) }
         val p = ui.progress
-        if (p != null) {
-            ProgressBar(p) { vm.cancelTransfer() }
-        } else {
-            OutlinedButton(onClick = { vm.syncNow(cfg) }) { Text("Синкать выбранное сейчас") }
-        }
-        HorizontalDivider(modifier = Modifier.padding(vertical = 6.dp))
+        if (p != null) ProgressBar(p) { vm.cancelTransfer() }
+        HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
 
         when {
             ui.manifestLoading -> CircularProgressIndicator(modifier = Modifier.padding(16.dp))
