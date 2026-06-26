@@ -154,10 +154,13 @@ async fn run(path: &Path) -> Result<()> {
     let state = Arc::new(AgentState {
         shares: RwLock::new(Arc::new(shares)),
         hub_key,
+        hash_cache: manifest::HashCache::new(),
     });
 
     // Hot reload: pick up `share`/`unshare` edits to the config without restart.
     spawn_config_watcher(state.clone(), path.to_path_buf());
+    // Keep manifests cheap to serve even for large shares.
+    spawn_manifest_warmer(state.clone());
 
     let app = server::router(state);
 
@@ -212,6 +215,20 @@ fn spawn_config_watcher(state: Arc<AgentState>, path: PathBuf) {
                 }
                 Err(e) => tracing::warn!("config reload failed, keeping current shares: {e:#}"),
             }
+        }
+    });
+}
+
+/// Keep the per-file hash cache warm so `/manifest` is fast even for a large
+/// share: build every share's manifest on startup and once a minute after.
+/// Cheap once warm (only changed files re-hash). Runs off the async executor via
+/// `spawn_blocking`, so a slow first pass over a big share never stalls requests.
+fn spawn_manifest_warmer(state: Arc<AgentState>) {
+    tokio::spawn(async move {
+        loop {
+            let st = state.clone();
+            let _ = tokio::task::spawn_blocking(move || st.warm_manifests()).await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
         }
     });
 }

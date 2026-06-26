@@ -32,7 +32,7 @@ use tower_http::services::ServeFile;
 use xr_proto::share::{verify_share_token, ShareManifest};
 
 use crate::auth::extract_token;
-use crate::manifest::{build_manifest, build_manifest_for_file};
+use crate::manifest::{build_manifest, build_manifest_for_file, HashCache};
 use crate::safepath::resolve_within;
 
 /// One served share: a canonical path that is either a directory tree or a
@@ -43,12 +43,13 @@ pub struct ShareRoot {
 }
 
 impl ShareRoot {
-    /// Build this share's manifest (directory walk, or a single-file entry).
-    fn manifest(&self) -> anyhow::Result<ShareManifest> {
+    /// Build this share's manifest (directory walk, or a single-file entry),
+    /// hashing through the shared cache so unchanged files are not re-read.
+    fn manifest(&self, cache: &HashCache) -> anyhow::Result<ShareManifest> {
         if self.is_file {
-            build_manifest_for_file(&self.path)
+            build_manifest_for_file(&self.path, cache)
         } else {
-            build_manifest(&self.path)
+            build_manifest(&self.path, cache)
         }
     }
 
@@ -93,16 +94,28 @@ pub fn build_shares(entries: &[crate::config::ShareEntry]) -> SharesMap {
     map
 }
 
-/// Runtime state. `shares` is swappable for hot reload; `hub_key` is fixed.
+/// Runtime state. `shares` is swappable for hot reload; `hub_key` is fixed;
+/// `hash_cache` is shared by every manifest build (and the background warmer).
 pub struct AgentState {
     pub shares: RwLock<Arc<SharesMap>>,
     pub hub_key: VerifyingKey,
+    pub hash_cache: HashCache,
 }
 
 impl AgentState {
     /// Cheap snapshot of the current share table (clones the `Arc`, not the map).
     fn snapshot(&self) -> Arc<SharesMap> {
         self.shares.read().expect("shares lock poisoned").clone()
+    }
+
+    /// Build every share's manifest to prime the hash cache, so a later
+    /// `/manifest` request is fast even for a large share. Errors are ignored: a
+    /// share that fails to build just stays cold. Blocking — call it off the
+    /// async executor (a `spawn_blocking` warmer in `main`).
+    pub fn warm_manifests(&self) {
+        for root in self.snapshot().values() {
+            let _ = root.manifest(&self.hash_cache);
+        }
     }
 }
 
@@ -190,7 +203,7 @@ fn manifest_response(
         .get(share_id)
         .ok_or((StatusCode::NOT_FOUND, "no such share"))?;
     check_token(state, share_id, req)?;
-    let manifest = share.manifest().map_err(|e| {
+    let manifest = share.manifest(&state.hash_cache).map_err(|e| {
         tracing::error!("manifest build failed for {share_id}: {e:#}");
         (StatusCode::INTERNAL_SERVER_ERROR, "manifest error")
     })?;
@@ -241,6 +254,7 @@ mod tests {
         Arc::new(AgentState {
             shares: RwLock::new(Arc::new(shares)),
             hub_key: key.verifying_key(),
+            hash_cache: HashCache::new(),
         })
     }
 
