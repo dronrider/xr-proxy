@@ -20,6 +20,9 @@ use xr_proto::invite_url;
 use xr_core::sync::LocalFile;
 use xr_proto::share::{ShareManifest, ShareManifestEntry, ShareToken};
 
+use base64::Engine as _;
+use std::collections::HashSet;
+
 /// Global engine instance.
 static ENGINE: OnceLock<Mutex<Option<EngineHandle>>> = OnceLock::new();
 
@@ -874,6 +877,60 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeListShares(
     jstring_into_raw(&mut env, json)
 }
 
+/// GET the shares attached to an invite (the access anchor, §9.5). Returns
+/// `{"shares":[{share_id,name,addr,port,agent_pubkey,token,exp}...]}` where
+/// `token` is the **decoded ShareToken JSON** (ready for `nativeFetchManifest` /
+/// `nativeDownloadFile`, which select the share by the token via the agent's
+/// legacy routes). `{"error":".."}` on failure (a 410 means invite expired).
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeInviteShares(
+    mut env: JNIEnv,
+    _class: JClass,
+    hub_url: JString,
+    invite_token: JString,
+    timeout_ms: jlong,
+) -> jstring {
+    let hub_url = match read_jstring(&mut env, &hub_url) {
+        Ok(s) => s,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let invite_token = match read_jstring(&mut env, &invite_token) {
+        Ok(s) => s,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+
+    let json = match with_onboarding_runtime(sync::list_invite_shares(&hub_url, &invite_token, timeout)) {
+        Ok(Ok(grants)) => {
+            let shares: Vec<_> = grants
+                .into_iter()
+                .map(|g| {
+                    // The grant token is a base64url(ShareToken JSON) blob; decode
+                    // it back to JSON so the existing manifest/download path (which
+                    // expects a ShareToken JSON) consumes it unchanged.
+                    let token_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(g.token.trim())
+                        .ok()
+                        .and_then(|b| String::from_utf8(b).ok())
+                        .unwrap_or_default();
+                    serde_json::json!({
+                        "share_id": g.share_id,
+                        "name": g.name,
+                        "addr": g.addr,
+                        "port": g.port,
+                        "agent_pubkey": g.agent_pubkey,
+                        "token": token_json,
+                        "exp": g.exp,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "shares": shares }).to_string()
+        }
+        Ok(Err(e)) | Err(e) => json_error(&e),
+    };
+    jstring_into_raw(&mut env, json)
+}
+
 /// Fetch a share's manifest from the agent (presenting the token). Returns the
 /// ShareManifest JSON (`{"entries":[{path,size,mtime,sha256}...]}`) or
 /// `{"error":".."}`. Used to populate the file picker for one-time download.
@@ -957,6 +1014,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePlanSync(
     _class: JClass,
     manifest_json: JString,
     local_json: JString,
+    selection_json: JString,
 ) -> jstring {
     let manifest = match read_jstring(&mut env, &manifest_json) {
         Ok(s) => match serde_json::from_str::<ShareManifest>(&s) {
@@ -972,8 +1030,16 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePlanSync(
         },
         Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
     };
+    // Selection: a JSON array of chosen manifest paths. Empty / "[]" / unreadable
+    // means "the whole share" (mirror everything), matching plan_sync.
+    let selection: Option<HashSet<String>> = match read_jstring(&mut env, &selection_json) {
+        Ok(s) if !s.trim().is_empty() && s.trim() != "[]" => {
+            serde_json::from_str::<Vec<String>>(&s).ok().map(|v| v.into_iter().collect())
+        }
+        _ => None,
+    };
 
-    let plan = sync::plan_sync(&manifest, &local);
+    let plan = sync::plan_with_selection(&manifest, &local, selection.as_ref());
     let json =
         serde_json::to_string(&plan).unwrap_or_else(|e| json_error(&format!("serialize: {e}")));
     jstring_into_raw(&mut env, json)
