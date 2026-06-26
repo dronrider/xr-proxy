@@ -209,4 +209,11 @@ object NativeBridge {
         dryRun: Boolean,
         timeoutMs: Long,
     ): String
+
+    /** Poll the running transfer's progress: `{active,cancelled,file,files_done,
+     *  files_total,bytes_done,bytes_total}` (`active:false` when idle). */
+    external fun nativeTransferProgress(): String
+
+    /** Cancel the running sync/download (aborts at the next chunk). */
+    external fun nativeCancelTransfer()
 }

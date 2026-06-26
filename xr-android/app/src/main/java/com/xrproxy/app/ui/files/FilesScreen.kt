@@ -1,10 +1,14 @@
+@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+
 package com.xrproxy.app.ui.files
 
 import android.content.Context
 import android.content.Intent
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -20,6 +24,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.Checkbox
@@ -27,6 +32,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Switch
@@ -36,6 +42,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -51,9 +60,10 @@ import com.xrproxy.app.model.explorerLevel
 import java.io.File
 
 /**
- * Files tab (LLD-19, XR-031). A list of shares ("drives"); tapping one opens an
- * Explorer that navigates its folders one level at a time, like a file manager.
- * Tick files or whole folders to mirror; tap a downloaded file to open it.
+ * Files tab (LLD-19, XR-031): a list of shares ("drives") and an Explorer that
+ * navigates one share's folders. Tap a file to download + open it; tick files or
+ * whole folders to mirror. A compact progress bar with speed + cancel covers any
+ * running transfer.
  */
 @Composable
 fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modifier) {
@@ -70,6 +80,12 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
         ui.message?.let {
             Toast.makeText(context, it, Toast.LENGTH_SHORT).show()
             vm.consumeMessage()
+        }
+    }
+    LaunchedEffect(ui.openFileEvent) {
+        ui.openFileEvent?.let {
+            openLocalFile(context, it)
+            vm.consumeOpenEvent()
         }
     }
 
@@ -113,6 +129,7 @@ private fun ShareListView(
                 }
             }
         }
+        ui.progress?.let { p -> item { ProgressBar(p) { vm.cancelTransfer() } } }
         if (ui.loadingHub) item { CircularProgressIndicator(modifier = Modifier.padding(8.dp)) }
 
         if (addable.isNotEmpty()) {
@@ -142,9 +159,7 @@ private fun ShareListView(
             }
         }
         items(configs, key = { it.shareId }) { cfg ->
-            Card(
-                modifier = Modifier.fillMaxWidth().clickable { vm.openShare(cfg) },
-            ) {
+            Card(modifier = Modifier.fillMaxWidth().clickable { vm.openShare(cfg) }) {
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(12.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -159,8 +174,6 @@ private fun ShareListView(
                             fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    if (ui.busyShareId == cfg.shareId)
-                        CircularProgressIndicator(modifier = Modifier.size(20.dp))
                     Switch(checked = cfg.syncEnabled, onCheckedChange = { vm.setSyncEnabled(cfg.shareId, it) })
                     IconButton(onClick = { vm.removeShare(cfg.shareId) }) {
                         Icon(Icons.Default.Delete, contentDescription = "Удалить")
@@ -182,11 +195,12 @@ private fun ExplorerView(
     context: Context,
     modifier: Modifier,
 ) {
+    var detailsFor by remember { mutableStateOf<ManifestEntry?>(null) }
     val level = explorerLevel(ui.manifest, ui.currentPath)
+
     Column(modifier = modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
-        // Breadcrumbs + back.
         Row(
-            modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 4.dp),
+            modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             TextButton(onClick = { vm.navigateUp() }) { Text("‹ Назад") }
@@ -195,37 +209,49 @@ private fun ExplorerView(
             Switch(checked = cfg.syncEnabled, onCheckedChange = { vm.setSyncEnabled(cfg.shareId, it) })
         }
         Breadcrumbs(cfg.name, ui.currentPath) { vm.navigateTo(it) }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = { vm.syncNow(cfg) }, enabled = ui.busyShareId != cfg.shareId) {
-                Text("Синкать выбранное сейчас")
-            }
-            if (ui.busyShareId == cfg.shareId) {
-                Spacer(Modifier.width(8.dp))
-                CircularProgressIndicator(modifier = Modifier.size(20.dp))
-            }
+        val p = ui.progress
+        if (p != null) {
+            ProgressBar(p) { vm.cancelTransfer() }
+        } else {
+            OutlinedButton(onClick = { vm.syncNow(cfg) }) { Text("Синкать выбранное сейчас") }
         }
         HorizontalDivider(modifier = Modifier.padding(vertical = 6.dp))
 
-        if (ui.manifestLoading) {
-            CircularProgressIndicator(modifier = Modifier.padding(16.dp))
-            return@Column
-        }
-        if (level.isEmpty()) {
-            Text("Папка пуста", modifier = Modifier.padding(16.dp),
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-            return@Column
-        }
-
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            items(level, key = { it.path }) { node ->
-                when (node) {
-                    is TreeNode.Folder -> FolderRow(node, cfg, vm)
-                    is TreeNode.FileNode -> FileRow(node, cfg, ui, vm, context)
+        when {
+            ui.manifestLoading -> CircularProgressIndicator(modifier = Modifier.padding(16.dp))
+            level.isEmpty() -> Text(
+                "Папка пуста", modifier = Modifier.padding(16.dp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            else -> LazyColumn {
+                items(level, key = { it.path }) { node ->
+                    when (node) {
+                        is TreeNode.Folder -> FolderRow(node, cfg, vm)
+                        is TreeNode.FileNode -> FileRow(node, cfg, ui, vm) { detailsFor = it }
+                    }
+                    HorizontalDivider()
                 }
-                HorizontalDivider()
+                item { Spacer(Modifier.height(24.dp)) }
             }
-            item { Spacer(Modifier.height(24.dp)) }
         }
+    }
+
+    detailsFor?.let { e ->
+        AlertDialog(
+            onDismissRequest = { detailsFor = null },
+            confirmButton = { TextButton(onClick = { detailsFor = null }) { Text("Закрыть") } },
+            title = { Text("Файл") },
+            text = {
+                Column {
+                    Text(e.path.substringAfterLast('/'), style = MaterialTheme.typography.titleSmall)
+                    Spacer(Modifier.height(6.dp))
+                    Text("Путь: ${e.path}", fontSize = 12.sp)
+                    Text("Размер: ${humanSize(e.size)}", fontSize = 12.sp)
+                    Text("SHA-256: ${e.sha256.take(16)}…", fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            },
+        )
     }
 }
 
@@ -233,7 +259,7 @@ private fun ExplorerView(
 private fun FolderRow(node: TreeNode.Folder, cfg: ShareConfig, vm: FilesViewModel) {
     val coveredByParent = coveredByAncestor(node.path, cfg.selection)
     Row(
-        modifier = Modifier.fillMaxWidth().clickable { vm.navigateTo(node.path) }.padding(vertical = 4.dp),
+        modifier = Modifier.fillMaxWidth().clickable { vm.navigateTo(node.path) }.padding(vertical = 3.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Checkbox(
@@ -241,11 +267,11 @@ private fun FolderRow(node: TreeNode.Folder, cfg: ShareConfig, vm: FilesViewMode
             enabled = !coveredByParent,
             onCheckedChange = { vm.setSelected(cfg.shareId, node.path, it) },
         )
-        Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(26.dp))
-        Spacer(Modifier.width(10.dp))
+        Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(24.dp))
+        Spacer(Modifier.width(8.dp))
         Column(modifier = Modifier.weight(1f)) {
-            Text(node.name, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            Text("${node.fileCount} файл(ов)", fontSize = 11.sp,
+            Text(node.name, maxLines = 1, fontSize = 14.sp, modifier = Modifier.basicMarquee())
+            Text("${node.fileCount} файл(ов)", fontSize = 10.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Text("›", fontSize = 22.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -259,16 +285,17 @@ private fun FileRow(
     cfg: ShareConfig,
     ui: FilesViewModel.UiState,
     vm: FilesViewModel,
-    context: Context,
+    onDetails: (ManifestEntry) -> Unit,
 ) {
     val downloaded = ui.localPaths.contains(node.entry.path)
     val coveredByParent = coveredByAncestor(node.entry.path, cfg.selection)
     Row(
         modifier = Modifier.fillMaxWidth()
-            .clickable(enabled = downloaded) {
-                vm.localFile(cfg.shareId, node.entry.path)?.let { openLocalFile(context, it) }
-            }
-            .padding(vertical = 4.dp),
+            .combinedClickable(
+                onClick = { vm.downloadAndOpen(cfg, node.entry) },
+                onLongClick = { onDetails(node.entry) },
+            )
+            .padding(vertical = 3.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Checkbox(
@@ -276,20 +303,38 @@ private fun FileRow(
             enabled = !coveredByParent,
             onCheckedChange = { vm.setSelected(cfg.shareId, node.entry.path, it) },
         )
-        Column(modifier = Modifier.weight(1f).padding(start = 4.dp)) {
-            Text(node.name, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        Column(modifier = Modifier.weight(1f).padding(start = 2.dp)) {
+            Text(node.name, maxLines = 1, fontSize = 13.sp, modifier = Modifier.basicMarquee())
             Text(
-                humanSize(node.entry.size) + if (downloaded) " · скачано" else "",
-                fontSize = 11.sp,
+                humanSize(node.entry.size) + if (downloaded) " · скачано, тап откроет" else " · тап скачает и откроет",
+                fontSize = 10.sp,
                 color = if (downloaded) MaterialTheme.colorScheme.primary
                 else MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        if (!downloaded) {
-            TextButton(onClick = { vm.download(cfg, node.entry) }) { Text("Скачать") }
-        } else {
-            Text("Открыть", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.padding(end = 8.dp))
+    }
+}
+
+@Composable
+private fun ProgressBar(p: FilesViewModel.Progress, onCancel: () -> Unit) {
+    val frac = if (p.bytesTotal > 0) (p.bytesDone.toFloat() / p.bytesTotal).coerceIn(0f, 1f) else 0f
+    Card(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    p.file.substringAfterLast('/').ifEmpty { "Подготовка…" },
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 12.sp,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = onCancel) { Text("Стоп") }
+            }
+            LinearProgressIndicator(progress = { frac }, modifier = Modifier.fillMaxWidth())
+            Text(
+                "${humanSize(p.bytesDone)} / ${humanSize(p.bytesTotal)} · ${humanSize(p.speedBytesPerSec)}/с" +
+                    if (p.filesTotal > 1) " · файл ${p.filesDone + 1}/${p.filesTotal}" else "",
+                fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 2.dp),
+            )
         }
     }
 }
@@ -297,12 +342,9 @@ private fun FileRow(
 @Composable
 private fun Breadcrumbs(shareName: String, currentPath: String, onJump: (String) -> Unit) {
     val segments = if (currentPath.isEmpty()) emptyList() else currentPath.split('/')
-    Row(modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(modifier = Modifier.fillMaxWidth().padding(bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
         Text(
-            shareName,
-            fontSize = 13.sp,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
+            shareName, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
             color = MaterialTheme.colorScheme.primary,
             modifier = Modifier.clickable { onJump("") }.weight(1f, fill = false),
         )
@@ -323,8 +365,7 @@ private fun Breadcrumbs(shareName: String, currentPath: String, onJump: (String)
 @Composable
 private fun SectionLabel(text: String) {
     Text(
-        text,
-        style = MaterialTheme.typography.titleSmall,
+        text, style = MaterialTheme.typography.titleSmall,
         color = MaterialTheme.colorScheme.primary,
         modifier = Modifier.padding(top = 8.dp, bottom = 2.dp),
     )
@@ -332,8 +373,6 @@ private fun SectionLabel(text: String) {
 
 // ── helpers ─────────────────────────────────────────────────────────
 
-/** True if any ancestor folder of [path] is in [selection] (so the item is
- *  covered top-down and managed at the folder level). */
 private fun coveredByAncestor(path: String, selection: Set<String>): Boolean {
     var p = path
     while (true) {

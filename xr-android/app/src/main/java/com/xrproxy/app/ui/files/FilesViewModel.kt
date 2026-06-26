@@ -5,22 +5,26 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xrproxy.app.data.ShareRepository
 import com.xrproxy.app.data.ShareStore
+import com.xrproxy.app.jni.NativeBridge
 import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
 import com.xrproxy.app.model.ShareGrant
 import com.xrproxy.app.service.ShareSyncScheduler
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.File
 
 /**
- * Drives the Files screen (LLD-19, XR-031): a list of shares ("drives"), and an
- * Explorer that navigates one share's folders. Files mirror into the app's own
- * directory; selection (files / folder prefixes) drives the background mirror.
+ * Drives the Files screen (LLD-19, XR-031): a list of shares ("drives") and an
+ * Explorer over one share's folders. Files mirror into the app's own directory.
+ * Transfers report progress (polled from native) and can be cancelled.
  */
 class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -29,27 +33,40 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
     val configs: StateFlow<List<ShareConfig>> = store.shares
 
+    /** Live progress of the running sync/download. */
+    data class Progress(
+        val file: String,
+        val filesDone: Long,
+        val filesTotal: Long,
+        val bytesDone: Long,
+        val bytesTotal: Long,
+        val speedBytesPerSec: Long,
+    )
+
     data class UiState(
         val hubShares: List<ShareGrant> = emptyList(),
         val loadingHub: Boolean = false,
-        // Explorer
         val openShareId: String? = null,
         val currentPath: String = "",
         val manifest: List<ManifestEntry> = emptyList(),
         val manifestLoading: Boolean = false,
         val localPaths: Set<String> = emptySet(),
         val busyShareId: String? = null,
+        val progress: Progress? = null,
+        val openFileEvent: File? = null,
         val message: String? = null,
     )
 
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui
 
+    private var pollJob: Job? = null
+
     fun consumeMessage() = _ui.update { it.copy(message = null) }
+    fun consumeOpenEvent() = _ui.update { it.copy(openFileEvent = null) }
 
     // ── share list ──────────────────────────────────────────────────
 
-    /** List the shares attached to this server's invite (the token rides along). */
     fun refreshHub(hubUrl: String?, inviteToken: String?) {
         if (hubUrl.isNullOrBlank() || inviteToken.isNullOrBlank()) {
             _ui.update { it.copy(message = "Нет инвайта — добавьте сервер по инвайту") }
@@ -80,7 +97,6 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
     // ── explorer ────────────────────────────────────────────────────
 
-    /** Enter a share: load its manifest + what is already downloaded. */
     fun openShare(config: ShareConfig) {
         _ui.update {
             it.copy(
@@ -108,15 +124,12 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
     fun navigateTo(path: String) = _ui.update { it.copy(currentPath = path) }
 
-    /** Up one level; at the root, leave the share. */
     fun navigateUp() {
         val p = _ui.value.currentPath
         if (p.isEmpty()) closeShare()
         else _ui.update { it.copy(currentPath = p.substringBeforeLast('/', "")) }
     }
 
-    /** Tick/untick a file or folder for sync. Selecting a folder subsumes (and
-     *  clears) any individually-selected descendants; deselecting clears them. */
     fun setSelected(shareId: String, path: String, selected: Boolean) {
         store.update(shareId) { cfg ->
             val sel = cfg.selection.toMutableSet()
@@ -126,26 +139,31 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** One-time download of a single file. */
-    fun download(config: ShareConfig, entry: ManifestEntry) {
+    /** Tap a file: open it if downloaded, else download (with progress) then open. */
+    fun downloadAndOpen(config: ShareConfig, entry: ManifestEntry) {
+        localFile(config.shareId, entry.path)?.let {
+            _ui.update { st -> st.copy(openFileEvent = it) }
+            return
+        }
         _ui.update { it.copy(busyShareId = config.shareId) }
+        startProgressPolling()
         viewModelScope.launch {
             val ok = withContext(Dispatchers.IO) { repo.downloadOne(config, entry) }
             val local = withContext(Dispatchers.IO) { repo.localPaths(config.shareId) }
             _ui.update {
                 it.copy(
-                    busyShareId = null, localPaths = local,
-                    message = if (ok) "Скачано: ${entry.path.substringAfterLast('/')}" else "Не удалось скачать",
+                    busyShareId = null, localPaths = local, progress = null,
+                    openFileEvent = if (ok) repo.fileFor(config.shareId, entry.path) else null,
+                    message = if (ok) null else "Не удалось скачать",
                 )
             }
         }
     }
 
-    /** Local file for a share-relative path, if it is downloaded (for opening). */
     fun localFile(shareId: String, relPath: String): File? =
         repo.fileFor(shareId, relPath).takeIf { it.isFile }
 
-    // ── sync ────────────────────────────────────────────────────────
+    // ── sync + transfer control ─────────────────────────────────────
 
     fun setSyncEnabled(shareId: String, enabled: Boolean) {
         val cfg = store.get(shareId) ?: return
@@ -163,17 +181,60 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
     fun syncNow(config: ShareConfig) {
         _ui.update { it.copy(busyShareId = config.shareId) }
+        startProgressPolling()
         viewModelScope.launch {
             val outcome = withContext(Dispatchers.IO) { repo.syncOnce(config) }
             val local = withContext(Dispatchers.IO) { repo.localPaths(config.shareId) }
             _ui.update {
                 it.copy(
-                    busyShareId = null, localPaths = local,
+                    busyShareId = null, progress = null, localPaths = local,
                     message = if (outcome.ok)
                         "Синк «${config.name}»: +${outcome.fetched} −${outcome.deleted}" +
                             if (outcome.failed > 0) " (ошибок ${outcome.failed})" else ""
                     else "Синк «${config.name}»: ${outcome.error}",
                 )
+            }
+        }
+    }
+
+    fun cancelTransfer() {
+        viewModelScope.launch { withContext(Dispatchers.IO) { NativeBridge.nativeCancelTransfer() } }
+        _ui.update { it.copy(message = "Останавливаю…") }
+    }
+
+    /** Poll native transfer progress ~2.5x/sec while a transfer is running,
+     *  computing speed from the byte delta between polls. */
+    private fun startProgressPolling() {
+        pollJob?.cancel()
+        pollJob = viewModelScope.launch {
+            var lastBytes = 0L
+            var lastTime = System.currentTimeMillis()
+            while (true) {
+                val snap = withContext(Dispatchers.IO) { NativeBridge.nativeTransferProgress() }
+                val o = runCatching { JSONObject(snap) }.getOrNull()
+                if (o == null || !o.optBoolean("active", false)) {
+                    _ui.update { it.copy(progress = null) }
+                    break
+                }
+                val now = System.currentTimeMillis()
+                val bytesDone = o.optLong("bytes_done")
+                val dt = (now - lastTime).coerceAtLeast(1)
+                val speed = ((bytesDone - lastBytes) * 1000 / dt).coerceAtLeast(0)
+                lastBytes = bytesDone
+                lastTime = now
+                _ui.update {
+                    it.copy(
+                        progress = Progress(
+                            file = o.optString("file"),
+                            filesDone = o.optLong("files_done"),
+                            filesTotal = o.optLong("files_total"),
+                            bytesDone = bytesDone,
+                            bytesTotal = o.optLong("bytes_total"),
+                            speedBytesPerSec = speed,
+                        )
+                    )
+                }
+                delay(400)
             }
         }
     }
