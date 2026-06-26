@@ -50,6 +50,11 @@ pub struct Invite {
     #[serde(default)]
     pub comment: String,
     pub payload: InvitePayload,
+    /// share_ids attached to this invite (LLD-19 §9.5, XR-031). The invite is a
+    /// durable access anchor: whoever holds it reaches every share listed here.
+    /// `default` so invites stored before this field still load.
+    #[serde(default)]
+    pub share_ids: Vec<String>,
 }
 
 /// Connection details delivered to a client via invite.
