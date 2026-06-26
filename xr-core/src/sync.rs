@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use xr_proto::share::{ShareInfo, ShareManifest, ShareManifestEntry, ShareToken};
+use xr_proto::share::{ShareGrant, ShareInfo, ShareManifest, ShareManifestEntry, ShareToken};
 
 /// A file we already hold locally, keyed by share-relative path + its hash.
 /// (De)serializable so an Android consumer using SAF storage — where file I/O
@@ -208,6 +208,34 @@ pub async fn list_shares(hub_url: &str, timeout: Duration) -> Result<Vec<ShareIn
         return Err(format!("http_{}", resp.status().as_u16()));
     }
     resp.json::<Vec<ShareInfo>>()
+        .await
+        .map_err(|e| format!("parse: {e}"))
+}
+
+/// GET the shares attached to an invite (`GET /api/v1/invite/{token}/shares`,
+/// §9.5). The invite is the access anchor: each grant carries the agent address,
+/// the key to pin, and a hub-minted access token. A `410` means the invite is
+/// expired or revoked.
+pub async fn list_invite_shares(
+    hub_url: &str,
+    invite_token: &str,
+    timeout: Duration,
+) -> Result<Vec<ShareGrant>, String> {
+    let client = http_client(timeout)?;
+    let url = format!(
+        "{}/api/v1/invite/{}/shares",
+        hub_url.trim_end_matches('/'),
+        invite_token
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("network: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("http_{}", resp.status().as_u16()));
+    }
+    resp.json::<Vec<ShareGrant>>()
         .await
         .map_err(|e| format!("parse: {e}"))
 }
