@@ -49,6 +49,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -209,13 +210,22 @@ private fun ExplorerView(
                 contentPadding = PaddingValues(horizontal = 8.dp),
             ) { Text("‹ Назад") }
             Spacer(Modifier.weight(1f))
-            // Sync the selected subset; the icon lights up once something is ticked.
+            // Sync the selected subset; the icon + count light up once something
+            // is ticked, so it is obvious there is a selection to push.
+            val selCount = cfg.selection.size
             IconButton(onClick = { vm.syncNow(cfg) }) {
                 Icon(
                     Icons.Default.Sync,
                     contentDescription = "Синкать выбранное",
-                    tint = if (cfg.selection.isNotEmpty()) MaterialTheme.colorScheme.primary
+                    tint = if (selCount > 0) MaterialTheme.colorScheme.primary
                     else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (selCount > 0) {
+                Text(
+                    "$selCount", color = MaterialTheme.colorScheme.primary,
+                    fontSize = 13.sp, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(end = 4.dp),
                 )
             }
             Spacer(Modifier.width(6.dp))

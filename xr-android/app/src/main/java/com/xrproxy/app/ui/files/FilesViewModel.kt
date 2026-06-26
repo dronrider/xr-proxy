@@ -60,8 +60,6 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui
 
-    private var pollJob: Job? = null
-
     fun consumeMessage() = _ui.update { it.copy(message = null) }
     fun consumeOpenEvent() = _ui.update { it.copy(openFileEvent = null) }
 
@@ -145,10 +143,12 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             _ui.update { st -> st.copy(openFileEvent = it) }
             return
         }
-        _ui.update { it.copy(busyShareId = config.shareId) }
-        startProgressPolling()
+        if (_ui.value.busyShareId != null) return
+        _ui.update { it.copy(busyShareId = config.shareId, progress = preparing()) }
+        val poll = launchPolling()
         viewModelScope.launch {
             val ok = withContext(Dispatchers.IO) { repo.downloadOne(config, entry) }
+            poll.cancel()
             val local = withContext(Dispatchers.IO) { repo.localPaths(config.shareId) }
             _ui.update {
                 it.copy(
@@ -180,10 +180,16 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun syncNow(config: ShareConfig) {
-        _ui.update { it.copy(busyShareId = config.shareId) }
-        startProgressPolling()
+        if (config.selection.isEmpty()) {
+            _ui.update { it.copy(message = "Отметь галочками файлы или папки для синка") }
+            return
+        }
+        if (_ui.value.busyShareId != null) return
+        _ui.update { it.copy(busyShareId = config.shareId, progress = preparing()) }
+        val poll = launchPolling()
         viewModelScope.launch {
             val outcome = withContext(Dispatchers.IO) { repo.syncOnce(config) }
+            poll.cancel()
             val local = withContext(Dispatchers.IO) { repo.localPaths(config.shareId) }
             _ui.update {
                 it.copy(
@@ -202,30 +208,31 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update { it.copy(message = "Останавливаю…") }
     }
 
-    /** Poll native transfer progress ~2.5x/sec while a transfer is running,
-     *  computing speed from the byte delta between polls. */
-    private fun startProgressPolling() {
-        pollJob?.cancel()
-        pollJob = viewModelScope.launch {
-            var lastBytes = 0L
-            var lastTime = System.currentTimeMillis()
-            while (true) {
-                val snap = withContext(Dispatchers.IO) { NativeBridge.nativeTransferProgress() }
-                val o = runCatching { JSONObject(snap) }.getOrNull()
-                if (o == null || !o.optBoolean("active", false)) {
-                    _ui.update { it.copy(progress = null) }
-                    break
-                }
-                val now = System.currentTimeMillis()
+    private fun preparing() = Progress("Подготовка…", 0, 0, 0, 0, 0)
+
+    /**
+     * Poll native transfer progress until the launching operation cancels this
+     * job. It does NOT stop on `active == false`: at the start the native side is
+     * still fetching the manifest (not yet active), so breaking there would hide
+     * the bar until a second tap. Speed is computed from the byte delta.
+     */
+    private fun launchPolling(): Job = viewModelScope.launch {
+        var lastBytes = 0L
+        var lastTime = System.currentTimeMillis()
+        while (true) {
+            val snap = withContext(Dispatchers.IO) { NativeBridge.nativeTransferProgress() }
+            runCatching { JSONObject(snap) }.getOrNull()?.let { o ->
                 val bytesDone = o.optLong("bytes_done")
+                val now = System.currentTimeMillis()
                 val dt = (now - lastTime).coerceAtLeast(1)
-                val speed = ((bytesDone - lastBytes) * 1000 / dt).coerceAtLeast(0)
+                val speed = if (o.optBoolean("active", false))
+                    ((bytesDone - lastBytes) * 1000 / dt).coerceAtLeast(0) else 0
                 lastBytes = bytesDone
                 lastTime = now
                 _ui.update {
                     it.copy(
                         progress = Progress(
-                            file = o.optString("file"),
+                            file = o.optString("file").ifEmpty { "Подготовка…" },
                             filesDone = o.optLong("files_done"),
                             filesTotal = o.optLong("files_total"),
                             bytesDone = bytesDone,
@@ -234,8 +241,8 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                         )
                     )
                 }
-                delay(400)
             }
+            delay(350)
         }
     }
 
