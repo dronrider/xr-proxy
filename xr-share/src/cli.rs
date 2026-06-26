@@ -50,6 +50,10 @@ pub struct ShareArgs {
     /// Access-token lifetime in seconds (hub default 7 days, cap 30 days).
     #[arg(long)]
     pub ttl: Option<u64>,
+    /// Attach the new share to this invite, so everyone holding that invite
+    /// reaches it (the access anchor, §9.5). Repeatable.
+    #[arg(long = "invite")]
+    pub invites: Vec<String>,
 }
 
 /// `xr-share install` — set up the binary + service with **no** folder binding.
@@ -157,15 +161,32 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     });
     write_config(config_path, &cfg)?;
 
+    // Attach to invites so their holders get access (the access anchor, §9.5).
+    for invite in &args.invites {
+        let body = serde_json::json!({ "credential": cred, "share_id": share_id, "invite_token": invite });
+        match hub_post(&format!("{}/api/v1/share/attach", hub.trim_end_matches('/')), &body) {
+            Ok(_) => println!("  ✓ привязана к инвайту {}", short(invite)),
+            Err(e) => println!("  ! не удалось привязать к инвайту {}: {e}", short(invite)),
+        }
+    }
+
     let kind = if canon.is_file() { "файл" } else { "папка" };
-    let link = format!("xrshare://{addr}:{port}/{share_id}?token={token}");
     println!("✓ Шара добавлена ({kind}): {name}");
     println!("  путь:     {}", canon.display());
     println!("  share_id: {share_id}");
     println!("  адрес:    {addr}:{port}");
-    println!("\n  Ссылка для получателя (отправь её в мессенджере):");
-    println!("  {link}");
+    if args.invites.is_empty() {
+        // No invite: hand out a self-contained link (receiver pulls directly).
+        println!("\n  Ссылка для получателя (отправь её в мессенджере):");
+        println!("  xrshare://{addr}:{port}/{share_id}?token={token}");
+    } else {
+        println!("\n  Получатели с привязанным инвайтом уже видят шару (xr-share pull / приложение).");
+    }
     Ok(())
+}
+
+fn short(s: &str) -> String {
+    if s.len() > 12 { format!("{}…", &s[..10]) } else { s.to_string() }
 }
 
 /// `xr-share list` — show the shares this agent serves.

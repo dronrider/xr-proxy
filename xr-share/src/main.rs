@@ -7,6 +7,7 @@ mod auth;
 mod cli;
 mod config;
 mod manifest;
+mod pull;
 mod safepath;
 mod server;
 mod setup;
@@ -59,6 +60,8 @@ enum Commands {
         /// share_id or path to remove.
         target: String,
     },
+    /// Receive (desktop): list the shares on an invite, pick files, download them.
+    Pull(pull::PullArgs),
     /// Manage OS autostart (systemd on Linux, Scheduled Task on Windows).
     Service {
         #[command(subcommand)]
@@ -95,6 +98,7 @@ fn main() -> Result<()> {
         Some(Commands::Share(args)) => return cli::share(&config_path, args),
         Some(Commands::List) => return cli::list(&config_path),
         Some(Commands::Unshare { target }) => return cli::unshare(&config_path, &target),
+        Some(Commands::Pull(args)) => return pull::pull(args),
         Some(Commands::Service { action }) => {
             return match action {
                 ServiceAction::Install => setup::service_install(&config_path),
