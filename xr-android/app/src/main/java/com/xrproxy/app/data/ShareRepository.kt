@@ -76,6 +76,11 @@ class ShareRepository(private val context: Context) {
      * empty selection mirrors the whole share.
      */
     fun syncOnce(config: ShareConfig): SyncOutcome {
+        // Empty selection means "nothing ticked", not "mirror the whole share":
+        // the background worker must not auto-download the entire share, which
+        // would hold the transfer lock and block taps with a false "busy". The
+        // UI mirrors only ticked files/folders.
+        if (config.selection.isEmpty()) return SyncOutcome(0, 0, 0)
         val token = config.tokenJson ?: return SyncOutcome(0, 0, 0, "no token")
         val res = NativeBridge.nativeSyncShare(
             config.agentBaseUrl, token, destDir(config.shareId).absolutePath,
