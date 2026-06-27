@@ -158,7 +158,7 @@ async fn get_manifest(
     AxPath(share_id): AxPath<String>,
     req: Request,
 ) -> Result<Json<ShareManifest>, (StatusCode, &'static str)> {
-    manifest_response(&state, &share_id, &req)
+    manifest_response(state, share_id, req).await
 }
 
 async fn serve_file(
@@ -176,7 +176,7 @@ async fn get_manifest_legacy(
     req: Request,
 ) -> Result<Json<ShareManifest>, (StatusCode, &'static str)> {
     let share_id = token_share_id(&req)?;
-    manifest_response(&state, &share_id, &req)
+    manifest_response(state, share_id, req).await
 }
 
 async fn serve_file_legacy(
@@ -193,21 +193,34 @@ async fn serve_file_legacy(
 
 // ── shared bodies ───────────────────────────────────────────────────
 
-fn manifest_response(
-    state: &AgentState,
-    share_id: &str,
-    req: &Request,
+async fn manifest_response(
+    state: Arc<AgentState>,
+    share_id: String,
+    req: Request,
 ) -> Result<Json<ShareManifest>, (StatusCode, &'static str)> {
-    let shares = state.snapshot();
-    let share = shares
-        .get(share_id)
-        .ok_or((StatusCode::NOT_FOUND, "no such share"))?;
-    check_token(state, share_id, req)?;
-    let manifest = share.manifest(&state.hash_cache).map_err(|e| {
-        tracing::error!("manifest build failed for {share_id}: {e:#}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "manifest error")
-    })?;
-    Ok(Json(manifest))
+    if !state.snapshot().contains_key(&share_id) {
+        return Err((StatusCode::NOT_FOUND, "no such share"));
+    }
+    check_token(&state, &share_id, &req)?;
+    // Hashing a large share is CPU+IO bound. Building it on the async runtime
+    // would stall every other request on the worker threads until a cold cache
+    // (tens of GB) finishes, so the whole agent looks dead. Build off the runtime.
+    let built = tokio::task::spawn_blocking(move || -> anyhow::Result<ShareManifest> {
+        let shares = state.snapshot();
+        let share = shares
+            .get(&share_id)
+            .ok_or_else(|| anyhow::anyhow!("share removed during build"))?;
+        share.manifest(&state.hash_cache)
+    })
+    .await;
+    match built {
+        Ok(Ok(manifest)) => Ok(Json(manifest)),
+        Ok(Err(e)) => {
+            tracing::error!("manifest build failed: {e:#}");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "manifest error"))
+        }
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "manifest task failed")),
+    }
 }
 
 async fn file_response(state: &AgentState, share_id: &str, rel: &str, req: Request) -> Response {
