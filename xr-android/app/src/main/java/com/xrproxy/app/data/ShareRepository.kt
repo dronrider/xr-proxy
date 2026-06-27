@@ -55,13 +55,19 @@ class ShareRepository(private val context: Context) {
         return parseManifest(NativeBridge.nativeFetchManifest(config.agentBaseUrl, token, MANIFEST_TIMEOUT_MS))
     }
 
-    /** One-time download of a single file into the share's app directory. */
-    fun downloadOne(config: ShareConfig, entry: ManifestEntry): Boolean {
-        val token = config.tokenJson ?: return false
+    /** One-time download of a single file into the share's app directory.
+     *  Returns null on success, otherwise the error code ("busy" when another
+     *  transfer is already running). */
+    fun downloadOne(config: ShareConfig, entry: ManifestEntry): String? {
+        val token = config.tokenJson ?: return "no token"
         val res = NativeBridge.nativeDownloadFile(
             config.agentBaseUrl, token, entry.toJson(), destDir(config.shareId).absolutePath, XFER_TIMEOUT_MS,
         )
-        return runCatching { JSONObject(res).optBoolean("ok", false) }.getOrDefault(false)
+        return runCatching {
+            val o = JSONObject(res)
+            if (o.optBoolean("ok", false)) null
+            else o.optString("error").takeIf { it.isNotBlank() && it != "null" } ?: "download failed"
+        }.getOrDefault("download failed")
     }
 
     /**

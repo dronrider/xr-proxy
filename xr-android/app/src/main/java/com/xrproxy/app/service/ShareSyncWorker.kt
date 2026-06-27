@@ -36,6 +36,7 @@ class ShareSyncWorker(appContext: Context, params: WorkerParameters) :
         if (enabled.isEmpty()) return@withContext Result.success()
 
         var anyFailed = false
+        var deferred = false
         for (config in enabled) {
             val result = runCatching { repo.syncOnce(config) }
             val outcome = result.getOrNull()
@@ -44,15 +45,24 @@ class ShareSyncWorker(appContext: Context, params: WorkerParameters) :
                 anyFailed = true
                 continue
             }
-            if (outcome.ok) {
-                Log.i(TAG, "synced '${config.name}': +${outcome.fetched} -${outcome.deleted}")
-                if (outcome.failed > 0) anyFailed = true
-            } else {
-                Log.w(TAG, "sync '${config.name}' failed: ${outcome.error}")
-                anyFailed = true
+            when {
+                outcome.ok -> {
+                    Log.i(TAG, "synced '${config.name}': +${outcome.fetched} -${outcome.deleted}")
+                    if (outcome.failed > 0) anyFailed = true
+                }
+                // A foreground transfer holds the single-transfer lock; not an
+                // error, just retry once it frees (WorkManager backs off).
+                outcome.error == "busy" -> {
+                    Log.i(TAG, "sync '${config.name}' skipped: busy")
+                    deferred = true
+                }
+                else -> {
+                    Log.w(TAG, "sync '${config.name}' failed: ${outcome.error}")
+                    anyFailed = true
+                }
             }
         }
-        if (anyFailed) Result.retry() else Result.success()
+        if (anyFailed || deferred) Result.retry() else Result.success()
     }
 
     companion object {

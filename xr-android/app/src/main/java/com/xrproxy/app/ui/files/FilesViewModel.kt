@@ -147,14 +147,18 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update { it.copy(busyShareId = config.shareId, progress = preparing()) }
         val poll = launchPolling()
         viewModelScope.launch {
-            val ok = withContext(Dispatchers.IO) { repo.downloadOne(config, entry) }
+            val err = withContext(Dispatchers.IO) { repo.downloadOne(config, entry) }
             poll.cancel()
             val local = withContext(Dispatchers.IO) { repo.localPaths(config.shareId) }
             _ui.update {
                 it.copy(
                     busyShareId = null, localPaths = local, progress = null,
-                    openFileEvent = if (ok) repo.fileFor(config.shareId, entry.path) else null,
-                    message = if (ok) null else "Не удалось скачать",
+                    openFileEvent = if (err == null) repo.fileFor(config.shareId, entry.path) else null,
+                    message = when {
+                        err == null -> null
+                        err == "busy" -> "Идёт синхронизация, попробуй ещё раз"
+                        else -> "Не удалось скачать"
+                    },
                 )
             }
         }
@@ -194,10 +198,13 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             _ui.update {
                 it.copy(
                     busyShareId = null, progress = null, localPaths = local,
-                    message = if (outcome.ok)
-                        "Синк «${config.name}»: +${outcome.fetched} −${outcome.deleted}" +
-                            if (outcome.failed > 0) " (ошибок ${outcome.failed})" else ""
-                    else "Синк «${config.name}»: ${outcome.error}",
+                    message = when {
+                        outcome.ok ->
+                            "Синк «${config.name}»: +${outcome.fetched} −${outcome.deleted}" +
+                                if (outcome.failed > 0) " (ошибок ${outcome.failed})" else ""
+                        outcome.error == "busy" -> "Идёт синхронизация, подождите"
+                        else -> "Синк «${config.name}»: ${outcome.error}"
+                    },
                 )
             }
         }
@@ -222,21 +229,24 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         while (true) {
             val snap = withContext(Dispatchers.IO) { NativeBridge.nativeTransferProgress() }
             runCatching { JSONObject(snap) }.getOrNull()?.let { o ->
-                val bytesDone = o.optLong("bytes_done")
+                // Before the native transfer flips active (manifest still
+                // loading) the counters are zero/stale, so show a "preparing"
+                // bar at 0 rather than leftover bytes from a previous transfer.
+                val active = o.optBoolean("active", false)
+                val bytesDone = if (active) o.optLong("bytes_done") else 0L
                 val now = System.currentTimeMillis()
                 val dt = (now - lastTime).coerceAtLeast(1)
-                val speed = if (o.optBoolean("active", false))
-                    ((bytesDone - lastBytes) * 1000 / dt).coerceAtLeast(0) else 0
+                val speed = if (active) ((bytesDone - lastBytes) * 1000 / dt).coerceAtLeast(0) else 0
                 lastBytes = bytesDone
                 lastTime = now
                 _ui.update {
                     it.copy(
                         progress = Progress(
-                            file = o.optString("file").ifEmpty { "Подготовка…" },
-                            filesDone = o.optLong("files_done"),
-                            filesTotal = o.optLong("files_total"),
+                            file = if (active) o.optString("file").ifEmpty { "Подготовка…" } else "Подготовка…",
+                            filesDone = if (active) o.optLong("files_done") else 0,
+                            filesTotal = if (active) o.optLong("files_total") else 0,
                             bytesDone = bytesDone,
-                            bytesTotal = o.optLong("bytes_total"),
+                            bytesTotal = if (active) o.optLong("bytes_total") else 0,
                             speedBytesPerSec = speed,
                         )
                     )
