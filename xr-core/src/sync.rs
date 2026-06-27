@@ -59,15 +59,47 @@ impl TransferControl {
 
 static TRANSFER: TransferControl = TransferControl::new();
 
-/// Begin a transfer: reset counters, clear cancel, set totals, mark active.
-pub fn transfer_start(files_total: usize, bytes_total: u64) {
-    TRANSFER.cancel.store(false, Ordering::Relaxed);
-    TRANSFER.bytes_done.store(0, Ordering::Relaxed);
-    TRANSFER.bytes_total.store(bytes_total, Ordering::Relaxed);
-    TRANSFER.files_done.store(0, Ordering::Relaxed);
-    TRANSFER.files_total.store(files_total as u64, Ordering::Relaxed);
-    *TRANSFER.file.lock().expect("transfer lock") = String::new();
-    TRANSFER.active.store(true, Ordering::Relaxed);
+/// RAII lock for the single active transfer. [`acquire`](TransferGuard::acquire)
+/// resets the counters and marks a transfer running; dropping it releases the
+/// lock. It returns `None` when a transfer is already in flight, so concurrent
+/// callers (a foreground tap and the background mirror worker) never share the
+/// global byte counters or write the same `.part` file at once. Without this the
+/// progress bar overshoots (two streams add into one counter) and the partial
+/// files corrupt each other.
+#[must_use]
+pub struct TransferGuard(());
+
+impl TransferGuard {
+    pub fn acquire(files_total: usize, bytes_total: u64) -> Option<Self> {
+        if TRANSFER
+            .active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        TRANSFER.cancel.store(false, Ordering::Relaxed);
+        TRANSFER.bytes_done.store(0, Ordering::Relaxed);
+        TRANSFER.bytes_total.store(bytes_total, Ordering::Relaxed);
+        TRANSFER.files_done.store(0, Ordering::Relaxed);
+        TRANSFER.files_total.store(files_total as u64, Ordering::Relaxed);
+        *TRANSFER.file.lock().expect("transfer lock") = String::new();
+        Some(Self(()))
+    }
+}
+
+impl Drop for TransferGuard {
+    fn drop(&mut self) {
+        // Clear the counters so a poll between this transfer and the next acquire
+        // does not surface stale bytes (the "256 MB / 0 B" preparing artifact).
+        // `active` is released last.
+        TRANSFER.bytes_done.store(0, Ordering::Relaxed);
+        TRANSFER.bytes_total.store(0, Ordering::Relaxed);
+        TRANSFER.files_done.store(0, Ordering::Relaxed);
+        TRANSFER.files_total.store(0, Ordering::Relaxed);
+        *TRANSFER.file.lock().expect("transfer lock") = String::new();
+        TRANSFER.active.store(false, Ordering::Relaxed);
+    }
 }
 
 /// Mark the current file (and how many are already done).
@@ -79,11 +111,6 @@ pub fn transfer_file(path: &str, index: usize) {
 /// Request cancellation of the running transfer.
 pub fn transfer_cancel() {
     TRANSFER.cancel.store(true, Ordering::Relaxed);
-}
-
-/// Mark the transfer finished (success, failure, or cancel).
-pub fn transfer_stop() {
-    TRANSFER.active.store(false, Ordering::Relaxed);
 }
 
 fn transfer_cancelled() -> bool {
@@ -377,9 +404,14 @@ pub async fn sync_share_selected(
         return Ok(SyncResult { plan, report: None });
     }
     let bytes_total: u64 = plan.fetch.iter().map(|e| e.size).sum();
-    transfer_start(plan.fetch.len(), bytes_total);
+    // Refuse to run a second transfer in parallel with another one (e.g. the
+    // background worker while the user taps a file): they would corrupt the
+    // shared progress and the same `.part`. The skipped sync runs next cycle.
+    let _guard = match TransferGuard::acquire(plan.fetch.len(), bytes_total) {
+        Some(g) => g,
+        None => return Err("busy".into()),
+    };
     let report = apply_plan(agent_url, token, &plan, dest_root, timeout).await;
-    transfer_stop();
     Ok(SyncResult { plan, report: Some(report) })
 }
 

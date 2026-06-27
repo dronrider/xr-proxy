@@ -995,14 +995,20 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeDownloadFile(
     let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
 
     // Drive the shared progress/cancel controller so the UI can show a bar and
-    // stop a large single-file download too.
-    sync::transfer_start(1, entry.size);
-    sync::transfer_file(&entry.path, 0);
-    let result = with_onboarding_runtime(sync::download_entry(&agent_url, &token, &entry, &dest, timeout));
-    sync::transfer_stop();
-    let json = match result {
-        Ok(Ok(())) => serde_json::json!({ "ok": true }).to_string(),
-        Ok(Err(e)) | Err(e) => json_error(&e),
+    // stop a large single-file download too. The guard locks out a concurrent
+    // transfer (e.g. the background mirror worker) instead of sharing counters
+    // and the same `.part`; "busy" tells the UI to ask the user to retry.
+    let json = match sync::TransferGuard::acquire(1, entry.size) {
+        None => json_error("busy"),
+        Some(_guard) => {
+            sync::transfer_file(&entry.path, 0);
+            let result =
+                with_onboarding_runtime(sync::download_entry(&agent_url, &token, &entry, &dest, timeout));
+            match result {
+                Ok(Ok(())) => serde_json::json!({ "ok": true }).to_string(),
+                Ok(Err(e)) | Err(e) => json_error(&e),
+            }
+        }
     };
     jstring_into_raw(&mut env, json)
 }
