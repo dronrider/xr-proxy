@@ -58,6 +58,17 @@ impl HashCache {
             .insert(path.to_path_buf(), CacheEntry { size, mtime, sha256: sha.clone() });
         Ok(sha)
     }
+
+    /// The cached hash if `(size, mtime)` still match, **without ever hashing**.
+    /// Used by the listing path so a request never blocks on a cold file.
+    fn cached(&self, path: &Path, size: u64, mtime: i64) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("hash cache poisoned")
+            .get(path)
+            .filter(|e| e.size == size && e.mtime == mtime)
+            .map(|e| e.sha256.clone())
+    }
 }
 
 fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
@@ -102,6 +113,64 @@ pub fn build_manifest(root: &Path, cache: &HashCache) -> Result<ShareManifest> {
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(ShareManifest { entries })
+}
+
+/// Like [`build_manifest`] but **never hashes**: each entry carries the cached
+/// hash if present, else an empty string. Browsing must be instant even on a
+/// cold cache and a huge share (XR-039), so the SHA-256 is filled lazily by the
+/// warmer ([`build_manifest`]); a consumer treats an empty hash as "not known
+/// yet" (skip verify / fall back to size+mtime).
+pub fn build_listing(root: &Path, cache: &HashCache) -> Result<ShareManifest> {
+    let mut entries = Vec::new();
+
+    for entry in WalkDir::new(root).follow_links(false).into_iter() {
+        let entry = entry.context("walking share directory")?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(root)
+            .context("path not under root")?
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+
+        let meta = entry.metadata().context("reading file metadata")?;
+        let mtime = mtime_secs(&meta);
+
+        entries.push(ShareManifestEntry {
+            path: rel,
+            size: meta.len(),
+            mtime,
+            sha256: cache.cached(path, meta.len(), mtime).unwrap_or_default(),
+        });
+    }
+
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(ShareManifest { entries })
+}
+
+/// Listing for a single-file share, without hashing (see [`build_listing`]).
+pub fn build_listing_for_file(path: &Path, cache: &HashCache) -> Result<ShareManifest> {
+    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!("share path is not a regular file: {}", path.display());
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .context("file share has no file name")?;
+    let mtime = mtime_secs(&meta);
+    Ok(ShareManifest {
+        entries: vec![ShareManifestEntry {
+            path: name,
+            size: meta.len(),
+            mtime,
+            sha256: cache.cached(path, meta.len(), mtime).unwrap_or_default(),
+        }],
+    })
 }
 
 /// Build a one-entry manifest for a **single-file** share (§9.1): the entry path

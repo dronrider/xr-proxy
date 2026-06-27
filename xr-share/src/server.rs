@@ -32,7 +32,9 @@ use tower_http::services::ServeFile;
 use xr_proto::share::{verify_share_token, ShareManifest};
 
 use crate::auth::extract_token;
-use crate::manifest::{build_manifest, build_manifest_for_file, HashCache};
+use crate::manifest::{
+    build_listing, build_listing_for_file, build_manifest, build_manifest_for_file, HashCache,
+};
 use crate::safepath::resolve_within;
 
 /// One served share: a canonical path that is either a directory tree or a
@@ -50,6 +52,16 @@ impl ShareRoot {
             build_manifest_for_file(&self.path, cache)
         } else {
             build_manifest(&self.path, cache)
+        }
+    }
+
+    /// Listing without hashing (XR-039): instant even on a cold cache. Hashes are
+    /// filled lazily by the warmer (which uses [`manifest`](Self::manifest)).
+    fn listing(&self, cache: &HashCache) -> anyhow::Result<ShareManifest> {
+        if self.is_file {
+            build_listing_for_file(&self.path, cache)
+        } else {
+            build_listing(&self.path, cache)
         }
     }
 
@@ -202,15 +214,17 @@ async fn manifest_response(
         return Err((StatusCode::NOT_FOUND, "no such share"));
     }
     check_token(&state, &share_id, &req)?;
-    // Hashing a large share is CPU+IO bound. Building it on the async runtime
-    // would stall every other request on the worker threads until a cold cache
-    // (tens of GB) finishes, so the whole agent looks dead. Build off the runtime.
+    // Listing never hashes (XR-039): it returns metadata plus any hash already in
+    // the cache, so it is instant even on a cold cache of a huge share. The
+    // warmer fills hashes in the background. Still off the async runtime because
+    // the directory walk/stat is blocking I/O (a slow/network drive must not
+    // stall other requests).
     let built = tokio::task::spawn_blocking(move || -> anyhow::Result<ShareManifest> {
         let shares = state.snapshot();
         let share = shares
             .get(&share_id)
             .ok_or_else(|| anyhow::anyhow!("share removed during build"))?;
-        share.manifest(&state.hash_cache)
+        share.listing(&state.hash_cache)
     })
     .await;
     match built {
