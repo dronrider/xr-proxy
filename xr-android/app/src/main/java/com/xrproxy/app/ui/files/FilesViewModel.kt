@@ -161,8 +161,12 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Tap a file: open it if downloaded, else download (with progress) then open. */
+    /** Tap a file: open it if downloaded, else download (with progress) then open.
+     *  A tap is a manual sync of this file: it is added to the selection so it is
+     *  treated exactly like a ticked + synced file (kept locally, re-mirrored when
+     *  the toggle is on, never pruned as an ad-hoc copy). */
     fun downloadAndOpen(config: ShareConfig, entry: ManifestEntry) {
+        setSelected(config.shareId, entry.path, true)
         localFile(config.shareId, entry.path)?.let {
             _ui.update { st -> st.copy(openFileEvent = it) }
             return
