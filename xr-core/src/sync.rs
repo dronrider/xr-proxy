@@ -517,7 +517,10 @@ pub async fn download_entry(
     drop(file);
 
     let got = hex_lower(&hasher.finalize());
-    if !got.eq_ignore_ascii_case(&entry.sha256) {
+    // An empty expected hash means the listing hasn't hashed this file yet
+    // (XR-039 cold cache): skip verification rather than fail, since there is
+    // nothing to compare against. A non-empty mismatch is still a hard error.
+    if !entry.sha256.is_empty() && !got.eq_ignore_ascii_case(&entry.sha256) {
         // A corrupt result is discarded so the next attempt starts clean.
         let _ = tokio::fs::remove_file(&part).await;
         return Err(format!("sha256 mismatch (want {}, got {got})", entry.sha256));
