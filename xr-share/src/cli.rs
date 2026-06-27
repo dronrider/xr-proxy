@@ -175,6 +175,11 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     println!("  путь:     {}", canon.display());
     println!("  share_id: {share_id}");
     println!("  адрес:    {addr}:{port}");
+    if addr_is_private(&addr) {
+        eprintln!("\n  ВНИМАНИЕ: адрес {addr} приватный, шара видна только в локальной сети.");
+        eprintln!("  Снаружи она недоступна. Регистрируй с хоста агента (хаб подставит белый IP сам),");
+        eprintln!("  либо передай --addr <публичный IP или DDNS> и пробрось порт {port} на эту машину.");
+    }
     if args.invites.is_empty() {
         // No invite: hand out a self-contained link (receiver pulls directly).
         println!("\n  Ссылка для получателя (отправь её в мессенджере):");
@@ -183,6 +188,17 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
         println!("\n  Получатели с привязанным инвайтом уже видят шару (xr-share pull / приложение).");
     }
     Ok(())
+}
+
+/// True if a resolved address is a private/loopback/link-local IP, so a share at
+/// it is reachable only inside the LAN. A hostname (DDNS) is treated as public.
+fn addr_is_private(addr: &str) -> bool {
+    use std::net::IpAddr;
+    match addr.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        Ok(IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Err(_) => false,
+    }
 }
 
 fn short(s: &str) -> String {
