@@ -47,7 +47,7 @@ class ShareRepository(private val context: Context) {
 
     /** Shares attached to the user's invite (the access anchor, §9.5). */
     fun inviteShares(hubUrl: String, inviteToken: String): Result<List<ShareGrant>> =
-        ShareGrant.listFrom(NativeBridge.nativeInviteShares(hubUrl, inviteToken, MANIFEST_TIMEOUT_MS))
+        ShareGrant.listFrom(NativeBridge.nativeInviteShares(hubUrl, inviteToken, INVITE_TIMEOUT_MS))
 
     /** A share's file listing from the agent (token-gated). */
     fun fetchManifest(config: ShareConfig): Result<List<ManifestEntry>> {
@@ -103,6 +103,9 @@ class ShareRepository(private val context: Context) {
     private fun sanitize(s: String): String = s.replace(Regex("[^A-Za-z0-9_.-]"), "_")
 
     companion object {
+        /** Invite-share listing is a quick hub metadata call; keep it short so a
+         *  slow/unreachable hub clears the refresh spinner fast instead of hanging. */
+        private const val INVITE_TIMEOUT_MS = 15_000L
         /** Listing is cheap on the agent (cached hashes), so a tight bound. */
         private const val MANIFEST_TIMEOUT_MS = 60_000L
         /** Transfers may be multi-GB; the engine uses a 10s connect-timeout, so a

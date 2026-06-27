@@ -73,7 +73,9 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update { it.copy(loadingHub = true) }
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) { repo.inviteShares(hubUrl, inviteToken) }
-            result.onSuccess { reconcileShares(it) }
+            // Must never block clearing the spinner: a failure here would otherwise
+            // leave `loadingHub` stuck true and the indicator spinning forever.
+            result.onSuccess { runCatching { reconcileShares(it) } }
             _ui.update { st ->
                 result.fold(
                     onSuccess = { st.copy(hubShares = it, loadingHub = false) },
