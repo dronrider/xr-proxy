@@ -35,6 +35,10 @@ pub struct InstallArgs {
     /// Don't prompt — take every value from flags.
     #[arg(long)]
     pub non_interactive: bool,
+    /// Clean reinstall: new identity, drop existing shares. Without it an existing
+    /// agent's identity, shares and mandate are kept (re-running install is safe).
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args)]
@@ -60,6 +64,23 @@ pub struct ShareArgs {
 /// With `--token`, swaps the reg-token for an agent credential right away (§9.3).
 pub fn install(config_path: &Path, args: InstallArgs) -> Result<()> {
     println!("xr-share install — установка агента (без привязки к папке)\n");
+
+    // Re-running install must not orphan an existing agent's shares (XR-037):
+    // generating a fresh identity and an empty share list would leave every
+    // registered share unreachable on the hub. Keep the existing config and just
+    // refresh the autostart service. A clean wipe is opt-in via --force.
+    if !args.force {
+        if let Ok(existing) = read_config(config_path) {
+            println!("  ✓ найден конфиг: личность, шары ({}) и мандат сохранены", existing.shares.len());
+            if !args.no_service {
+                setup::service_install(config_path)?;
+            }
+            println!("\n✓ Агент обновлён, существующие шары на месте.");
+            println!("  Перезапусти службу, чтобы поднять новый бинарь.");
+            println!("  Полная переустановка с нуля: xr-share install --force ...");
+            return Ok(());
+        }
+    }
 
     let hub = setup::resolve(args.hub, args.non_interactive, "URL хаба (напр. https://xr-hub.zoobr.top)", None)?;
     let listen = setup::resolve(args.listen, args.non_interactive, "Адрес прослушивания", Some("0.0.0.0:8443"))?;
