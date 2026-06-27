@@ -22,6 +22,12 @@ $dir  = Join-Path $env:LOCALAPPDATA 'Programs\xr-share'
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $dest = Join-Path $dir 'xr-share.exe'
 
+# Stop a running agent first (XR-037): Windows locks a running .exe, so an update
+# can't overwrite it. No-op on a fresh install. Needs an elevated shell.
+schtasks /End /TN xr-share 2>$null | Out-Null
+Get-Process -Name xr-share -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 800
+
 Write-Host "Downloading $bin ..."
 Invoke-WebRequest -Uri "$base/$bin" -OutFile $dest -UseBasicParsing
 
