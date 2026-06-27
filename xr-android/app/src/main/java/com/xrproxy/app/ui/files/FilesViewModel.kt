@@ -73,11 +73,35 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update { it.copy(loadingHub = true) }
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) { repo.inviteShares(hubUrl, inviteToken) }
+            result.onSuccess { reconcileShares(it) }
             _ui.update { st ->
                 result.fold(
                     onSuccess = { st.copy(hubShares = it, loadingHub = false) },
                     onFailure = { st.copy(loadingHub = false, message = "Шары по инвайту: ${it.message}") },
                 )
+            }
+        }
+    }
+
+    /**
+     * Refresh of the invite carries the agent's current address/port/token. If a
+     * share was added earlier and the agent has since moved (e.g. a private LAN
+     * address replaced by the public IP), update the stored connection fields in
+     * place so we stop hitting the stale address. The user's selection and sync
+     * toggle are kept; a remove + re-add is no longer needed.
+     */
+    private fun reconcileShares(grants: List<ShareGrant>) {
+        grants.forEach { g ->
+            val existing = store.get(g.shareId) ?: return@forEach
+            if (existing.addr != g.addr || existing.port != g.port ||
+                existing.agentPubkey != g.agentPubkey || existing.tokenJson != g.tokenJson
+            ) {
+                store.update(g.shareId) {
+                    it.copy(
+                        addr = g.addr, port = g.port, agentPubkey = g.agentPubkey,
+                        tokenJson = g.tokenJson, name = g.name,
+                    )
+                }
             }
         }
     }
