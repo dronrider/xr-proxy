@@ -27,7 +27,7 @@
 | XR-012 | Информативный индикатор соединения вместо смайлика | task/LLD | P2 | `local-docs/problems.md` (10) |
 | XR-013 | Гибридный редактор правил xr-hub плюс Android rules editor | LLD | P2 | [docs/lld/14-hub-hybrid-rules-editor.md](lld/14-hub-hybrid-rules-editor.md), [docs/lld/05-android-rules-editor.md](lld/05-android-rules-editor.md) |
 | XR-015 | Развёртывание нового сервера и роутера в один клик (по SSH из приложения: установка прокси, имя сети, минимум ручных шагов) | LLD | P2 | [docs/lld/13-zero-touch-provisioning.md](lld/13-zero-touch-provisioning.md) |
-| XR-016 | Per-app split tunneling | LLD | P2 | [docs/lld/07-android-per-app-tunnel.md](lld/07-android-per-app-tunnel.md) |
+| XR-016 | Раздельный туннель по приложениям (выбрать, какие приложения идут через прокси, остальные напрямую) | LLD | P2 | [docs/lld/07-android-per-app-tunnel.md](lld/07-android-per-app-tunnel.md) |
 | XR-020 | Живые правила из хаба для серверов, добавленных вручную | LLD | P2 | [docs/lld/16-manual-server-hub-rules.md](lld/16-manual-server-hub-rules.md) |
 | XR-025 | Хаб-реестр роутеров и удалённое управление (pull control-plane) | LLD | P2 | [docs/lld/17-hub-router-registry.md](lld/17-hub-router-registry.md) |
 | XR-032 | QR на странице инвайта `/view` кодирует относительный claim-путь (POST), приложение такое не парсит. Кодировать каноническую ссылку `https://<host>/invite/<token>` (хост берётся из payload.hub_url/конфига хаба) | bug | P2 | [xr-hub/src/api/invites.rs:76](../xr-hub/src/api/invites.rs#L76) |
