@@ -146,8 +146,9 @@ data class SyncPlan(
 
 /**
  * A locally-stored share the user has configured: identity from the hub, the
- * access [tokenJson] (handed out-of-band by the owner), the chosen SAF tree
- * [treeUri], and whether background mirror sync is on. Persisted as JSON.
+ * access [tokenJson] (handed out-of-band by the owner), where its files mirror
+ * to ([storagePath]), and whether background mirror sync is on. Persisted as
+ * JSON.
  */
 data class ShareConfig(
     val shareId: String,
@@ -160,6 +161,13 @@ data class ShareConfig(
     /** Chosen manifest paths and/or folder prefixes to mirror (§9.6). Empty =
      *  the whole share; downloads land in the app's own directory. */
     val selection: Set<String> = emptySet(),
+    /** Absolute filesystem directory this share's files mirror into (XR-043).
+     *  `null` = the app's own per-share directory (the default, no permission).
+     *  A non-null path is a user-picked folder on shared storage. */
+    val storagePath: String? = null,
+    /** Whether the user has made the first-sync storage choice. We prompt once,
+     *  then stop asking, even if the choice was the default app directory. */
+    val storageChosen: Boolean = false,
 ) {
     val agentBaseUrl: String get() = "http://$addr:$port"
     val hasToken: Boolean get() = !tokenJson.isNullOrBlank()
@@ -176,6 +184,8 @@ data class ShareConfig(
         .put("token_json", tokenJson ?: JSONObject.NULL)
         .put("sync_enabled", syncEnabled)
         .put("selection", JSONArray().apply { selection.forEach { put(it) } })
+        .put("storage_path", storagePath ?: JSONObject.NULL)
+        .put("storage_chosen", storageChosen)
 
     companion object {
         /** Build a configured share from an invite grant — the token comes with it. */
@@ -199,6 +209,8 @@ data class ShareConfig(
             selection = (o.optJSONArray("selection") ?: JSONArray()).let { arr ->
                 (0 until arr.length()).map { arr.getString(it) }.toSet()
             },
+            storagePath = o.optString("storage_path").takeIf { it.isNotBlank() && it != "null" },
+            storageChosen = o.optBoolean("storage_chosen", false),
         )
     }
 }

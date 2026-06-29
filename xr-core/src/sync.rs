@@ -307,6 +307,258 @@ fn scan_dir(root: &Path, dir: &Path, out: &mut Vec<LocalFile>) -> std::io::Resul
     Ok(())
 }
 
+// ── Storage migration (XR-043) ───────────────────────────────────────
+//
+// Changing a share's storage directory moves the already-downloaded data, it
+// does not re-download it: shares run to tens of GB and the move is offline. On
+// the same volume every file is a rename (instant, no extra space); across
+// volumes it is a copy+remove, pre-checked against free space so a full target
+// fails before the first byte moves. The diff is hash-based, so a moved file is
+// seen as already-present on the next sync and never re-fetched.
+
+/// Suffix [`download_entry`] gives an in-flight download. Such a leftover is
+/// incomplete, so migration drops it instead of moving half a file.
+const PART_SUFFIX: &str = ".xrsync-part";
+
+/// Outcome of [`migrate_dir`]. `moved`/`bytes` count relocated files; `conflicts`
+/// are paths left in place because the destination already held a **different**
+/// file there (the source copy is kept, the user decides); `failed` are per-file
+/// errors; `cancelled` is true when the user aborted (already-moved files stay).
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct MigrateReport {
+    pub moved: usize,
+    pub bytes: u64,
+    pub conflicts: Vec<String>,
+    pub failed: Vec<(String, String)>,
+    pub cancelled: bool,
+}
+
+struct MigFile {
+    abs: PathBuf,
+    rel: String,
+    size: u64,
+}
+
+/// Count the files (and total bytes) [`migrate_dir`] would move, ignoring
+/// `.xrsync-part` leftovers. Cheap (metadata only, no hashing): the caller sizes
+/// the progress bar with it before taking the transfer lock.
+pub fn dir_totals(root: &Path) -> (usize, u64) {
+    let files = collect_files(root);
+    let bytes = files.iter().map(|f| f.size).sum();
+    (files.len(), bytes)
+}
+
+/// Enumerate real files under `root` (relative forward-slash path + size),
+/// skipping symlinks and `.xrsync-part` leftovers. Sorted for determinism.
+fn collect_files(root: &Path) -> Vec<MigFile> {
+    let mut out = Vec::new();
+    if root.exists() {
+        let _ = collect_dir(root, root, &mut out);
+    }
+    out.sort_by(|a, b| a.rel.cmp(&b.rel));
+    out
+}
+
+fn collect_dir(root: &Path, dir: &Path, out: &mut Vec<MigFile>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if ft.is_dir() {
+            collect_dir(root, &path, out)?;
+        } else if ft.is_file() {
+            if entry.file_name().to_string_lossy().ends_with(PART_SUFFIX) {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push(MigFile { abs: path, rel, size });
+        }
+    }
+    Ok(())
+}
+
+/// Move every file under `src_root` into `dst_root`, preserving relative paths,
+/// so a storage-directory change keeps the already-downloaded data (XR-043 §3).
+/// A destination file that is byte-identical is treated as already-migrated (the
+/// source duplicate is removed); a **differing** destination file is a conflict
+/// and left untouched. Reports per-file outcomes; only an upfront failure
+/// (unreadable source, full target volume) returns `Err`. Honours the global
+/// transfer cancel flag and feeds the progress controller the UI polls.
+pub fn migrate_dir(src_root: &Path, dst_root: &Path) -> Result<MigrateReport, String> {
+    let mut report = MigrateReport::default();
+    if src_root == dst_root || !src_root.exists() {
+        return Ok(report); // same place, or nothing downloaded yet
+    }
+    // A nested pair would chase its own output (move into a sub/parent of the
+    // source). The picker prevents this; belt and braces.
+    if dst_root.starts_with(src_root) || src_root.starts_with(dst_root) {
+        return Err("nested directories".into());
+    }
+    std::fs::create_dir_all(dst_root).map_err(|e| format!("mkdir dst: {e}"))?;
+
+    let files = collect_files(src_root);
+
+    // Free-space precheck only matters across volumes (a same-volume rename needs
+    // no extra space). Failing here, before the first file moves, keeps a full
+    // target from leaving a half-migrated share.
+    let cross = match (device_of(src_root), device_of(dst_root)) {
+        (Some(a), Some(b)) => a != b,
+        _ => true, // unknown -> assume cross and check space
+    };
+    if cross {
+        let total: u64 = files.iter().map(|f| f.size).sum();
+        if let Some(free) = free_space(dst_root) {
+            if free < total {
+                return Err(format!("no_space: need {total}, free {free}"));
+            }
+        }
+    }
+
+    for f in &files {
+        if transfer_cancelled() {
+            report.cancelled = true;
+            break;
+        }
+        transfer_file(&f.rel, report.moved);
+        let Some(dst) = safe_dest(dst_root, &f.rel) else {
+            report.failed.push((f.rel.clone(), "unsafe path".into()));
+            continue;
+        };
+        if dst.exists() {
+            match files_identical(&f.abs, &dst) {
+                Ok(true) => {
+                    let _ = std::fs::remove_file(&f.abs);
+                    prune_empty_dirs(src_root, &f.abs);
+                    report.moved += 1;
+                    report.bytes += f.size;
+                    transfer_add_bytes(f.size);
+                }
+                Ok(false) => report.conflicts.push(f.rel.clone()),
+                Err(e) => report.failed.push((f.rel.clone(), format!("compare: {e}"))),
+            }
+            continue;
+        }
+        if let Some(parent) = dst.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                report.failed.push((f.rel.clone(), format!("mkdir: {e}")));
+                continue;
+            }
+        }
+        match move_file(&f.abs, &dst) {
+            Ok(()) => {
+                prune_empty_dirs(src_root, &f.abs);
+                report.moved += 1;
+                report.bytes += f.size;
+                transfer_add_bytes(f.size);
+            }
+            Err(e) => report.failed.push((f.rel.clone(), e)),
+        }
+    }
+
+    // Tidy the old location: drop incomplete leftovers and now-empty dirs.
+    // Skipped on cancel so a half migration stays resumable from a clean tree.
+    if !report.cancelled {
+        remove_part_leftovers(src_root);
+        remove_empty_dirs(src_root);
+    }
+    Ok(report)
+}
+
+/// Move one file, preferring an instant rename and falling back to copy+remove
+/// when the destination is on another filesystem (`EXDEV`).
+fn move_file(src: &Path, dst: &Path) -> Result<(), String> {
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if is_exdev(&e) => {
+            std::fs::copy(src, dst).map_err(|e| format!("copy: {e}"))?;
+            std::fs::remove_file(src).map_err(|e| format!("remove src: {e}"))?;
+            Ok(())
+        }
+        Err(e) => Err(format!("rename: {e}")),
+    }
+}
+
+/// Same bytes? Compares size first (cheap), then SHA-256 over both files.
+fn files_identical(a: &Path, b: &Path) -> std::io::Result<bool> {
+    let (ma, mb) = (std::fs::metadata(a)?, std::fs::metadata(b)?);
+    if ma.len() != mb.len() {
+        return Ok(false);
+    }
+    Ok(sha256_file(a)? == sha256_file(b)?)
+}
+
+fn remove_part_leftovers(root: &Path) {
+    let Ok(rd) = std::fs::read_dir(root) else { return };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            remove_part_leftovers(&path);
+        } else if entry.file_name().to_string_lossy().ends_with(PART_SUFFIX) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Remove empty directories under `root` bottom-up, including `root` itself once
+/// empty (the share's old folder is gone after a full migration). A directory
+/// still holding a conflicted file is non-empty, so `remove_dir` no-ops and it
+/// survives.
+fn remove_empty_dirs(root: &Path) {
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                remove_empty_dirs(&path);
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(root);
+}
+
+#[cfg(unix)]
+fn device_of(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.dev())
+}
+
+#[cfg(not(unix))]
+fn device_of(_path: &Path) -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
+fn free_space(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs fills a zeroed struct from a valid C path; on success we
+    // read two scalar fields only.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn free_space(_path: &Path) -> Option<u64> {
+    None
+}
+
+fn is_exdev(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EXDEV)
+}
+
 // ── Network application ──────────────────────────────────────────────
 
 /// Outcome of [`apply_plan`]: which paths were fetched/deleted, and per-path
@@ -454,7 +706,7 @@ pub async fn download_entry(
             .map_err(|e| format!("mkdir: {e}"))?;
     }
     let part = dest.with_file_name(format!(
-        "{}.xrsync-part",
+        "{}{PART_SUFFIX}",
         dest.file_name().and_then(|n| n.to_str()).unwrap_or("download")
     ));
 
@@ -818,5 +1070,75 @@ mod tests {
         let partial: Vec<_> = local.iter().filter(|f| f.path == "a.txt").cloned().collect();
         let plan = plan_sync(&m, &partial);
         assert_eq!(plan.fetch.iter().map(|e| e.path.clone()).collect::<Vec<_>>(), vec!["sub/b.bin"]);
+    }
+
+    // ── migrate_dir (XR-043) ─────────────────────────────────────────
+
+    fn read(p: &Path) -> String {
+        std::fs::read_to_string(p).unwrap()
+    }
+
+    #[test]
+    fn migrate_moves_tree_and_clears_source() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
+        std::fs::create_dir(src.path().join("sub")).unwrap();
+        std::fs::write(src.path().join("sub/b.bin"), b"world").unwrap();
+        // An incomplete download must be dropped, not migrated.
+        std::fs::write(src.path().join("c.bin.xrsync-part"), b"partial").unwrap();
+
+        let rep = migrate_dir(src.path(), dst.path()).unwrap();
+        assert_eq!(rep.moved, 2);
+        assert!(rep.conflicts.is_empty() && rep.failed.is_empty());
+
+        assert_eq!(read(&dst.path().join("a.txt")), "hello");
+        assert_eq!(read(&dst.path().join("sub/b.bin")), "world");
+        // The diff would now see the moved files as already present.
+        let m = manifest(
+            scan_local_dir(dst.path()).unwrap().iter().map(|f| entry(&f.path, &f.sha256)).collect(),
+        );
+        assert!(plan_sync(&m, &scan_local_dir(dst.path()).unwrap()).is_empty());
+        // Source folder is gone (the leftover .part was dropped, dirs pruned).
+        assert!(!src.path().exists());
+    }
+
+    #[test]
+    fn migrate_skips_identical_keeps_conflict() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("same.txt"), b"DATA").unwrap();
+        std::fs::write(src.path().join("diff.txt"), b"src-version").unwrap();
+        // Destination already holds these paths: one identical, one different.
+        std::fs::write(dst.path().join("same.txt"), b"DATA").unwrap();
+        std::fs::write(dst.path().join("diff.txt"), b"dst-version").unwrap();
+
+        let rep = migrate_dir(src.path(), dst.path()).unwrap();
+        // Identical file counts as migrated; its source duplicate is removed.
+        assert_eq!(rep.moved, 1);
+        assert_eq!(rep.conflicts, vec!["diff.txt".to_string()]);
+        assert!(!src.path().join("same.txt").exists());
+        // Conflict: destination untouched, source copy left for the user.
+        assert_eq!(read(&dst.path().join("diff.txt")), "dst-version");
+        assert_eq!(read(&src.path().join("diff.txt")), "src-version");
+    }
+
+    #[test]
+    fn migrate_noops_when_same_or_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("x"), b"1").unwrap();
+        // Same source and destination: nothing to do, files untouched.
+        let rep = migrate_dir(dir.path(), dir.path()).unwrap();
+        assert_eq!(rep.moved, 0);
+        assert!(dir.path().join("x").exists());
+
+        // Nested destination is refused outright.
+        let nested = dir.path().join("inside");
+        assert!(migrate_dir(dir.path(), &nested).is_err());
+
+        // A never-downloaded share (missing source) is a clean no-op.
+        let missing = dir.path().join("nope");
+        let rep = migrate_dir(&missing, dir.path()).unwrap();
+        assert_eq!(rep.moved, 0);
     }
 }

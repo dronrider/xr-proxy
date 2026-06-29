@@ -4,8 +4,11 @@ package com.xrproxy.app.ui.files
 
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -23,6 +26,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DriveFileMove
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Sync
@@ -45,6 +49,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -55,6 +60,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.xrproxy.app.data.StorageAccess
 import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
 import com.xrproxy.app.model.TreeNode
@@ -73,6 +79,45 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
     val ui by vm.ui.collectAsState()
     val configs by vm.configs.collectAsState()
     val context = LocalContext.current
+
+    // Storage-directory picker (XR-043). A custom folder needs all-files access;
+    // we route the user to the system settings to grant it, then to the folder
+    // picker, and hand the engine the picked folder's real path.
+    var pickShareId by rememberSaveable { mutableStateOf<String?>(null) }
+    val treePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        val sid = pickShareId
+        pickShareId = null
+        if (sid == null) return@rememberLauncherForActivityResult
+        if (uri == null) {
+            vm.dismissStorageDialog()
+            return@rememberLauncherForActivityResult
+        }
+        val path = StorageAccess.treeUriToRealPath(uri)
+        if (path == null) {
+            Toast.makeText(context, "Выберите папку на основном хранилище (не SD-карту)", Toast.LENGTH_LONG).show()
+            vm.dismissStorageDialog()
+        } else {
+            vm.chooseStorage(sid, path)
+        }
+    }
+    val grantLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        if (StorageAccess.hasAllFilesAccess()) {
+            treePicker.launch(null)
+        } else {
+            pickShareId = null
+            vm.dismissStorageDialog()
+            Toast.makeText(context, "Доступ ко всем файлам не выдан", Toast.LENGTH_LONG).show()
+        }
+    }
+    val startCustomPick: (String) -> Unit = startCustomPick@{ sid ->
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            Toast.makeText(context, "Своя папка доступна на Android 11+", Toast.LENGTH_LONG).show()
+            return@startCustomPick
+        }
+        pickShareId = sid
+        if (StorageAccess.hasAllFilesAccess()) treePicker.launch(null)
+        else grantLauncher.launch(StorageAccess.allFilesAccessSettings(context))
+    }
 
     LaunchedEffect(Unit) {
         vm.refreshHub(hubUrl, inviteToken)
@@ -99,6 +144,63 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
     } else {
         ShareListView(vm, ui, configs, hubUrl, inviteToken, modifier)
     }
+
+    val storageCfg = configs.firstOrNull { it.shareId == ui.storageDialogFor }
+    if (storageCfg != null) {
+        StorageDialog(
+            cfg = storageCfg,
+            promptMode = ui.storagePromptMode,
+            onAppDir = { vm.chooseStorage(storageCfg.shareId, null) },
+            onCustom = { vm.hideStorageDialog(); startCustomPick(storageCfg.shareId) },
+            onDismiss = { vm.dismissStorageDialog() },
+        )
+    }
+}
+
+// ── Storage-directory dialog (XR-043) ───────────────────────────────
+
+@Composable
+private fun StorageDialog(
+    cfg: ShareConfig,
+    promptMode: Boolean,
+    onAppDir: () -> Unit,
+    onCustom: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (promptMode) "Куда сохранять файлы?" else "Папка хранения") },
+        text = {
+            Column {
+                if (promptMode) {
+                    Text(
+                        "Куда складывать скачанные файлы шары «${cfg.name}». Поменять можно позже.",
+                        fontSize = 13.sp,
+                    )
+                } else {
+                    Text("Сейчас: ${StorageAccess.label(cfg.storagePath)}", fontSize = 13.sp)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Смена папки перенесёт уже скачанное в новое место без повторной загрузки.",
+                        fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (!StorageAccess.customFolderSupported()) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "Своя папка доступна на Android 11+.",
+                        fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onCustom, enabled = StorageAccess.customFolderSupported()) {
+                Text("Своя папка…")
+            }
+        },
+        dismissButton = { TextButton(onClick = onAppDir) { Text("Папка приложения") } },
+    )
 }
 
 // ── Share list (the "drives") ───────────────────────────────────────
@@ -175,6 +277,14 @@ private fun ShareListView(
                             if (cfg.selection.isEmpty()) "вся шара" else "выбрано: ${cfg.selection.size}",
                             fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                        Text(
+                            "Папка: ${StorageAccess.label(cfg.storagePath)}",
+                            fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    IconButton(onClick = { vm.openStorageDialog(cfg.shareId) }) {
+                        Icon(Icons.Default.DriveFileMove, contentDescription = "Папка хранения")
                     }
                     Switch(checked = cfg.syncEnabled, onCheckedChange = { vm.setSyncEnabled(cfg.shareId, it) })
                     IconButton(onClick = { vm.removeShare(cfg.shareId) }) {

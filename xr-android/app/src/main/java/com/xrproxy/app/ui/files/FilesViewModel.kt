@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xrproxy.app.data.ShareRepository
 import com.xrproxy.app.data.ShareStore
+import com.xrproxy.app.data.StorageAccess
 import com.xrproxy.app.jni.NativeBridge
 import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
@@ -58,7 +59,21 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         val progress: Progress? = null,
         val openFileEvent: File? = null,
         val message: String? = null,
+        /** Share whose storage-directory dialog is open (XR-043), or null. */
+        val storageDialogFor: String? = null,
+        /** True when the dialog is the first-sync prompt (auto-continues the
+         *  deferred action on choice) vs. a later "change folder" from settings. */
+        val storagePromptMode: Boolean = false,
     )
+
+    /** A sync action deferred until the user makes the first-sync storage choice. */
+    private sealed interface Pending {
+        data class Download(val shareId: String, val entry: ManifestEntry) : Pending
+        data class Sync(val shareId: String) : Pending
+        data class EnableSync(val shareId: String) : Pending
+    }
+
+    private var pending: Pending? = null
 
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui
@@ -133,7 +148,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
         viewModelScope.launch {
             val (result, localManifest) = withContext(Dispatchers.IO) {
-                repo.fetchManifest(config) to repo.localManifest(config.shareId)
+                repo.fetchManifest(config) to repo.localManifest(config)
             }
             val local = localManifest.map { it.path }.toSet()
             _ui.update { st ->
@@ -183,8 +198,14 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
      *  the toggle is on, never pruned as an ad-hoc copy). */
     fun downloadAndOpen(config: ShareConfig, entry: ManifestEntry) {
         setSelected(config.shareId, entry.path, true)
-        localFile(config.shareId, entry.path)?.let {
+        localFile(config, entry.path)?.let {
             _ui.update { st -> st.copy(openFileEvent = it) }
+            return
+        }
+        // A download writes, so settle where it lands first (only on the very
+        // first sync of this share); an already-downloaded file opened above.
+        if (!config.storageChosen) {
+            promptStorage(config.shareId, Pending.Download(config.shareId, entry))
             return
         }
         if (_ui.value.busyShareId != null) return
@@ -193,11 +214,11 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val err = withContext(Dispatchers.IO) { repo.downloadOne(config, entry) }
             poll.cancel()
-            val local = withContext(Dispatchers.IO) { repo.localPaths(config.shareId) }
+            val local = withContext(Dispatchers.IO) { repo.localPaths(config) }
             _ui.update {
                 it.copy(
                     busyShareId = null, localPaths = local, progress = null,
-                    openFileEvent = if (err == null) repo.fileFor(config.shareId, entry.path) else null,
+                    openFileEvent = if (err == null) repo.fileFor(config, entry.path) else null,
                     message = when {
                         err == null -> null
                         err == "busy" -> "Идёт синхронизация, попробуй ещё раз"
@@ -208,8 +229,8 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun localFile(shareId: String, relPath: String): File? =
-        repo.fileFor(shareId, relPath).takeIf { it.isFile }
+    fun localFile(config: ShareConfig, relPath: String): File? =
+        repo.fileFor(config, relPath).takeIf { it.isFile }
 
     // ── sync + transfer control ─────────────────────────────────────
 
@@ -217,6 +238,12 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         val cfg = store.get(shareId) ?: return
         if (enabled && !cfg.hasToken) {
             _ui.update { it.copy(message = "Нет токена доступа") }
+            return
+        }
+        // Enabling background sync starts writing files, so settle the storage
+        // directory first (once per share).
+        if (enabled && !cfg.storageChosen) {
+            promptStorage(shareId, Pending.EnableSync(shareId))
             return
         }
         store.update(shareId) { it.copy(syncEnabled = enabled) }
@@ -232,13 +259,17 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             _ui.update { it.copy(message = "Отметь галочками файлы или папки для синка") }
             return
         }
+        if (!config.storageChosen) {
+            promptStorage(config.shareId, Pending.Sync(config.shareId))
+            return
+        }
         if (_ui.value.busyShareId != null) return
         _ui.update { it.copy(busyShareId = config.shareId, progress = preparing()) }
         val poll = launchPolling()
         viewModelScope.launch {
             val outcome = withContext(Dispatchers.IO) { repo.syncOnce(config) }
             poll.cancel()
-            val local = withContext(Dispatchers.IO) { repo.localPaths(config.shareId) }
+            val local = withContext(Dispatchers.IO) { repo.localPaths(config) }
             _ui.update {
                 it.copy(
                     busyShareId = null, progress = null, localPaths = local,
@@ -257,6 +288,108 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     fun cancelTransfer() {
         viewModelScope.launch { withContext(Dispatchers.IO) { NativeBridge.nativeCancelTransfer() } }
         _ui.update { it.copy(message = "Останавливаю…") }
+    }
+
+    // ── storage directory (XR-043) ──────────────────────────────────
+
+    private fun promptStorage(shareId: String, action: Pending) {
+        pending = action
+        _ui.update { it.copy(storageDialogFor = shareId, storagePromptMode = true) }
+    }
+
+    /** Open the storage dialog from share settings (change folder at any time). */
+    fun openStorageDialog(shareId: String) {
+        pending = null
+        _ui.update { it.copy(storageDialogFor = shareId, storagePromptMode = false) }
+    }
+
+    fun dismissStorageDialog() {
+        pending = null
+        _ui.update { it.copy(storageDialogFor = null, storagePromptMode = false) }
+    }
+
+    /** Close the dialog to show the system folder picker, keeping any deferred
+     *  first-sync action so it runs once the folder is chosen. */
+    fun hideStorageDialog() = _ui.update { it.copy(storageDialogFor = null) }
+
+    /**
+     * Apply a storage choice for [shareId]: [parentPath] null = the app directory,
+     * non-null = a user-picked **parent** folder (the share gets its own subfolder
+     * inside it, so the true-mirror delete can't touch the user's other files
+     * there). When the location changes, the already-downloaded files are migrated
+     * (moved, not re-downloaded) before the new path is persisted; a failed
+     * migration keeps the old location. On success any deferred first-sync action
+     * runs.
+     */
+    fun chooseStorage(shareId: String, parentPath: String?) {
+        val cfg = store.get(shareId) ?: return
+        val newPath = parentPath?.let { File(it, repo.shareSubdir(cfg)).absolutePath }
+        val newDir = repo.dirFor(newPath, shareId)
+        if (repo.destDir(cfg).absolutePath == newDir.absolutePath) {
+            store.update(shareId) { it.copy(storagePath = newPath, storageChosen = true) }
+            _ui.update { it.copy(storageDialogFor = null, storagePromptMode = false) }
+            runPending(shareId)
+            return
+        }
+        if (_ui.value.busyShareId != null) {
+            _ui.update { it.copy(message = "Идёт передача, попробуйте позже") }
+            return
+        }
+        _ui.update {
+            it.copy(
+                storageDialogFor = null, storagePromptMode = false,
+                busyShareId = shareId, progress = preparing(),
+            )
+        }
+        val poll = launchPolling()
+        viewModelScope.launch {
+            val outcome = withContext(Dispatchers.IO) { repo.migrateStorage(cfg, newDir) }
+            poll.cancel()
+            val persisted = outcome.ok && !outcome.cancelled
+            if (persisted) store.update(shareId) { it.copy(storagePath = newPath, storageChosen = true) }
+            val fresh = store.get(shareId)
+            val local = if (_ui.value.openShareId == shareId && fresh != null) {
+                withContext(Dispatchers.IO) { repo.localPaths(fresh) }
+            } else {
+                _ui.value.localPaths
+            }
+            _ui.update {
+                it.copy(
+                    busyShareId = null, progress = null, localPaths = local,
+                    message = migrateMessage(outcome, newPath),
+                )
+            }
+            if (persisted) runPending(shareId)
+        }
+    }
+
+    /** Re-dispatch the action the first-sync prompt deferred, now that the share's
+     *  config is updated (storageChosen = true, so it won't prompt again). */
+    private fun runPending(shareId: String) {
+        val p = pending ?: return
+        pending = null
+        if (p.shareIdOf() != shareId) return
+        when (p) {
+            is Pending.Download -> store.get(p.shareId)?.let { downloadAndOpen(it, p.entry) }
+            is Pending.Sync -> store.get(p.shareId)?.let { syncNow(it) }
+            is Pending.EnableSync -> setSyncEnabled(p.shareId, true)
+        }
+    }
+
+    private fun Pending.shareIdOf(): String = when (this) {
+        is Pending.Download -> shareId
+        is Pending.Sync -> shareId
+        is Pending.EnableSync -> shareId
+    }
+
+    private fun migrateMessage(o: ShareRepository.MigrateOutcome, newPath: String?): String = when {
+        o.error == "busy" -> "Идёт синхронизация, попробуйте позже"
+        o.error?.startsWith("no_space") == true -> "Недостаточно места в новой папке"
+        o.error != null -> "Не удалось перенести: ${o.error}"
+        o.cancelled -> "Перенос отменён, папка не изменена"
+        else -> "Папка: ${StorageAccess.label(newPath)} (перенесено ${o.moved})" +
+            (if (o.conflicts > 0) ", конфликтов ${o.conflicts}" else "") +
+            (if (o.failed > 0) ", ошибок ${o.failed}" else "")
     }
 
     private fun preparing() = Progress("Подготовка…", 0, 0, 0, 0, 0)

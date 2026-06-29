@@ -1107,6 +1107,39 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
     jstring_into_raw(&mut env, json)
 }
 
+/// Move a share's downloaded files from `src_dir` to `dst_dir` after a storage-
+/// directory change (XR-043), without re-downloading. Holds the single-transfer
+/// lock so it can't race the mirror engine (`"busy"` if one is running) and feeds
+/// the same progress controller the UI polls. Synchronous (a same-volume move is
+/// renames). Returns the report `{"moved":N,"bytes":N,"conflicts":[..],
+/// "failed":[[path,reason]..],"cancelled":bool}` or `{"error":".."}`.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeMigrateShareDir(
+    mut env: JNIEnv,
+    _class: JClass,
+    src_dir: JString,
+    dst_dir: JString,
+) -> jstring {
+    let src = match read_jstring(&mut env, &src_dir) {
+        Ok(s) => PathBuf::from(s),
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let dst = match read_jstring(&mut env, &dst_dir) {
+        Ok(s) => PathBuf::from(s),
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let (files, bytes) = sync::dir_totals(&src);
+    let json = match sync::TransferGuard::acquire(files, bytes) {
+        None => json_error("busy"),
+        Some(_guard) => match sync::migrate_dir(&src, &dst) {
+            Ok(report) => serde_json::to_string(&report)
+                .unwrap_or_else(|e| json_error(&format!("serialize: {e}"))),
+            Err(e) => json_error(&e),
+        },
+    };
+    jstring_into_raw(&mut env, json)
+}
+
 /// Poll the running transfer's progress as JSON (`{active,cancelled,file,
 /// files_done,files_total,bytes_done,bytes_total}`); `active:false` when idle.
 /// The UI polls this for a progress bar and computes speed from the byte delta.

@@ -16,6 +16,14 @@
          shows its "allow install from this source" gate — we never crash. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
+    <!-- Своя папка хранения шары (XR-043): движок синка пишет реальный FS-путь,
+         поэтому пользовательская папка на общем хранилище требует all-files
+         доступа. Приложение ставится сайдлоадом, ограничение Play на это
+         разрешение неприменимо. По умолчанию шара лежит в папке приложения и
+         разрешение не нужно; запрашиваем (через системные Настройки) только при
+         выборе своей папки. Android 11+. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
     <!-- Trusted-network auto-pause (task 3b-2): reading the current Wi-Fi SSID.
          FINE_LOCATION is the cross-version path that unredacts the SSID in
          NetworkCapabilities (API 29+); on Android 13+ NEARBY_WIFI_DEVICES is

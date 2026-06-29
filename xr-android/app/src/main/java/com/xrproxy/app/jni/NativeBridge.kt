@@ -210,6 +210,14 @@ object NativeBridge {
         timeoutMs: Long,
     ): String
 
+    /** Move a share's downloaded files from [srcDir] to [dstDir] after a storage-
+     *  directory change (XR-043), without re-downloading. Same-volume moves are
+     *  renames; cross-volume is copy+remove, pre-checked against free space. Holds
+     *  the single-transfer lock (`{"error":"busy"}` if a sync is running) and feeds
+     *  the same progress as a download. Returns `{"moved":N,"bytes":N,"conflicts":
+     *  [..],"failed":[[path,reason]..],"cancelled":bool}` or `{"error":".."}`. */
+    external fun nativeMigrateShareDir(srcDir: String, dstDir: String): String
+
     /** Poll the running transfer's progress: `{active,cancelled,file,files_done,
      *  files_total,bytes_done,bytes_total}` (`active:false` when idle). */
     external fun nativeTransferProgress(): String

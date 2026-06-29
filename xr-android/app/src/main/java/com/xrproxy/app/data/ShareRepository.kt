@@ -11,10 +11,12 @@ import java.io.File
 
 /**
  * File-sharing flows over the [NativeBridge] (LLD-19, XR-031). All diff/IO lives
- * in Rust (`xr-core::sync`); this composes the calls. Files land in the **app's
- * own directory** ([destDir]) — no SAF, no permissions — so the sync engine
- * works on a real filesystem path (which also fixed the empty-plan bug the SAF
- * layer caused). Every method blocks — call from a background dispatcher / Worker.
+ * in Rust (`xr-core::sync`); this composes the calls. Files mirror into a real
+ * filesystem path so the sync engine writes directly. SAF was dropped because it
+ * broke the diff with an empty plan. The path is the app's own per-share
+ * directory by default, or a user-picked folder on shared storage (XR-043,
+ * [ShareConfig.storagePath]). Every method blocks, so call it from a background
+ * dispatcher or Worker.
  */
 class ShareRepository(private val context: Context) {
 
@@ -28,16 +30,44 @@ class ShareRepository(private val context: Context) {
         val ok: Boolean get() = error == null
     }
 
-    /** The app-owned directory a share's files mirror into. */
-    fun destDir(shareId: String): File =
-        File(context.getExternalFilesDir("shares"), sanitize(shareId)).apply { mkdirs() }
+    /** Outcome of a storage-directory migration (XR-043). */
+    data class MigrateOutcome(
+        val moved: Int,
+        val conflicts: Int,
+        val failed: Int,
+        val cancelled: Boolean,
+        val error: String? = null,
+    ) {
+        val ok: Boolean get() = error == null
+    }
+
+    /** The directory a share's files mirror into: the user-picked folder if set
+     *  (XR-043), else the app's own per-share directory (the default). */
+    fun destDir(config: ShareConfig): File = dirFor(config.storagePath, config.shareId).apply { mkdirs() }
+
+    /** Resolve a (storagePath, shareId) pair to a directory without creating it.
+     *  Used to name the source and target of a migration. */
+    fun dirFor(storagePath: String?, shareId: String): File =
+        storagePath?.let { File(it) } ?: File(context.getExternalFilesDir("shares"), sanitize(shareId))
+
+    /** The per-share subfolder name to create inside a user-picked parent folder.
+     *  A share gets its own folder so the true-mirror delete (it removes local
+     *  files not in the selection) can never touch unrelated files the user keeps
+     *  alongside it on shared storage. Keeps a readable name (Cyrillic, spaces),
+     *  stripping only filesystem-unsafe characters; falls back to the id. */
+    fun shareSubdir(config: ShareConfig): String {
+        val cleaned = config.name.trim()
+            .replace(Regex("[/\\\\:*?\"<>|\\x00-\\x1F]"), "_")
+            .trim('.', ' ')
+        return cleaned.ifBlank { sanitize(config.shareId) }
+    }
 
     /** The local file for a share-relative path (for opening / existence checks). */
-    fun fileFor(shareId: String, relPath: String): File = File(destDir(shareId), relPath)
+    fun fileFor(config: ShareConfig, relPath: String): File = File(destDir(config), relPath)
 
     /** Share-relative paths already downloaded locally (drives the "downloaded" mark). */
-    fun localPaths(shareId: String): Set<String> {
-        val root = destDir(shareId)
+    fun localPaths(config: ShareConfig): Set<String> {
+        val root = destDir(config)
         val out = HashSet<String>()
         root.walkTopDown().filter { it.isFile }.forEach {
             out.add(it.relativeTo(root).path.replace(File.separatorChar, '/'))
@@ -48,8 +78,8 @@ class ShareRepository(private val context: Context) {
     /** A manifest built from the locally-downloaded files, for offline browsing:
      *  when the agent is unreachable the already-downloaded files must stay
      *  viewable and openable. Hash is empty (unknown offline); size/mtime local. */
-    fun localManifest(shareId: String): List<ManifestEntry> {
-        val root = destDir(shareId)
+    fun localManifest(config: ShareConfig): List<ManifestEntry> {
+        val root = destDir(config)
         return root.walkTopDown().filter { it.isFile }.map {
             ManifestEntry(
                 path = it.relativeTo(root).path.replace(File.separatorChar, '/'),
@@ -58,6 +88,27 @@ class ShareRepository(private val context: Context) {
                 sha256 = "",
             )
         }.sortedBy { it.path }.toList()
+    }
+
+    /** Move the share's already-downloaded files into [newDir] after a storage
+     *  change (XR-043). Offline, no re-download: the engine's hash diff sees the
+     *  moved files as already present. A no-op when the location is unchanged. */
+    fun migrateStorage(config: ShareConfig, newDir: File): MigrateOutcome {
+        val src = destDir(config)
+        if (src.absolutePath == newDir.absolutePath) return MigrateOutcome(0, 0, 0, false)
+        val res = NativeBridge.nativeMigrateShareDir(src.absolutePath, newDir.absolutePath)
+        return runCatching {
+            val o = JSONObject(res)
+            o.optString("error").takeIf { it.isNotBlank() && it != "null" }?.let {
+                return MigrateOutcome(0, 0, 0, false, it)
+            }
+            MigrateOutcome(
+                moved = o.optInt("moved"),
+                conflicts = o.optJSONArray("conflicts")?.length() ?: 0,
+                failed = o.optJSONArray("failed")?.length() ?: 0,
+                cancelled = o.optBoolean("cancelled", false),
+            )
+        }.getOrElse { MigrateOutcome(0, 0, 0, false, it.message ?: "migrate error") }
     }
 
     /** Shares attached to the user's invite (the access anchor, §9.5). */
@@ -76,7 +127,7 @@ class ShareRepository(private val context: Context) {
     fun downloadOne(config: ShareConfig, entry: ManifestEntry): String? {
         val token = config.tokenJson ?: return "no token"
         val res = NativeBridge.nativeDownloadFile(
-            config.agentBaseUrl, token, entry.toJson(), destDir(config.shareId).absolutePath, XFER_TIMEOUT_MS,
+            config.agentBaseUrl, token, entry.toJson(), destDir(config).absolutePath, XFER_TIMEOUT_MS,
         )
         return runCatching {
             val o = JSONObject(res)
@@ -98,7 +149,7 @@ class ShareRepository(private val context: Context) {
         if (config.selection.isEmpty()) return SyncOutcome(0, 0, 0)
         val token = config.tokenJson ?: return SyncOutcome(0, 0, 0, "no token")
         val res = NativeBridge.nativeSyncShare(
-            config.agentBaseUrl, token, destDir(config.shareId).absolutePath,
+            config.agentBaseUrl, token, destDir(config).absolutePath,
             config.selectionJson(), false, XFER_TIMEOUT_MS,
         )
         return runCatching {
