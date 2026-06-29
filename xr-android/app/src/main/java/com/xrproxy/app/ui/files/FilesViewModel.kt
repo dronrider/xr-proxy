@@ -50,6 +50,9 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         val currentPath: String = "",
         val manifest: List<ManifestEntry> = emptyList(),
         val manifestLoading: Boolean = false,
+        /** True when the manifest is the local-files fallback (agent unreachable):
+         *  only already-downloaded files are shown. */
+        val offlineLocal: Boolean = false,
         val localPaths: Set<String> = emptySet(),
         val busyShareId: String? = null,
         val progress: Progress? = null,
@@ -129,14 +132,25 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             )
         }
         viewModelScope.launch {
-            val (result, local) = withContext(Dispatchers.IO) {
-                repo.fetchManifest(config) to repo.localPaths(config.shareId)
+            val (result, localManifest) = withContext(Dispatchers.IO) {
+                repo.fetchManifest(config) to repo.localManifest(config.shareId)
             }
+            val local = localManifest.map { it.path }.toSet()
             _ui.update { st ->
                 if (st.openShareId != config.shareId) return@update st
                 result.fold(
-                    onSuccess = { st.copy(manifest = it, manifestLoading = false, localPaths = local) },
-                    onFailure = { st.copy(manifestLoading = false, message = "Манифест: ${it.message}") },
+                    onSuccess = {
+                        st.copy(manifest = it, manifestLoading = false, localPaths = local, offlineLocal = false)
+                    },
+                    onFailure = {
+                        // Agent unreachable (offline): still let the user browse and open
+                        // what was already downloaded, from the local files.
+                        if (localManifest.isNotEmpty()) {
+                            st.copy(manifest = localManifest, manifestLoading = false, localPaths = local, offlineLocal = true)
+                        } else {
+                            st.copy(manifestLoading = false, localPaths = local, message = "Манифест: ${it.message}")
+                        }
+                    },
                 )
             }
         }

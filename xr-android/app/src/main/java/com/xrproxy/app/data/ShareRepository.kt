@@ -45,6 +45,21 @@ class ShareRepository(private val context: Context) {
         return out
     }
 
+    /** A manifest built from the locally-downloaded files, for offline browsing:
+     *  when the agent is unreachable the already-downloaded files must stay
+     *  viewable and openable. Hash is empty (unknown offline); size/mtime local. */
+    fun localManifest(shareId: String): List<ManifestEntry> {
+        val root = destDir(shareId)
+        return root.walkTopDown().filter { it.isFile }.map {
+            ManifestEntry(
+                path = it.relativeTo(root).path.replace(File.separatorChar, '/'),
+                size = it.length(),
+                mtime = it.lastModified() / 1000,
+                sha256 = "",
+            )
+        }.sortedBy { it.path }.toList()
+    }
+
     /** Shares attached to the user's invite (the access anchor, §9.5). */
     fun inviteShares(hubUrl: String, inviteToken: String): Result<List<ShareGrant>> =
         ShareGrant.listFrom(NativeBridge.nativeInviteShares(hubUrl, inviteToken, INVITE_TIMEOUT_MS))

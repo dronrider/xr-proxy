@@ -244,6 +244,14 @@ private fun ExplorerView(
             Switch(checked = cfg.syncEnabled, onCheckedChange = { vm.setSyncEnabled(cfg.shareId, it) })
         }
         Breadcrumbs(cfg.name, ui.currentPath) { vm.navigateTo(it) }
+        if (ui.offlineLocal) {
+            Text(
+                "Офлайн: показаны только скачанные файлы",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 2.dp),
+            )
+        }
         val p = ui.progress
         if (p != null) ProgressBar(p) { vm.cancelTransfer() }
         HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
