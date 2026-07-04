@@ -9,7 +9,7 @@
 Admin SPA, axum, JSON-стор: расширяем реестром.
 [LLD-13](13-zero-touch-provisioning.md): bootstrap регистрирует роутер и пишет
 per-router ключ в конфиг (это «шов» установка -> учёт).
-[LLD-10](10-router-multi-vps-failover.md): `ServerPool`/`HealthState`, статус,
+[LLD-10](10-client-multi-vps-failover.md): `ServerPool`/`HealthState`, статус,
 который роутер репортит наверх. [LLD-11](11-monitoring-health-panel.md):
 классификация сбоя и `ServerHealth`, содержимое отчёта. [LLD-16](16-manual-server-hub-rules.md):
 per-router назначение пресетов через хаб.

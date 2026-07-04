@@ -472,7 +472,7 @@ GeoIP (за feature-flag).
 > failover, мониторинг/панель здоровья, самообновление APK, provisioning,
 > гибридный редактор правил — см. `local-docs/c5-start.md`), поэтому
 > trusted-networks занял свободный id **15**.
-| 10 | [10-router-multi-vps-failover.md](lld/10-router-multi-vps-failover.md) | Multi-VPS failover на роутере: `ServerPool` поверх нескольких `MuxPool` (по одному на сервер), primary/backup по приоритету, пассивный (breaker C1) + активный health-check, sticky-to-primary с failback hold-down. Обобщает LLD-09 от пула TCP до пула серверов. | Шаг 9 (LLD-09) | Draft |
+| 10 | [10-client-multi-vps-failover.md](lld/10-client-multi-vps-failover.md) | Multi-VPS failover клиента (роутер + Android): `ServerPool` поверх нескольких `MuxPool` (по одному на сервер), primary/backup по приоритету, пассивный (breaker C1) + активный health-check, sticky-to-primary с failback hold-down. На Android пул живёт внутри профиля (LLD-08), список серверов раздаётся подписанным инвайтом/пресетом хаба, на мобильном экономная политика проб без тёплого backup (XR-068). Обобщает LLD-09 от пула TCP до пула серверов. | Шаги 9 (LLD-09), 8 (LLD-08), 4 (LLD-04), 2 (LLD-01) | Draft |
 | 11 | [11-monitoring-health-panel.md](lld/11-monitoring-health-panel.md) | Мониторинг + уведомления + панель здоровья: классификация сбоя (`ServerUnreachable`/`HandshakeReset`/`AuthFailed`) в breaker, слои индикатора вместо смайлика, локальные уведомления падение/восстановление, напоминание об оплате (`paidUntil` в профиле). Объединяет задачи 6 и 10. | Шаги 3, 8 (LLD-08), 10 | Draft |
 | 12 | [12-android-apk-self-update.md](lld/12-android-apk-self-update.md) | Самообновление APK: xr-hub раздаёт APK + подписанный манифест версии (`/api/v1/app/latest`, `/api/v1/app/download/:ver`, файлы в `releases/`), приложение проверяет подпись **отдельным release-ключом** (pinned в сборке `BuildConfig.RELEASE_PUBLIC_KEY`, ≠ серверный) + SHA-256, ставит через `PackageInstaller`. VPS-compromise ≠ RCE. Verify — в `xr-core/update.rs`; CLI `xr-hub sign-release` / `gen-release-key` (офлайн-ключ). | Шаг 2 (LLD-01) | Implemented |
 | 13 | [13-zero-touch-provisioning.md](lld/13-zero-touch-provisioning.md) | Zero-touch provisioning: идемпотентный `xr-bootstrap` (VPS: xr-server+xr-hub; роутер: xr-client) + Android SSH-обёртка. Один движок, два профиля. Заканчивается выдачей инвайта (LLD-04). Этап 1 (bootstrap) — MVP, этап 2 (SSH из приложения) — поверх. | Шаги 2, 4, 8 (LLD-08), 10 | Draft |
@@ -484,7 +484,7 @@ GeoIP (за feature-flag).
 | 20 | [20-router-remote-management.md](lld/20-router-remote-management.md) | Удалённое управление роутерами поверх реестра LLD-17: подписанные команды из закрытого enum (`apply_preset`/`update_config` по белому списку полей/`reload`/`restart`/`deregister`) через тот же исходящий poll, верификация закреплённым ключом, least-privilege (не shell), аудит-лог. Компрометация VPS не равна RCE без офлайн-ключа подписи. | Шаги 17 (LLD-17), 2 (LLD-01), 16 (LLD-16) | Draft |
 
 **Предварительный порядок реализации второго пакета (C6+):** LLD-03 ✓ →
-**LLD-10** (failover-движок) → **LLD-08** (Android мультисервер) → **LLD-11**
+**LLD-10** (failover клиента: движок + роутер + Android) → **LLD-08** (Android мультисервер) → **LLD-11**
 (панель здоровья поверх 10+08) → **LLD-05 + LLD-14** связкой (общий `RuleFragment`)
 → **LLD-12** (self-update) → **LLD-13** (provisioning) → **LLD-17** (реестр +
 удалённое управление, поверх 13) → **LLD-18** (fleet-метрики/Grafana, поверх 17,

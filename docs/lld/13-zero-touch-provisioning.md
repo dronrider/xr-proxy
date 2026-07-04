@@ -10,7 +10,7 @@ ed25519-ключи, формат пресетов. [LLD-04](04-onboarding-qr-uri
 (`nativeApplyInvite`, TOFU): provisioning **заканчивается** выдачей такого инвайта,
 дальше работает существующий онбординг. [LLD-08](08-android-multi-server.md) —
 `ServerProfile`: свежеподнятый сервер добавляется как профиль.
-[LLD-10](10-router-multi-vps-failover.md) — поднятый сервер попадает в пул как
+[LLD-10](10-client-multi-vps-failover.md) — поднятый сервер попадает в пул как
 backup/primary; конфиг роутера генерируется в формате `[[servers]]`.
 [LLD-17](17-hub-router-registry.md) — после установки роутера bootstrap
 **регистрирует** его на хабе одноразовым enrollment-токеном и пишет `[control]`

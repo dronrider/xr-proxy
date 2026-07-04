@@ -9,7 +9,7 @@
 идентичность, per-router секрет и **исходящий poll** (роутер -> хаб). Здесь поверх
 него добавляются команды. [LLD-01](01-control-plane.md): xr-hub, ed25519, Admin
 SPA, JSON-стор. [LLD-16](16-manual-server-hub-rules.md): назначение пресета
-(команда `apply_preset`). [LLD-10](10-router-multi-vps-failover.md): поля
+(команда `apply_preset`). [LLD-10](10-client-multi-vps-failover.md): поля
 `[[servers]]` для `update_config`. [LLD-12](12-android-apk-self-update.md):
 отделённый офлайн-ключ подписи как образец (компрометация VPS не даёт права
 подписывать команды).

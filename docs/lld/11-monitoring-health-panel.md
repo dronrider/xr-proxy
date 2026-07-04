@@ -8,7 +8,7 @@
 **Зависимости:** [LLD-06](06-android-visual.md) — `ShieldArrowIcon`, `HealthFace`,
 палитра, раскладка статистики (этот LLD заменяет смайлик слоями статуса).
 [LLD-08](08-android-multi-server.md) — `ServerProfile`/`ServerRepository`; health
-и дата оплаты — атрибуты профиля. [LLD-10](10-router-multi-vps-failover.md) —
+и дата оплаты — атрибуты профиля. [LLD-10](10-client-multi-vps-failover.md) —
 `ServerPool` + `HealthState`: источник «сервер up/down/класс сбоя».
 [LLD-02](02-android-reliability.md) — `recentErrors`, `StatsSnapshot`, foreground
 notification, `POST_NOTIFICATIONS`.
