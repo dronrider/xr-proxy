@@ -312,7 +312,10 @@ fn default_true() -> bool {
     true
 }
 fn default_on_server_down() -> String {
-    "direct".into()
+    // fail-closed по умолчанию: домены в прокси напрямую либо не работают, либо
+    // светят реальный IP (риск блокировки аккаунта), поэтому «либо через прокси,
+    // либо никак». Перекрывается явным значением в конфиге.
+    "block".into()
 }
 fn default_log_level() -> String {
     "warn".into()
