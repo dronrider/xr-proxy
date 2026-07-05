@@ -72,7 +72,17 @@ domains = [
 [client]
 listen_port = 1080                    # Local port for transparent proxy
 auto_redirect = true                  # Auto-setup nftables/iptables rules
-on_server_down = "direct"             # "direct" = bypass if server is down, "block" = block traffic
+# Что делать, когда весь пул серверов недоступен:
+#   "block"  = резать проксируемый трафик (fail-closed). Домены попадают в
+#              прокси не просто так: напрямую они либо не открываются, либо
+#              работают с ограничениями, а случайная утечка реального IP может
+#              стоить блокировки аккаунта. Поэтому «либо через прокси, либо
+#              никак». Непроксируемый трафик (Direct по правилам) не затронут.
+#   "direct" = пускать проксируемый трафик напрямую (fail-open). Мягче
+#              деградирует, но светит реальный IP на заблокированных ресурсах.
+# failover primary -> backup внутри пула работает при любом значении; это
+# поведение только для случая, когда ЛЁГ ВЕСЬ пул.
+on_server_down = "block"
 log_level = "info"                    # error, warn, info, debug
 # bypass_ips: LAN devices whose traffic should NOT go through the proxy.
 # Useful for game consoles, smart TVs, etc. Use their static DHCP IP.
