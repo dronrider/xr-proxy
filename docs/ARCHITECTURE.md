@@ -102,6 +102,20 @@ Cargo-workspace + Android-модуль:
   default 4); стримы балансируются round-robin, при обрыве слота open_stream
   failover'ит на следующий, мёртвый слот переподнимается лениво. Это убирает
   HoL-blocking одного TCP — потеря пакета на одном туннеле не тормозит остальные.
+- [server_pool.rs](../xr-proto/src/server_pool.rs) вводит `ServerPool`
+  (LLD-10): пул *серверов* поверх нескольких `MuxPool` (по одному на VPS), строгий
+  primary/backup по приоритету (не балансировка). `open_stream` идёт в пул
+  активного сервера; отказ активного (breaker C1) переключает на следующий
+  здоровый, `Err` наружу только когда исчерпан весь пул (тогда клиент уводит
+  соединение в Direct). На primary возвращает фоновый `health_loop` с
+  hold-down (default 60с непрерывного up) против флаппинга. Энергопрофили
+  `PoolProfile`: роутер `router()` (тёплые резервы, проба каждые 15с),
+  Android `mobile()` (холодный backup, пробер живёт только пока активен
+  резерв, поэтому в здоровом простое ни одного лишнего пробуждения радио,
+  XR-068). Список серверов роутер берёт из `[[servers]]` в конфиге (legacy
+  `[server]` читается как пул из одного), Android держит `endpoints` внутри
+  `ServerProfile` и наполняет их руками или полем `servers` подписанного
+  инвайт-payload'а.
 - [invite_url.rs](../xr-proto/src/invite_url.rs) — парсер invite-ссылок
   для Android onboarding (LLD-04): `InviteLink::{Https, Custom}`,
   `parse_invite_link`, `build_https_url`. Принимает `https://<hub>/invite/<token>`
@@ -116,7 +130,9 @@ Cargo-workspace + Android-модуль:
 
 - [lib.rs](../xr-core/src/lib.rs) — реэкспорт модулей.
 - [engine.rs](../xr-core/src/engine.rs) — `VpnEngine` (start/stop) и `VpnConfig`.
-  Держит smoltcp-стек, `MuxPool`, обфускатор, роутер, fake DNS, статистику.
+  Держит smoltcp-стек, `ServerPool` (пул серверов, внутри `MuxPool` на
+  каждый), обфускатор, роутер, fake DNS, статистику. `on_network_changed`
+  ресайклит весь пул и возвращает активность primary'ю.
 - [ip_stack.rs](../xr-core/src/ip_stack.rs) — `PacketQueue` (мост между TUN и
   smoltcp), `IpStack` (userspace TCP/IP).
 - [dns.rs](../xr-core/src/dns.rs) — `FakeDns` в диапазоне 198.18.0.0/15 (RFC 2544).
@@ -291,7 +307,9 @@ Kotlin + Jetpack Compose, Material3, MVVM без DI-фреймворка.
 Поверх одного TCP-соединения работает **mux**: один живой обфусцированный
 канал, внутри — множество логических стримов (`MuxStream`). Клиент (xr-core или
 xr-client) держит `MuxPool`, который переиспользует туннель между сессиями и
-умеет переподключаться.
+умеет переподключаться. Над пулами стоит `ServerPool` (LLD-10): по `MuxPool`
+на каждый VPS из списка, primary/backup по приоритету, failover при падении
+активного и failback с hold-down после восстановления primary.
 
 ### 5.2 UDP relay
 
@@ -382,9 +400,10 @@ GeoIP (за feature-flag).
 1. Старт: читает TOML, поднимает TCP listener + UDP TPROXY socket, ставит
    nftables-правила перенаправления.
 2. Входящее TCP-соединение (TPROXY): `SO_ORIGINAL_DST` → SNI extraction →
-   `Router::resolve(host, ip)` → либо `MuxPool` до VPS, либо прямое соединение.
+   `Router::resolve(host, ip)` → либо `ServerPool` (mux до активного VPS,
+   failover на резервный внутри пула), либо прямое соединение.
 3. Входящий UDP: `recvmsg` + `IP_ORIGDSTADDR` → UDP-relay до VPS → spoofed-ответ.
-4. Стоп: cleanup nftables, закрытие MuxPool. Всё управляется procd + watchdog
+4. Стоп: cleanup nftables, закрытие mux-пулов. Всё управляется procd + watchdog
    (см. [deploy/](../deploy/)).
 
 ### 7.2 xr-android
@@ -472,7 +491,7 @@ GeoIP (за feature-flag).
 > failover, мониторинг/панель здоровья, самообновление APK, provisioning,
 > гибридный редактор правил — см. `local-docs/c5-start.md`), поэтому
 > trusted-networks занял свободный id **15**.
-| 10 | [10-client-multi-vps-failover.md](lld/10-client-multi-vps-failover.md) | Multi-VPS failover клиента (роутер + Android): `ServerPool` поверх нескольких `MuxPool` (по одному на сервер), primary/backup по приоритету, пассивный (breaker C1) + активный health-check, sticky-to-primary с failback hold-down. На Android пул живёт внутри профиля (LLD-08), список серверов раздаётся подписанным инвайтом/пресетом хаба, на мобильном экономная политика проб без тёплого backup (XR-068). Обобщает LLD-09 от пула TCP до пула серверов. | Шаги 9 (LLD-09), 8 (LLD-08), 4 (LLD-04), 2 (LLD-01) | Draft |
+| 10 | [10-client-multi-vps-failover.md](lld/10-client-multi-vps-failover.md) | Multi-VPS failover клиента (роутер + Android): `ServerPool` поверх нескольких `MuxPool` (по одному на сервер), primary/backup по приоритету, пассивный (breaker C1) + активный health-check, sticky-to-primary с failback hold-down. На Android пул живёт внутри профиля (LLD-08), список серверов раздаётся подписанным инвайтом/пресетом хаба, на мобильном экономная политика проб без тёплого backup (XR-068). Обобщает LLD-09 от пула TCP до пула серверов. | Шаги 9 (LLD-09), 8 (LLD-08), 4 (LLD-04), 2 (LLD-01) | Implemented |
 | 11 | [11-monitoring-health-panel.md](lld/11-monitoring-health-panel.md) | Мониторинг + уведомления + панель здоровья: классификация сбоя (`ServerUnreachable`/`HandshakeReset`/`AuthFailed`) в breaker, слои индикатора вместо смайлика, локальные уведомления падение/восстановление, напоминание об оплате (`paidUntil` в профиле). Объединяет задачи 6 и 10. | Шаги 3, 8 (LLD-08), 10 | Draft |
 | 12 | [12-android-apk-self-update.md](lld/12-android-apk-self-update.md) | Самообновление APK: xr-hub раздаёт APK + подписанный манифест версии (`/api/v1/app/latest`, `/api/v1/app/download/:ver`, файлы в `releases/`), приложение проверяет подпись **отдельным release-ключом** (pinned в сборке `BuildConfig.RELEASE_PUBLIC_KEY`, ≠ серверный) + SHA-256, ставит через `PackageInstaller`. VPS-compromise ≠ RCE. Verify — в `xr-core/update.rs`; CLI `xr-hub sign-release` / `gen-release-key` (офлайн-ключ). | Шаг 2 (LLD-01) | Implemented |
 | 13 | [13-zero-touch-provisioning.md](lld/13-zero-touch-provisioning.md) | Zero-touch provisioning: идемпотентный `xr-bootstrap` (VPS: xr-server+xr-hub; роутер: xr-client) + Android SSH-обёртка. Один движок, два профиля. Заканчивается выдачей инвайта (LLD-04). Этап 1 (bootstrap) — MVP, этап 2 (SSH из приложения) — поверх. | Шаги 2, 4, 8 (LLD-08), 10 | Draft |
