@@ -31,3 +31,19 @@ obfuscation_key = "YOUR_BASE64_KEY"
 modifier = "positional_xor_rotate"
 salt = 0xDEADBEEF
 hub_url = "https://xr-hub.example.com"
+
+# Пул серверов в инвайте (LLD-10): приложение получает список и делает
+# failover само. Legacy-поля server_address/server_port выше при заданном
+# пуле игнорируются, payload заполняется primary'м из списка.
+#
+# [[invites.defaults.servers]]
+# name = "aeza"
+# address = "PRIMARY_SERVER_IP"
+# port = 8443
+# priority = 0                      # меньше = выше приоритет
+#
+# [[invites.defaults.servers]]
+# name = "timeweb"
+# address = "BACKUP_SERVER_IP"
+# port = 8443
+# priority = 1

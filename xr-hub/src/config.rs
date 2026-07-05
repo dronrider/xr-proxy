@@ -62,6 +62,8 @@ pub struct SigningConfig {
 
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct InviteDefaults {
+    /// Legacy одиночный сервер. При заданном `servers` игнорируется:
+    /// legacy-поля payload'а заполняются primary'м из списка.
     #[serde(default)]
     pub server_address: String,
     #[serde(default = "default_server_port")]
@@ -74,6 +76,21 @@ pub struct InviteDefaults {
     pub salt: u64,
     #[serde(default)]
     pub hub_url: String,
+    /// Пул серверов для failover на клиенте (LLD-10 §2.8): та же схема, что
+    /// `[[servers]]` роутера, в TOML это `[[invites.defaults.servers]]`.
+    #[serde(default)]
+    pub servers: Vec<xr_proto::preset::PayloadServer>,
+}
+
+impl InviteDefaults {
+    /// Список серверов payload'а, отсортированный по приоритету. Пустой,
+    /// если хаб сконфигурирован только legacy-полями; клиент тогда строит
+    /// пул из одного `server_address`.
+    pub fn sorted_servers(&self) -> Vec<xr_proto::preset::PayloadServer> {
+        let mut servers = self.servers.clone();
+        servers.sort_by_key(|s| s.priority);
+        servers
+    }
 }
 
 impl Default for InviteDefaults {
@@ -85,6 +102,7 @@ impl Default for InviteDefaults {
             modifier: default_modifier(),
             salt: 0,
             hub_url: String::new(),
+            servers: Vec::new(),
         }
     }
 }

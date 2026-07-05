@@ -242,14 +242,22 @@ pub async fn create_invite(
         p
     } else {
         let preset_name = req.preset.unwrap_or_default();
+        // Пул серверов из конфига хаба (LLD-10 §2.8); legacy-поля всегда
+        // несут primary, чтобы старое приложение работало по ним как раньше.
+        let servers = defaults.sorted_servers();
+        let (server_address, server_port) = servers
+            .first()
+            .map(|s| (s.address.clone(), s.port))
+            .unwrap_or_else(|| (defaults.server_address.clone(), defaults.server_port));
         InvitePayload {
-            server_address: defaults.server_address.clone(),
-            server_port: defaults.server_port,
+            server_address,
+            server_port,
             obfuscation_key: defaults.obfuscation_key.clone(),
             modifier: defaults.modifier.clone(),
             salt: defaults.salt,
             preset: preset_name,
             hub_url: defaults.hub_url.clone(),
+            servers,
         }
     };
 
