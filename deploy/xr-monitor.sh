@@ -41,11 +41,13 @@ done
 
 echo "$TS xr=$ALIVE fd=$FD rss=${RSS}k memavail=${MEM_AVAIL}M xr_proxy=$PROXY killswitch=$KS mux[ $MUX]" >> "$STATUS_LOG"
 
-# Аномалия: приложение лежит или redirect снят при живом хосте. Оба состояния
-# это либо текущая утечка (redirect снят, трафик идёт напрямую), либо её канун.
-if [ "$ALIVE" = DOWN ] || [ "$PROXY" = NO ]; then
+# Аномалия: приложение лежит, redirect снят, ЛИБО RSS перевалил порог (утечка
+# памяти близка к деградации). Ловим полный контекст ДО того, как кольцо logread
+# в RAM перезатрёт логи инцидента: субминутное окно теряется иначе.
+RSS_ANOMALY_KB=12000
+if [ "$ALIVE" = DOWN ] || [ "$PROXY" = NO ] || { [ -n "$RSS" ] && [ "$RSS" -gt "$RSS_ANOMALY_KB" ]; }; then
     {
-        echo "=== ANOMALY $TS xr=$ALIVE xr_proxy=$PROXY killswitch=$KS ==="
+        echo "=== ANOMALY $TS xr=$ALIVE xr_proxy=$PROXY killswitch=$KS rss=${RSS}k ==="
         echo "--- logread (xr) ---"
         logread 2>/dev/null | grep -iE 'xr-client|xr-watchdog|xr-monitor' | tail -50
         echo "--- dmesg tail ---"

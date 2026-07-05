@@ -9,6 +9,13 @@ export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
 CRASHLOG=/etc/xr-proxy/crash.log
 
+# Порог RSS xr-client (КБ), выше которого watchdog его перезапускает. Мера против
+# утечки памяти (XR-079): под потоком RSS ползёт и рантайм деградирует до отказа
+# прокси, хотя процесс жив (pidof его видит, поэтому обычная проверка не ловит).
+# Baseline ~6 МБ, деградация наблюдалась к ~14 МБ. Рестарт fail-closed: kill-switch
+# держит окно без redirect. Временно, пока не устранён корень утечки.
+RSS_MAX_KB=15000
+
 # Fail-closed kill-switch (XR-077): держим постоянно, пока сервис под присмотром.
 # Ставим только если таблицы нет (без периодического пере-создания, чтобы не
 # флапать forward-drop). Это гарантирует, что в любое окно, когда xr-client не
@@ -110,6 +117,18 @@ else
         if [ "$current" != "-900" ]; then
             echo -900 > "/proc/$pid/oom_score_adj" 2>/dev/null
             logger -t xr-watchdog "OOM protection set for PID $pid"
+        fi
+    fi
+
+    # Мера против утечки памяти (XR-079): процесс жив, но RSS перевалил порог, а
+    # значит рантайм близок к деградации (прокси встанет, не упав). Рестартим до
+    # отказа. kill-switch держит окно рестарта fail-closed, утечки не будет.
+    if [ -n "$pid" ]; then
+        rss=$(awk '/VmRSS/{print $2}' "/proc/$pid/status" 2>/dev/null)
+        if [ -n "$rss" ] && [ "$rss" -gt "$RSS_MAX_KB" ]; then
+            logger -t xr-watchdog "xr-client RSS ${rss}k > ${RSS_MAX_KB}k, restarting (memory-leak mitigation)"
+            { echo "=== RSS-RESTART $(date '+%Y-%m-%d %H:%M:%S') rss=${rss}k ==="; } >> "$CRASHLOG"
+            /etc/init.d/xr-proxy restart
         fi
     fi
 fi
