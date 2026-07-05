@@ -129,8 +129,20 @@ class ServerRepository(private val prefs: SharedPreferences) {
     private fun toJson(p: ServerProfile): JSONObject = JSONObject().apply {
         put("id", p.id)
         put("name", p.name)
-        put("server_address", p.serverAddress)
-        put("server_port", p.serverPort)
+        // Legacy-поля зеркалят primary (endpoints[0]): откат на старую версию
+        // приложения не теряет адрес (LLD-10 §5.7).
+        val eps = p.effectiveEndpoints
+        put("server_address", eps.firstOrNull()?.address ?: p.serverAddress)
+        put("server_port", eps.firstOrNull()?.port ?: p.serverPort)
+        put("endpoints", JSONArray().apply {
+            eps.forEach { ep ->
+                put(JSONObject().apply {
+                    put("name", ep.name)
+                    put("address", ep.address)
+                    put("port", ep.port)
+                })
+            }
+        })
         put("obfuscation_key", p.obfuscationKey)
         put("modifier", p.modifier)
         put("salt", p.salt)
@@ -150,6 +162,7 @@ class ServerRepository(private val prefs: SharedPreferences) {
         name = j.optString("name", ""),
         serverAddress = j.optString("server_address", ""),
         serverPort = j.optInt("server_port", 8443),
+        endpoints = parseEndpoints(j),
         obfuscationKey = j.optString("obfuscation_key", ""),
         modifier = j.optString("modifier", "positional_xor_rotate"),
         salt = j.optLong("salt", 0xDEADBEEFL),
@@ -167,6 +180,24 @@ class ServerRepository(private val prefs: SharedPreferences) {
             ServerSource.Manual
         },
     )
+
+    /** Пул адресов профиля (LLD-10). Профиль, сохранённый до появления
+     *  `endpoints`, отдаёт пустой список: миграция ленивая, через
+     *  `effectiveEndpoints` (legacy-поля), а при первом же сохранении
+     *  список материализуется в prefs. */
+    private fun parseEndpoints(j: JSONObject): List<ProfileEndpoint> {
+        val arr = j.optJSONArray("endpoints") ?: return emptyList()
+        return (0 until arr.length()).mapNotNull { i ->
+            val ep = arr.optJSONObject(i) ?: return@mapNotNull null
+            val address = ep.optString("address", "").trim()
+            if (address.isEmpty()) return@mapNotNull null
+            ProfileEndpoint(
+                name = ep.optString("name", ""),
+                address = address,
+                port = ep.optInt("port", 8443),
+            )
+        }
+    }
 
     companion object {
         private const val KEY_SERVERS = "servers"

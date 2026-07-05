@@ -565,6 +565,17 @@ fun ConnectionSection(
             color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 
+    // Активен резервный сервер пула (LLD-10 §2.6): primary упал, движок
+    // увёл трафик на backup. Строка исчезает после failback.
+    if (state.connected && state.backupActive && state.activeServer.isNotBlank()) {
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "через ${state.activeServer} (резерв)",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.tertiary,
+        )
+    }
+
     // Version
     val context = LocalContext.current
     val versionName = remember {

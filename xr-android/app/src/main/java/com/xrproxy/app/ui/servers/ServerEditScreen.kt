@@ -16,8 +16,11 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentPaste
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
@@ -33,15 +36,18 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import com.xrproxy.app.data.ProfileEndpoint
 import com.xrproxy.app.data.ServerProfile
 import com.xrproxy.app.data.ServerSource
 import com.xrproxy.app.ui.VpnViewModel
@@ -65,8 +71,15 @@ fun ServerEditScreen(
     )
 
     var name by remember { mutableStateOf(base.name) }
-    var address by remember { mutableStateOf(base.serverAddress) }
-    var port by remember { mutableStateOf(base.serverPort.toString()) }
+    // Пул адресов (LLD-10): порядок в списке и есть приоритет, первый это
+    // primary. Легаси-профиль разворачивается в одну строку.
+    val endpoints = remember {
+        val initial = base.effectiveEndpoints.ifEmpty {
+            listOf(ProfileEndpoint(address = "", port = 8443))
+        }
+        mutableStateListOf(*initial.map { EndpointDraft(it.name, it.address, it.port.toString()) }
+            .toTypedArray())
+    }
     var key by remember { mutableStateOf(base.obfuscationKey) }
     var showKey by remember { mutableStateOf(false) }
     var modifier by remember { mutableStateOf(base.modifier) }
@@ -80,7 +93,7 @@ fun ServerEditScreen(
     var hubTouched by remember { mutableStateOf(base.hubUrl.isNotBlank()) }
 
     var nameError by remember { mutableStateOf(false) }
-    var addressError by remember { mutableStateOf(false) }
+    var endpointsError by remember { mutableStateOf(false) }
     var keyError by remember { mutableStateOf(false) }
     var saltError by remember { mutableStateOf(false) }
 
@@ -88,10 +101,12 @@ fun ServerEditScreen(
 
     fun validate(): Boolean {
         nameError = name.isBlank()
-        addressError = address.isBlank()
+        // Минимум один адрес, пустых строк в пуле нет: та же валидация,
+        // что у [[servers]] на роутере.
+        endpointsError = endpoints.isEmpty() || endpoints.any { it.address.isBlank() }
         keyError = key.isBlank()
         saltError = parseSalt(salt) == null
-        return !nameError && !addressError && !keyError && !saltError
+        return !nameError && !endpointsError && !keyError && !saltError
     }
 
     Scaffold(
@@ -123,28 +138,79 @@ fun ServerEditScreen(
             )
             Spacer(Modifier.height(8.dp))
 
-            OutlinedTextField(
-                value = address,
-                onValueChange = {
-                    address = it; addressError = false
-                    // Default the hub URL to the server address (https) until
-                    // the user overrides it — see the Hub field below.
-                    if (!hubTouched) hubUrl = if (it.isBlank()) "" else "https://${it.trim()}"
-                },
-                label = { Text("Адрес сервера") },
-                placeholder = { Text("1.2.3.4") },
-                modifier = Modifier.fillMaxWidth(), singleLine = true,
-                isError = addressError,
-                supportingText = if (addressError) {{ Text("Обязательное поле") }} else null,
+            Text("Серверы", style = MaterialTheme.typography.titleSmall)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Первый адрес основной, остальные резервные: при падении " +
+                    "основного трафик сам переключится на следующий.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(Modifier.height(8.dp))
 
-            OutlinedTextField(
-                value = port, onValueChange = { port = it },
-                label = { Text("Порт") },
-                modifier = Modifier.fillMaxWidth(), singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            )
+            endpoints.forEachIndexed { idx, draft ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    OutlinedTextField(
+                        value = draft.address,
+                        onValueChange = {
+                            endpoints[idx] = draft.copy(address = it)
+                            endpointsError = false
+                            // Default the hub URL to the primary address (https)
+                            // until the user overrides it (see the Hub field below).
+                            if (idx == 0 && !hubTouched) {
+                                hubUrl = if (it.isBlank()) "" else "https://${it.trim()}"
+                            }
+                        },
+                        label = { Text(if (idx == 0) "Адрес сервера" else "Резерв ${idx}") },
+                        placeholder = { Text("1.2.3.4") },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                        isError = endpointsError && draft.address.isBlank(),
+                        supportingText = if (endpointsError && draft.address.isBlank()) {
+                            { Text("Обязательное поле") }
+                        } else null,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedTextField(
+                        value = draft.port,
+                        onValueChange = { endpoints[idx] = draft.copy(port = it) },
+                        label = { Text("Порт") },
+                        modifier = Modifier.width(96.dp),
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    )
+                    if (endpoints.size > 1) {
+                        IconButton(
+                            onClick = {
+                                if (idx > 0) {
+                                    // Вверх по списку = выше приоритет.
+                                    val tmp = endpoints[idx - 1]
+                                    endpoints[idx - 1] = endpoints[idx]
+                                    endpoints[idx] = tmp
+                                }
+                            },
+                            enabled = idx > 0,
+                        ) {
+                            Icon(Icons.Default.ArrowUpward, "Выше приоритет")
+                        }
+                        IconButton(onClick = { endpoints.removeAt(idx) }) {
+                            Icon(Icons.Default.Delete, "Удалить адрес")
+                        }
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+            }
+            OutlinedButton(
+                onClick = { endpoints.add(EndpointDraft("", "", "8443")) },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(Icons.Default.Add, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Добавить резервный адрес")
+            }
             Spacer(Modifier.height(16.dp))
 
             Text("Обфускация", style = MaterialTheme.typography.titleSmall)
@@ -293,12 +359,21 @@ fun ServerEditScreen(
             Button(
                 onClick = {
                     if (!validate()) return@Button
-                    val trimmedAddress = address.trim()
-                    val autoName = name.ifBlank { trimmedAddress }
+                    val newEndpoints = endpoints.map {
+                        ProfileEndpoint(
+                            name = it.name,
+                            address = it.address.trim(),
+                            port = it.port.toIntOrNull() ?: 8443,
+                        )
+                    }
+                    val primary = newEndpoints.first()
+                    val autoName = name.ifBlank { primary.address }
                     val profile = base.copy(
                         name = autoName,
-                        serverAddress = trimmedAddress,
-                        serverPort = port.toIntOrNull() ?: 8443,
+                        // Legacy-поля зеркалят primary (LLD-10 §5.7).
+                        serverAddress = primary.address,
+                        serverPort = primary.port,
+                        endpoints = newEndpoints,
                         obfuscationKey = key.trim(),
                         modifier = modifier,
                         salt = parseSalt(salt) ?: DEFAULT_SALT,
@@ -337,6 +412,17 @@ internal fun normalizeHubUrl(input: String): String {
     if (t.isEmpty()) return ""
     return if (t.contains("://")) t else "https://$t"
 }
+
+/**
+ * Черновик строки пула в редакторе: порт как текст (пока набирается), имя
+ * не редактируется, но сохраняется. Оно приходит из инвайта и питает
+ * статусную строку «через X (резерв)».
+ */
+private data class EndpointDraft(
+    val name: String,
+    val address: String,
+    val port: String,
+)
 
 private const val DEFAULT_SALT = 0xDEADBEEFL
 

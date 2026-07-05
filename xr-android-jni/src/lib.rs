@@ -228,9 +228,10 @@ fn parse_config(json: &str) -> Result<VpnConfig, String> {
     let mux_pool_size = get_num("mux_pool_size").map(|v| v as usize).unwrap_or(0);
 
     let dns_resolvers = parse_dns_resolvers(json);
+    let servers = parse_servers(json);
 
     Ok(VpnConfig {
-        server_address, server_port, obfuscation_key, modifier, salt,
+        server_address, server_port, servers, obfuscation_key, modifier, salt,
         padding_min, padding_max, routing, geoip_path: None, on_server_down,
         dns_resolvers,
         hub_url, hub_preset, hub_cache_dir, hub_refresh_interval_secs,
@@ -239,6 +240,42 @@ fn parse_config(json: &str) -> Result<VpnConfig, String> {
         system_resolver: None,
         mux_pool_size,
     })
+}
+
+/// Extract the `servers` array (LLD-10): `[{"name":"aeza","address":"1.2.3.4",
+/// "port":8443}, ...]`, порядок в массиве и есть приоритет. Разбирается
+/// полноценным serde_json (в отличие от остального ad-hoc парсера): это
+/// вложенные объекты, ручной парсер их не потянет. Отсутствие ключа или
+/// битый JSON дают пустой список, движок тогда работает по legacy-полю.
+fn parse_servers(json: &str) -> Vec<xr_proto::config::ServerEntry> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return vec![];
+    };
+    let Some(arr) = value.get("servers").and_then(|v| v.as_array()) else {
+        return vec![];
+    };
+    arr.iter()
+        .enumerate()
+        .filter_map(|(idx, item)| {
+            let address = item.get("address")?.as_str()?.trim().to_string();
+            if address.is_empty() {
+                return None;
+            }
+            Some(xr_proto::config::ServerEntry {
+                name: item
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                address,
+                port: item.get("port").and_then(|v| v.as_u64()).unwrap_or(8443) as u16,
+                priority: idx as u32,
+                key: None,
+                salt: None,
+                modifier: None,
+            })
+        })
+        .collect()
 }
 
 /// Extract the `dns_resolvers` JSON array of strings, e.g.
@@ -535,10 +572,16 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetStats(
             let errors_json: Vec<String> = errors.iter()
                 .map(|e| format!("\"{}\"", e.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ")))
                 .collect();
+            // Активный сервер пула (LLD-10): имя + признак резерва для
+            // статусной строки «через X (резерв)» на главном экране.
+            let (srv_name, srv_backup) = h.engine.active_server_info()
+                .unwrap_or_default();
+            let srv_escaped = srv_name.replace('\\', "\\\\").replace('"', "\\\"");
             format!(
-                "{{\"bytes_up\":{},\"bytes_down\":{},\"active\":{},\"total\":{},\"uptime\":{},\"dns\":{},\"syns\":{},\"smol_recv\":{},\"smol_send\":{},\"relay_warn\":{},\"relay_err\":{},\"debug\":\"{}\",\"errors\":[{}]}}",
+                "{{\"bytes_up\":{},\"bytes_down\":{},\"active\":{},\"total\":{},\"uptime\":{},\"dns\":{},\"syns\":{},\"smol_recv\":{},\"smol_send\":{},\"relay_warn\":{},\"relay_err\":{},\"debug\":\"{}\",\"active_server\":\"{}\",\"backup_active\":{},\"errors\":[{}]}}",
                 s.bytes_up, s.bytes_down, s.active_connections, s.total_connections, s.uptime_seconds,
                 s.dns_queries, s.tcp_syns, s.smol_recv, s.smol_send, s.relay_warns, s.relay_errors, debug_escaped,
+                srv_escaped, srv_backup,
                 errors_json.join(",")
             )
         }
@@ -1247,5 +1290,51 @@ domains = ["youtube.com", "*.youtube.com"]"#;
     fn parse_dns_resolvers_with_whitespace() {
         let json = r#"{"dns_resolvers": [ "1.1.1.1" , "8.8.4.4" ]}"#;
         assert_eq!(parse_dns_resolvers(json), vec!["1.1.1.1", "8.8.4.4"]);
+    }
+
+    /// Пул серверов в JNI-конфиге (LLD-10): массив объектов, порядок в массиве
+    /// и есть приоритет.
+    #[test]
+    fn parse_servers_basic() {
+        let json = r#"{
+            "server_address": "1.2.3.4",
+            "servers": [
+                {"name": "aeza", "address": "1.2.3.4", "port": 8443},
+                {"name": "timeweb", "address": "5.6.7.8", "port": 9000}
+            ]
+        }"#;
+        let servers = parse_servers(json);
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].name, "aeza");
+        assert_eq!(servers[0].priority, 0);
+        assert_eq!(servers[1].address, "5.6.7.8");
+        assert_eq!(servers[1].port, 9000);
+        assert_eq!(servers[1].priority, 1);
+    }
+
+    /// Легаси-конфиг без `servers` даёт пустой список: движок строит пул из
+    /// одиночного `server_address`, поведение прежнее.
+    #[test]
+    fn parse_servers_missing_falls_back_to_legacy() {
+        let json = r#"{"server_address":"1.2.3.4","server_port":8443,"obfuscation_key":"a2V5"}"#;
+        assert!(parse_servers(json).is_empty());
+
+        let cfg = parse_config(json).unwrap();
+        assert!(cfg.servers.is_empty());
+        assert_eq!(cfg.server_address, "1.2.3.4");
+    }
+
+    /// Записи без адреса выбрасываются, порт по умолчанию 8443.
+    #[test]
+    fn parse_servers_skips_bad_entries() {
+        let json = r#"{"servers": [
+            {"name": "no-addr"},
+            {"address": "  "},
+            {"address": "9.9.9.9"}
+        ]}"#;
+        let servers = parse_servers(json);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].address, "9.9.9.9");
+        assert_eq!(servers[0].port, 8443);
     }
 }

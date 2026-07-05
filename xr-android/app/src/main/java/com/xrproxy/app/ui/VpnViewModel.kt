@@ -16,6 +16,7 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
+import com.xrproxy.app.data.ProfileEndpoint
 import com.xrproxy.app.data.ServerProfile
 import com.xrproxy.app.data.ServerRepository
 import com.xrproxy.app.data.ServerSource
@@ -114,6 +115,10 @@ data class VpnUiState(
     /** Log tab search query (LLD-03). Lives in VM so it survives tab switches. */
     val logQuery: String = "",
     val logRegexMode: Boolean = false,
+    /** Имя активного сервера пула (LLD-10); пустое, пока движок не запущен. */
+    val activeServer: String = "",
+    /** Активен резерв, статусная строка показывает «через X (резерв)». */
+    val backupActive: Boolean = false,
 ) {
     val connected: Boolean
         get() = phase == ConnectPhase.Connected
@@ -710,12 +715,19 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             val serverAddr = payload.optString("server_address")
             val serverPort = payload.optInt("server_port", 8443)
             val presetName = payload.optString("preset")
+            // Пул серверов из payload'а (LLD-10 §2.8); легаси-инвайт без
+            // `servers` даёт профиль с одним адресом, как раньше.
+            val endpoints = parsePayloadServers(payload).ifEmpty {
+                if (serverAddr.isBlank()) emptyList()
+                else listOf(ProfileEndpoint(address = serverAddr, port = serverPort))
+            }
 
             val profile = ServerProfile(
                 id = UUID.randomUUID().toString(),
                 name = repo.generateName(serverAddr, hubFromPayload, current.comment),
-                serverAddress = serverAddr,
-                serverPort = serverPort,
+                serverAddress = endpoints.firstOrNull()?.address ?: serverAddr,
+                serverPort = endpoints.firstOrNull()?.port ?: serverPort,
+                endpoints = endpoints,
                 obfuscationKey = payload.optString("obfuscation_key"),
                 modifier = payload.optString("modifier", "positional_xor_rotate"),
                 salt = payload.optLong("salt", 0xDEADBEEFL),
@@ -735,6 +747,22 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             }
             _onboardingState.value = OnboardingState.Completed
         }
+    }
+
+    /** Список серверов инвайт-payload'а, отсортированный по `priority`. */
+    private fun parsePayloadServers(payload: JSONObject): List<ProfileEndpoint> {
+        val arr = payload.optJSONArray("servers") ?: return emptyList()
+        return (0 until arr.length())
+            .mapNotNull { i -> arr.optJSONObject(i) }
+            .filter { it.optString("address").isNotBlank() }
+            .sortedBy { it.optInt("priority", 0) }
+            .map {
+                ProfileEndpoint(
+                    name = it.optString("name", ""),
+                    address = it.optString("address"),
+                    port = it.optInt("port", 8443),
+                )
+            }
     }
 
     private fun friendlyInviteInfoError(code: String): String = when (code) {
@@ -766,7 +794,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         val s = _uiState.value
         if (s.phase != ConnectPhase.Idle) return
         val server = repo.activeServer()
-        if (server == null || server.serverAddress.isBlank() || server.obfuscationKey.isBlank()) {
+        if (server == null || server.effectiveEndpoints.isEmpty() || server.obfuscationKey.isBlank()) {
             emitMessage("Заполните сервер и ключ", UiSeverity.Info)
             return
         }
@@ -867,6 +895,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             recentErrors = (snap?.recentErrors ?: emptyList()) + svcState.probeLog,
             pausedSsid = svcState.pausedSsid,
             restrictedNetwork = svcState.restrictedNetwork,
+            activeServer = snap?.activeServer ?: "",
+            backupActive = snap?.backupActive ?: false,
         )
         if (svcState.phase == XrVpnService.Phase.Error && svcState.errorMessage != null) {
             emitMessage(svcState.errorMessage, UiSeverity.Error)
@@ -896,10 +926,23 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 "hub_cache_dir": "${presetCacheDir.absolutePath}",
                 "hub_refresh_interval_secs": 300"""
         } else ""
+        // Пул серверов (LLD-10): порядок в массиве и есть приоритет.
+        // Legacy-поля с primary остаются рядом, движок и старые версии
+        // читают их как раньше.
+        val endpoints = server.effectiveEndpoints
+        // Пустой пул сюда не доходит (onConnectClicked валидирует), но пустой
+        // адрес пусть отвергает движок своей ошибкой, а не NPE здесь.
+        val primary = endpoints.firstOrNull()
+            ?: ProfileEndpoint(address = server.serverAddress, port = server.serverPort)
+        fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
+        val serversArray = endpoints.joinToString(", ") {
+            """{"name": "${esc(it.name)}", "address": "${esc(it.address)}", "port": ${it.port}}"""
+        }
         return """
             {
-                "server_address": "${server.serverAddress}",
-                "server_port": ${server.serverPort},
+                "server_address": "${esc(primary.address)}",
+                "server_port": ${primary.port},
+                "servers": [$serversArray],
                 "obfuscation_key": "${server.obfuscationKey}",
                 "modifier": "${server.modifier}",
                 "salt": ${server.salt},

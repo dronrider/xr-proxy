@@ -107,6 +107,11 @@ class XrVpnService : VpnService() {
         val relayErrors: Long,
         val debugMsg: String,
         val recentErrors: List<String>,
+        /** Имя активного сервера пула (LLD-10); пустое до старта движка. */
+        val activeServer: String = "",
+        /** Активен резервный сервер, на главном экране показывается
+         *  «через [activeServer] (резерв)». */
+        val backupActive: Boolean = false,
     )
 
     data class ServiceState(
@@ -1037,6 +1042,8 @@ class XrVpnService : VpnService() {
             relayErrors = json.optLong("relay_err", 0),
             debugMsg = json.optString("debug", ""),
             recentErrors = recentErrors,
+            activeServer = json.optString("active_server", ""),
+            backupActive = json.optBoolean("backup_active", false),
         )
     }
 
