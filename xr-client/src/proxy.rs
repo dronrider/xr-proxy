@@ -181,6 +181,12 @@ async fn handle_connection(
     let direct_connect_timeout = Duration::from_secs(5);
 
     match action {
+        Action::Block => {
+            // Правило маршрутизации явно блокирует: рвём соединение, наружу не
+            // выпускаем. Для проксируемого трафика это fail-closed, IP не течёт.
+            tracing::debug!("Blocked {} -> {} (routing action=block)", client_addr, orig_dst);
+            Ok(())
+        }
         Action::Direct => {
             // Connect directly to the original destination
             let mut target = match tokio::time::timeout(

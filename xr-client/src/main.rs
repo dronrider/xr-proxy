@@ -118,7 +118,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         routing::Router::new(&config.routing, geoip_path)
     };
 
-    let on_server_down = routing::Action::from_str(&config.client.on_server_down);
+    let on_server_down = routing::Action::on_server_down_from_str(&config.client.on_server_down);
 
     // Build the server pool: per-server MuxPool (N parallel mux tunnels each),
     // primary/backup by priority, failover/failback inside the pool (LLD-10).
