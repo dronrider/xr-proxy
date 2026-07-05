@@ -6,7 +6,15 @@ use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 pub struct ClientConfig {
-    pub server: ServerAddress,
+    /// Legacy одиночный `[server]`. Понимается как пул из одного сервера
+    /// с priority=0, чтобы конфиги боевых роутеров работали без правки.
+    #[serde(default)]
+    pub server: Option<ServerAddress>,
+    /// Упорядоченный пул серверов `[[servers]]` (LLD-10). Меньший priority
+    /// значит выше в очереди (0 = primary). Взаимоисключим с `[server]` по смыслу:
+    /// если задан хотя бы один `[[servers]]`, legacy-секция игнорируется.
+    #[serde(default)]
+    pub servers: Vec<ServerEntry>,
     pub obfuscation: ObfuscationConfig,
     pub routing: RoutingConfig,
     #[serde(default)]
@@ -23,6 +31,60 @@ pub struct ClientConfig {
 pub struct ServerAddress {
     pub address: String,
     pub port: u16,
+}
+
+/// Один сервер пула `[[servers]]`. Общая обфускация берётся из
+/// `[obfuscation]`, а `key`/`salt`/`modifier` здесь это опциональный override
+/// на случай, когда у резервного VPS другой ключ.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerEntry {
+    /// Человекочитаемый лейбл для логов и индикации. Если пустой, берётся адрес.
+    #[serde(default)]
+    pub name: String,
+    pub address: String,
+    pub port: u16,
+    /// Меньше = выше приоритет; 0 = primary.
+    #[serde(default)]
+    pub priority: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salt: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modifier: Option<String>,
+}
+
+impl ServerEntry {
+    /// Лейбл для логов: явное имя либо адрес.
+    pub fn display_name(&self) -> &str {
+        if self.name.is_empty() { &self.address } else { &self.name }
+    }
+}
+
+impl ClientConfig {
+    /// Итоговый пул серверов: `[[servers]]`, отсортированный по priority
+    /// (при равенстве порядок файла сохраняется), либо legacy `[server]`
+    /// как пул из одного элемента. Пустой пул это ошибка конфигурации, как
+    /// пустой `source_ips` у UDP relay.
+    pub fn server_entries(&self) -> Result<Vec<ServerEntry>, String> {
+        if !self.servers.is_empty() {
+            let mut entries = self.servers.clone();
+            entries.sort_by_key(|e| e.priority);
+            Ok(entries)
+        } else if let Some(ref s) = self.server {
+            Ok(vec![ServerEntry {
+                name: String::new(),
+                address: s.address.clone(),
+                port: s.port,
+                priority: 0,
+                key: None,
+                salt: None,
+                modifier: None,
+            }])
+        } else {
+            Err("config: задайте [[servers]] (или legacy [server])".into())
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -304,6 +366,137 @@ pub fn load_server_config(path: &Path) -> Result<ServerConfig, Box<dyn std::erro
     let content = std::fs::read_to_string(path)?;
     let config: ServerConfig = toml::from_str(&content)?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str = r#"
+[obfuscation]
+key = "dGVzdA=="
+
+[routing]
+default_action = "direct"
+"#;
+
+    /// Конфиги боевых роутеров со старым `[server]` должны работать без
+    /// правки: одиночная секция читается как пул из одного primary.
+    #[test]
+    fn test_legacy_single_server_parses() {
+        let toml_str = format!(
+            r#"{BASE}
+[server]
+address = "1.2.3.4"
+port = 8443
+"#
+        );
+        let cfg: ClientConfig = toml::from_str(&toml_str).unwrap();
+        let entries = cfg.server_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].address, "1.2.3.4");
+        assert_eq!(entries[0].port, 8443);
+        assert_eq!(entries[0].priority, 0);
+        assert!(entries[0].key.is_none());
+        assert_eq!(entries[0].display_name(), "1.2.3.4");
+    }
+
+    #[test]
+    fn test_servers_sorted_by_priority() {
+        let toml_str = format!(
+            r#"{BASE}
+[[servers]]
+name = "timeweb"
+address = "5.6.7.8"
+port = 8443
+priority = 1
+
+[[servers]]
+name = "aeza"
+address = "1.2.3.4"
+port = 8443
+priority = 0
+"#
+        );
+        let cfg: ClientConfig = toml::from_str(&toml_str).unwrap();
+        let entries = cfg.server_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "aeza", "primary must sort first");
+        assert_eq!(entries[1].name, "timeweb");
+    }
+
+    /// При равных приоритетах порядок файла сохраняется (stable sort),
+    /// иначе выбор primary был бы недетерминированным.
+    #[test]
+    fn test_equal_priority_keeps_file_order() {
+        let toml_str = format!(
+            r#"{BASE}
+[[servers]]
+name = "first"
+address = "1.1.1.1"
+port = 8443
+
+[[servers]]
+name = "second"
+address = "2.2.2.2"
+port = 8443
+"#
+        );
+        let cfg: ClientConfig = toml::from_str(&toml_str).unwrap();
+        let entries = cfg.server_entries().unwrap();
+        assert_eq!(entries[0].name, "first");
+        assert_eq!(entries[1].name, "second");
+    }
+
+    /// `[[servers]]` при наличии выигрывает у legacy `[server]`.
+    #[test]
+    fn test_servers_take_precedence_over_legacy() {
+        let toml_str = format!(
+            r#"{BASE}
+[server]
+address = "9.9.9.9"
+port = 1111
+
+[[servers]]
+name = "pool"
+address = "1.2.3.4"
+port = 8443
+"#
+        );
+        let cfg: ClientConfig = toml::from_str(&toml_str).unwrap();
+        let entries = cfg.server_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].address, "1.2.3.4");
+    }
+
+    /// Ни `[server]`, ни `[[servers]]` даёт явную ошибку старта, а не панику
+    /// где-то дальше по стеку.
+    #[test]
+    fn test_no_servers_is_config_error() {
+        let cfg: ClientConfig = toml::from_str(BASE).unwrap();
+        assert!(cfg.server_entries().is_err());
+    }
+
+    /// Per-server override ключа обфускации парсится (кейс «у резерва другой
+    /// провайдер и другой ключ», §2.1).
+    #[test]
+    fn test_per_server_key_override_parses() {
+        let toml_str = format!(
+            r#"{BASE}
+[[servers]]
+name = "other"
+address = "5.6.7.8"
+port = 8443
+key = "b3RoZXI="
+salt = 42
+"#
+        );
+        let cfg: ClientConfig = toml::from_str(&toml_str).unwrap();
+        let entries = cfg.server_entries().unwrap();
+        assert_eq!(entries[0].key.as_deref(), Some("b3RoZXI="));
+        assert_eq!(entries[0].salt, Some(42));
+        assert!(entries[0].modifier.is_none());
+    }
 }
 
 /// Decode base64 key from config string into raw bytes.

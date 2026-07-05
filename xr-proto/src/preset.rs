@@ -58,6 +58,10 @@ pub struct Invite {
 }
 
 /// Connection details delivered to a client via invite.
+///
+/// `server_address`/`server_port` это legacy-поля с primary-сервером: старое
+/// приложение читает только их, новое при пустом `servers` строит пул из
+/// одного легаси-адреса. Ломающих комбинаций version skew нет (LLD-10 §2.8).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvitePayload {
     pub server_address: String,
@@ -67,6 +71,22 @@ pub struct InvitePayload {
     pub salt: u64,
     pub preset: String,
     pub hub_url: String,
+    /// Пул серверов профиля (LLD-10). Ключ/salt/modifier общие на профиль
+    /// и приходят в полях выше, per-server ключей в инвайте нет by design.
+    #[serde(default)]
+    pub servers: Vec<PayloadServer>,
+}
+
+/// Один сервер в составе invite-payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PayloadServer {
+    #[serde(default)]
+    pub name: String,
+    pub address: String,
+    pub port: u16,
+    /// Меньше = выше приоритет; 0 = primary.
+    #[serde(default)]
+    pub priority: u32,
 }
 
 /// Public invite metadata (no secrets). Returned by GET /invite/:token.
@@ -77,4 +97,53 @@ pub struct InviteInfo {
     pub comment: String,
     pub status: String,
     pub expires_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Version skew хаба и приложения (LLD-10 §5.8): payload без `servers`
+    /// (старый хаб) парсится в пустой список, payload со списком отдаёт его
+    /// целиком, а legacy-поля в обоих случаях несут primary.
+    #[test]
+    fn test_payload_legacy_roundtrip() {
+        // Старый payload, как его сериализует хаб до LLD-10.
+        let legacy = r#"{
+            "server_address": "1.2.3.4",
+            "server_port": 8443,
+            "obfuscation_key": "a2V5",
+            "modifier": "positional_xor_rotate",
+            "salt": 7,
+            "preset": "russia",
+            "hub_url": "https://hub.example"
+        }"#;
+        let p: InvitePayload = serde_json::from_str(legacy).unwrap();
+        assert!(p.servers.is_empty(), "legacy payload -> empty pool list");
+        assert_eq!(p.server_address, "1.2.3.4");
+
+        // Новый payload: список + зеркальные legacy-поля с primary.
+        let full = InvitePayload {
+            servers: vec![
+                PayloadServer {
+                    name: "aeza".into(),
+                    address: "1.2.3.4".into(),
+                    port: 8443,
+                    priority: 0,
+                },
+                PayloadServer {
+                    name: "timeweb".into(),
+                    address: "5.6.7.8".into(),
+                    port: 8443,
+                    priority: 1,
+                },
+            ],
+            ..p
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        let back: InvitePayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.servers.len(), 2);
+        assert_eq!(back.servers[0].name, "aeza");
+        assert_eq!(back.server_address, "1.2.3.4", "legacy field keeps primary");
+    }
 }

@@ -382,6 +382,18 @@ impl MuxPool {
         }
     }
 
+    /// Lightweight health probe for `ServerPool` (LLD-10): ensure slot 0 has a
+    /// live mux, connecting it if needed; no user stream is opened. Cheap on a
+    /// healthy warm slot (one `is_alive` check under the slot lock). Bypasses
+    /// the breaker gate on purpose (an active prober MUST test the real path)
+    /// and clears the breaker on success so the next `open_stream` doesn't
+    /// short-circuit on a stale cooldown.
+    pub async fn probe(&self) -> io::Result<()> {
+        self.acquire_or_connect(0, false).await?;
+        self.clear_breaker();
+        Ok(())
+    }
+
     /// Force every slot to reconnect and clear the fail-open breaker.
     ///
     /// Called when the host signals that the underlying network changed
