@@ -142,19 +142,23 @@ impl Drop for MuxStream {
             return;
         }
         if !self.closed && self.alive.load(Ordering::Relaxed) {
-            let tx = self.writer_tx.clone();
-            let sid = self.stream_id;
-            tokio::spawn(async move {
-                let _ = tx
-                    .send(OutFrame {
-                        stream_id: sid,
-                        command: Command::Close,
-                        payload: Vec::new(),
-                    })
-                    .await;
-            });
+            close_on_drop(&self.writer_tx, self.stream_id);
         }
     }
+}
+
+/// Best-effort Close при дропе стрима, БЕЗ `tokio::spawn`. Раньше здесь
+/// спавнился таск, ждущий `writer_tx.send(Close).await`; под churn'ом соединений
+/// и медленным writer'ом (деградирующий линк к серверу) канал переполнялся, и
+/// эти ждущие таски копились неограниченно, утягивая память (XR-079). `try_send`
+/// не блокирует и не спавнит: если очередь writer'а полна, Close теряется, а
+/// сервер закрывает стрим сам по своему idle-таймауту.
+fn close_on_drop(writer_tx: &mpsc::Sender<OutFrame>, stream_id: u32) {
+    let _ = writer_tx.try_send(OutFrame {
+        stream_id,
+        command: Command::Close,
+        payload: Vec::new(),
+    });
 }
 
 // ── MuxStream split halves ──────────────────────────────────────────
@@ -221,17 +225,7 @@ impl MuxWriteHalf {
 impl Drop for MuxWriteHalf {
     fn drop(&mut self) {
         if !self.closed && self.alive.load(Ordering::Relaxed) {
-            let tx = self.writer_tx.clone();
-            let sid = self.stream_id;
-            tokio::spawn(async move {
-                let _ = tx
-                    .send(OutFrame {
-                        stream_id: sid,
-                        command: Command::Close,
-                        payload: Vec::new(),
-                    })
-                    .await;
-            });
+            close_on_drop(&self.writer_tx, self.stream_id);
         }
     }
 }
@@ -633,39 +627,69 @@ pub async fn mux_open_stream(
     // Register before sending Connect so we don't miss ConnectAck.
     mux.streams.lock().await.insert(stream_id, data_tx);
 
+    // Guard снимает регистрацию, если мы НЕ вернём MuxStream: по ошибке или по
+    // ОТМЕНЕ future (наш bounded-таймаут в ServerPool рвёт ожидание ConnectAck на
+    // полпути). Без этого на неотвечающем/blackhole сервере (ConnectAck не
+    // приходит, а поздний try_send не срабатывает, ведь receiver жив пока future
+    // не отменён) запись осиротевала бы и копила память (XR-079). disarm() только
+    // на успехе.
+    let mut guard = StreamRegGuard {
+        streams: Some(mux.streams.clone()),
+        stream_id,
+    };
+
     // Send Connect(stream_id, target_addr).
-    mux.send_frame(stream_id, Command::Connect, target.encode()).await
-        .map_err(|e| {
-            let streams = mux.streams.clone();
-            let sid = stream_id;
-            tokio::spawn(async move { streams.lock().await.remove(&sid); });
-            e
-        })?;
+    mux.send_frame(stream_id, Command::Connect, target.encode()).await?;
 
     // Wait for ConnectAck — delivered as first message on the channel.
     // The reader task dispatches ConnectAck payload (after stream_id prefix)
     // to this stream's channel.
-    match tokio::time::timeout(Duration::from_secs(10), data_rx.recv()).await {
-        Ok(Some(_ack_payload)) => {
-            // ConnectAck received — stream is ready.
-            Ok(MuxStream {
-                stream_id,
-                rx: Some(data_rx),
-                writer_tx: mux.writer_tx.clone(),
-                alive: mux.alive.clone(),
-                closed: false,
-                detached: false,
-            })
-        }
-        Ok(None) => {
-            // Channel closed — mux connection died.
-            mux.streams.lock().await.remove(&stream_id);
-            Err(io::Error::new(io::ErrorKind::BrokenPipe, "mux connection died during open"))
-        }
-        Err(_) => {
-            // Timeout.
-            mux.streams.lock().await.remove(&stream_id);
-            Err(io::Error::new(io::ErrorKind::TimedOut, "mux connect ack timeout"))
+    let result = match tokio::time::timeout(Duration::from_secs(10), data_rx.recv()).await {
+        Ok(Some(_ack_payload)) => Ok(MuxStream {
+            stream_id,
+            rx: Some(data_rx),
+            writer_tx: mux.writer_tx.clone(),
+            alive: mux.alive.clone(),
+            closed: false,
+            detached: false,
+        }),
+        Ok(None) => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "mux connection died during open",
+        )),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "mux connect ack timeout",
+        )),
+    };
+    if result.is_ok() {
+        guard.disarm();
+    }
+    result
+}
+
+/// Снимает регистрацию стрима из `mux.streams`, если `mux_open_stream` не дошёл
+/// до успешного возврата `MuxStream`. Ловит и обычный ранний выход, и ОТМЕНУ
+/// future (bounded-таймаут в `ServerPool::open_stream`). Очистка идёт в
+/// отдельном таске: `streams` за async-Mutex, синхронный Drop его не залочит.
+struct StreamRegGuard {
+    streams: Option<Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>>,
+    stream_id: u32,
+}
+
+impl StreamRegGuard {
+    fn disarm(&mut self) {
+        self.streams = None;
+    }
+}
+
+impl Drop for StreamRegGuard {
+    fn drop(&mut self) {
+        if let Some(streams) = self.streams.take() {
+            let sid = self.stream_id;
+            tokio::spawn(async move {
+                streams.lock().await.remove(&sid);
+            });
         }
     }
 }
@@ -764,5 +788,42 @@ mod tests {
         assert_eq!(response, b"hello from server");
 
         server_task.await.unwrap();
+    }
+
+    /// Регрессия XR-079: отмена `mux_open_stream` (наш bounded-таймаут в
+    /// ServerPool рвёт ожидание ConnectAck) НЕ должна оставлять осиротевшую
+    /// запись в `mux.streams`. Иначе на неотвечающем сервере регистрации
+    /// копятся и утягивают память. Сервер тут молчит на ConnectAck.
+    #[tokio::test]
+    async fn test_open_stream_cancel_cleans_registration() {
+        // `_server_io` держим живым, иначе duplex закроется, reader получит EOF
+        // и mux станет !alive (open вернётся рано, минуя путь отмены).
+        let (client_io, _server_io) = duplex(65536);
+        let codec = test_codec();
+        let mux = Multiplexer::new_client(client_io, codec);
+
+        let target = TargetAddr::Domain("silent.test".to_string(), 443);
+        // Внешний таймаут короче внутренних 10с ConnectAck: он отменяет
+        // `mux_open_stream` на полпути, как это делает ServerPool.
+        let r = tokio::time::timeout(
+            Duration::from_millis(50),
+            mux_open_stream(&mux, &target),
+        )
+        .await;
+        assert!(r.is_err(), "open must be cancelled by the outer timeout");
+
+        // Guard чистит регистрацию в отдельном таске: даём ему прокрутиться.
+        let mut cleaned = false;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if mux.streams.lock().await.is_empty() {
+                cleaned = true;
+                break;
+            }
+        }
+        assert!(
+            cleaned,
+            "cancelled open_stream must not leak the stream registration"
+        );
     }
 }
