@@ -19,10 +19,15 @@ PID=$(pidof xr-client 2>/dev/null)
 if [ -n "$PID" ]; then
     ALIVE=up
     FD=$(ls "/proc/$PID/fd" 2>/dev/null | wc -l)
+    # RSS в КБ: ловим медленный рост памяти xr-client на длинном аптайме.
+    RSS=$(awk '/VmRSS/{print $2}' "/proc/$PID/status" 2>/dev/null)
 else
     ALIVE=DOWN
     FD=0
+    RSS=0
 fi
+# Свободная память роутера (МБ), чтобы видеть общий запас в динамике.
+MEM_AVAIL=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
 
 nft list table ip xr_proxy >/dev/null 2>&1 && PROXY=yes || PROXY=NO
 nft list table ip xr_killswitch >/dev/null 2>&1 && KS=yes || KS=-
@@ -34,7 +39,7 @@ for s in $(grep -E '^address = ' "$CONFIG" 2>/dev/null | grep -oE '[0-9]+\.[0-9]
     MUX="$MUX$s=$n "
 done
 
-echo "$TS xr=$ALIVE fd=$FD xr_proxy=$PROXY killswitch=$KS mux[ $MUX]" >> "$STATUS_LOG"
+echo "$TS xr=$ALIVE fd=$FD rss=${RSS}k memavail=${MEM_AVAIL}M xr_proxy=$PROXY killswitch=$KS mux[ $MUX]" >> "$STATUS_LOG"
 
 # Аномалия: приложение лежит или redirect снят при живом хосте. Оба состояния
 # это либо текущая утечка (redirect снят, трафик идёт напрямую), либо её канун.
