@@ -2,9 +2,33 @@
 # Place this file at /etc/xr-proxy/config.toml on your OpenWRT router
 
 # ─── Server connection ────────────────────────────────────────────────
+# Legacy-вариант с одним сервером. Продолжает работать как пул из одного
+# элемента; при заданных [[servers]] игнорируется.
 [server]
 address = "YOUR_SERVER_IP"            # IP address of your VPS
 port = 8443                           # Must match server config
+
+# ─── Пул серверов (multi-VPS failover, LLD-10) ────────────────────────
+# Вместо одиночного [server] можно задать упорядоченный пул: активен сервер
+# с наименьшим priority среди здоровых (0 = primary). При падении активного
+# трафик за секунды переключается на следующий, после восстановления primary
+# возвращается на него (failback c hold-down от флаппинга). Direct остаётся
+# последним рубежом, когда недоступен весь пул.
+#
+# [[servers]]
+# name = "aeza"                       # лейбл для логов
+# address = "PRIMARY_SERVER_IP"
+# port = 8443
+# priority = 0                        # меньше = выше приоритет
+#
+# [[servers]]
+# name = "timeweb"
+# address = "BACKUP_SERVER_IP"
+# port = 8443
+# priority = 1
+# # key = "..."                       # опционально: override общего
+# # salt = 0xDEADBEEF                 # [obfuscation]-ключа, если у резерва
+# # modifier = "positional_xor_rotate"# другой провайдер и другой ключ
 
 # ─── Obfuscation (must match server exactly!) ─────────────────────────
 [obfuscation]

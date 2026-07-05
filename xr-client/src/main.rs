@@ -6,10 +6,11 @@ use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use xr_proto::config::{decode_key, load_client_config};
+use xr_proto::config::{decode_key, load_client_config, ObfuscationConfig, ServerEntry};
 use xr_proto::obfuscation::{ModifierStrategy, Obfuscator};
 use xr_proto::protocol::Codec;
 use xr_proto::routing;
+use xr_proto::server_pool::{PoolProfile, PoolServer, ServerPool};
 
 const CRASH_LOG: &str = "/etc/xr-proxy/crash.log";
 
@@ -90,6 +91,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.obfuscation.padding_max,
     );
 
+    // Пул серверов (LLD-10): [[servers]] по приоритету либо legacy [server]
+    // как пул из одного. Пустой пул это ошибка старта.
+    let server_entries = config.server_entries()?;
+
     // Build router, optionally merging with hub preset.
     let geoip_path = config.geoip.as_ref().map(|g| g.database.as_str());
     let hub_config = config.hub.as_ref();
@@ -113,42 +118,53 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         routing::Router::new(&config.routing, geoip_path)
     };
 
-    // Resolve server address
-    let server_addr: SocketAddr = format!("{}:{}", config.server.address, config.server.port)
-        .parse()
-        .map_err(|e| format!("invalid server address: {}", e))?;
-
     let on_server_down = routing::Action::from_str(&config.client.on_server_down);
 
-    // Build mux pool: N parallel multiplexed tunnels to the server.
-    let mux_pool = {
-        let addr = server_addr;
-        xr_proto::mux_pool::MuxPool::new(
+    // Build the server pool: per-server MuxPool (N parallel mux tunnels each),
+    // primary/backup by priority, failover/failback inside the pool (LLD-10).
+    let mut pool_servers = Vec::with_capacity(server_entries.len());
+    for entry in &server_entries {
+        let addr: SocketAddr = format!("{}:{}", entry.address, entry.port)
+            .parse()
+            .map_err(|e| format!("invalid server address {}: {}", entry.address, e))?;
+        let entry_codec = codec_for_entry(entry, &config.obfuscation, &codec)?;
+        let mux_pool = xr_proto::mux_pool::MuxPool::new(
             Arc::new(move || {
                 Box::pin(async move {
                     xr_proto::tunnel::connect_to_server(&addr).await
                 })
             }),
-            codec.clone(),
+            entry_codec,
             config.client.mux_pool_size,
-        )
-    };
+        );
+        pool_servers.push(PoolServer {
+            name: entry.display_name().to_string(),
+            addr: addr.to_string(),
+            pool: mux_pool,
+        });
+    }
+    let server_pool = ServerPool::new(pool_servers, PoolProfile::router(), None);
+
+    // Фоновый пробер: держит mux ко всем серверам тёплым и возвращает трафик
+    // на primary после восстановления (failback с hold-down).
+    tokio::spawn(server_pool.clone().health_loop());
 
     let state = Arc::new(proxy::ProxyState {
         router: std::sync::RwLock::new(Arc::new(router)),
         on_server_down,
         listen_port: config.client.listen_port,
-        mux_pool,
+        server_pool,
     });
 
     // Setup firewall redirect
+    let server_ips: Vec<String> = server_entries.iter().map(|e| e.address.clone()).collect();
     let fw_backend = if config.client.auto_redirect {
         match redirect::detect_backend() {
             Some(backend) => {
                 redirect::setup_redirect(
                     backend,
                     config.client.listen_port,
-                    &config.server.address,
+                    &server_ips,
                     &config.client.bypass_ips,
                     config.client.block_quic,
                 )?;
@@ -223,8 +239,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Run UDP relay if configured
-    let server_address = config.server.address.clone();
+    // Run UDP relay if configured. Relay ходит только через primary: его
+    // failover не входит в LLD-10 (у relay свой канал и своя семантика).
+    let server_address = server_entries[0].address.clone();
     let udp_handle = if let Some(udp_config) = config.udp_relay {
         if udp_config.enabled {
             tracing::info!("Starting UDP relay (port {})", udp_config.listen_port);
@@ -271,6 +288,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("XR Proxy Client stopped");
     log_to_file("xr-client stopped");
     Ok(())
+}
+
+/// Кодек для сервера пула: общий `[obfuscation]`, либо собранный заново, если
+/// у записи есть override (`key`/`salt`/`modifier`). Это кейс «у резерва
+/// другой провайдер и другой ключ» (LLD-10 §2.1).
+fn codec_for_entry(
+    entry: &ServerEntry,
+    obfuscation: &ObfuscationConfig,
+    shared: &Codec,
+) -> Result<Codec, Box<dyn std::error::Error>> {
+    if entry.key.is_none() && entry.salt.is_none() && entry.modifier.is_none() {
+        return Ok(shared.clone());
+    }
+    let key = decode_key(entry.key.as_deref().unwrap_or(&obfuscation.key))?;
+    let modifier = entry.modifier.as_deref().unwrap_or(&obfuscation.modifier);
+    let strategy = ModifierStrategy::from_str(modifier)
+        .ok_or_else(|| format!("unknown modifier strategy for server {}", entry.display_name()))?;
+    let salt = entry.salt.unwrap_or(obfuscation.salt);
+    let obfuscator = Obfuscator::new(key, salt as u32, strategy);
+    Ok(Codec::new(obfuscator, obfuscation.padding_min, obfuscation.padding_max))
 }
 
 async fn shutdown_signal() {

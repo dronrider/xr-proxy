@@ -1,6 +1,6 @@
 /// Transparent proxy core: accept connections, extract SNI, route, tunnel.
-use xr_proto::mux_pool::MuxPool;
 use xr_proto::routing::{Action, Router};
+use xr_proto::server_pool::ServerPool;
 use xr_proto::sni;
 use xr_proto::tunnel;
 use std::io;
@@ -58,7 +58,9 @@ pub struct ProxyState {
     pub router: RwLock<Arc<Router>>,
     pub on_server_down: Action,
     pub listen_port: u16,
-    pub mux_pool: Arc<MuxPool>,
+    /// Пул серверов (LLD-10): primary/backup по приоритету, failover и
+    /// failback внутри. `Err` от него означает «весь пул недоступен».
+    pub server_pool: Arc<ServerPool>,
 }
 
 /// Enable TCP keepalive on a stream to detect dead connections.
@@ -270,9 +272,10 @@ async fn tunnel_connection(
     };
 
     // Failure to open a mux stream is a tunnel-side problem (mux dead,
-    // ConnectAck timeout, etc.) — direct fallback is appropriate.
+    // ConnectAck timeout, etc.), so the direct fallback is appropriate. Err
+    // от server_pool означает, что исчерпан весь пул серверов, не один VPS.
     let mux_stream = state
-        .mux_pool
+        .server_pool
         .open_stream(&target_addr)
         .await
         .map_err(RelayError::Tunnel)?;

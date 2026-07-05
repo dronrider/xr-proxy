@@ -65,18 +65,19 @@ pub fn detect_backend() -> Option<FirewallBackend> {
     }
 }
 
-/// Set up redirect rules. `server_ip` is excluded to avoid redirect loops.
+/// Set up redirect rules. `server_ips` (все серверы пула LLD-10) are excluded
+/// to avoid redirect loops.
 /// `bypass_ips` are source IPs that should not be redirected (game consoles, etc.)
 pub fn setup_redirect(
     backend: FirewallBackend,
     listen_port: u16,
-    server_ip: &str,
+    server_ips: &[String],
     bypass_ips: &[String],
     block_quic: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match backend {
-        FirewallBackend::Nftables => setup_nftables(listen_port, server_ip, bypass_ips, block_quic),
-        FirewallBackend::Iptables => setup_iptables(listen_port, server_ip, bypass_ips, block_quic),
+        FirewallBackend::Nftables => setup_nftables(listen_port, server_ips, bypass_ips, block_quic),
+        FirewallBackend::Iptables => setup_iptables(listen_port, server_ips, bypass_ips, block_quic),
     }
 }
 
@@ -92,7 +93,7 @@ pub fn cleanup_redirect(backend: FirewallBackend) -> Result<(), Box<dyn std::err
 
 fn setup_nftables(
     listen_port: u16,
-    server_ip: &str,
+    server_ips: &[String],
     bypass_ips: &[String],
     block_quic: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -129,13 +130,21 @@ fn setup_nftables(
         ""
     };
 
+    // Пул серверов (LLD-10): исключаем из перехвата каждый VPS, иначе
+    // туннель к резерву сам попал бы под redirect.
+    let server_returns: String = server_ips
+        .iter()
+        .map(|ip| format!("        ip daddr {} return", ip))
+        .collect::<Vec<_>>()
+        .join("\n");
+
     let ruleset = format!(
         r#"
 table ip {table} {{
     chain prerouting {{
         type nat hook prerouting priority dstnat; policy accept;
 {bypass_section}
-        ip daddr {server_ip} return
+{server_returns}
         ip daddr 10.0.0.0/8 return
         ip daddr 172.16.0.0/12 return
         ip daddr 192.168.0.0/16 return
@@ -160,7 +169,7 @@ table ip {table} {{
 {quic_section}}}
 "#,
         table = NFT_TABLE,
-        server_ip = server_ip,
+        server_returns = server_returns,
         listen_port = listen_port,
         bypass_section = bypass_section,
         quic_section = quic_section,
@@ -209,7 +218,7 @@ fn cleanup_nftables() -> Result<(), Box<dyn std::error::Error>> {
 
 fn setup_iptables(
     listen_port: u16,
-    server_ip: &str,
+    server_ips: &[String],
     bypass_ips: &[String],
     block_quic: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -223,8 +232,10 @@ fn setup_iptables(
         run_ipt(&["-t", "nat", "-A", IPT_CHAIN, "-s", ip, "-j", "RETURN"])?;
     }
 
-    // Skip server IP, private destination ranges
-    run_ipt(&["-t", "nat", "-A", IPT_CHAIN, "-d", server_ip, "-j", "RETURN"])?;
+    // Skip server IPs (весь пул LLD-10), private destination ranges
+    for ip in server_ips {
+        run_ipt(&["-t", "nat", "-A", IPT_CHAIN, "-d", ip, "-j", "RETURN"])?;
+    }
     run_ipt(&["-t", "nat", "-A", IPT_CHAIN, "-d", "10.0.0.0/8", "-j", "RETURN"])?;
     run_ipt(&["-t", "nat", "-A", IPT_CHAIN, "-d", "172.16.0.0/12", "-j", "RETURN"])?;
     run_ipt(&["-t", "nat", "-A", IPT_CHAIN, "-d", "192.168.0.0/16", "-j", "RETURN"])?;
