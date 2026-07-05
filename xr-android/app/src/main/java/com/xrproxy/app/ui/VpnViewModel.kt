@@ -136,6 +136,18 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     val trustedRepo = com.xrproxy.app.data.TrustedNetworksRepository(prefs)
 
+    /** Политика при отказе всего пула серверов: true = block (fail-closed,
+     *  проксируемый трафик режется, реальный IP не светится), false = direct
+     *  (fail-open, проксируемое уходит напрямую). Дефолт block. */
+    private val KEY_FAIL_CLOSED = "on_server_down_block"
+    private val _failClosed = MutableStateFlow(prefs.getBoolean(KEY_FAIL_CLOSED, true))
+    val failClosed: StateFlow<Boolean> = _failClosed
+
+    fun setFailClosed(value: Boolean) {
+        prefs.edit().putBoolean(KEY_FAIL_CLOSED, value).apply()
+        _failClosed.value = value
+    }
+
     private val _uiState = MutableStateFlow(VpnUiState())
     val uiState: StateFlow<VpnUiState> = _uiState
 
@@ -949,7 +961,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 "padding_min": 16,
                 "padding_max": 128,
                 "routing_toml": "${routingToml.replace("\"", "\\\"").replace("\n", "\\n")}",
-                "on_server_down": "direct",
+                "on_server_down": "${if (_failClosed.value) "block" else "direct"}",
                 "dns_resolvers": [$dnsArray]$hubFields
             }
         """.trimIndent()

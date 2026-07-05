@@ -52,6 +52,7 @@ import com.xrproxy.app.ui.servers.ServerSwitcherSheet
 import com.xrproxy.app.ui.logs.LogList
 import com.xrproxy.app.ui.logs.LogToolbar
 import com.xrproxy.app.ui.logs.filterLog
+import com.xrproxy.app.ui.servers.FailurePolicySection
 import com.xrproxy.app.ui.servers.ServersSection
 import com.xrproxy.app.ui.theme.XrTheme
 import com.xrproxy.app.ui.trusted.TrustedNetworksSection
@@ -156,6 +157,7 @@ fun MainScreen(
     }
     val trustedNetworks by viewModel.trustedRepo.networks.collectAsState()
     val trustedEnabled by viewModel.trustedRepo.enabled.collectAsState()
+    val failClosed by viewModel.failClosed.collectAsState()
     val updateState by viewModel.updateState.collectAsState()
 
     // Location permission for reading the current Wi-Fi SSID (auto-pause,
@@ -480,6 +482,10 @@ fun MainScreen(
                     onRemove = { viewModel.removeTrustedNetwork(it) },
                     onRequestPermission = requestSsidPermission,
                     availableSsids = { viewModel.availableSsids() },
+                )
+                FailurePolicySection(
+                    failClosed = failClosed,
+                    onToggle = { viewModel.setFailClosed(it) },
                 )
                 Spacer(Modifier.height(8.dp))
                 val appVersion = remember {

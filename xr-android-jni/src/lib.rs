@@ -210,7 +210,7 @@ fn parse_config(json: &str) -> Result<VpnConfig, String> {
     let salt = get_num("salt").unwrap_or(0xDEADBEEF) as u32;
     let padding_min = get_num("padding_min").unwrap_or(16) as u8;
     let padding_max = get_num("padding_max").unwrap_or(128) as u8;
-    let on_server_down = get_str("on_server_down").unwrap_or_else(|_| "direct".into());
+    let on_server_down = get_str("on_server_down").unwrap_or_else(|_| "block".into());
 
     let routing = if let Ok(toml_str) = get_str("routing_toml") {
         toml::from_str::<RoutingConfig>(&toml_str).unwrap_or_else(|e| {
