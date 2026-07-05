@@ -1,5 +1,5 @@
 #!/bin/sh
-# XR Proxy Watchdog — страховка от падений:
+# XR Proxy Watchdog, страховка от падений:
 # 1. Фиксирует факт и причину краша в /etc/xr-proxy/crash.log
 # 2. Чистит firewall-правила (чтобы интернет не пропал)
 # 3. Перезапускает через procd
@@ -8,6 +8,16 @@
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
 CRASHLOG=/etc/xr-proxy/crash.log
+
+# Fail-closed kill-switch (XR-077): держим постоянно, пока сервис под присмотром.
+# Ставим только если таблицы нет (без периодического пере-создания, чтобы не
+# флапать forward-drop). Это гарантирует, что в любое окно, когда xr-client не
+# перехватывает (упал, рестартится, redirect снят), проксируемый LAN-трафик
+# режется, а не утекает напрямую с реальным IP. Снимается только явным
+# `init stop` через killswitch-cleanup.
+if [ -x /usr/bin/killswitch-setup.sh ]; then
+    nft list table ip xr_killswitch >/dev/null 2>&1 || /usr/bin/killswitch-setup.sh
+fi
 
 is_running() {
     if command -v pidof >/dev/null 2>&1; then
@@ -93,7 +103,7 @@ if ! is_running; then
         /etc/init.d/xr-proxy start
     fi
 else
-    # Процесс жив — убедиться что OOM-защита установлена
+    # Процесс жив, убедиться что OOM-защита установлена
     pid=$(pidof xr-client 2>/dev/null)
     if [ -n "$pid" ] && [ -f "/proc/$pid/oom_score_adj" ]; then
         current=$(cat "/proc/$pid/oom_score_adj" 2>/dev/null)

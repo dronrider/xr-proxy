@@ -1,5 +1,5 @@
 #!/bin/sh /etc/rc.common
-# XR Proxy Client — OpenWRT procd init script
+# XR Proxy Client, OpenWRT procd init script
 
 START=99
 STOP=10
@@ -9,6 +9,8 @@ PROG=/usr/bin/xr-client
 CONFIG=/etc/xr-proxy/config.toml
 WATCHDOG=/usr/bin/xr-watchdog.sh
 UDP_TPROXY=/usr/bin/udp-tproxy-setup.sh
+KILLSWITCH_SETUP=/usr/bin/killswitch-setup.sh
+KILLSWITCH_CLEANUP=/usr/bin/killswitch-cleanup.sh
 CRON_LINE="* * * * * $WATCHDOG"
 
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
@@ -31,12 +33,19 @@ start_service() {
         (crontab -l 2>/dev/null | grep -v "$WATCHDOG"; echo "$CRON_LINE") | crontab -
     fi
 
+    # Fail-closed kill-switch (XR-077): ставим ДО запуска xr-client, чтобы любое
+    # окно без перехвата (запуск, краш, рестарт) резало проксируемый трафик, а не
+    # выпускало его напрямую с реальным IP. Снимается только здесь, в stop.
+    if [ -x "$KILLSWITCH_SETUP" ]; then
+        "$KILLSWITCH_SETUP" "$CONFIG"
+    fi
+
     procd_open_instance
     procd_set_param command "$PROG" -c "$CONFIG"
     procd_set_param env PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
     # respawn <threshold> <timeout> <retry>
-    #   threshold: если процесс жил дольше этого (сек) — сбросить счётчик
+    #   threshold: если процесс жил дольше этого (сек), сбросить счётчик
     #   timeout: пауза перед перезапуском
     #   retry: макс. попыток (0 = бесконечно)
     procd_set_param respawn 3600 15 0
@@ -62,6 +71,13 @@ start_service() {
 stop_service() {
     # Remove watchdog cron job
     crontab -l 2>/dev/null | grep -v "$WATCHDOG" | crontab - 2>/dev/null
+
+    # Снять fail-closed kill-switch: это осознанная полная остановка сервиса,
+    # значит LAN возвращается к обычному интернету. При крашах/рестартах
+    # kill-switch НЕ трогаем (иначе снова окно Direct-утечки).
+    if [ -x "$KILLSWITCH_CLEANUP" ]; then
+        "$KILLSWITCH_CLEANUP"
+    fi
 
     # Force cleanup firewall rules using full paths
     NFT=$(find_nft)
