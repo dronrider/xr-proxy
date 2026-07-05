@@ -56,12 +56,13 @@ pub struct SessionContext {
     /// Живые сессии не «едут под ногами»: Action выбирается один раз по value.
     pub router: std::sync::RwLock<Arc<Router>>,
     pub codec: Codec,
-    pub server_addr: SocketAddr,
     pub fake_dns: Arc<FakeDns>,
     pub stats: Stats,
     pub on_server_down: Action,
     pub protect_socket: ProtectSocketFn,
-    pub mux_pool: Arc<xr_proto::mux_pool::MuxPool>,
+    /// Пул серверов (LLD-10): для профиля с одним эндпоинтом это пул из
+    /// одного слота, поведение неотличимо от прежнего одиночного mux_pool.
+    pub server_pool: Arc<xr_proto::server_pool::ServerPool>,
     /// DNS resolvers for direct-connection name resolution, tried in parallel.
     /// First one to answer wins. System-provided (via Android ConnectivityManager)
     /// resolvers come first, with public resolvers as a universal fallback.
@@ -266,13 +267,13 @@ pub async fn relay_session_with_domain(
         Action::Proxy => {
             ctx.stats.set_debug(format!(
                 "proxy: {} [{}] -> srv {}",
-                key.dst_addr, domain.as_deref().unwrap_or("-"), ctx.server_addr,
+                key.dst_addr, domain.as_deref().unwrap_or("-"), ctx.server_pool.active_label(),
             ));
             // Open the mux stream upfront so that a failure here can fall back
             // to direct without having consumed anything from the inbound
             // channels yet (relay_via_mux_stream drains data_rx, so we can't
             // retry after that starts).
-            match ctx.mux_pool.open_stream(&target_addr).await {
+            match ctx.server_pool.open_stream(&target_addr).await {
                 Ok(mux_stream) => {
                     ctx.stats.add_log(&format!("mux relay for {:?}", target_addr));
                     tracing::debug!("mux relay for {:?}", target_addr);

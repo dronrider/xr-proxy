@@ -17,10 +17,11 @@ use smoltcp::socket::tcp::State as TcpState;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 
-use xr_proto::config::{decode_key, RoutingConfig};
+use xr_proto::config::{decode_key, RoutingConfig, ServerEntry};
 use xr_proto::obfuscation::{ModifierStrategy, Obfuscator};
 use xr_proto::protocol::Codec;
 use xr_proto::routing::{Action, Router};
+use xr_proto::server_pool::{PoolProfile, PoolServer, ServerPool};
 
 use crate::dns::FakeDns;
 use crate::ip_stack::{IpStack, PacketQueue};
@@ -42,8 +43,13 @@ fn next_ephemeral_port() -> u16 {
 }
 
 pub struct VpnConfig {
+    /// Legacy одиночный сервер; используется, когда `servers` пуст.
     pub server_address: String,
     pub server_port: u16,
+    /// Пул серверов профиля (LLD-10): primary/backup по `priority`.
+    /// Ключ/salt/modifier общие на профиль; per-endpoint override на
+    /// Android не поддерживается by design (§2.6), поля записей игнорируются.
+    pub servers: Vec<ServerEntry>,
     pub obfuscation_key: String,
     pub modifier: String,
     pub salt: u32,
@@ -79,9 +85,10 @@ pub struct VpnEngine {
     state: StateHandle,
     stats: Stats,
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
-    /// Live mux pool, kept after `start()` so `on_network_changed` can recycle
-    /// it when the underlying network switches. `None` while not running.
-    mux_pool: Option<Arc<xr_proto::mux_pool::MuxPool>>,
+    /// Live server pool, kept after `start()` so `on_network_changed` can
+    /// recycle it when the underlying network switches. `None` while not
+    /// running.
+    server_pool: Option<Arc<ServerPool>>,
     /// Network-generation signal. Bumped on every underlying-network switch;
     /// the event loop drops all active sessions when it changes so they
     /// re-establish on the new uplink. `None` while not running.
@@ -95,7 +102,7 @@ impl VpnEngine {
             state: StateHandle::new(),
             stats: Stats::new(),
             shutdown_tx: None,
-            mux_pool: None,
+            server_pool: None,
             netgen_tx: None,
         }
     }
@@ -149,16 +156,33 @@ impl VpnEngine {
         } else {
             Router::new(&self.config.routing, self.config.geoip_path.as_deref())
         };
-        let server_addr: SocketAddr = format!("{}:{}", self.config.server_address, self.config.server_port)
-            .parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{}", e)))?;
         let on_server_down = Action::from_str(&self.config.on_server_down);
         let fake_dns = Arc::new(FakeDns::new());
 
-        // Build mux pool with protected socket factory.
-        let mux_pool = {
-            let addr = server_addr;
+        // Пул серверов профиля (LLD-10): `servers` по приоритету, при пустом
+        // списке legacy-одиночный адрес как пул из одного слота.
+        let mut entries = self.config.servers.clone();
+        entries.sort_by_key(|e| e.priority);
+        if entries.is_empty() {
+            entries.push(ServerEntry {
+                name: String::new(),
+                address: self.config.server_address.clone(),
+                port: self.config.server_port,
+                priority: 0,
+                key: None,
+                salt: None,
+                modifier: None,
+            });
+        }
+
+        // Build per-server mux pools with the protected socket factory.
+        let mut pool_servers = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let addr: SocketAddr = format!("{}:{}", entry.address, entry.port)
+                .parse()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{}", e)))?;
             let protect = protect_socket.clone();
-            xr_proto::mux_pool::MuxPool::new(
+            let mux_pool = xr_proto::mux_pool::MuxPool::new(
                 Arc::new(move || {
                     let protect = protect.clone();
                     let addr = addr;
@@ -168,8 +192,21 @@ impl VpnEngine {
                 }),
                 codec.clone(),
                 self.config.mux_pool_size,
-            )
-        };
+            );
+            pool_servers.push(PoolServer {
+                name: entry.display_name().to_string(),
+                addr: addr.to_string(),
+                pool: mux_pool,
+            });
+        }
+        // Failover/failback дублируем в пользовательский журнал движка,
+        // на эти записи опирается индикация LLD-10 §2.6.
+        let stats_events = self.stats.clone();
+        let server_pool = ServerPool::new(
+            pool_servers,
+            PoolProfile::mobile(),
+            Some(Arc::new(move |msg: &str| stats_events.add_log(msg))),
+        );
 
         // Parse DNS resolvers from config strings.
         // Accept both "1.2.3.4" (assume :53) and "1.2.3.4:53". Bad entries
@@ -191,15 +228,15 @@ impl VpnEngine {
 
         // Keep a handle to the pool so a later network switch can recycle it
         // without tearing down the whole engine.
-        self.mux_pool = Some(mux_pool.clone());
+        self.server_pool = Some(server_pool.clone());
 
         let ctx = Arc::new(SessionContext {
             router: std::sync::RwLock::new(Arc::new(router)),
-            codec, server_addr,
+            codec,
             fake_dns: fake_dns.clone(),
             stats: self.stats.clone(),
             on_server_down, protect_socket,
-            mux_pool,
+            server_pool: server_pool.clone(),
             dns_resolvers,
             system_resolver: self.config.system_resolver.clone(),
         });
@@ -212,6 +249,20 @@ impl VpnEngine {
         self.netgen_tx = Some(netgen_tx);
         let state = self.state.clone();
         let stats = self.stats.clone();
+
+        // Health-пробер пула (LLD-10 §2.7, экономный профиль): в здоровом
+        // состоянии молчит и не будит радио; при активном резерве пробит
+        // primary раз в минуту ради failback'а с hold-down.
+        {
+            let pool_hl = server_pool.clone();
+            let mut shutdown_hl = shutdown_rx.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = pool_hl.health_loop() => {},
+                    _ = shutdown_hl.changed() => {},
+                }
+            });
+        }
 
         // Background preset refresh — hot-swaps `ctx.router` when the hub
         // publishes a new version. Поведение то же, что в `xr-client` (см.
@@ -277,7 +328,7 @@ impl VpnEngine {
             // stream will open instantly without a separate TCP connect.
             let mut health_shutdown = shutdown_rx.clone();
             let health_result = tokio::select! {
-                r = ctx.mux_pool.warmup() => Some(r),
+                r = ctx.server_pool.warmup() => Some(r),
                 _ = health_shutdown.changed() => None,
             };
             match health_result {
@@ -314,10 +365,19 @@ impl VpnEngine {
         }
         // Drop the post-start handles so a stray `on_network_changed` after
         // stop is a no-op and the pool can be released.
-        self.mux_pool = None;
+        self.server_pool = None;
         self.netgen_tx = None;
     }
     pub fn is_running(&self) -> bool { self.shutdown_tx.is_some() }
+
+    /// Активный сервер пула: `(имя, работаем_через_резерв)`. Питает строку
+    /// статуса «через X (резерв)» на главном экране (LLD-10 §2.6).
+    /// `None`, пока движок не запущен.
+    pub fn active_server_info(&self) -> Option<(String, bool)> {
+        self.server_pool
+            .as_ref()
+            .map(|p| (p.active_name(), p.is_backup_active()))
+    }
 
     /// React to an underlying-network switch (Android LTE↔Wi-Fi).
     ///
@@ -337,10 +397,11 @@ impl VpnEngine {
             tx.send_modify(|g| *g = g.wrapping_add(1));
         }
         // Recycle off-task: drop stale multiplexers + clear the fail-open
-        // breaker, then best-effort pre-warm so the first proxied stream after
-        // the switch opens without paying a reconnect. A warmup failure is
-        // fine — slots reconnect lazily on the next `open_stream`.
-        if let Some(pool) = &self.mux_pool {
+        // breakers (all pool servers) and reset stickiness back to primary,
+        // then best-effort pre-warm so the first proxied stream after the
+        // switch opens without paying a reconnect. A warmup failure is fine,
+        // slots reconnect lazily on the next `open_stream`.
+        if let Some(pool) = &self.server_pool {
             let pool = pool.clone();
             tokio::spawn(async move {
                 pool.recycle().await;
