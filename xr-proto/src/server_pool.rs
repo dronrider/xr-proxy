@@ -33,6 +33,18 @@ pub type PoolEventFn = Arc<dyn Fn(&str) + Send + Sync>;
 /// молча съедающего SYN, висела бы до таймаута ОС и копилась от тика к тику.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Сколько ждать стрим от одного сервера, прежде чем перейти на следующий.
+///
+/// Молчащий (blackhole) primary держит TCP «живым» и не отдаёт RST, поэтому его
+/// `MuxPool::open_stream` возвращает ошибку только после обхода всех слотов, где
+/// каждый упирается в свой ConnectAck-таймаут (~4×10с). Без этой границы
+/// `open_stream` висел бы десятки секунд и уводил соединение в Direct
+/// (`on_server_down`), хотя живой резерв принял бы его за один RTT. Граница
+/// переводит на следующий сервер за секунды, поэтому трафик уходит на резерв, а
+/// не утекает мимо прокси. Значение с запасом над нормальным ConnectAck (<1с),
+/// но много меньше полного обхода слотов.
+const PER_SERVER_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Энергетический профиль пула (LLD-10 §2.7). Роутер может позволить себе
 /// тёплые резервы и частые пробы; телефону каждое лишнее пробуждение радио
 /// стоит батареи, поэтому там пробер живёт только в деградированном состоянии.
@@ -42,10 +54,6 @@ pub struct PoolProfile {
     /// постоянные ESTAB на каждом VPS). Холодный профиль поднимает mux к
     /// backup только в момент failover (+1 RTT на handshake).
     pub warm_backups: bool,
-    /// Пробить серверы и в здоровом состоянии (active == primary). При false
-    /// пробер молчит, пока активен primary: пассивный breaker сам поймает его
-    /// падение по реальному трафику, а failback без деградации не нужен.
-    pub probe_when_healthy: bool,
     pub probe_interval: Duration,
     /// Сколько primary должен быть непрерывно живым, прежде чем активный
     /// трафик вернётся на него. Гасит флаппинг на нестабильной связи.
@@ -57,7 +65,6 @@ impl PoolProfile {
     pub fn router() -> Self {
         Self {
             warm_backups: true,
-            probe_when_healthy: true,
             probe_interval: Duration::from_secs(15),
             failback_hold: Duration::from_secs(60),
         }
@@ -68,7 +75,6 @@ impl PoolProfile {
     pub fn mobile() -> Self {
         Self {
             warm_backups: false,
-            probe_when_healthy: false,
             probe_interval: Duration::from_secs(60),
             failback_hold: Duration::from_secs(60),
         }
@@ -267,15 +273,23 @@ impl ServerPool {
         let mut last_err: Option<io::Error> = None;
 
         for idx in self.walk_order(start) {
-            match self.slots[idx].pool.open_stream(target).await {
-                Ok(stream) => {
+            // Ограничиваем ожидание каждого сервера: молчащий primary иначе
+            // держал бы нас десятки секунд (см. PER_SERVER_OPEN_TIMEOUT), и
+            // соединение утекло бы в Direct вместо живого резерва.
+            let outcome = tokio::time::timeout(
+                PER_SERVER_OPEN_TIMEOUT,
+                self.slots[idx].pool.open_stream(target),
+            )
+            .await;
+            match outcome {
+                Ok(Ok(stream)) => {
                     self.slots[idx].mark_up();
                     if idx != start {
                         self.switch_active(start, idx, "failover");
                     }
                     return Ok(stream);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     self.slots[idx].mark_down();
                     tracing::debug!(
                         "server {} unavailable ({}), trying next",
@@ -283,6 +297,18 @@ impl ServerPool {
                         e
                     );
                     last_err = Some(e);
+                }
+                Err(_) => {
+                    self.slots[idx].mark_down();
+                    tracing::debug!(
+                        "server {} did not answer in {:?}, trying next",
+                        self.slots[idx].label(),
+                        PER_SERVER_OPEN_TIMEOUT
+                    );
+                    last_err = Some(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("server {} open timed out", self.slots[idx].label()),
+                    ));
                 }
             }
         }
@@ -382,36 +408,27 @@ impl ServerPool {
     async fn health_tick(&self) {
         let active = self.active_index();
 
-        // Экономный профиль: пока активен primary, не пробим вообще.
-        // Падение primary поймает пассивный breaker по реальному трафику,
-        // а failback без деградации не нужен (§2.7).
-        if !self.profile.probe_when_healthy && active == 0 {
-            return;
+        // Тёплый профиль держит резервы поднятыми: warmup наполняет пустые
+        // слоты один раз, дальше mux сам себя keepalive'ит, поэтому в норме это
+        // no-op без лишних коннектов. Результат warmup для здоровья НЕ берём: на
+        // blackhole'нутом сервере он вернёт Ok по «живым» (но глухим) mux.
+        // Реальное здоровье считает только probe_fresh ниже.
+        if self.profile.warm_backups {
+            for slot in &self.slots {
+                let _ = tokio::time::timeout(PROBE_TIMEOUT, slot.pool.warmup()).await;
+            }
         }
 
-        // Кого пробить: кандидатов на failback (выше по приоритету активного)
-        // всегда, а в тёплом профиле все серверы целиком, что заодно держит
-        // mux к каждому из них живым (мгновенный failover без cold-start).
-        let upto = if self.profile.probe_when_healthy {
-            self.slots.len()
-        } else {
-            active
-        };
-
-        for idx in 0..upto {
-            let slot = &self.slots[idx];
-            // Тёплый профиль прогревает все N слотов mux-пула, холодный
-            // ограничивается одним соединением-пробой.
-            let probe = async {
-                if self.profile.warm_backups {
-                    slot.pool.warmup().await
-                } else {
-                    slot.pool.probe().await
-                }
-            };
-            match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
-                Ok(Ok(())) => slot.mark_up(),
-                Ok(Err(_)) | Err(_) => slot.mark_down(),
+        // Пробим кандидатов на failback (приоритетнее активного) реальным
+        // round-trip'ом: свежий handshake ловит blackhole (mux ещё is_alive, но
+        // глотает egress) за таймаут коннекта, а не читает мёртвый primary
+        // «живым» минутами. В норме (active == primary) кандидатов нет, поэтому
+        // ни одной пробы: пул не шлёт лишних коннектов на VPS. Failover активного
+        // ловит ограниченный по времени open_stream по реальному трафику (§2.7).
+        for idx in 0..active {
+            match tokio::time::timeout(PROBE_TIMEOUT, self.slots[idx].pool.probe_fresh()).await {
+                Ok(Ok(())) => self.slots[idx].mark_up(),
+                Ok(Err(_)) | Err(_) => self.slots[idx].mark_down(),
             }
         }
 
@@ -568,6 +585,38 @@ mod tests {
         assert_eq!(primary_calls.load(Ordering::Relaxed), primary_before);
     }
 
+    /// Молчащий primary (blackhole): TCP-коннект зависает без ответа и без RST.
+    /// Без границы времени `open_stream` висел бы на нём десятки секунд и увёл бы
+    /// соединение в Direct. Проверяем, что пул отдаёт стрим *резерва* (а не Err),
+    /// то есть трафик уходит на backup, а не мимо прокси. Тест реально ждёт
+    /// `PER_SERVER_OPEN_TIMEOUT` (детерминированно), успех-путь на живом IO
+    /// backup'а несовместим с `start_paused` (авто-проматывание клока срубило бы
+    /// и его таймаут).
+    #[tokio::test]
+    async fn test_silent_primary_bounds_and_fails_over_to_backup() {
+        let backup_addr = spawn_test_server().await;
+        // primary «съедает» коннект: SYN ушёл, ответа нет, RST нет.
+        let hang: ConnectFn =
+            Arc::new(|| Box::pin(std::future::pending::<io::Result<TcpStream>>()));
+
+        let pool = ServerPool::new(
+            vec![
+                slot("primary", hang),
+                slot("backup", connect_to(backup_addr, Arc::new(AtomicU32::new(0)))),
+            ],
+            PoolProfile::router(),
+            None,
+        );
+
+        let stream = pool
+            .open_stream(&target())
+            .await
+            .expect("backup must serve when primary is silent (no Direct)");
+        assert!(stream.is_alive());
+        assert_eq!(pool.active_index(), 1, "active must move to the backup");
+        assert!(pool.is_backup_active());
+    }
+
     #[tokio::test]
     async fn test_all_down_returns_err() {
         let pool = ServerPool::new(
@@ -588,11 +637,13 @@ mod tests {
         let server_addr = spawn_test_server().await;
         let primary_dead = Arc::new(AtomicBool::new(true));
 
+        // Запас hold-down с большой форой над задержкой реальной пробы
+        // (`probe_fresh` теперь делает настоящий localhost-коннект на тик, а не
+        // мгновенную проверку `is_alive`), иначе тест ловил бы ложный failback.
         let profile = PoolProfile {
             warm_backups: false,
-            probe_when_healthy: false,
             probe_interval: Duration::from_millis(10),
-            failback_hold: Duration::from_millis(50),
+            failback_hold: Duration::from_millis(300),
         };
         let pool = ServerPool::new(
             vec![
@@ -627,7 +678,7 @@ mod tests {
         );
 
         // Непрерывный up дольше hold-down даёт возврат на primary.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
         pool.health_tick().await;
         assert_eq!(pool.active_index(), 0, "failback must return to primary");
         assert!(!pool.is_backup_active());

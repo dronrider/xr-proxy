@@ -382,16 +382,32 @@ impl MuxPool {
         }
     }
 
-    /// Lightweight health probe for `ServerPool` (LLD-10): ensure slot 0 has a
-    /// live mux, connecting it if needed; no user stream is opened. Cheap on a
-    /// healthy warm slot (one `is_alive` check under the slot lock). Bypasses
-    /// the breaker gate on purpose (an active prober MUST test the real path)
-    /// and clears the breaker on success so the next `open_stream` doesn't
-    /// short-circuit on a stale cooldown.
-    pub async fn probe(&self) -> io::Result<()> {
-        self.acquire_or_connect(0, false).await?;
-        self.clear_breaker();
-        Ok(())
+    /// Real reachability probe for `ServerPool` health (LLD-10): open a
+    /// throwaway connection and run the mux handshake, then drop it.
+    ///
+    /// Why not reuse the warm mux (a cheap `is_alive` check): a *blackholed*
+    /// server (egress silently dropped, but the TCP not yet RST) keeps its warm
+    /// mux `is_alive` for minutes — the reader just blocks, and the 30s keepalive
+    /// Ping is buffered without any Pong check. So an `is_alive`-based probe reads
+    /// a dead primary as healthy and failover/failback both misfire. A fresh
+    /// handshake actually round-trips: on a blackholed server the connect itself
+    /// times out (seconds), so the server is honestly marked down. On success the
+    /// breaker is cleared so the next `open_stream` doesn't short-circuit on a
+    /// stale cooldown. The probe connection is dropped immediately (its FIN
+    /// closes the server-side mux cleanly).
+    pub async fn probe_fresh(&self) -> io::Result<()> {
+        let mut stream = (self.connect_fn)().await?;
+        match mux_handshake_client(&mut stream, &self.codec).await {
+            Ok(true) => {
+                self.clear_breaker();
+                Ok(())
+            }
+            Ok(false) => Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "probe: server rejected mux handshake",
+            )),
+            Err(e) => Err(e),
+        }
     }
 
     /// Force every slot to reconnect and clear the fail-open breaker.
