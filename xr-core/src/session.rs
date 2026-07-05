@@ -302,6 +302,14 @@ pub async fn relay_session_with_domain(
             ));
             relay_direct(ctx, key.dst_addr, domain.as_deref(), initial_data, data_rx, data_tx, waker).await
         }
+        Action::Block => {
+            // Правило маршрутизации явно блокирует: соединение не выпускаем.
+            ctx.stats.set_debug(format!(
+                "block: {} [{}]",
+                key.dst_addr, domain.as_deref().unwrap_or("-"),
+            ));
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "blocked by routing"))
+        }
     }
 }
 

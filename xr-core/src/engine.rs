@@ -156,7 +156,7 @@ impl VpnEngine {
         } else {
             Router::new(&self.config.routing, self.config.geoip_path.as_deref())
         };
-        let on_server_down = Action::from_str(&self.config.on_server_down);
+        let on_server_down = Action::on_server_down_from_str(&self.config.on_server_down);
         let fake_dns = Arc::new(FakeDns::new());
 
         // Пул серверов профиля (LLD-10): `servers` по приоритету, при пустом
