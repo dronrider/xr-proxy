@@ -7,13 +7,32 @@ use crate::config::{RoutingConfig, RoutingRule};
 pub enum Action {
     Proxy,
     Direct,
+    /// Соединение рвётся, наружу не выпускается. Для правил маршрутизации это
+    /// явный блэкхол домена, для политики `on_server_down` это fail-closed:
+    /// проксируемое либо идёт через прокси, либо не идёт вовсе, но никогда не
+    /// утекает в Direct с реальным IP.
+    Block,
 }
 
 impl Action {
     pub fn from_str(s: &str) -> Self {
         match s {
             "proxy" => Action::Proxy,
+            "block" => Action::Block,
             _ => Action::Direct,
+        }
+    }
+
+    /// Разбор политики `on_server_down`. Отличается от `from_str` тем, что
+    /// дефолт здесь fail-closed: всё, кроме явного `"direct"`, это `Block`.
+    /// Так опечатка (`"blok"`, `"Block"`, пустая строка) не открывает молча
+    /// трафик в Direct. Раньше варианта `Block` не было вообще, и `"block"`
+    /// проваливался в `Direct`, отчего реальный IP утекал при каждом отказе
+    /// туннеля.
+    pub fn on_server_down_from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "direct" => Action::Direct,
+            _ => Action::Block,
         }
     }
 }
@@ -305,6 +324,29 @@ mod tests {
         let router = Router::new(&make_config(), None);
         let ip: IpAddr = "93.184.216.34".parse().unwrap();
         assert_eq!(router.resolve(Some("youtube.com"), ip), Action::Proxy);
+    }
+
+    #[test]
+    fn test_from_str_recognizes_block() {
+        // Регресс XR-081: раньше варианта Block не было, и "block"
+        // проваливался в Direct, отчего on_server_down=block молча утекал.
+        assert_eq!(Action::from_str("proxy"), Action::Proxy);
+        assert_eq!(Action::from_str("direct"), Action::Direct);
+        assert_eq!(Action::from_str("block"), Action::Block);
+        assert_eq!(Action::from_str("whatever"), Action::Direct);
+    }
+
+    #[test]
+    fn test_on_server_down_is_fail_closed() {
+        // Явный direct открывает Direct-фолбэк, всё остальное (block,
+        // опечатка, пустая строка, иной регистр) это Block, то есть
+        // проксируемое рвётся, а не утекает мимо прокси.
+        assert_eq!(Action::on_server_down_from_str("direct"), Action::Direct);
+        assert_eq!(Action::on_server_down_from_str("block"), Action::Block);
+        assert_eq!(Action::on_server_down_from_str("Block"), Action::Block);
+        assert_eq!(Action::on_server_down_from_str("  block  "), Action::Block);
+        assert_eq!(Action::on_server_down_from_str("blok"), Action::Block);
+        assert_eq!(Action::on_server_down_from_str(""), Action::Block);
     }
 
     #[test]
