@@ -37,6 +37,12 @@ const STREAM_CHANNEL_SIZE: usize = 1024;
 // queue. Under torrent-like load (many parallel streams) the previous 512
 // became a contention bottleneck.
 const WRITER_CHANNEL_SIZE: usize = 2048;
+// Очередь новых входящих стримов (server-side): reader кладёт сюда каждый Connect,
+// mux_handler разбирает. Было 64: под всплеском Connect'ов (флуд/много устройств)
+// канал переполнялся, и reader МОЛЧА ронял Connect через try_send -> клиент не
+// получал ConnectAck и ловил "open timed out" (кандидат в корень XR-086). Подняли
+// с запасом; дроп теперь логируется (см. dispatch_frame).
+const NEW_STREAM_CHANNEL_SIZE: usize = 1024;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// Force mux reconnection every 4 hours to prevent TCP degradation.
 const MUX_MAX_LIFETIME: Duration = Duration::from_secs(4 * 3600);
@@ -297,7 +303,7 @@ impl Multiplexer {
         let alive = Arc::new(AtomicBool::new(true));
         let close_notify = Arc::new(Notify::new());
         let shutdown_notify = Arc::new(Notify::new());
-        let (new_stream_tx, new_stream_rx) = mpsc::channel::<NewStream>(64);
+        let (new_stream_tx, new_stream_rx) = mpsc::channel::<NewStream>(NEW_STREAM_CHANNEL_SIZE);
 
         let (read_half, write_half) = tokio::io::split(stream);
 
@@ -562,10 +568,23 @@ async fn dispatch_frame(
                     let _ = tx.try_send(data.to_vec());
                 } else {
                     drop(streams_guard);
-                    let _ = new_stream_tx.try_send(NewStream {
+                    // Инструментация XR-086: при переполнении канала new_stream
+                    // reader роняет Connect (try_send), клиент ловит "open timed
+                    // out" без блокировок и ошибок. Логируем дроп, чтобы поймать
+                    // этот механизм на живом эпизоде.
+                    match new_stream_tx.try_send(NewStream {
                         stream_id,
                         payload: data.to_vec(),
-                    });
+                    }) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(
+                                "mux new_stream channel FULL, DROPPING Connect sid={} (клиент словит open timed out)",
+                                stream_id
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                    }
                 }
             }
         }
