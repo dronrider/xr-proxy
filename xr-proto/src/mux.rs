@@ -454,17 +454,30 @@ async fn reader_task<R: AsyncReadExt + Unpin>(
                         "mux dead link: no data within timeout",
                     ));
                 }
-                // Send Ping to keep the connection alive and detect dead links.
+                // Keepalive-Ping БЕЗ блокировки на writer-канале. Раньше был
+                // `send().await`: при переполненном канале (флуд соединений от
+                // одного LAN-устройства забивает очередь Connect-кадрами) reader
+                // повисал на отправке Ping, ПЕРЕСТАВАЛ читать сокет, и mux вставал
+                // намертво (дедлок reader/writer: сервер под backpressure не
+                // читает -> сокет клиента не отдаёт -> writer не сливает канал ->
+                // reader ждёт место под Ping -> не читает ответы сервера). Kill
+                // процесса лечил, само не оживало. Теперь try_send: полный канал
+                // -> Ping пропускаем (под нагрузкой last_recv и так свежий от
+                // реального трафика), закрытый канал (writer умер) -> рвём mux.
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
-                if writer_tx.send(OutFrame {
+                match writer_tx.try_send(OutFrame {
                     stream_id: 0,
                     command: Command::Ping,
                     payload: ts.to_be_bytes().to_vec(),
-                }).await.is_err() {
-                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "writer closed"));
+                }) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "writer closed"));
+                    }
                 }
             }
         }
@@ -479,13 +492,15 @@ async fn dispatch_frame(
 ) {
     match frame.command {
         Command::Ping => {
-            let _ = writer_tx
-                .send(OutFrame {
-                    stream_id: 0,
-                    command: Command::Pong,
-                    payload: frame.payload.clone(),
-                })
-                .await;
+            // Ответный Pong best-effort через try_send: reader НИКОГДА не должен
+            // блокироваться на writer-канале, иначе под флудом (переполненный
+            // канал) он перестаёт читать сокет и mux встаёт намертво. Полный
+            // канал -> Pong пропускаем (пир переживёт по своему таймауту).
+            let _ = writer_tx.try_send(OutFrame {
+                stream_id: 0,
+                command: Command::Pong,
+                payload: frame.payload.clone(),
+            });
         }
         Command::Pong => {}
         Command::Data | Command::ConnectAck => {
@@ -720,7 +735,7 @@ impl Drop for StreamRegGuard {
 mod tests {
     use super::*;
     use crate::obfuscation::{ModifierStrategy, Obfuscator};
-    use tokio::io::duplex;
+    use tokio::io::{duplex, AsyncWriteExt};
 
     fn test_codec() -> Codec {
         let key = b"test-key-32-bytes-long-enough!!!".to_vec();
@@ -878,5 +893,32 @@ mod tests {
             }
         }
         assert!(dead, "a silent (blackhole) link must be detected as dead");
+    }
+
+    /// Регрессия XR-083b (дедлок reader/writer под флудом): пир заваливает
+    /// клиента Ping-кадрами и НЕ читает ответные Pong, поэтому writer клиента
+    /// упирается и writer_tx забивается. Раньше reader отвечал Pong через
+    /// блокирующий `send().await` и повисал на переполненном канале, переставал
+    /// читать сокет, и mux вставал намертво (лечился только kill). С `try_send`
+    /// reader продолжает читать (Pong дропается), поэтому наш поток Ping уходит
+    /// без зависания.
+    #[tokio::test]
+    async fn test_reader_survives_full_writer_flood() {
+        let codec = test_codec();
+        // Маленький буфер, чтобы writer клиента упёрся быстро.
+        let (client_io, mut server_io) = duplex(512);
+        let _client = Multiplexer::new_client(client_io, codec.clone());
+
+        let ping = codec.encode_frame(Command::Ping, &0u64.to_be_bytes()).unwrap();
+        let flood = tokio::time::timeout(Duration::from_secs(5), async {
+            for _ in 0..5000 {
+                server_io.write_all(&ping).await.unwrap();
+            }
+        })
+        .await;
+        assert!(
+            flood.is_ok(),
+            "reader must keep draining the socket under a full writer channel (no deadlock)"
+        );
     }
 }
