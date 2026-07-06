@@ -187,7 +187,12 @@ impl VpnEngine {
                     let protect = protect.clone();
                     let addr = addr;
                     Box::pin(async move {
-                        crate::session::connect_protected_pub(addr, &protect).await
+                        let stream = crate::session::connect_protected_pub(addr, &protect).await?;
+                        // Nagle off на mux-сокете: Connect нового стрима не должен
+                        // коалесцироваться за upload-Data (симметрично роутеру,
+                        // см. tunnel::connect_to_server).
+                        let _ = stream.set_nodelay(true);
+                        Ok(stream)
                     })
                 }),
                 codec.clone(),
