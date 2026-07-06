@@ -31,17 +31,28 @@ fd=$(ls "/proc/$pid/fd" 2>/dev/null | wc -l)
 # IP серверов из конфига.
 srv=$(grep -E '^address = ' "$CONFIG" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
 
-# Байты и число флоу mux к серверам (dst=<srv> dport=8443). bytes= с обеих сторон.
-muxbytes=0; muxn=0
+# МОНОТОННЫЙ счётчик тунельных байт через nft (conntrack-сумма немонотонна:
+# записи закрываются между срезами и сумма падает в 0 даже при активном трафике,
+# из-за чего сигнал врал про «сухой туннель»). Отдельная таблица только со
+# счётчиками (policy accept, трафик не трогаем): output к серверу:8443 (upload) и
+# input от сервера:8443 (download).
+if ! nft list table ip xr_hwcount >/dev/null 2>&1; then
+    nft add table ip xr_hwcount 2>/dev/null
+    nft add chain ip xr_hwcount mon_out '{ type filter hook output priority 300; policy accept; }' 2>/dev/null
+    nft add chain ip xr_hwcount mon_in '{ type filter hook input priority 300; policy accept; }' 2>/dev/null
+    for s in $srv; do
+        nft add rule ip xr_hwcount mon_out ip daddr "$s" tcp dport 8443 counter 2>/dev/null
+        nft add rule ip xr_hwcount mon_in ip saddr "$s" tcp sport 8443 counter 2>/dev/null
+    done
+fi
+muxbytes=$(nft list table ip xr_hwcount 2>/dev/null | grep -oE 'bytes [0-9]+' | awk '{s+=$2} END{print s+0}')
+muxn=0
 for s in $srv; do
-    line=$(grep "dst=$s " /proc/net/nf_conntrack 2>/dev/null | grep "dport=8443")
-    n=$(echo "$line" | grep -c 'dport=8443')
-    b=$(echo "$line" | grep -oE 'bytes=[0-9]+' | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}')
-    muxn=$((muxn + n)); muxbytes=$((muxbytes + b))
+    muxn=$((muxn + $(grep "dst=$s " /proc/net/nf_conntrack 2>/dev/null | grep -c 'dport=8443')))
 done
 prevb=$(cat "$STAMP.mux" 2>/dev/null || echo "$muxbytes"); echo "$muxbytes" > "$STAMP.mux"
 dmux=$((muxbytes - prevb))
-# После рестарта conntrack обнуляется -> отрицательная дельта, нормализуем в 0.
+# nft-счётчик сбрасывается только с таблицей (рестарт роутера) -> нормализуем.
 [ "$dmux" -lt 0 ] && dmux=0
 
 ct=$(wc -l < /proc/net/nf_conntrack 2>/dev/null)
