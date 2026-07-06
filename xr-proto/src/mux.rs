@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex, Notify};
@@ -41,6 +40,14 @@ const WRITER_CHANNEL_SIZE: usize = 2048;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// Force mux reconnection every 4 hours to prevent TCP degradation.
 const MUX_MAX_LIFETIME: Duration = Duration::from_secs(4 * 3600);
+/// Мёртвый линк: если по соединению не пришло НИЧЕГО (даже Pong на наши Ping)
+/// дольше этого срока, считаем mux сдохшим и рвём его (XR-083). Здоровый линк
+/// получает Pong на каждый keepalive-Ping (сервер отвечает симметрично), поэтому
+/// на нём входящие идут не реже KEEPALIVE_INTERVAL. Порог с запасом на один
+/// потерянный Pong: без детекта blackhole-mux (egress тихо дропается, TCP без
+/// RST, read висит без EOF) числился бы «живым» до MUX_MAX_LIFETIME=4ч, отравляя
+/// слот пула до рестарта процесса.
+const DEAD_LINK_TIMEOUT: Duration = Duration::from_secs(75);
 const MUX_PROTOCOL_VERSION: u8 = 1;
 
 // ── Outgoing frame ──────────────────────────────────────────────────
@@ -403,7 +410,12 @@ async fn reader_task<R: AsyncReadExt + Unpin>(
 ) -> io::Result<()> {
     let mut buf = vec![0u8; 65536 + 256];
     let mut filled = 0;
-    let started = Instant::now();
+    // tokio-часы (не std::Instant): в проде эквивалентно, но так MUX_MAX_LIFETIME
+    // и детект мёртвого линка тестируются под `tokio::time::pause`.
+    let started = tokio::time::Instant::now();
+    // Последний момент, когда по линку пришли данные. Любой Pong на наш Ping его
+    // обновляет, поэтому на живом линке он не стареет дольше KEEPALIVE_INTERVAL.
+    let mut last_recv = tokio::time::Instant::now();
     let mut keepalive_interval = tokio::time::interval(KEEPALIVE_INTERVAL);
     keepalive_interval.tick().await; // skip first immediate tick
 
@@ -417,6 +429,7 @@ async fn reader_task<R: AsyncReadExt + Unpin>(
             result = reader.read(&mut buf[filled..]) => {
                 let n = result?;
                 if n == 0 { return Ok(()); }
+                last_recv = tokio::time::Instant::now();
                 filled += n;
 
                 // Decode all complete frames.
@@ -432,6 +445,15 @@ async fn reader_task<R: AsyncReadExt + Unpin>(
                 }
             }
             _ = keepalive_interval.tick() => {
+                // Детект мёртвого линка: на blackhole (egress тихо дропается)
+                // Pong'и не приходят и last_recv стареет. Рвём mux, чтобы слот
+                // пула переподнялся, а не числился «живым» до 4ч (XR-083).
+                if last_recv.elapsed() >= DEAD_LINK_TIMEOUT {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "mux dead link: no data within timeout",
+                    ));
+                }
                 // Send Ping to keep the connection alive and detect dead links.
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -825,5 +847,36 @@ mod tests {
             cleaned,
             "cancelled open_stream must not leak the stream registration"
         );
+    }
+
+    /// Регрессия XR-083: blackhole-линк (сервер не шлёт ни данных, ни Pong, но
+    /// TCP не закрыт) должен помечаться мёртвым по `DEAD_LINK_TIMEOUT`, а не
+    /// числиться живым до `MUX_MAX_LIFETIME`=4ч. `_server_io` держим живым, чтобы
+    /// не сработал путь EOF: детект должен идти именно по молчанию.
+    #[tokio::test(start_paused = true)]
+    async fn test_reader_detects_dead_link() {
+        let (client_io, _server_io) = duplex(65536);
+        let codec = test_codec();
+        let mux = Multiplexer::new_client(client_io, codec);
+        assert!(mux.is_alive(), "fresh mux must be alive");
+
+        // Дать reader-таску запуститься и встать на select (skip-тик + await).
+        tokio::task::yield_now().await;
+
+        // Промотать paused-часы шагами по keepalive, прокручивая reader на каждом:
+        // на шаге, где молчание перевалит DEAD_LINK_TIMEOUT, keepalive-ветка
+        // вернёт Err и выставит alive=false.
+        let mut dead = false;
+        for _ in 0..6 {
+            tokio::time::advance(KEEPALIVE_INTERVAL).await;
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            if !mux.is_alive() {
+                dead = true;
+                break;
+            }
+        }
+        assert!(dead, "a silent (blackhole) link must be detected as dead");
     }
 }

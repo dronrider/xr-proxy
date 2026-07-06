@@ -356,6 +356,13 @@ impl MuxPool {
                 return Ok(mux.clone());
             }
         }
+        // Мёртвый mux в слоте (в т.ч. пойманный детектом мёртвого линка XR-083):
+        // явно закрываем его сокет перед переподнятием, иначе осиротевший writer
+        // держит ESTAB на сервере до MUX_MAX_LIFETIME (ghost-сессии).
+        if let Some(old) = guard.take() {
+            old.shutdown();
+            self.timeout_counters[idx].store(0, Ordering::Relaxed);
+        }
 
         // No live mux on this slot. If the breaker armed while we waited for the
         // lock, don't burn a connect timeout — fail open immediately.
