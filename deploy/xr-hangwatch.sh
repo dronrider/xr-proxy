@@ -57,7 +57,18 @@ dmux=$((muxbytes - prevb))
 
 ct=$(wc -l < /proc/net/nf_conntrack 2>/dev/null)
 
-echo "$TS st=$st dcpu=${dcpu}t fd=$fd mux[n=$muxn dBytes=${dmux}] ct=$ct" >> "$LOG"
+# Очереди на mux-сокетах к серверам (Recv-Q/Send-Q через netstat). Ключевой сигнал
+# per-slot затыка ConnectAck (XR-086): при зависании reader клиента застрял ->
+# Recv-Q пухнет (сервер шлёт, клиент не читает); если Recv-Q=0 при живом сервере
+# -> сервер молчит именно в этот сокет. Берём максимум по всем сокетам к серверам.
+rq=0; sq=0
+for s in $srv; do
+    eval "$(netstat -tn 2>/dev/null | awk -v s="$s" '$0 ~ (s":8443") {if($2+0>rq)rq=$2; if($3+0>sq)sq=$3} END{print "lrq="rq+0"; lsq="sq+0}')"
+    [ "${lrq:-0}" -gt "$rq" ] && rq=$lrq
+    [ "${lsq:-0}" -gt "$sq" ] && sq=$lsq
+done
+
+echo "$TS st=$st dcpu=${dcpu}t fd=$fd mux[n=$muxn dBytes=${dmux} rq=$rq sq=$sq] ct=$ct" >> "$LOG"
 
 # Подозрение на зависание: туннель НЕ двигает байты, но сеть активна (fd высокий,
 # то есть кто-то ломится). Считаем подряд идущие "сухие" срезы, дампим на 3-м.
