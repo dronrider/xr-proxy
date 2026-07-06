@@ -14,13 +14,19 @@ use crate::protocol::{Codec, Command, TargetAddr};
 /// Server sends ConnectAck instantly, so if connection doesn't work
 /// in 2 seconds — it won't work at all, retry or fall back.
 pub async fn connect_to_server(addr: &SocketAddr) -> io::Result<TcpStream> {
-    tokio::time::timeout(
+    let stream = tokio::time::timeout(
         Duration::from_secs(2),
         TcpStream::connect(addr),
     )
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut,
-        format!("server connect timeout ({})", addr)))?
+        format!("server connect timeout ({})", addr)))??;
+    // Nagle off на mux-сокете: контрольные кадры (Connect) крошечные и должны
+    // уходить сразу, а не коалесцироваться за неотправленной upload-Data. Иначе
+    // под заливкой открытие нового стрима задерживается на RTT (в паре с
+    // приоритетным контрольным планом writer'а это держит открытия быстрыми).
+    let _ = stream.set_nodelay(true);
+    Ok(stream)
 }
 
 /// Connect to the xr-server with retry logic (legacy, used by older configs).

@@ -1,15 +1,21 @@
 //! Multiplexer: multiple logical streams over one TCP connection.
 //!
-//! Architecture:
+//! Architecture (два плана записи, контрольный приоритетнее):
 //! ```text
-//! Stream 1 ─┐                              ┌─ Stream 1 channel
-//! Stream 2 ─┼─ writer_tx ─→ Writer Task ─→ TCP ─→ Reader Task ─→ dispatch by stream_id
-//! Stream 3 ─┘                              └─ Stream 3 channel
+//!   ctrl_tx (Connect/ConnectAck/Ping/Pong) --\  biased
+//! Stream 1 --\                                |
+//! Stream 2 ---+-- writer_tx (Data + Close) ---+--> Writer Task --> TCP --> Reader Task --> dispatch
+//! Stream 3 --/
 //! ```
 //!
 //! Each MuxStream is an independent bidirectional channel that looks like
 //! a TCP connection to the caller. The Multiplexer owns the real TCP
 //! connection and routes frames by stream_id.
+//!
+//! Два плана записи: контрольный (`ctrl_tx`) и балк-данные (`writer_tx`). Writer
+//! сливает их одним biased-select'ом с приоритетом контрольного, поэтому
+//! ConnectAck нового стрима не залипает за мегабайтами Data чужих загрузок
+//! (head-of-line, корень XR-086).
 
 use std::collections::HashMap;
 use std::io;
@@ -43,6 +49,16 @@ const WRITER_CHANNEL_SIZE: usize = 2048;
 // получал ConnectAck и ловил "open timed out" (кандидат в корень XR-086). Подняли
 // с запасом; дроп теперь логируется (см. dispatch_frame).
 const NEW_STREAM_CHANNEL_SIZE: usize = 1024;
+// КОНТРОЛЬНЫЙ план mux: Connect/ConnectAck/Ping/Pong идут ОТДЕЛЬНЫМ каналом от
+// балка Data и пишутся writer'ом с приоритетом. Раньше всё шло одним FIFO
+// writer_tx, и ConnectAck нового стрима вставал в хвост за мегабайтами Data
+// существующих загрузок; на медленном линке он уходил в провод дольше
+// PER_SERVER_OPEN_TIMEOUT=5с -> клиент ловил "open timed out" (корень XR-086,
+// head-of-line блокировка контрольных кадров). Отдельный приоритетный план это
+// снимает. Close СОЗНАТЕЛЬНО остаётся в балк-плане рядом с Data того же стрима
+// (иначе обгонит недописанные Data и обрежет выгрузку). Канал маленький:
+// контрольные кадры редки и крошечны.
+const CTRL_CHANNEL_SIZE: usize = 1024;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// Force mux reconnection every 4 hours to prevent TCP degradation.
 const MUX_MAX_LIFETIME: Duration = Duration::from_secs(4 * 3600);
@@ -77,6 +93,9 @@ struct OutFrame {
 pub struct MuxStream {
     stream_id: u32,
     rx: Option<mpsc::Receiver<Vec<u8>>>,
+    /// Единый FIFO этого стрима: и Data, и Close. Close НЕ уводим в контрольный
+    /// план, иначе он обгонит ещё не записанные Data того же стрима и обрежет
+    /// выгрузку (пир закроет стрим раньше, чем дочитает данные).
     writer_tx: mpsc::Sender<OutFrame>,
     alive: Arc<AtomicBool>,
     closed: bool,
@@ -165,11 +184,12 @@ impl Drop for MuxStream {
 }
 
 /// Best-effort Close при дропе стрима, БЕЗ `tokio::spawn`. Раньше здесь
-/// спавнился таск, ждущий `writer_tx.send(Close).await`; под churn'ом соединений
-/// и медленным writer'ом (деградирующий линк к серверу) канал переполнялся, и
-/// эти ждущие таски копились неограниченно, утягивая память (XR-079). `try_send`
-/// не блокирует и не спавнит: если очередь writer'а полна, Close теряется, а
-/// сервер закрывает стрим сам по своему idle-таймауту.
+/// спавнился таск, ждущий `send(Close).await`; под churn'ом соединений и медленным
+/// writer'ом (деградирующий линк к серверу) канал переполнялся, и эти ждущие таски
+/// копились неограниченно, утягивая память (XR-079). `try_send` не блокирует и не
+/// спавнит: если очередь полна, Close теряется, а сервер закрывает стрим сам по
+/// своему idle-таймауту. Идёт по балк-плану (`writer_tx`) вместе с Data, чтобы не
+/// обгонять ещё не записанные Data того же стрима.
 fn close_on_drop(writer_tx: &mpsc::Sender<OutFrame>, stream_id: u32) {
     let _ = writer_tx.try_send(OutFrame {
         stream_id,
@@ -198,6 +218,7 @@ impl MuxReadHalf {
 #[derive(Debug)]
 pub struct MuxWriteHalf {
     stream_id: u32,
+    /// Единый FIFO стрима (Data + Close), см. MuxStream::writer_tx.
     writer_tx: mpsc::Sender<OutFrame>,
     alive: Arc<AtomicBool>,
     closed: bool,
@@ -258,7 +279,10 @@ pub struct NewStream {
 
 /// Manages a multiplexed TCP connection with multiple logical streams.
 pub struct Multiplexer {
+    /// Балк-план: Command::Data и Close (Close ордерится за Data того же стрима).
     writer_tx: mpsc::Sender<OutFrame>,
+    /// Контрольный план (приоритет в writer'е): Connect/ConnectAck/Ping/Pong.
+    ctrl_tx: mpsc::Sender<OutFrame>,
     streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
     next_stream_id: AtomicU32,
     alive: Arc<AtomicBool>,
@@ -298,6 +322,7 @@ impl Multiplexer {
         S: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
     {
         let (writer_tx, writer_rx) = mpsc::channel::<OutFrame>(WRITER_CHANNEL_SIZE);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<OutFrame>(CTRL_CHANNEL_SIZE);
         let streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
@@ -307,15 +332,16 @@ impl Multiplexer {
 
         let (read_half, write_half) = tokio::io::split(stream);
 
-        // Spawn reader task.
+        // Spawn reader task. Reader шлёт только контрольные кадры (Ping/Pong),
+        // поэтому получает КОНТРОЛЬНЫЙ канал.
         {
             let streams = streams.clone();
             let alive = alive.clone();
             let close_notify = close_notify.clone();
             let codec = codec.clone();
-            let writer_tx = writer_tx.clone();
+            let reader_ctrl = ctrl_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = reader_task(read_half, codec, streams.clone(), writer_tx, new_stream_tx).await {
+                if let Err(e) = reader_task(read_half, codec, streams.clone(), reader_ctrl, new_stream_tx).await {
                     tracing::debug!("mux reader ended: {}", e);
                 }
                 alive.store(false, Ordering::Relaxed);
@@ -334,7 +360,7 @@ impl Multiplexer {
             let shutdown_notify = shutdown_notify.clone();
             tokio::spawn(async move {
                 tokio::select! {
-                    res = writer_task(write_half, codec, writer_rx) => {
+                    res = writer_task(write_half, codec, ctrl_rx, writer_rx) => {
                         if let Err(e) = res {
                             tracing::debug!("mux writer ended: {}", e);
                         }
@@ -351,6 +377,7 @@ impl Multiplexer {
 
         Arc::new(Self {
             writer_tx,
+            ctrl_tx,
             streams,
             next_stream_id: AtomicU32::new(first_stream_id),
             alive,
@@ -380,14 +407,18 @@ impl Multiplexer {
 
     /// Send a raw frame (used for ConnectAck, Ping, Pong).
     ///
-    /// Инструментация XR-086: если отправка виснет на переполненном writer-канале
-    /// дольше 2с (writer-таск не сливает канал в сокет, backpressure), логируем
-    /// WARN с командой. На сервере это ловит затык `mux_handler` на ConnectAck
-    /// (обработка Connect для клиента встаёт, keepalive при этом жив), на клиенте
-    /// затык отправки Connect/данных. Поведение то же (дожидаемся), только лог.
+    /// Все кадры send_frame это КОНТРОЛЬ (Connect/ConnectAck/Ping/Pong), поэтому
+    /// идут по приоритетному контрольному каналу и НЕ встают в хвост за балком
+    /// Data (корень XR-086: ConnectAck нового стрима залипал за мегабайтами
+    /// download в общей FIFO writer'а). Контрольный канал сливается writer-таском
+    /// раньше Data (biased select), переполниться под балком не может.
+    ///
+    /// Инструментация: если отправка всё же виснет дольше 2с, значит стоит сам
+    /// writer-таск (TCP send-буфер полон, сокет не принимает даже контроль),
+    /// логируем WARN с командой. Поведение то же (дожидаемся), только лог.
     pub async fn send_frame(&self, stream_id: u32, command: Command, payload: Vec<u8>) -> io::Result<()> {
         let fut = self
-            .writer_tx
+            .ctrl_tx
             .send(OutFrame { stream_id, command, payload });
         tokio::pin!(fut);
         let broken = || io::Error::new(io::ErrorKind::BrokenPipe, "mux writer closed");
@@ -395,7 +426,7 @@ impl Multiplexer {
             Ok(r) => r.map_err(|_| broken()),
             Err(_) => {
                 tracing::warn!(
-                    "mux send_frame({:?}) blocked >2s on full writer channel (writer drain stuck?)",
+                    "mux send_frame({:?}) blocked >2s on ctrl channel (writer task / TCP send stuck?)",
                     command
                 );
                 fut.await.map_err(|_| broken())
@@ -432,7 +463,7 @@ async fn reader_task<R: AsyncReadExt + Unpin>(
     mut reader: R,
     codec: Codec,
     streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
-    writer_tx: mpsc::Sender<OutFrame>,
+    ctrl_tx: mpsc::Sender<OutFrame>,
     new_stream_tx: mpsc::Sender<NewStream>,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; 65536 + 256];
@@ -463,7 +494,7 @@ async fn reader_task<R: AsyncReadExt + Unpin>(
                 loop {
                     match codec.decode_frame(&buf[..filled])? {
                         Some((frame, consumed)) => {
-                            dispatch_frame(&frame, &streams, &writer_tx, &new_stream_tx).await;
+                            dispatch_frame(&frame, &streams, &ctrl_tx, &new_stream_tx).await;
                             buf.copy_within(consumed..filled, 0);
                             filled -= consumed;
                         }
@@ -481,21 +512,19 @@ async fn reader_task<R: AsyncReadExt + Unpin>(
                         "mux dead link: no data within timeout",
                     ));
                 }
-                // Keepalive-Ping БЕЗ блокировки на writer-канале. Раньше был
-                // `send().await`: при переполненном канале (флуд соединений от
-                // одного LAN-устройства забивает очередь Connect-кадрами) reader
-                // повисал на отправке Ping, ПЕРЕСТАВАЛ читать сокет, и mux вставал
-                // намертво (дедлок reader/writer: сервер под backpressure не
-                // читает -> сокет клиента не отдаёт -> writer не сливает канал ->
-                // reader ждёт место под Ping -> не читает ответы сервера). Kill
-                // процесса лечил, само не оживало. Теперь try_send: полный канал
+                // Keepalive-Ping идёт по КОНТРОЛЬНОМУ каналу (отдельно от Data), и
+                // всё равно через try_send без блокировки. Контрольный канал
+                // сливается writer-таском с приоритетом и переполниться под
+                // балком не может, но reader не должен блокироваться в принципе:
+                // блокировка отправки = reader перестаёт читать сокет = mux
+                // встаёт намертво (дедлок reader/writer, XR-084). Полный канал
                 // -> Ping пропускаем (под нагрузкой last_recv и так свежий от
                 // реального трафика), закрытый канал (writer умер) -> рвём mux.
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
-                match writer_tx.try_send(OutFrame {
+                match ctrl_tx.try_send(OutFrame {
                     stream_id: 0,
                     command: Command::Ping,
                     payload: ts.to_be_bytes().to_vec(),
@@ -514,16 +543,16 @@ async fn reader_task<R: AsyncReadExt + Unpin>(
 async fn dispatch_frame(
     frame: &Frame,
     streams: &Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
-    writer_tx: &mpsc::Sender<OutFrame>,
+    ctrl_tx: &mpsc::Sender<OutFrame>,
     new_stream_tx: &mpsc::Sender<NewStream>,
 ) {
     match frame.command {
         Command::Ping => {
-            // Ответный Pong best-effort через try_send: reader НИКОГДА не должен
-            // блокироваться на writer-канале, иначе под флудом (переполненный
-            // канал) он перестаёт читать сокет и mux встаёт намертво. Полный
-            // канал -> Pong пропускаем (пир переживёт по своему таймауту).
-            let _ = writer_tx.try_send(OutFrame {
+            // Ответный Pong best-effort через try_send по контрольному каналу:
+            // reader НИКОГДА не должен блокироваться на отправке, иначе он
+            // перестаёт читать сокет и mux встаёт намертво. Полный канал -> Pong
+            // пропускаем (пир переживёт по своему таймауту).
+            let _ = ctrl_tx.try_send(OutFrame {
                 stream_id: 0,
                 command: Command::Pong,
                 payload: frame.payload.clone(),
@@ -597,9 +626,30 @@ async fn dispatch_frame(
 async fn writer_task<W: AsyncWriteExt + Unpin>(
     mut writer: W,
     codec: Codec,
-    mut rx: mpsc::Receiver<OutFrame>,
+    mut ctrl_rx: mpsc::Receiver<OutFrame>,
+    mut data_rx: mpsc::Receiver<OutFrame>,
 ) -> io::Result<()> {
-    while let Some(frame) = rx.recv().await {
+    // ПРИОРИТЕТ контрольного плана: `biased` select проверяет ctrl_rx раньше
+    // data_rx, поэтому между любыми двумя балк-кадрами Data успевают уйти все
+    // накопившиеся контрольные кадры (ConnectAck и т.п.). Так ConnectAck нового
+    // стрима не стоит в очереди за мегабайтами Data (корень XR-086). Каждый канал
+    // отключается из select своим guard'ом при закрытии, чтобы закрытый ctrl не
+    // крутил busy-loop и не глотал недослитый data (и наоборот).
+    let mut ctrl_open = true;
+    let mut data_open = true;
+    while ctrl_open || data_open {
+        let frame = tokio::select! {
+            biased;
+            c = ctrl_rx.recv(), if ctrl_open => match c {
+                Some(f) => f,
+                None => { ctrl_open = false; continue; }
+            },
+            d = data_rx.recv(), if data_open => match d {
+                Some(f) => f,
+                None => { data_open = false; continue; }
+            },
+        };
+
         let payload = match frame.command {
             Command::Ping | Command::Pong => {
                 // Control frames: no stream_id prefix.
@@ -729,9 +779,10 @@ pub async fn mux_open_stream(
         stream_id,
     };
 
-    // Send Connect(stream_id, target_addr). Таймаут+WARN: если открытие вешается
-    // здесь, значит writer-канал переполнен и не сливается (writer-таск встал).
-    // Именно так выглядел живой хэнг DE (0 пакетов на сервер, open timed out).
+    // Send Connect(stream_id, target_addr) по контрольному плану. Таймаут+WARN:
+    // если открытие вешается здесь, значит встал сам writer-таск (TCP send-буфер
+    // полон, сокет не принимает даже контроль). Именно так выглядел живой хэнг DE
+    // (0 пакетов на сервер, open timed out).
     match tokio::time::timeout(
         OPEN_STEP_TIMEOUT,
         mux.send_frame(stream_id, Command::Connect, target.encode()),
@@ -741,7 +792,7 @@ pub async fn mux_open_stream(
         Ok(r) => r?,
         Err(_) => {
             tracing::warn!(
-                "mux_open_stream wedged >4s sending Connect (writer_tx full / writer task stuck?)"
+                "mux_open_stream wedged >4s sending Connect (ctrl channel / writer task stuck?)"
             );
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -807,7 +858,8 @@ impl Drop for StreamRegGuard {
 mod tests {
     use super::*;
     use crate::obfuscation::{ModifierStrategy, Obfuscator};
-    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
 
     fn test_codec() -> Codec {
         let key = b"test-key-32-bytes-long-enough!!!".to_vec();
@@ -991,6 +1043,82 @@ mod tests {
         assert!(
             flood.is_ok(),
             "reader must keep draining the socket under a full writer channel (no deadlock)"
+        );
+    }
+
+    /// Регрессия XR-086 (head-of-line контрольных кадров): контрольный кадр
+    /// (ConnectAck нового стрима), поставленный в очередь ПОСЛЕ того как балк-план
+    /// уже забит мегабайтами Data, всё равно уходит в провод ПЕРВЫМ. Раньше всё
+    /// шло одним FIFO writer'а, и ConnectAck вставал в хвост за всей балк-очередью;
+    /// на медленном линке он не успевал за PER_SERVER_OPEN_TIMEOUT, и клиент ловил
+    /// "open timed out" (прокси «зависало», лечил только рестарт).
+    ///
+    /// Детерминизм: оба канала заполнены ДО старта writer'а, а `biased`-select
+    /// сливает контрольный раньше балка независимо от планировщика. Мутация,
+    /// возвращающая баг (увести ConnectAck в `data_tx` или убрать приоритет), даёт
+    /// позицию ConnectAck в хвосте -> тест краснеет.
+    #[tokio::test]
+    async fn test_writer_prioritizes_ctrl_over_bulk_data() {
+        let codec = test_codec();
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<OutFrame>(CTRL_CHANNEL_SIZE);
+        let (data_tx, data_rx) = mpsc::channel::<OutFrame>(WRITER_CHANNEL_SIZE);
+
+        const BULK: usize = 500;
+        for _ in 0..BULK {
+            data_tx
+                .try_send(OutFrame {
+                    stream_id: 7,
+                    command: Command::Data,
+                    payload: vec![0u8; 64],
+                })
+                .unwrap();
+        }
+        // Контрольный кадр «пришёл» уже после того, как балк осел в очереди.
+        ctrl_tx
+            .try_send(OutFrame {
+                stream_id: 42,
+                command: Command::ConnectAck,
+                payload: vec![1],
+            })
+            .unwrap();
+
+        // Закрываем отправители, чтобы writer слил всё и вышел (дропнув свой конец
+        // duplex -> EOF на приёмнике).
+        drop(ctrl_tx);
+        drop(data_tx);
+
+        let (w, mut r) = duplex(1 << 20); // буфер вмещает весь балк, writer не встаёт
+        let codec_w = codec.clone();
+        let writer = tokio::spawn(async move {
+            writer_task(w, codec_w, ctrl_rx, data_rx).await.unwrap();
+        });
+
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).await.unwrap();
+        writer.await.unwrap();
+
+        // Декодируем кадры по порядку и ищем позицию ConnectAck.
+        let mut off = 0;
+        let mut ack_pos = None;
+        let mut count = 0;
+        while off < buf.len() {
+            match codec.decode_frame(&buf[off..]).unwrap() {
+                Some((frame, consumed)) => {
+                    if ack_pos.is_none() && matches!(frame.command, Command::ConnectAck) {
+                        ack_pos = Some(count);
+                    }
+                    count += 1;
+                    off += consumed;
+                }
+                None => break,
+            }
+        }
+
+        assert_eq!(count, BULK + 1, "все кадры должны быть записаны");
+        assert_eq!(
+            ack_pos,
+            Some(0),
+            "ConnectAck обязан уйти первым, не в хвосте за балком Data"
         );
     }
 }
