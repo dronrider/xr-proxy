@@ -45,6 +45,19 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// но много меньше полного обхода слотов.
 const PER_SERVER_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Анти-флаппинг failback (XR-082). На прерывисто-достижимом сервере лёгкая
+/// проба `probe_fresh` изредка пролезает и набирает hold-down, failback
+/// возвращает на него активность, но реальный трафик тут же не идёт и failover
+/// уводит обратно. Цикл повторяется каждые ~hold секунд. Если failback
+/// откатывается реальным failover'ом в пределах этого окна, считаем его
+/// преждевременным (слот «мигнул»).
+const FAILBACK_FLAP_WINDOW: Duration = Duration::from_secs(45);
+/// Потолок счётчика миганий: `hold * 2^cap` уже перекрывает `FAILBACK_BACKOFF_MAX`,
+/// дальше растить незачем (и защита от переполнения сдвига).
+const FAILBACK_FLAP_CAP: u32 = 6;
+/// Максимальная задержка перед повторным failback на мигающий слот.
+const FAILBACK_BACKOFF_MAX: Duration = Duration::from_secs(1800);
+
 /// Энергетический профиль пула (LLD-10 §2.7). Роутер может позволить себе
 /// тёплые резервы и частые пробы; телефону каждое лишнее пробуждение радио
 /// стоит батареи, поэтому там пробер живёт только в деградированном состоянии.
@@ -111,6 +124,17 @@ struct SlotState {
     /// hold-down для failback. Сбрасывается любым сбоем (пробы или
     /// реального стрима).
     up_since: Option<Instant>,
+    /// Когда слот последний раз стал активным (failover/failback/warmup).
+    /// По нему ловим «мигание»: failback тут же откатывается реальным
+    /// failover'ом (XR-082).
+    became_active_at: Option<Instant>,
+    /// Сколько раз подряд failback на этот слот оказался преждевременным
+    /// (тут же откат). Растит экспоненциальную задержку до следующего
+    /// failback, сбрасывается устойчивой работой.
+    flap_count: u32,
+    /// До этого момента failback на слот подавлен (анти-флаппинг). `None`
+    /// значит подавления нет.
+    failback_suppressed_until: Option<Instant>,
 }
 
 struct ServerSlot {
@@ -148,10 +172,50 @@ impl ServerSlot {
         self.state.lock().unwrap().up_since.map(|t| t.elapsed())
     }
 
+    /// Отметить, что слот стал активным (вызывается из switch_active).
+    fn note_became_active(&self) {
+        self.state.lock().unwrap().became_active_at = Some(Instant::now());
+    }
+
+    /// Сколько слот пробыл активным с последнего переключения.
+    fn active_for(&self) -> Option<Duration> {
+        self.state.lock().unwrap().became_active_at.map(|t| t.elapsed())
+    }
+
+    /// failback на слот сейчас подавлен анти-флаппингом.
+    fn failback_suppressed(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .failback_suppressed_until
+            .is_some_and(|t| Instant::now() < t)
+    }
+
+    /// Слот мигнул (failback -> немедленный failover): растим счётчик и
+    /// подавляем следующий failback на `hold * 2^flap` (с потолком).
+    fn penalize_flap(&self, hold: Duration) {
+        let mut st = self.state.lock().unwrap();
+        st.flap_count = (st.flap_count + 1).min(FAILBACK_FLAP_CAP);
+        let backoff = hold
+            .saturating_mul(1u32 << st.flap_count)
+            .min(FAILBACK_BACKOFF_MAX);
+        st.failback_suppressed_until = Some(Instant::now() + backoff);
+    }
+
+    /// Слот устойчиво отработал активным: снимаем штраф за мигание.
+    fn clear_flap(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.flap_count = 0;
+        st.failback_suppressed_until = None;
+    }
+
     fn reset(&self) {
         let mut st = self.state.lock().unwrap();
         st.health = HealthState::Up;
         st.up_since = None;
+        st.became_active_at = None;
+        st.flap_count = 0;
+        st.failback_suppressed_until = None;
     }
 }
 
@@ -182,7 +246,13 @@ impl ServerPool {
                 name: s.name,
                 addr: s.addr,
                 pool: s.pool,
-                state: Mutex::new(SlotState { health: HealthState::Up, up_since: None }),
+                state: Mutex::new(SlotState {
+                    health: HealthState::Up,
+                    up_since: None,
+                    became_active_at: None,
+                    flap_count: 0,
+                    failback_suppressed_until: None,
+                }),
             })
             .collect();
         Arc::new(Self {
@@ -245,6 +315,7 @@ impl ServerPool {
             .compare_exchange(from, to, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok();
         if switched {
+            self.slots[to].note_became_active();
             self.emit(&format!(
                 "server {}: {} -> {}",
                 reason,
@@ -285,7 +356,20 @@ impl ServerPool {
                 Ok(Ok(stream)) => {
                     self.slots[idx].mark_up();
                     if idx != start {
+                        // Ушли с активного `start` на другой сервер. Если `start`
+                        // только что стал активным (недавний failback) и тут же
+                        // не смог отдать стрим, это преждевременный failback:
+                        // штрафуем его, чтобы health_loop не возвращался на него
+                        // сразу (XR-082).
+                        if self.slots[start].active_for().is_some_and(|d| d < FAILBACK_FLAP_WINDOW) {
+                            self.slots[start].penalize_flap(self.profile.failback_hold);
+                        }
                         self.switch_active(start, idx, "failover");
+                    } else if self.slots[start].active_for().is_some_and(|d| d >= FAILBACK_FLAP_WINDOW) {
+                        // Активный устойчиво отдаёт реальный трафик дольше окна
+                        // мигания: снимаем накопленный штраф, будущий failback
+                        // на него снова быстрый.
+                        self.slots[start].clear_flap();
                     }
                     return Ok(stream);
                 }
@@ -435,8 +519,14 @@ impl ServerPool {
         // Failback: самый приоритетный сервер, непрерывно живой не меньше
         // hold-down, забирает активность. Мигание primary в течение окна
         // сбрасывает up_since (mark_down выше), и таймер начинается заново.
+        // Слот под анти-флаппинг-штрафом (недавно мигнул) пропускаем, пока штраф
+        // не истечёт: иначе на прерывистом сервере проба-пролаз даёт бесконечный
+        // цикл failback -> failover каждые ~hold секунд (XR-082).
         let active = self.active_index();
         for idx in 0..active {
+            if self.slots[idx].failback_suppressed() {
+                continue;
+            }
             if let Some(up) = self.slots[idx].up_for() {
                 if up >= self.profile.failback_hold {
                     self.switch_active(active, idx, "failback");
@@ -795,6 +885,79 @@ mod tests {
             log.iter().any(|m| m.contains("failover") && m.contains("timeweb")),
             "failover must be reported to the host log, got: {:?}",
             *log
+        );
+    }
+
+    /// XR-082: если только что сделанный failback тут же откатывается реальным
+    /// failover'ом (primary «мигает»), слот получает анти-флаппинг-штраф.
+    #[tokio::test]
+    async fn test_premature_failback_is_penalized() {
+        let backup_addr = spawn_test_server().await;
+        let pool = ServerPool::new(
+            vec![
+                slot("primary", failing_connect(Arc::new(AtomicU32::new(0)))),
+                slot("backup", connect_to(backup_addr, Arc::new(AtomicU32::new(0)))),
+            ],
+            PoolProfile::router(),
+            None,
+        );
+        // Симулируем свежий failback: primary только что стал активным.
+        pool.slots[0].note_became_active();
+        assert!(!pool.slots[0].failback_suppressed());
+
+        // Реальный open с active=primary: primary падает, уходим на backup.
+        let _ = pool.open_stream(&target()).await.expect("backup serves");
+        assert_eq!(pool.active_index(), 1);
+        assert!(
+            pool.slots[0].failback_suppressed(),
+            "a primary that fails right after failback must be suppressed"
+        );
+    }
+
+    /// XR-082: пока слот под штрафом, health_loop НЕ делает failback на него,
+    /// даже когда проба держит его «живым» дольше hold-down. После снятия
+    /// штрафа failback возобновляется.
+    #[tokio::test]
+    async fn test_suppressed_slot_skips_failback() {
+        let addr = spawn_test_server().await;
+        let profile = PoolProfile {
+            warm_backups: false,
+            probe_interval: Duration::from_millis(10),
+            failback_hold: Duration::from_millis(50),
+        };
+        let pool = ServerPool::new(
+            vec![
+                slot("primary", connect_to(addr, Arc::new(AtomicU32::new(0)))),
+                slot("backup", connect_to(addr, Arc::new(AtomicU32::new(0)))),
+            ],
+            profile,
+            None,
+        );
+
+        // Уводим активность на backup и штрафуем primary (как будто мигнул).
+        pool.switch_active(0, 1, "failover");
+        assert_eq!(pool.active_index(), 1);
+        pool.slots[0].penalize_flap(Duration::from_secs(3600));
+
+        // primary здоров для проб (реальный сервер), но failback подавлен.
+        for _ in 0..5 {
+            pool.health_tick().await;
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert_eq!(
+            pool.active_index(),
+            1,
+            "suppressed primary must not steal active back"
+        );
+
+        // Штраф снят -> failback снова разрешён.
+        pool.slots[0].clear_flap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        pool.health_tick().await;
+        assert_eq!(
+            pool.active_index(),
+            0,
+            "after the penalty clears, failback resumes"
         );
     }
 }
