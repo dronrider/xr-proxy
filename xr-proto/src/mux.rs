@@ -48,6 +48,10 @@ const MUX_MAX_LIFETIME: Duration = Duration::from_secs(4 * 3600);
 /// RST, read висит без EOF) числился бы «живым» до MUX_MAX_LIFETIME=4ч, отравляя
 /// слот пула до рестарта процесса.
 const DEAD_LINK_TIMEOUT: Duration = Duration::from_secs(75);
+/// Верхняя граница каждого шага открытия стрима (взятие локов, отправка Connect).
+/// Меньше `PER_SERVER_OPEN_TIMEOUT`=5с, чтобы конкретный залипший шаг залогировался
+/// поимённо и превратился в failover, а не в немой таймаут пула (XR-086).
+const OPEN_STEP_TIMEOUT: Duration = Duration::from_secs(4);
 const MUX_PROTOCOL_VERSION: u8 = 1;
 
 // ── Outgoing frame ──────────────────────────────────────────────────
@@ -662,7 +666,21 @@ pub async fn mux_open_stream(
     let (data_tx, mut data_rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
 
     // Register before sending Connect so we don't miss ConnectAck.
-    mux.streams.lock().await.insert(stream_id, data_tx);
+    // Таймаут+WARN на взятие async-Mutex `streams`: если открытие вешается ЗДЕСЬ
+    // (дедлок на этом локе), лог назовёт точку (XR-086, диагностика клиентского
+    // зависания «open timed out, 0 пакетов на сервер»).
+    match tokio::time::timeout(OPEN_STEP_TIMEOUT, mux.streams.lock()).await {
+        Ok(mut streams) => {
+            streams.insert(stream_id, data_tx);
+        }
+        Err(_) => {
+            tracing::warn!("mux_open_stream wedged >4s taking streams lock (deadlock?)");
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "mux streams lock wedged",
+            ));
+        }
+    }
 
     // Guard снимает регистрацию, если мы НЕ вернём MuxStream: по ошибке или по
     // ОТМЕНЕ future (наш bounded-таймаут в ServerPool рвёт ожидание ConnectAck на
@@ -675,8 +693,26 @@ pub async fn mux_open_stream(
         stream_id,
     };
 
-    // Send Connect(stream_id, target_addr).
-    mux.send_frame(stream_id, Command::Connect, target.encode()).await?;
+    // Send Connect(stream_id, target_addr). Таймаут+WARN: если открытие вешается
+    // здесь, значит writer-канал переполнен и не сливается (writer-таск встал).
+    // Именно так выглядел живой хэнг DE (0 пакетов на сервер, open timed out).
+    match tokio::time::timeout(
+        OPEN_STEP_TIMEOUT,
+        mux.send_frame(stream_id, Command::Connect, target.encode()),
+    )
+    .await
+    {
+        Ok(r) => r?,
+        Err(_) => {
+            tracing::warn!(
+                "mux_open_stream wedged >4s sending Connect (writer_tx full / writer task stuck?)"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "mux send_frame(Connect) wedged",
+            ));
+        }
+    }
 
     // Wait for ConnectAck — delivered as first message on the channel.
     // The reader task dispatches ConnectAck payload (after stream_id prefix)

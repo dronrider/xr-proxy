@@ -350,7 +350,25 @@ impl MuxPool {
         idx: usize,
         bail_if_down: bool,
     ) -> io::Result<Arc<Multiplexer>> {
-        let mut guard = self.slots[idx].lock().await;
+        // Таймаут+WARN на взятие лока слота: слот-лок держится через connect и
+        // handshake, и если предыдущий вызов застрял с ним (полу-открытый reconnect),
+        // ВСЕ последующие open вешаются здесь. Живой хэнг DE (XR-086) показал open
+        // без единого пакета на сервер, этот лог отличит слот-лок от streams/writer.
+        let mut guard = match tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            self.slots[idx].lock(),
+        )
+        .await
+        {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::warn!("mux slot {} lock wedged >4s (stuck connect/handshake?)", idx);
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "mux slot lock wedged",
+                ));
+            }
+        };
         if let Some(ref mux) = *guard {
             if mux.is_alive() {
                 return Ok(mux.clone());
