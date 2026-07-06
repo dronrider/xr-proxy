@@ -17,7 +17,7 @@ PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 9443
 DUR = int(sys.argv[3]) if len(sys.argv) > 3 else 300
 SLOW = int(sys.argv[4]) if len(sys.argv) > 4 else 40
 CHURN = int(sys.argv[5]) if len(sys.argv) > 5 else 400
-CONNECT_TIMEOUT = 8.0
+CONNECT_TIMEOUT = 12.0
 
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
@@ -58,13 +58,13 @@ async def slow_worker():
     # Крупная загрузка, читаемая МЕДЛЕННО: забивает серверный writer_tx.
     while time.time() < stop_at:
         try:
-            reader, writer = await req("/download?size=52428800")  # 50 МБ
+            reader, writer = await req("/download?size=209715200")  # 200 МБ, держим долго
             while time.time() < stop_at:
-                chunk = await asyncio.wait_for(reader.read(16384), timeout=CONNECT_TIMEOUT)
+                chunk = await asyncio.wait_for(reader.read(8192), timeout=CONNECT_TIMEOUT)
                 if not chunk:
                     break
                 stats["slow_bytes"] += len(chunk)
-                await asyncio.sleep(0.2)  # медленное потребление
+                await asyncio.sleep(0.5)  # ОЧЕНЬ медленное потребление -> забить серверный writer_tx
             writer.close()
             stats["slow_ok"] += 1
         except asyncio.TimeoutError:
