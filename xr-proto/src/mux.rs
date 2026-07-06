@@ -373,11 +373,28 @@ impl Multiplexer {
     }
 
     /// Send a raw frame (used for ConnectAck, Ping, Pong).
+    ///
+    /// Инструментация XR-086: если отправка виснет на переполненном writer-канале
+    /// дольше 2с (writer-таск не сливает канал в сокет, backpressure), логируем
+    /// WARN с командой. На сервере это ловит затык `mux_handler` на ConnectAck
+    /// (обработка Connect для клиента встаёт, keepalive при этом жив), на клиенте
+    /// затык отправки Connect/данных. Поведение то же (дожидаемся), только лог.
     pub async fn send_frame(&self, stream_id: u32, command: Command, payload: Vec<u8>) -> io::Result<()> {
-        self.writer_tx
-            .send(OutFrame { stream_id, command, payload })
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "mux writer closed"))
+        let fut = self
+            .writer_tx
+            .send(OutFrame { stream_id, command, payload });
+        tokio::pin!(fut);
+        let broken = || io::Error::new(io::ErrorKind::BrokenPipe, "mux writer closed");
+        match tokio::time::timeout(Duration::from_secs(2), &mut fut).await {
+            Ok(r) => r.map_err(|_| broken()),
+            Err(_) => {
+                tracing::warn!(
+                    "mux send_frame({:?}) blocked >2s on full writer channel (writer drain stuck?)",
+                    command
+                );
+                fut.await.map_err(|_| broken())
+            }
+        }
     }
 
     /// Take the new-stream notification receiver (server-side use).
