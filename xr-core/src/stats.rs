@@ -2,36 +2,9 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
-/// Format current wall-clock time as YYYY-MM-DD HH:MM:SS UTC.
-fn timestamp() -> String {
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    // Days since epoch → date (simplified, no leap second handling).
-    let days = (secs / 86400) as i64;
-    let time = secs % 86400;
-    let h = time / 3600;
-    let m = (time % 3600) / 60;
-    let s = time % 60;
-
-    // Civil date from days since 1970-01-01 (Rata Die algorithm).
-    let z = days + 719468;
-    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if mo <= 2 { y + 1 } else { y };
-
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, m, s)
-}
+use crate::journal::Journal;
 
 /// Thread-safe traffic counters.
 #[derive(Clone)]
@@ -51,13 +24,16 @@ struct StatsInner {
     smol_recv: AtomicU64,
     smol_send: AtomicU64,
     /// Cumulative WARN-level event count (policy drops: fake IPs, private IPs, blocked DoT, etc.).
-    /// Grows monotonically, not affected by drain of the `recent_errors` ring.
+    /// Grows monotonically, not affected by clearing the journal.
     relay_warns: AtomicU64,
     /// Cumulative ERROR-level event count (real I/O failures: mux open fail, timeouts).
-    /// Grows monotonically, not affected by drain of the `recent_errors` ring.
+    /// Grows monotonically, not affected by clearing the journal.
     relay_errors: AtomicU64,
     debug_msg: std::sync::Mutex<String>,
-    recent_errors: std::sync::Mutex<Vec<String>>,
+    /// Куда уходят записи `add_log`/`add_warn`/`add_error`. По умолчанию
+    /// memory-only журнал; Android-обвязка подменяет его на общий
+    /// персистентный (XR-042), и тогда лента переживает перезапуск движка.
+    journal: std::sync::Mutex<Journal>,
 }
 
 /// Snapshot of current statistics.
@@ -79,24 +55,6 @@ pub struct StatsSnapshot {
     pub debug_msg: String,
 }
 
-/// Parse "... (×N)" suffix. Returns (core, count). If no suffix — count is 1.
-/// Used by both appender (to coalesce) and tests (to inspect output).
-/// Note: `×` is U+00D7 (2 bytes in UTF-8); byte-slicing is safe here because
-/// we only split at ASCII boundaries (the leading space and trailing `)`).
-fn split_count_suffix(s: &str) -> (&str, u64) {
-    if !s.ends_with(')') { return (s, 1); }
-    let Some(open) = s.rfind(" (×") else { return (s, 1); };
-    // Offsets: " " = 1 byte, "(" = 1, "×" = 2 → 4 bytes total.
-    let num_start = open + 4;
-    let num_end = s.len() - 1;
-    if num_start >= num_end { return (s, 1); }
-    let num_str = &s[num_start..num_end];
-    match num_str.parse::<u64>() {
-        Ok(n) => (&s[..open], n),
-        Err(_) => (s, 1),
-    }
-}
-
 impl Stats {
     pub fn new() -> Self {
         Self {
@@ -113,9 +71,19 @@ impl Stats {
                 relay_warns: AtomicU64::new(0),
                 relay_errors: AtomicU64::new(0),
                 debug_msg: std::sync::Mutex::new(String::new()),
-                recent_errors: std::sync::Mutex::new(Vec::new()),
+                journal: std::sync::Mutex::new(Journal::memory()),
             }),
         }
+    }
+
+    /// Подключить внешний журнал (общий персистентный буфер приложения).
+    /// Вызывается сразу после создания движка, до первых записей.
+    pub fn set_journal(&self, journal: Journal) {
+        *self.inner.journal.lock().unwrap() = journal;
+    }
+
+    fn journal(&self) -> Journal {
+        self.inner.journal.lock().unwrap().clone()
     }
 
     pub fn mark_started(&self) {
@@ -157,84 +125,28 @@ impl Stats {
 
     /// Информационное событие (успешное действие), не увеличивает counters.
     pub fn add_log(&self, msg: &str) {
-        self.append_entry("INFO", msg);
+        self.journal().append("INFO", "vpn", msg);
     }
 
     /// Ожидаемое срабатывание policy (fake IP без домена, private IP, blocked DoT).
     /// Инкрементит `relay_warns`. Это не баг, а настроенная защитная реакция.
     pub fn add_warn(&self, msg: &str) {
         self.inner.relay_warns.fetch_add(1, Ordering::Relaxed);
-        self.append_entry("WARN", msg);
+        self.journal().append("WARN", "vpn", msg);
     }
 
     /// Реальный отказ (VPS недоступен, I/O ошибка, таймаут). Инкрементит `relay_errors`.
     pub fn add_error(&self, msg: &str) {
         self.inner.relay_errors.fetch_add(1, Ordering::Relaxed);
-        self.append_entry("ERROR", msg);
-    }
-
-    fn append_entry(&self, level: &str, msg: &str) {
-        let mut entries = self.inner.recent_errors.lock().unwrap();
-
-        // Ширина уровня 5, чтобы "ERROR" (5) и "WARN"/"INFO" (4) выровнялись.
-        let new_entry = format!("{} {:>5} {}", timestamp(), level, msg);
-
-        // Сворачивание дубликатов. Когда подряд приходят одинаковые записи
-        // (напр. burst `geller-pa.googleapis.com` 50 раз за секунду), читать
-        // лог становится невозможно. Сравниваем с последней записью по core
-        // (без суффикса " (×N)") — если совпадает, переписываем last на
-        // "core (×N+1)". Timestamp уже внутри core → свёртка ограничена
-        // одной секундой естественным образом.
-        //
-        // Counters WARN/ERROR инкрементятся в вызывающей функции ДО нас —
-        // это гарантирует, что relay_warns/relay_errors честно отражают
-        // число событий, даже если в журнале мы их схлопнули.
-        if let Some(last) = entries.last_mut() {
-            let (last_core, last_count) = split_count_suffix(last);
-            let (new_core, _) = split_count_suffix(&new_entry);
-            if last_core == new_core {
-                *last = format!("{} (×{})", last_core, last_count + 1);
-                return;
-            }
-        }
-
-        if entries.len() >= 200 {
-            // Трёхуровневый приоритетный drain:
-            //   1. Сначала 50 самых старых INFO → скидываем.
-            //   2. Если всё ещё переполнено (INFO не хватило) — 50 самых старых WARN.
-            //   3. В крайнем случае — drain(0..50) любых записей, не трогая порядок.
-            // Это гарантирует, что ERROR никогда не вытесняются INFO-шумом
-            // или даже WARN-шумом — бадж и заголовок вкладки Log в Android
-            // всегда честно показывают реальные отказы.
-            let mut to_drop = 50usize;
-            entries.retain(|e| {
-                if to_drop == 0 { return true; }
-                if e.contains(" WARN ") || e.contains(" ERROR ") { return true; }
-                to_drop -= 1;
-                false
-            });
-            if entries.len() >= 200 {
-                let mut to_drop_warn = 50usize;
-                entries.retain(|e| {
-                    if to_drop_warn == 0 { return true; }
-                    if e.contains(" ERROR ") { return true; }
-                    to_drop_warn -= 1;
-                    false
-                });
-            }
-            if entries.len() >= 200 {
-                entries.drain(0..50);
-            }
-        }
-        entries.push(new_entry);
+        self.journal().append("ERROR", "vpn", msg);
     }
 
     pub fn recent_errors(&self) -> Vec<String> {
-        self.inner.recent_errors.lock().unwrap().clone()
+        self.journal().tail()
     }
 
     pub fn clear_errors(&self) {
-        self.inner.recent_errors.lock().unwrap().clear();
+        self.journal().clear();
         self.inner.relay_warns.store(0, Ordering::Relaxed);
         self.inner.relay_errors.store(0, Ordering::Relaxed);
     }
@@ -300,100 +212,6 @@ mod tests {
     }
 
     #[test]
-    fn drain_prefers_info_over_warn_and_error() {
-        let stats = Stats::new();
-
-        // Имитируем реальное подключение: 3 serious ERROR + 2 policy WARN + потоп INFO.
-        stats.add_error("mux open fail: initial1");
-        stats.add_error("mux open fail: initial2");
-        stats.add_error("mux open fail: initial3");
-        stats.add_warn("fake IP without domain");
-        stats.add_warn("private IP blocked");
-        for i in 0..250 {
-            stats.add_log(&format!("mux relay for target-{}", i));
-        }
-
-        let entries = stats.recent_errors();
-
-        // Инвариант: ERROR и WARN никогда не должны быть вытеснены INFO-шумом.
-        let error_count = entries.iter().filter(|e| e.contains(" ERROR ")).count();
-        let warn_count = entries.iter().filter(|e| e.contains(" WARN ")).count();
-        assert_eq!(error_count, 3, "все 3 ERROR должны остаться: {:?}", entries);
-        assert_eq!(warn_count, 2, "все 2 WARN должны остаться: {:?}", entries);
-
-        // Буфер не растёт неограниченно.
-        assert!(entries.len() < 250, "буфер не должен хранить всё: {}", entries.len());
-
-        // Счётчики отражают реальные значения.
-        let snap = stats.snapshot();
-        assert_eq!(snap.relay_errors, 3);
-        assert_eq!(snap.relay_warns, 2);
-    }
-
-    #[test]
-    fn drain_prefers_warn_over_error() {
-        let stats = Stats::new();
-
-        // Сначала несколько ERROR, потом поток WARN. Если INFO-drain не
-        // помог (их нет), следующий приоритет — старые WARN, но ERROR
-        // остаются нетронутыми.
-        for i in 0..5 {
-            stats.add_error(&format!("fatal-{}", i));
-        }
-        for i in 0..250 {
-            stats.add_warn(&format!("policy-{}", i));
-        }
-
-        let entries = stats.recent_errors();
-
-        // Все 5 ERROR выживают (они старее WARN, но drain их защищает).
-        let error_count = entries.iter().filter(|e| e.contains(" ERROR ")).count();
-        assert_eq!(error_count, 5, "все ERROR должны быть сохранены");
-
-        // Часть WARN выпала через drain.
-        assert!(entries.len() <= 200);
-    }
-
-    #[test]
-    fn coalesce_duplicate_entries() {
-        let stats = Stats::new();
-        stats.add_log("mux relay for Domain(\"x.example\", 443)");
-        stats.add_log("mux relay for Domain(\"x.example\", 443)");
-        stats.add_log("mux relay for Domain(\"x.example\", 443)");
-
-        let entries = stats.recent_errors();
-        // Три одинаковых → одна запись с суффиксом (×3).
-        assert_eq!(entries.len(), 1, "entries: {:?}", entries);
-        assert!(entries[0].ends_with(" (\u{00D7}3)"), "unexpected: {}", entries[0]);
-    }
-
-    #[test]
-    fn coalesce_increments_existing_suffix() {
-        let stats = Stats::new();
-        stats.add_log("same");
-        stats.add_log("same");
-        stats.add_log("same");
-        stats.add_log("same");
-
-        let entries = stats.recent_errors();
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].ends_with(" (\u{00D7}4)"), "unexpected: {}", entries[0]);
-    }
-
-    #[test]
-    fn different_messages_not_coalesced() {
-        let stats = Stats::new();
-        stats.add_log("mux relay for X");
-        stats.add_log("mux relay for Y");
-        stats.add_log("mux relay for X");
-
-        let entries = stats.recent_errors();
-        // Чередование разных сообщений не схлопывается.
-        assert_eq!(entries.len(), 3);
-        assert!(entries.iter().all(|e| !e.contains("(\u{00D7}")));
-    }
-
-    #[test]
     fn coalesce_does_not_affect_counters() {
         let stats = Stats::new();
         stats.add_warn("same warn");
@@ -403,7 +221,7 @@ mod tests {
         stats.add_error("same err");
 
         let snap = stats.snapshot();
-        // Счётчики считают КАЖДОЕ событие, даже если в логе они свёрнуты.
+        // Счётчики считают КАЖДОЕ событие, даже если в журнале они свёрнуты.
         assert_eq!(snap.relay_warns, 3);
         assert_eq!(snap.relay_errors, 2);
 
@@ -414,28 +232,24 @@ mod tests {
     }
 
     #[test]
-    fn split_count_suffix_parses() {
-        assert_eq!(split_count_suffix("hello"), ("hello", 1));
-        assert_eq!(split_count_suffix("hello (\u{00D7}5)"), ("hello", 5));
-        assert_eq!(split_count_suffix("hello (\u{00D7}42)"), ("hello", 42));
-        // Невалидные суффиксы не отрезаются.
-        assert_eq!(split_count_suffix("hello (world)"), ("hello (world)", 1));
-        assert_eq!(split_count_suffix("hello (\u{00D7}x)"), ("hello (\u{00D7}x)", 1));
-    }
+    fn external_journal_survives_stats_recreation() {
+        // Регрессия XR-042: раньше лента жила в Stats и обнулялась вместе с
+        // движком при каждом перезапуске (смена сети). С внешним журналом
+        // новый экземпляр Stats продолжает ту же ленту.
+        let journal = Journal::memory();
 
-    #[test]
-    fn drain_falls_back_when_only_errors() {
-        let stats = Stats::new();
+        let stats1 = Stats::new();
+        stats1.set_journal(journal.clone());
+        stats1.add_error("ошибка до перезапуска движка");
+        drop(stats1);
 
-        // Крайний случай: журнал состоит только из ERROR. Два первых уровня
-        // drain не сработают, fallback drain(0..50) срезает самые старые.
-        for i in 0..250 {
-            stats.add_error(&format!("fatal-{}", i));
-        }
+        let stats2 = Stats::new();
+        stats2.set_journal(journal.clone());
+        stats2.add_log("запись после перезапуска");
 
-        let entries = stats.recent_errors();
-        assert!(entries.len() <= 200);
-        assert!(entries.last().unwrap().contains("fatal-249"));
-        assert!(!entries.iter().any(|e| e.contains("fatal-0")));
+        let entries = stats2.recent_errors();
+        assert_eq!(entries.len(), 2, "entries: {:?}", entries);
+        assert!(entries[0].contains("ошибка до перезапуска движка"));
+        assert!(entries[1].contains("запись после перезапуска"));
     }
 }
