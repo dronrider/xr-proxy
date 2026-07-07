@@ -351,25 +351,17 @@ impl Multiplexer {
             });
         }
 
-        // Spawn writer task. select against shutdown_notify so an external
-        // shutdown() call drops write_half promptly, propagating FIN to
-        // the peer and closing the TCP cleanly.
+        // Spawn writer task. Внешний shutdown() будит его через shutdown_notify, и
+        // writer ЯВНО делает writer.shutdown() (FIN) перед выходом. Просто дроп
+        // write_half при tokio::io::split сокет НЕ закрывает (read-половина жива у
+        // reader_task), поэтому FIN нужен явно, иначе пир не получит EOF.
         {
             let alive = alive.clone();
             let codec = codec.clone();
             let shutdown_notify = shutdown_notify.clone();
             tokio::spawn(async move {
-                tokio::select! {
-                    res = writer_task(write_half, codec, ctrl_rx, writer_rx) => {
-                        if let Err(e) = res {
-                            tracing::debug!("mux writer ended: {}", e);
-                        }
-                    }
-                    _ = shutdown_notify.notified() => {
-                        tracing::debug!("mux writer shutdown by request");
-                        // write_half drops here → FIN sent → reader on
-                        // other side gets EOF → its reader_task exits.
-                    }
+                if let Err(e) = writer_task(write_half, codec, ctrl_rx, writer_rx, shutdown_notify).await {
+                    tracing::debug!("mux writer ended: {}", e);
                 }
                 alive.store(false, Ordering::Relaxed);
             });
@@ -445,15 +437,17 @@ impl Multiplexer {
     }
 
     /// Force-shutdown this Multiplexer. Marks it dead, wakes the writer
-    /// task (which will drop write_half → TCP FIN → remote closes → our
-    /// reader gets EOF and exits). Use this when the pool decides a slot
-    /// is zombie (server-state lost while TCP still ESTABLISHED). Without
-    /// this call, orphaned reader/writer tasks keep the socket open until
-    /// MUX_MAX_LIFETIME (4h), and the server accumulates ghost ESTAB.
+    /// task, which does an explicit writer.shutdown() (FIN) -> remote gets EOF and
+    /// reconnects. Use this when the pool decides a slot is zombie (server-state
+    /// lost while TCP still ESTABLISHED) or when the server accept-loop ends by
+    /// its lifetime cap. Without this call, orphaned reader/writer tasks keep the
+    /// socket open until MUX_MAX_LIFETIME (4h): keepalive still flows, so the peer
+    /// считает слот живым, но новых стримов уже не принять (корень XR-086).
+    /// `notify_one` даёт персистентный пермит (не теряется гонкой с writer'ом).
     /// Idempotent; safe to call multiple times.
     pub fn shutdown(&self) {
         self.alive.store(false, Ordering::Relaxed);
-        self.shutdown_notify.notify_waiters();
+        self.shutdown_notify.notify_one();
     }
 }
 
@@ -628,6 +622,7 @@ async fn writer_task<W: AsyncWriteExt + Unpin>(
     codec: Codec,
     mut ctrl_rx: mpsc::Receiver<OutFrame>,
     mut data_rx: mpsc::Receiver<OutFrame>,
+    shutdown: Arc<Notify>,
 ) -> io::Result<()> {
     // ПРИОРИТЕТ контрольного плана: `biased` select проверяет ctrl_rx раньше
     // data_rx, поэтому между любыми двумя балк-кадрами Data успевают уйти все
@@ -637,9 +632,14 @@ async fn writer_task<W: AsyncWriteExt + Unpin>(
     // крутил busy-loop и не глотал недослитый data (и наоборот).
     let mut ctrl_open = true;
     let mut data_open = true;
+    let mut res: io::Result<()> = Ok(());
     while ctrl_open || data_open {
         let frame = tokio::select! {
             biased;
+            // Внешний shutdown() (пул решил, что слот зомби; серверная accept-петля
+            // кончилась по лайфтайм-капу). notify_one даёт ПЕРСИСТЕНТНЫЙ пермит,
+            // поэтому сигнал не теряется, даже если пришёл, пока мы были в write_all.
+            _ = shutdown.notified() => break,
             c = ctrl_rx.recv(), if ctrl_open => match c {
                 Some(f) => f,
                 None => { ctrl_open = false; continue; }
@@ -661,10 +661,21 @@ async fn writer_task<W: AsyncWriteExt + Unpin>(
             }
         };
 
-        let wire = codec.encode_frame(frame.command, &payload)?;
-        writer.write_all(&wire).await?;
+        let wire = match codec.encode_frame(frame.command, &payload) {
+            Ok(w) => w,
+            Err(e) => { res = Err(e); break; }
+        };
+        if let Err(e) = writer.write_all(&wire).await {
+            res = Err(e);
+            break;
+        }
     }
-    Ok(())
+    // ЯВНЫЙ полу-close: шлём FIN пиру. Дроп write_half при tokio::io::split сокет НЕ
+    // закрывает (read-половину держит reader_task), поэтому без этого пир не получал
+    // бы EOF и висел бы на «живом» зомби-mux (корень XR-086: серверный accept умирал
+    // по 1ч-капу, а сокет жил до 4ч, keepalive шёл, новые Connect молча терялись).
+    let _ = writer.shutdown().await;
+    res
 }
 
 // ── Handshake helpers ───────────────────────────────────────────────
@@ -1089,8 +1100,9 @@ mod tests {
 
         let (w, mut r) = duplex(1 << 20); // буфер вмещает весь балк, writer не встаёт
         let codec_w = codec.clone();
+        let shutdown = Arc::new(Notify::new());
         let writer = tokio::spawn(async move {
-            writer_task(w, codec_w, ctrl_rx, data_rx).await.unwrap();
+            writer_task(w, codec_w, ctrl_rx, data_rx, shutdown).await.unwrap();
         });
 
         let mut buf = Vec::new();
