@@ -16,6 +16,7 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
+import com.xrproxy.app.data.JournalSettings
 import com.xrproxy.app.data.ProfileEndpoint
 import com.xrproxy.app.data.ServerProfile
 import com.xrproxy.app.data.ServerRepository
@@ -106,7 +107,10 @@ data class VpnUiState(
     val relayWarnings: Long = 0,
     val relayErrors: Long = 0,
     val debugMsg: String = "",
-    val recentErrors: List<String> = emptyList(),
+    /** Хвост единого журнала (XR-042): движок, пробы, смены сети/режима,
+     *  файловые события. Живёт независимо от подключения, поллится из
+     *  нативного журнала, пока приложение на переднем плане. */
+    val logLines: List<String> = emptyList(),
     val debugExpanded: Boolean = false,
     /** SSID of the trusted network the tunnel is paused on, when [phase] is Paused. */
     val pausedSsid: String? = null,
@@ -196,6 +200,42 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             // can sit up on a trusted Wi-Fi until the app is opened. Doing it
             // here makes opening the app deterministically land the pause.
             boundService?.reevaluateTrustedNetwork()
+            startLogPolling()
+        }
+
+        override fun onStop(owner: LifecycleOwner) {
+            stopLogPolling()
+        }
+    }
+
+    // ── Единый журнал (XR-042) ──────────────────────────────────────
+    // Лента больше не едет через снапшот сервиса: журнал живёт своей жизнью
+    // (движок может быть остановлен), поэтому VM поллит его хвост напрямую,
+    // пока приложение на переднем плане.
+
+    private var logPollJob: Job? = null
+
+    private fun startLogPolling() {
+        if (logPollJob != null) return
+        logPollJob = viewModelScope.launch {
+            while (true) {
+                refreshLog()
+                delay(1000)
+            }
+        }
+    }
+
+    private fun stopLogPolling() {
+        logPollJob?.cancel()
+        logPollJob = null
+    }
+
+    private suspend fun refreshLog() {
+        val lines = withContext(Dispatchers.IO) {
+            NativeBridge.nativeJournalTail().split('\n').filter { it.isNotEmpty() }
+        }
+        if (lines != _uiState.value.logLines) {
+            _uiState.value = _uiState.value.copy(logLines = lines)
         }
     }
 
@@ -231,7 +271,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 phase = ConnectPhase.Idle,
                 state = "Disconnected",
                 bytesUp = 0, bytesDown = 0, activeConnections = 0, uptime = 0,
-                recentErrors = emptyList(),
             )
         }
     }
@@ -357,7 +396,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun clearLog() { boundService?.clearLog() }
+    fun clearLog() {
+        NativeBridge.nativeJournalClear()
+        viewModelScope.launch { refreshLog() }
+    }
 
     // ── Log tab (LLD-03) ────────────────────────────────────────────
 
@@ -370,35 +412,44 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** Full, unfiltered log — toolbar actions always operate on this, the
-     *  search field is only a visual filter (LLD-03 §2.4). */
-    private fun buildFullLog(): String = _uiState.value.recentErrors.joinToString("\n")
+     *  search field is only a visual filter (LLD-03 §2.4). Читается с диска
+     *  целиком (весь журнал, не только хвост вкладки), поэтому off-main. */
+    private suspend fun buildFullLog(): String =
+        withContext(Dispatchers.IO) { NativeBridge.nativeJournalDump() }
 
     fun copyLog() {
-        val cm = getApplication<Application>()
-            .getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
-        if (cm == null) {
-            emitMessage("Буфер обмена недоступен", UiSeverity.Warn)
-            return
+        viewModelScope.launch {
+            val text = buildFullLog()
+            val cm = getApplication<Application>()
+                .getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+            if (cm == null) {
+                emitMessage("Буфер обмена недоступен", UiSeverity.Warn)
+                return@launch
+            }
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("xr-proxy log", text))
+            emitMessage("Скопировано", UiSeverity.Info)
         }
-        cm.setPrimaryClip(android.content.ClipData.newPlainText("xr-proxy log", buildFullLog()))
-        emitMessage("Скопировано", UiSeverity.Info)
     }
 
     fun shareLog(context: Context) {
-        try {
-            val file = File(context.cacheDir, "xr-proxy.log")
-            file.writeText(buildFullLog())
-            val uri = androidx.core.content.FileProvider.getUriForFile(
-                context, "${context.packageName}.fileprovider", file,
-            )
-            val intent = Intent(Intent.ACTION_SEND).apply {
-                type = "text/plain"
-                putExtra(Intent.EXTRA_STREAM, uri)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        viewModelScope.launch {
+            try {
+                val text = buildFullLog()
+                val file = withContext(Dispatchers.IO) {
+                    File(context.cacheDir, "xr-proxy.log").also { it.writeText(text) }
+                }
+                val uri = androidx.core.content.FileProvider.getUriForFile(
+                    context, "${context.packageName}.fileprovider", file,
+                )
+                val intent = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                context.startActivity(Intent.createChooser(intent, "Share log"))
+            } catch (e: Exception) {
+                emitMessage("Не удалось поделиться: ${e.message}", UiSeverity.Error)
             }
-            context.startActivity(Intent.createChooser(intent, "Share log"))
-        } catch (e: Exception) {
-            emitMessage("Не удалось поделиться: ${e.message}", UiSeverity.Error)
         }
     }
 
@@ -406,18 +457,31 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun writeLogTo(uri: android.net.Uri, resolver: android.content.ContentResolver) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                val text = NativeBridge.nativeJournalDump()
                 resolver.openOutputStream(uri)?.use { out ->
-                    out.writer(Charsets.UTF_8).use { w ->
-                        _uiState.value.recentErrors.forEach { line ->
-                            w.write(line); w.write("\n")
-                        }
-                    }
+                    out.writer(Charsets.UTF_8).use { w -> w.write(text) }
                 }
                 emitMessage("Лог сохранён", UiSeverity.Info)
             } catch (e: Exception) {
                 emitMessage("Не удалось сохранить: ${e.message}", UiSeverity.Error)
             }
         }
+    }
+
+    // ── Ротация журнала (XR-042) ────────────────────────────────────
+
+    private val _journalMaxKb = MutableStateFlow(JournalSettings.maxKb(prefs))
+    val journalMaxKb: StateFlow<Int> = _journalMaxKb
+
+    private val _journalMaxFiles = MutableStateFlow(JournalSettings.maxFiles(prefs))
+    val journalMaxFiles: StateFlow<Int> = _journalMaxFiles
+
+    fun setJournalRotation(maxKb: Int, maxFiles: Int) {
+        JournalSettings.setRotation(
+            prefs, getApplication<Application>().filesDir, maxKb, maxFiles,
+        )
+        _journalMaxKb.value = maxKb
+        _journalMaxFiles.value = maxFiles
     }
 
     // ── Trusted networks / auto-pause (task 3b-2) ───────────────────
@@ -858,7 +922,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.value = _uiState.value.copy(
             phase = ConnectPhase.Idle, state = "Disconnected",
             bytesUp = 0, bytesDown = 0, activeConnections = 0, uptime = 0,
-            recentErrors = emptyList(),
         )
     }
 
@@ -902,9 +965,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             relayWarnings = snap?.relayWarnings ?: 0,
             relayErrors = snap?.relayErrors ?: 0,
             debugMsg = snap?.debugMsg ?: "",
-            // Native engine errors + restriction-probe diagnostics (the latter
-            // run while paused with the engine down, so they ride in svcState).
-            recentErrors = (snap?.recentErrors ?: emptyList()) + svcState.probeLog,
             pausedSsid = svcState.pausedSsid,
             restrictedNetwork = svcState.restrictedNetwork,
             activeServer = snap?.activeServer ?: "",

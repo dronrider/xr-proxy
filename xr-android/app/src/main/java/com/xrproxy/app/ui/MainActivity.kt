@@ -53,6 +53,7 @@ import com.xrproxy.app.ui.logs.LogList
 import com.xrproxy.app.ui.logs.LogToolbar
 import com.xrproxy.app.ui.logs.filterLog
 import com.xrproxy.app.ui.servers.FailurePolicySection
+import com.xrproxy.app.ui.servers.JournalSection
 import com.xrproxy.app.ui.servers.ServersSection
 import com.xrproxy.app.ui.theme.XrTheme
 import com.xrproxy.app.ui.trusted.TrustedNetworksSection
@@ -158,6 +159,8 @@ fun MainScreen(
     val trustedNetworks by viewModel.trustedRepo.networks.collectAsState()
     val trustedEnabled by viewModel.trustedRepo.enabled.collectAsState()
     val failClosed by viewModel.failClosed.collectAsState()
+    val journalMaxKb by viewModel.journalMaxKb.collectAsState()
+    val journalMaxFiles by viewModel.journalMaxFiles.collectAsState()
     val updateState by viewModel.updateState.collectAsState()
 
     // Location permission for reading the current Wi-Fi SSID (auto-pause,
@@ -378,9 +381,9 @@ fun MainScreen(
                     onClick = { currentTab = 1 },
                     icon = {
                         BadgedBox(badge = {
-                            val infos = state.recentErrors.infoCount
-                            val warns = state.recentErrors.warnCount
-                            val errs = state.recentErrors.errorCount
+                            val infos = state.logLines.infoCount
+                            val warns = state.logLines.warnCount
+                            val errs = state.logLines.errorCount
                             if (infos + warns + errs > 0) {
                                 val infoColor = Color(0xFF4CAF50)
                                 val warnColor = Color(0xFFFFA726)
@@ -486,6 +489,11 @@ fun MainScreen(
                 FailurePolicySection(
                     failClosed = failClosed,
                     onToggle = { viewModel.setFailClosed(it) },
+                )
+                JournalSection(
+                    maxKb = journalMaxKb,
+                    maxFiles = journalMaxFiles,
+                    onChange = { kb, files -> viewModel.setJournalRotation(kb, files) },
                 )
                 Spacer(Modifier.height(8.dp))
                 val appVersion = remember {
@@ -755,10 +763,10 @@ fun LogSection(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
-    val filter = remember(state.recentErrors, state.logQuery, state.logRegexMode) {
-        filterLog(state.recentErrors, state.logQuery, state.logRegexMode)
+    val filter = remember(state.logLines, state.logQuery, state.logRegexMode) {
+        filterLog(state.logLines, state.logQuery, state.logRegexMode)
     }
-    val totalWarn = state.recentErrors.warnCount
+    val totalWarn = state.logLines.warnCount
     val matchedWarn = filter.entries.warnCount
 
     Column(modifier) {

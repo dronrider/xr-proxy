@@ -106,7 +106,6 @@ class XrVpnService : VpnService() {
         /** Cumulative ERROR count (real I/O failures: mux open fail, timeouts). */
         val relayErrors: Long,
         val debugMsg: String,
-        val recentErrors: List<String>,
         /** Имя активного сервера пула (LLD-10); пустое до старта движка. */
         val activeServer: String = "",
         /** Активен резервный сервер, на главном экране показывается
@@ -127,11 +126,6 @@ class XrVpnService : VpnService() {
          *  blocked resources aren't reachable direct, so the pause risks
          *  cutting access (task 3b-2 §2). */
         val restrictedNetwork: Boolean = false,
-        /** Diagnostic lines from the restriction probe (per-host DNS/connect/TLS
-         *  outcome + verdict), surfaced in the app Log tab. The probe runs while
-         *  paused with the engine stopped, so these can't go through the native
-         *  error log — they ride here instead. */
-        val probeLog: List<String> = emptyList(),
     )
 
     inner class LocalBinder : Binder() {
@@ -207,10 +201,6 @@ class XrVpnService : VpnService() {
     // looks at the phone instead of only after they open the app.
     private var screenOnReceiver: android.content.BroadcastReceiver? = null
 
-    // Bounded buffer of restriction-probe diagnostic lines (guarded by itself).
-    // Surfaced in ServiceState.probeLog → app Log tab.
-    private val probeLogBuf = ArrayDeque<String>()
-    private val probeLogTime = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
     // The running restriction-probe loop (one per pause). Cancelled when the
     // pause ends or a re-probe restarts it.
     @Volatile private var probeJob: Job? = null
@@ -294,6 +284,7 @@ class XrVpnService : VpnService() {
         scope.launch {
             transitionMutex.withLock {
                 if (_stateFlow.value.phase == Phase.Idle) return@withLock
+                NativeBridge.nativeJournalLog("INFO", "vpn", "туннель остановлен пользователем")
                 publish(Phase.Stopping)
                 updateNotification()
                 stopInternal()
@@ -309,12 +300,6 @@ class XrVpnService : VpnService() {
         }
     }
 
-    fun clearLog() {
-        NativeBridge.nativeClearErrorLog()
-        synchronized(probeLogBuf) { probeLogBuf.clear() }
-        _stateFlow.value = _stateFlow.value.copy(snapshot = readSnapshot(), probeLog = emptyList())
-    }
-
     /** Raw SSID of the current uplink as seen by the default-network callback
      *  (non-redacted when the app holds location permission). Used by the UI
      *  to pre-fill "add current network". Null when unknown / non-Wi-Fi. */
@@ -324,7 +309,7 @@ class XrVpnService : VpnService() {
      *  and keep the tunnel up on this network until it changes. */
     private fun resumeOverride() {
         overrideNetwork = currentDefaultNetwork
-        scope.launch { requestResume() }
+        scope.launch { requestResume("«включить здесь», остаёмся на доверенной сети") }
     }
 
     // ── Connection flow ───────────────────────────────────────────────
@@ -396,6 +381,7 @@ class XrVpnService : VpnService() {
             .establish()
 
         if (iface == null) {
+            NativeBridge.nativeJournalLog("ERROR", "vpn", "TUN establish failed")
             publish(Phase.Error, errorMessage = "TUN establish failed")
             updateNotification()
             stopInternal()
@@ -453,6 +439,7 @@ class XrVpnService : VpnService() {
         publish(Phase.Finalizing)
         updateNotification()
 
+        NativeBridge.nativeJournalLog("INFO", "vpn", "туннель поднят")
         publish(Phase.Connected, snapshot = readSnapshot())
         updateNotification()
 
@@ -479,6 +466,7 @@ class XrVpnService : VpnService() {
             // can show the message and unbind.
             if (native.startsWith("Error:")) {
                 val errorMsg = native.removePrefix("Error: ").trim()
+                NativeBridge.nativeJournalLog("ERROR", "vpn", "движок остановлен: $errorMsg")
                 publish(Phase.Error, errorMessage = errorMsg)
                 updateNotification()
                 stopInternal()
@@ -575,6 +563,9 @@ class XrVpnService : VpnService() {
         tearTunnelDown()
         pausedNetwork = currentDefaultNetwork
         val display = rawSsid?.let { NativeBridge.nativeNormalizeSsid(it) }
+        NativeBridge.nativeJournalLog(
+            "INFO", "net", "пауза: доверенная сеть «${display ?: "?"}», туннель остановлен",
+        )
         publish(Phase.Paused, snapshot = null, pausedSsid = display)
         updateNotification()
         launchRestrictionProbe()
@@ -629,16 +620,13 @@ class XrVpnService : VpnService() {
         if (_stateFlow.value.phase == Phase.Paused) launchRestrictionProbe()
     }
 
-    /** Append a restriction-probe diagnostic line to the app log (see
-     *  [ServiceState.probeLog]). Called from the probe's IO thread; the same
-     *  read-modify-write on _stateFlow as the rest of the service. */
+    /** Append a restriction-probe diagnostic line to the unified journal
+     *  (XR-042). The probe runs while paused with the engine stopped, so the
+     *  journal is the only buffer that outlives it: the old transient
+     *  probeLog kept dragging stale trusted-network lines into the feed after
+     *  the mode switched. */
     private fun logProbe(line: String) {
-        val stamped = "${probeLogTime.format(java.util.Date())} $line"
-        synchronized(probeLogBuf) {
-            probeLogBuf.addLast(stamped)
-            while (probeLogBuf.size > 120) probeLogBuf.removeFirst()
-            _stateFlow.value = _stateFlow.value.copy(probeLog = probeLogBuf.toList())
-        }
+        NativeBridge.nativeJournalLog("INFO", "probe", line)
     }
 
     /** UI ("Включить здесь") / notification action to keep the tunnel running
@@ -653,11 +641,12 @@ class XrVpnService : VpnService() {
         }
     }
 
-    private suspend fun requestResume() {
+    private suspend fun requestResume(reason: String) {
         transitionMutex.withLock {
             if (_stateFlow.value.phase != Phase.Paused) return@withLock
             probeJob?.cancel()
             probeJob = null
+            NativeBridge.nativeJournalLog("INFO", "net", "выход из паузы: $reason")
             publish(Phase.Connecting)
             updateNotification()
             bringTunnelUp()
@@ -766,7 +755,7 @@ class XrVpnService : VpnService() {
                     }
                     else -> {
                         // Left to a non-trusted network (cellular / other Wi-Fi).
-                        scope.launch { requestResume() }
+                        scope.launch { requestResume("сеть сменилась на недоверенную") }
                     }
                 }
             }
@@ -776,6 +765,9 @@ class XrVpnService : VpnService() {
                     scope.launch { requestPause(raw) }
                 } else if (!trusted && pendingSwitch) {
                     pendingSwitch = false
+                    NativeBridge.nativeJournalLog(
+                        "INFO", "net", "смена сети: перепривязка туннеля к новому аплинку",
+                    )
                     NativeBridge.nativeOnNetworkChanged()
                 }
             }
@@ -1019,15 +1011,8 @@ class XrVpnService : VpnService() {
             return StatsSnapshot(
                 bytesUp = 0, bytesDown = 0, activeConnections = 0, uptime = 0,
                 dnsQueries = 0, tcpSyns = 0, smolRecv = 0, smolSend = 0,
-                relayWarnings = 0, relayErrors = 0, debugMsg = "", recentErrors = emptyList(),
+                relayWarnings = 0, relayErrors = 0, debugMsg = "",
             )
-        }
-        val errorsJson = json.optJSONArray("errors")
-        val recentErrors: List<String> = if (errorsJson != null) {
-            List(errorsJson.length()) { i -> errorsJson.optString(i, "") }
-                .filter { it.isNotEmpty() }
-        } else {
-            emptyList()
         }
         return StatsSnapshot(
             bytesUp = json.optLong("bytes_up", 0),
@@ -1041,7 +1026,6 @@ class XrVpnService : VpnService() {
             relayWarnings = json.optLong("relay_warn", 0),
             relayErrors = json.optLong("relay_err", 0),
             debugMsg = json.optString("debug", ""),
-            recentErrors = recentErrors,
             activeServer = json.optString("active_server", ""),
             backupActive = json.optBoolean("backup_active", false),
         )

@@ -26,6 +26,19 @@ use std::collections::HashSet;
 /// Global engine instance.
 static ENGINE: OnceLock<Mutex<Option<EngineHandle>>> = OnceLock::new();
 
+/// Единый персистентный журнал приложения (XR-042). Живёт на уровне процесса,
+/// а не движка: перезапуск движка (смена сети, пауза) ленту не обнуляет.
+/// Инициализируется из Kotlin (`nativeJournalInit`) при старте приложения.
+static JOURNAL: OnceLock<xr_core::journal::Journal> = OnceLock::new();
+
+/// Дописать запись в журнал, если он уже инициализирован. До инициализации
+/// записи молча теряются (только первые миллисекунды жизни процесса).
+fn journal_log(level: &str, source: &str, msg: &str) {
+    if let Some(j) = JOURNAL.get() {
+        j.append(level, source, msg);
+    }
+}
+
 /// Global JVM reference.
 static JVM: OnceLock<JavaVM> = OnceLock::new();
 
@@ -403,9 +416,11 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
         }
     }
 
-    // Helper: return an error string to Kotlin.
+    // Helper: return an error string to Kotlin (журналируем здесь же, чтобы
+    // отказ старта был виден на вкладке Log, а не только в снекбаре).
     let err = |env: &mut JNIEnv, msg: &str| -> jstring {
         tracing::error!("{}", msg);
+        journal_log("ERROR", "vpn", msg);
         env.new_string(msg).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
     };
 
@@ -425,6 +440,11 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
     }
 
     let mut engine = VpnEngine::new(config);
+    // Лента движка уходит в общий персистентный журнал (XR-042): перезапуск
+    // движка при смене сети больше не обнуляет лог на вкладке Log.
+    if let Some(j) = JOURNAL.get() {
+        engine.stats().set_journal(j.clone());
+    }
     let queue = PacketQueue::new();
     let protect = make_protect_fn();
 
@@ -568,21 +588,19 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetStats(
         Some(ref h) => {
             let s = h.engine.stats().snapshot();
             let debug_escaped = s.debug_msg.replace('\\', "\\\\").replace('"', "\\\"");
-            let errors = h.engine.stats().recent_errors();
-            let errors_json: Vec<String> = errors.iter()
-                .map(|e| format!("\"{}\"", e.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ")))
-                .collect();
             // Активный сервер пула (LLD-10): имя + признак резерва для
             // статусной строки «через X (резерв)» на главном экране.
+            // Лента событий сюда больше не входит: UI читает её напрямую
+            // из журнала (`nativeJournalTail`), движок и не должен быть
+            // запущен, чтобы лог был виден (XR-042).
             let (srv_name, srv_backup) = h.engine.active_server_info()
                 .unwrap_or_default();
             let srv_escaped = srv_name.replace('\\', "\\\\").replace('"', "\\\"");
             format!(
-                "{{\"bytes_up\":{},\"bytes_down\":{},\"active\":{},\"total\":{},\"uptime\":{},\"dns\":{},\"syns\":{},\"smol_recv\":{},\"smol_send\":{},\"relay_warn\":{},\"relay_err\":{},\"debug\":\"{}\",\"active_server\":\"{}\",\"backup_active\":{},\"errors\":[{}]}}",
+                "{{\"bytes_up\":{},\"bytes_down\":{},\"active\":{},\"total\":{},\"uptime\":{},\"dns\":{},\"syns\":{},\"smol_recv\":{},\"smol_send\":{},\"relay_warn\":{},\"relay_err\":{},\"debug\":\"{}\",\"active_server\":\"{}\",\"backup_active\":{}}}",
                 s.bytes_up, s.bytes_down, s.active_connections, s.total_connections, s.uptime_seconds,
                 s.dns_queries, s.tcp_syns, s.smol_recv, s.smol_send, s.relay_warns, s.relay_errors, debug_escaped,
                 srv_escaped, srv_backup,
-                errors_json.join(",")
             )
         }
         None => "{\"bytes_up\":0,\"bytes_down\":0,\"active\":0,\"total\":0,\"uptime\":0,\"dns\":0,\"syns\":0,\"smol_recv\":0,\"smol_send\":0,\"relay_warn\":0,\"relay_err\":0,\"debug\":\"\"}".into(),
@@ -590,27 +608,96 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetStats(
     env.new_string(&json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
-/// Get full error log as newline-separated string.
+// ── Журнал приложения (XR-042) ──────────────────────────────────────
+
+/// Инициализировать персистентный журнал в `dir` (повторный вызов только
+/// обновляет параметры ротации: настройки поменяли на лету). Вызывается из
+/// `Application.onCreate`, до любых других обращений к журналу.
 #[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetErrorLog(
-    env: JNIEnv, _class: JClass,
-) -> jstring {
-    let lock = get_engine().lock().unwrap();
-    let log = match *lock {
-        Some(ref h) => h.engine.stats().recent_errors().join("\n"),
-        None => String::new(),
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalInit(
+    mut env: JNIEnv,
+    _class: JClass,
+    dir: JString,
+    max_file_bytes: jlong,
+    max_files: jint,
+) {
+    let dir: String = match env.get_string(&dir) {
+        Ok(s) => s.into(),
+        Err(_) => return,
     };
-    env.new_string(&log).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    let bytes = max_file_bytes.max(0) as u64;
+    let files = max_files.max(1) as u32;
+    match JOURNAL.get() {
+        Some(j) => j.set_rotation(bytes, files),
+        None => {
+            let _ = JOURNAL.set(xr_core::journal::Journal::open(PathBuf::from(dir), bytes, files));
+        }
+    }
 }
 
-/// Clear error log.
+/// Запись из Kotlin-слоя (пробы, смены сети/режима, жизненный цикл сервиса).
+/// `level` из {"INFO","WARN","ERROR"}, `source` это короткий тег источника.
 #[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeClearErrorLog(
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalLog(
+    mut env: JNIEnv,
+    _class: JClass,
+    level: JString,
+    source: JString,
+    message: JString,
+) {
+    let level: String = match env.get_string(&level) {
+        Ok(s) => s.into(),
+        Err(_) => return,
+    };
+    let source: String = match env.get_string(&source) {
+        Ok(s) => s.into(),
+        Err(_) => return,
+    };
+    let message: String = match env.get_string(&message) {
+        Ok(s) => s.into(),
+        Err(_) => return,
+    };
+    journal_log(&level, &source, &message);
+}
+
+/// Хвост журнала (последние строки, от старых к новым) одной строкой с `\n`.
+/// Работает независимо от того, запущен ли движок.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalTail(
+    env: JNIEnv, _class: JClass,
+) -> jstring {
+    let text = match JOURNAL.get() {
+        Some(j) => j.tail().join("\n"),
+        None => String::new(),
+    };
+    env.new_string(&text).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Полное содержимое журнала с диска (экспорт/шаринг), от старых записей к новым.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalDump(
+    env: JNIEnv, _class: JClass,
+) -> jstring {
+    let text = match JOURNAL.get() {
+        Some(j) => j.dump(),
+        None => String::new(),
+    };
+    env.new_string(&text).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Очистить журнал (кнопка Clear на вкладке Log). Заодно сбрасывает
+/// кумулятивные счётчики WARN/ERROR движка, если тот запущен, чтобы бадж
+/// и заголовок вкладки начали счёт заново.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalClear(
     _env: JNIEnv, _class: JClass,
 ) {
     let lock = get_engine().lock().unwrap();
     if let Some(ref h) = *lock {
+        // clear_errors чистит подключённый журнал (тот же буфер) и счётчики.
         h.engine.stats().clear_errors();
+    } else if let Some(j) = JOURNAL.get() {
+        j.clear();
     }
 }
 
@@ -998,7 +1085,13 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeFetchManifest
     let json = match with_onboarding_runtime(sync::fetch_manifest(&agent_url, &token, timeout)) {
         Ok(Ok(manifest)) => serde_json::to_string(&manifest)
             .unwrap_or_else(|e| json_error(&format!("serialize: {e}"))),
-        Ok(Err(e)) | Err(e) => json_error(&e),
+        Ok(Err(e)) | Err(e) => {
+            // WARN, не ERROR: агент за выключенным ноутом это штатная
+            // ситуация, UI уходит в офлайн-фолбэк (XR-059). Но след в
+            // журнале нужен, иначе «шара не открывается» не диагностируется.
+            journal_log("WARN", "files", &format!("манифест шары {}: {}", token.share_id, e));
+            json_error(&e)
+        }
     };
     jstring_into_raw(&mut env, json)
 }
@@ -1048,8 +1141,18 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeDownloadFile(
             let result =
                 with_onboarding_runtime(sync::download_entry(&agent_url, &token, &entry, &dest, timeout));
             match result {
-                Ok(Ok(())) => serde_json::json!({ "ok": true }).to_string(),
-                Ok(Err(e)) | Err(e) => json_error(&e),
+                Ok(Ok(())) => {
+                    journal_log("INFO", "files", &format!(
+                        "скачан {} ({} байт), шара {}", entry.path, entry.size, token.share_id,
+                    ));
+                    serde_json::json!({ "ok": true }).to_string()
+                }
+                Ok(Err(e)) | Err(e) => {
+                    journal_log("ERROR", "files", &format!(
+                        "скачивание {}: {}, шара {}", entry.path, e, token.share_id,
+                    ));
+                    json_error(&e)
+                }
             }
         }
     };
@@ -1135,17 +1238,45 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
     };
     let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
 
+    let dry = dry_run != 0;
     let json = match with_onboarding_runtime(sync::sync_share_selected(
         &agent_url,
         &token,
         &dest,
         selection.as_ref(),
-        dry_run != 0,
+        dry,
         timeout,
     )) {
-        Ok(Ok(result)) => serde_json::to_string(&result)
-            .unwrap_or_else(|e| json_error(&format!("serialize: {e}"))),
-        Ok(Err(e)) | Err(e) => json_error(&e),
+        Ok(Ok(result)) => {
+            // dry_run это предпросмотр плана, событием не считается. "busy"
+            // тоже не журналируем: ожидаемая контенция с другим переносом,
+            // фоновый синк просто повторит на следующем цикле.
+            if let (false, Some(report)) = (dry, result.report.as_ref()) {
+                if report.fetched.is_empty() && report.deleted.is_empty() && report.failed.is_empty() {
+                    // Пустой план (всё уже на месте): не шумим в журнал,
+                    // фоновый синк ходит по расписанию.
+                } else {
+                    journal_log("INFO", "files", &format!(
+                        "синк шары {}: получено {}, удалено {}",
+                        token.share_id, report.fetched.len(), report.deleted.len(),
+                    ));
+                }
+                if let Some((path, reason)) = report.failed.first() {
+                    journal_log("ERROR", "files", &format!(
+                        "синк шары {}: ошибок {}, первая: {}: {}",
+                        token.share_id, report.failed.len(), path, reason,
+                    ));
+                }
+            }
+            serde_json::to_string(&result)
+                .unwrap_or_else(|e| json_error(&format!("serialize: {e}")))
+        }
+        Ok(Err(e)) | Err(e) => {
+            if !dry && e != "busy" {
+                journal_log("ERROR", "files", &format!("синк шары {}: {}", token.share_id, e));
+            }
+            json_error(&e)
+        }
     };
     jstring_into_raw(&mut env, json)
 }
@@ -1175,9 +1306,25 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeMigrateShareD
     let json = match sync::TransferGuard::acquire(files, bytes) {
         None => json_error("busy"),
         Some(_guard) => match sync::migrate_dir(&src, &dst) {
-            Ok(report) => serde_json::to_string(&report)
-                .unwrap_or_else(|e| json_error(&format!("serialize: {e}"))),
-            Err(e) => json_error(&e),
+            Ok(report) => {
+                journal_log("INFO", "files", &format!(
+                    "перенос хранилища шары: файлов {}, байт {}{}",
+                    report.moved, report.bytes,
+                    if report.cancelled { ", отменён пользователем" } else { "" },
+                ));
+                if let Some((path, reason)) = report.failed.first() {
+                    journal_log("ERROR", "files", &format!(
+                        "перенос хранилища: ошибок {}, первая: {}: {}",
+                        report.failed.len(), path, reason,
+                    ));
+                }
+                serde_json::to_string(&report)
+                    .unwrap_or_else(|e| json_error(&format!("serialize: {e}")))
+            }
+            Err(e) => {
+                journal_log("ERROR", "files", &format!("перенос хранилища шары: {}", e));
+                json_error(&e)
+            }
         },
     };
     jstring_into_raw(&mut env, json)

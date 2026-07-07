@@ -97,11 +97,28 @@ object NativeBridge {
 
     external fun nativeGetState(): String
     external fun nativeGetStats(): String
-    /** Get full error log (newline-separated). */
-    external fun nativeGetErrorLog(): String
 
-    /** Clear error log. */
-    external fun nativeClearErrorLog()
+    // ── Единый журнал приложения (XR-042) ───────────────────────────
+    // Персистентный append-only буфер, общий для движка, проб, смен
+    // сети/режима и файловых событий. Живёт на уровне процесса и на диске,
+    // поэтому перезапуск движка и приложения ленту не обнуляет.
+
+    /** Поднять журнал в [dir] (повторный вызов обновляет ротацию на лету).
+     *  Вызывается из [com.xrproxy.app.XrApp] до любых других обращений. */
+    external fun nativeJournalInit(dir: String, maxFileBytes: Long, maxFiles: Int)
+
+    /** Запись из Kotlin-слоя. [level] из {"INFO","WARN","ERROR"}, [source]
+     *  это короткий тег источника ("net", "probe", "vpn", "files"). */
+    external fun nativeJournalLog(level: String, source: String, message: String)
+
+    /** Хвост журнала (последние строки, от старых к новым), разделитель `\n`. */
+    external fun nativeJournalTail(): String
+
+    /** Полное содержимое журнала с диска (экспорт/шаринг). */
+    external fun nativeJournalDump(): String
+
+    /** Очистить журнал; заодно сбрасывает счётчики WARN/ERROR движка. */
+    external fun nativeJournalClear()
 
     external fun nativePushPacket(packet: ByteArray)
     external fun nativePopPacket(): ByteArray?
