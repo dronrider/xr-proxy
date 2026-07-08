@@ -553,7 +553,7 @@ fun ConnectionSection(
         }
     } else ""
     val statusText = when (state.phase) {
-        ConnectPhase.Idle, ConnectPhase.NeedsPermission -> "Disconnected"
+        ConnectPhase.Idle, ConnectPhase.NeedsPermission -> "Отключено"
         ConnectPhase.Preparing -> "Подготовка…"
         ConnectPhase.Connecting -> "Подключение…"
         ConnectPhase.Finalizing -> "Проверка маршрутов…"
@@ -657,7 +657,7 @@ fun ConnectionSection(
 
     // Главная кнопка меняет состояние по контексту (XR-049): на паузе в
     // доверенной сети это «Включить здесь» (override), при включённом вручную
-    // туннеле «Выключить здесь» (возврат в авто-паузу). Полный стоп из этих
+    // туннеле «Доверенная сеть» (возврат в авто-паузу). Полный стоп из этих
     // состояний остаётся в уведомлении («Отключить») и по уходу из сети.
     val trustedForcedOn = state.connected && state.overrideSsid != null
     val btnColor = when {
@@ -684,11 +684,11 @@ fun ConnectionSection(
         colors = ButtonDefaults.buttonColors(containerColor = btnColor, contentColor = btnTextColor),
     ) {
         val btnText = when {
-            state.connecting -> "Cancel"
+            state.connecting -> "Отмена"
             state.paused -> "Включить здесь"
-            trustedForcedOn -> "Выключить здесь"
-            state.connected -> "Disconnect"
-            else -> "Connect"
+            trustedForcedOn -> "Доверенная сеть"
+            state.connected -> "Отключить"
+            else -> "Подключить"
         }
         Text(btnText, style = MaterialTheme.typography.titleMedium)
     }
