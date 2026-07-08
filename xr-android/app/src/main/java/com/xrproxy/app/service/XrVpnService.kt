@@ -62,6 +62,7 @@ class XrVpnService : VpnService() {
         const val ACTION_START = "com.xrproxy.app.START"
         const val ACTION_STOP = "com.xrproxy.app.STOP"
         const val ACTION_RESUME_OVERRIDE = "com.xrproxy.app.RESUME_OVERRIDE"
+        const val ACTION_PAUSE_OVERRIDE = "com.xrproxy.app.PAUSE_OVERRIDE"
         const val ACTION_BIND_INTERNAL = "com.xrproxy.app.BIND_INTERNAL"
         const val EXTRA_CONFIG_JSON = "config_json"
         private const val CHANNEL_ID = "xr_vpn_channel"
@@ -126,6 +127,10 @@ class XrVpnService : VpnService() {
          *  blocked resources aren't reachable direct, so the pause risks
          *  cutting access (task 3b-2 §2). */
         val restrictedNetwork: Boolean = false,
+        /** SSID of the trusted network the user chose to keep the tunnel up on
+         *  ("Включить здесь"), while that override is armed. Lets the UI offer
+         *  the way back to the auto-pause without a reconnect (XR-049). */
+        val overrideSsid: String? = null,
     )
 
     inner class LocalBinder : Binder() {
@@ -269,11 +274,12 @@ class XrVpnService : VpnService() {
                 }
                 // A fresh user connect follows the default policy: a previously
                 // chosen "включить здесь" must not leak into the new session.
-                overrideSsid = null
+                setOverrideSsid(null)
                 scope.launch { startVpn(configJson) }
             }
             ACTION_STOP -> stopFromUi()
             ACTION_RESUME_OVERRIDE -> resumeOverride()
+            ACTION_PAUSE_OVERRIDE -> pauseOverride()
         }
         return START_STICKY
     }
@@ -328,7 +334,7 @@ class XrVpnService : VpnService() {
                 if (configJson == null) {
                     // Recreated instance without a session (process death):
                     // nothing to start from, the user must connect from the app.
-                    overrideSsid = null
+                    setOverrideSsid(null)
                     NativeBridge.nativeJournalLog(
                         "WARN", "net",
                         "«включить здесь»: нет сохранённой конфигурации, подключитесь из приложения",
@@ -669,6 +675,25 @@ class XrVpnService : VpnService() {
      *  on the current trusted network until it changes. */
     fun resumeOnTrustedNetwork() = resumeOverride()
 
+    /** UI ("Вернуть паузу") / notification action: drop the override and put
+     *  the tunnel back on auto-pause on the current trusted network. This is
+     *  the way back from "включить здесь" without a disconnect (XR-049). */
+    fun pauseOnTrustedNetwork() = pauseOverride()
+
+    private fun pauseOverride() {
+        setOverrideSsid(null)
+        NativeBridge.nativeJournalLog(
+            "INFO", "net", "«вернуть паузу»: override снят, возвращаю авто-паузу",
+        )
+        val raw = usableSsid(currentRawSsid) ?: usableSsid(currentWifiSsidRaw())
+        if (isTrusted(raw)) {
+            scope.launch { requestPause(raw) }
+        }
+        // SSID unreadable or no longer trusted: nothing to pause right now;
+        // with the override gone the regular watcher re-pauses on its own as
+        // soon as it sees a trusted SSID again.
+    }
+
     private suspend fun requestPause(rawSsid: String?) {
         transitionMutex.withLock {
             val ph = _stateFlow.value.phase
@@ -714,13 +739,24 @@ class XrVpnService : VpnService() {
         return NativeBridge.nativeSsidMatches(rawSsid, arrayOf(ssid))
     }
 
+    /** Single write path for the override: keeps the volatile field and the
+     *  published state in sync, so the UI card ("Вернуть паузу") appears and
+     *  disappears together with the actual behavior. */
+    private fun setOverrideSsid(ssid: String?) {
+        if (overrideSsid == ssid) return
+        overrideSsid = ssid
+        _stateFlow.value = _stateFlow.value.copy(overrideSsid = ssid)
+    }
+
     /** Remember the current network as user-overridden ("включить здесь").
      *  Prefers a live SSID read; falls back to the SSID we paused on, which is
      *  what the user is looking at when tapping the button. */
     private fun armOverride() {
         val live = usableSsid(currentRawSsid) ?: usableSsid(currentWifiSsidRaw())
-        overrideSsid = live?.let { NativeBridge.nativeNormalizeSsid(it) }
-            ?: _stateFlow.value.pausedSsid
+        setOverrideSsid(
+            live?.let { NativeBridge.nativeNormalizeSsid(it) }
+                ?: _stateFlow.value.pausedSsid,
+        )
     }
 
     /** Drop the override once the uplink demonstrably left the overridden
@@ -730,10 +766,10 @@ class XrVpnService : VpnService() {
     private fun maybeDisarmOverride(rawSsid: String?, wifiUplink: Boolean) {
         if (overrideSsid == null) return
         if (!wifiUplink) {
-            overrideSsid = null
+            setOverrideSsid(null)
             return
         }
-        if (rawSsid != null && !overrideMatches(rawSsid)) overrideSsid = null
+        if (rawSsid != null && !overrideMatches(rawSsid)) setOverrideSsid(null)
     }
 
     private fun extractRawSsid(caps: NetworkCapabilities): String? {
@@ -1042,7 +1078,7 @@ class XrVpnService : VpnService() {
             currentDefaultIsWifi = false
             pausedNetwork = null
             pendingSwitch = false
-            overrideSsid = null
+            setOverrideSsid(null)
             try {
                 cm?.unregisterNetworkCallback(cb)
             } catch (_: IllegalArgumentException) {
@@ -1236,6 +1272,21 @@ class XrVpnService : VpnService() {
                     Icon.createWithResource(this, R.drawable.ic_notification),
                     "Включить здесь",
                     resumeIntent,
+                ).build()
+            )
+        }
+        if (state.phase == Phase.Connected && state.overrideSsid != null) {
+            // Mirror action for the override: one tap back to the auto-pause.
+            val pauseIntent = PendingIntent.getService(
+                this, 2,
+                Intent(this, XrVpnService::class.java).apply { action = ACTION_PAUSE_OVERRIDE },
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            builder.addAction(
+                Notification.Action.Builder(
+                    Icon.createWithResource(this, R.drawable.ic_notification),
+                    "Вернуть паузу",
+                    pauseIntent,
                 ).build()
             )
         }

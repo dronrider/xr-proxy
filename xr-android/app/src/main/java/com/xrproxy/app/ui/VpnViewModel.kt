@@ -116,6 +116,9 @@ data class VpnUiState(
     val pausedSsid: String? = null,
     /** While paused: this trusted network failed the restriction probe (task 3b-2 §2). */
     val restrictedNetwork: Boolean = false,
+    /** SSID of the trusted network the tunnel is kept up on by explicit user
+     *  choice ("Включить здесь"); null when no override is armed (XR-049). */
+    val overrideSsid: String? = null,
     /** Log tab search query (LLD-03). Lives in VM so it survives tab switches. */
     val logQuery: String = "",
     val logRegexMode: Boolean = false,
@@ -564,6 +567,22 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         tryBind(autoCreate = false)
     }
 
+    /** Put the tunnel back on auto-pause on the current trusted network,
+     *  dropping the "Включить здесь" override (XR-049). Same intent fallback
+     *  as [resumeOnTrustedNetwork]. */
+    fun pauseOnTrustedNetwork() {
+        val svc = boundService
+        if (svc != null) {
+            svc.pauseOnTrustedNetwork()
+            return
+        }
+        val intent = Intent(getApplication(), XrVpnService::class.java).apply {
+            action = XrVpnService.ACTION_PAUSE_OVERRIDE
+        }
+        try { getApplication<Application>().startService(intent) } catch (_: Exception) {}
+        tryBind(autoCreate = false)
+    }
+
     // ── APK self-update (LLD-12) ────────────────────────────────────
 
     /** Hub of the active server, or null when none is configured. */
@@ -978,6 +997,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             debugMsg = snap?.debugMsg ?: "",
             pausedSsid = svcState.pausedSsid,
             restrictedNetwork = svcState.restrictedNetwork,
+            overrideSsid = svcState.overrideSsid,
             activeServer = snap?.activeServer ?: "",
             backupActive = snap?.backupActive ?: false,
         )

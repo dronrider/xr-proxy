@@ -445,6 +445,7 @@ fun MainScreen(
                     onConnect = { viewModel.onConnectClicked() },
                     onDisconnect = viewModel::disconnect,
                     onResumeHere = { viewModel.resumeOnTrustedNetwork() },
+                    onPauseHere = { viewModel.pauseOnTrustedNetwork() },
                     onToggleDebug = viewModel::toggleDebug,
                     onSwitcherClick = { switcherSheetOpen = true },
                     snackbarHostState = snackbarHostState,
@@ -530,6 +531,7 @@ fun ConnectionSection(
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
     onResumeHere: () -> Unit,
+    onPauseHere: () -> Unit,
     onToggleDebug: () -> Unit,
     onSwitcherClick: () -> Unit,
     snackbarHostState: SnackbarHostState,
@@ -692,6 +694,47 @@ fun ConnectionSection(
                 Spacer(Modifier.height(4.dp))
                 Text(
                     "Поднимется сам при уходе из сети",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+            }
+        }
+    }
+
+    // Connected on a trusted network by explicit user choice ("Включить
+    // здесь"): mirror card with the way back to the auto-pause, so returning
+    // doesn't require a disconnect (XR-049).
+    if (state.connected && state.overrideSsid != null) {
+        Spacer(Modifier.height(24.dp))
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant,
+            ),
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Shield, null, tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.width(12.dp))
+                    Column {
+                        Text(
+                            "Доверенная сеть «${state.overrideSsid}»",
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Text(
+                            "VPN включён здесь по вашему выбору",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+                OutlinedButton(onClick = onPauseHere, modifier = Modifier.fillMaxWidth()) {
+                    Text("Вернуть паузу")
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Авто-пауза вернётся сама при смене сети",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.outline,
                 )
