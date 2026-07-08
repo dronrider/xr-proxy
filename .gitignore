@@ -8,3 +8,5 @@ local-docs/
 CLAUDE.local.md
 # Сборочные артефакты APK — не храним бинари в репозитории.
 *.apk
+# Бинарь утилиты доски, собирается по месту.
+tools/taskctl/taskctl
