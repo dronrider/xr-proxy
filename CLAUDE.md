@@ -1,8 +1,10 @@
 # CLAUDE.md
 
-Общие правила работы (окружение, git, ревью, стиль кода и текстов, трекинг задач) едины для всех проектов и подключаются импортом:
+Общие правила работы (окружение, git, ревью, стиль кода и текстов, трекинг задач) едины для всех проектов, живут в репозитории devkit и подключаются импортом:
 
-@../CLAUDE_RULES.md
+@../devkit/CLAUDE_RULES.md
+
+Если импорт не развернулся (соседней директории devkit нет), склонировать `https://github.com/dronrider/devkit` рядом с проектом и прочитать `CLAUDE_RULES.md` оттуда явно.
 
 Ниже только специфика xr-proxy.
 
@@ -84,7 +86,7 @@ Integer types differ across targets (`msg_controllen`, `iov_len`). Use `as _` fo
 - `scripts/udp-tproxy-cleanup.sh` - removes TPROXY rules and policy routes
 - `scripts/diagnose.sh` - comprehensive diagnostics (binary, config, process, ports, firewall, connectivity)
 - `scripts/generate-key.sh` - generate base64 obfuscation key
-- `tools/taskctl/` - Go-утилита канбан-доски `docs/TASKS.md`: `add`/`move`/`close`/`sort`/`lint`/`id`, запуск `go -C tools/taskctl run . <команда>`. Операции с доской (завести строку, статус, закрытие в архив с переносом файла задачи) делать ей, а не ручной правкой markdown; подробности в `tools/taskctl/README.md`
+- `taskctl` - утилита канбан-доски `docs/TASKS.md` (`add`/`move`/`close`/`sort`/`lint`/`id`), живёт в общем репозитории devkit рядом с проектом, бинарь ставится `cd ../devkit/taskctl && go build -o ~/go/bin/taskctl .`. Операции с доской (завести строку, статус, закрытие в архив с переносом файла задачи) делать ей, а не ручной правкой markdown; подробности в `../devkit/taskctl/README.md`
 
 ## Known Issues / Watch Out For
 
