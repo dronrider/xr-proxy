@@ -84,6 +84,7 @@ Integer types differ across targets (`msg_controllen`, `iov_len`). Use `as _` fo
 - `scripts/udp-tproxy-cleanup.sh` - removes TPROXY rules and policy routes
 - `scripts/diagnose.sh` - comprehensive diagnostics (binary, config, process, ports, firewall, connectivity)
 - `scripts/generate-key.sh` - generate base64 obfuscation key
+- `tools/taskctl/` - Go-утилита канбан-доски `docs/TASKS.md`: `add`/`move`/`close`/`sort`/`lint`/`id`, запуск `go -C tools/taskctl run . <команда>`. Операции с доской (завести строку, статус, закрытие в архив с переносом файла задачи) делать ей, а не ручной правкой markdown; подробности в `tools/taskctl/README.md`
 
 ## Known Issues / Watch Out For
 
