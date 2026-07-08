@@ -548,9 +548,20 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         return out.toList()
     }
 
-    /** Keep the tunnel running on the current trusted network ("Включить здесь"). */
+    /** Keep the tunnel running on the current trusted network ("Включить здесь").
+     *  Falls back to the intent path when the binder is not (yet) connected, so
+     *  the tap is never silently lost (XR-049). */
     fun resumeOnTrustedNetwork() {
-        boundService?.resumeOnTrustedNetwork()
+        val svc = boundService
+        if (svc != null) {
+            svc.resumeOnTrustedNetwork()
+            return
+        }
+        val intent = Intent(getApplication(), XrVpnService::class.java).apply {
+            action = XrVpnService.ACTION_RESUME_OVERRIDE
+        }
+        try { getApplication<Application>().startService(intent) } catch (_: Exception) {}
+        tryBind(autoCreate = false)
     }
 
     // ── APK self-update (LLD-12) ────────────────────────────────────

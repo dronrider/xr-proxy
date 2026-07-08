@@ -179,10 +179,14 @@ class XrVpnService : VpnService() {
     // only if the new network turns out NOT to be trusted (a trusted network
     // pauses instead of re-binding; we must not do both — see maybeEvaluate).
     @Volatile private var pendingSwitch = false
-    // The trusted network the user chose to keep the tunnel running on ("use
-    // anyway"). While the default network equals this, auto-pause is skipped.
-    // Cleared as soon as the default network changes.
-    @Volatile private var overrideNetwork: Network? = null
+    // Normalized SSID of the trusted network the user chose to keep the tunnel
+    // running on ("Включить здесь"). While the uplink still matches it, every
+    // auto-pause decision is skipped. Keyed by SSID, not by Network identity:
+    // the Network object changes on every Wi-Fi reconnect (netId blip, callbacks
+    // coalesced in Doze), which used to wipe the override and roll the tunnel
+    // right back into pause (XR-049). Disarmed in maybeDisarmOverride once the
+    // uplink demonstrably leaves the network.
+    @Volatile private var overrideSsid: String? = null
     // Completed by the first capabilities callback of a session, so startVpn
     // can wait briefly for the initial SSID before deciding to pause.
     @Volatile private var firstCapsSignal: CompletableDeferred<Unit>? = null
@@ -263,6 +267,9 @@ class XrVpnService : VpnService() {
                     stopSelf()
                     return START_NOT_STICKY
                 }
+                // A fresh user connect follows the default policy: a previously
+                // chosen "включить здесь" must not leak into the new session.
+                overrideSsid = null
                 scope.launch { startVpn(configJson) }
             }
             ACTION_STOP -> stopFromUi()
@@ -305,11 +312,41 @@ class XrVpnService : VpnService() {
      *  to pre-fill "add current network". Null when unknown / non-Wi-Fi. */
     fun currentRawSsidOrNull(): String? = currentRawSsid
 
-    /** Notification "use anyway" action: resume from a trusted-network pause
-     *  and keep the tunnel up on this network until it changes. */
+    /** "Включить здесь" (paused card / notification action): bring the tunnel
+     *  up on the current trusted network and keep it up until the uplink leaves
+     *  that network. Not just a resume from Paused: the tap can land on an
+     *  instance that is no longer paused (a stop raced it, or the action fired
+     *  after an error teardown), where it used to be a silent no-op (XR-049).
+     *  Those states restart from the kept session config instead. */
     private fun resumeOverride() {
-        overrideNetwork = currentDefaultNetwork
-        scope.launch { requestResume("«включить здесь», остаёмся на доверенной сети") }
+        armOverride()
+        when (_stateFlow.value.phase) {
+            Phase.Paused ->
+                scope.launch { requestResume("«включить здесь», остаёмся на доверенной сети") }
+            Phase.Idle, Phase.Error -> {
+                val configJson = lastConfigJson
+                if (configJson == null) {
+                    // Recreated instance without a session (process death):
+                    // nothing to start from, the user must connect from the app.
+                    overrideSsid = null
+                    NativeBridge.nativeJournalLog(
+                        "WARN", "net",
+                        "«включить здесь»: нет сохранённой конфигурации, подключитесь из приложения",
+                    )
+                    stopSelf()
+                } else {
+                    NativeBridge.nativeJournalLog(
+                        "INFO", "net", "«включить здесь»: туннель остановлен, поднимаю заново",
+                    )
+                    scope.launch { startVpn(configJson) }
+                }
+            }
+            else -> {
+                // Preparing/Connecting/Finalizing/Stopping: a transition is
+                // already in flight; the armed override steers its outcome
+                // (the connect path checks shouldAutoPause under the mutex).
+            }
+        }
     }
 
     // ── Connection flow ───────────────────────────────────────────────
@@ -342,7 +379,7 @@ class XrVpnService : VpnService() {
             firstCapsSignal = null
 
             val raw = currentRawSsid
-            if (raw != null && isTrusted(raw)) {
+            if (shouldAutoPause(raw)) {
                 doPause(raw)
                 return
             }
@@ -448,7 +485,7 @@ class XrVpnService : VpnService() {
         // Re-check now while we hold the lock — if trusted, pause instead of
         // running. (Skipped if the user chose "use anyway" on this network.)
         val raw = currentRawSsid
-        if (raw != null && currentDefaultNetwork != overrideNetwork && isTrusted(raw)) {
+        if (shouldAutoPause(raw)) {
             doPause(raw)
             return true
         }
@@ -482,11 +519,10 @@ class XrVpnService : VpnService() {
             // the SSID via WifiManager (VPN-independent) each tick and pause if
             // it resolves to a trusted network. Gated on the default uplink being
             // Wi-Fi so a stale association can't pause us on cellular.
-            if (_stateFlow.value.phase == Phase.Connected && currentDefaultIsWifi &&
-                currentDefaultNetwork != overrideNetwork
-            ) {
+            if (_stateFlow.value.phase == Phase.Connected && currentDefaultIsWifi) {
                 val wifiSsid = usableSsid(currentWifiSsidRaw())
-                if (wifiSsid != null && isTrusted(wifiSsid)) {
+                maybeDisarmOverride(wifiSsid, wifiUplink = true)
+                if (shouldAutoPause(wifiSsid)) {
                     requestPause(wifiSsid)
                     return
                 }
@@ -662,6 +698,44 @@ class XrVpnService : VpnService() {
         return NativeBridge.nativeSsidMatches(rawSsid, trusted)
     }
 
+    /** Auto-pause applies when the SSID is trusted AND the user has not chosen
+     *  "включить здесь" for that same network. The single gate for all four
+     *  decision points (initial connect, post-Connected backstop, poll-loop
+     *  re-check, capabilities watcher), so none of them can bypass the override. */
+    private fun shouldAutoPause(rawSsid: String?): Boolean =
+        rawSsid != null && isTrusted(rawSsid) && !overrideMatches(rawSsid)
+
+    /** Whether [rawSsid] names the network the user overrode. Matching goes
+     *  through the same Rust normalizer as trusted-list matching, so
+     *  quoting/case/sentinel quirks can't split the two decisions. */
+    private fun overrideMatches(rawSsid: String?): Boolean {
+        val ssid = overrideSsid ?: return false
+        if (rawSsid == null) return false
+        return NativeBridge.nativeSsidMatches(rawSsid, arrayOf(ssid))
+    }
+
+    /** Remember the current network as user-overridden ("включить здесь").
+     *  Prefers a live SSID read; falls back to the SSID we paused on, which is
+     *  what the user is looking at when tapping the button. */
+    private fun armOverride() {
+        val live = usableSsid(currentRawSsid) ?: usableSsid(currentWifiSsidRaw())
+        overrideSsid = live?.let { NativeBridge.nativeNormalizeSsid(it) }
+            ?: _stateFlow.value.pausedSsid
+    }
+
+    /** Drop the override once the uplink demonstrably left the overridden
+     *  network: a usable SSID of a different network, or a non-Wi-Fi uplink.
+     *  An unreadable SSID keeps it armed: transient "<unknown ssid>" reads are
+     *  routine while our VPN is up and must not cancel the user's choice. */
+    private fun maybeDisarmOverride(rawSsid: String?, wifiUplink: Boolean) {
+        if (overrideSsid == null) return
+        if (!wifiUplink) {
+            overrideSsid = null
+            return
+        }
+        if (rawSsid != null && !overrideMatches(rawSsid)) overrideSsid = null
+    }
+
     private fun extractRawSsid(caps: NetworkCapabilities): String? {
         val info = caps.transportInfo
         return if (info is WifiInfo) info.ssid else null
@@ -721,6 +795,8 @@ class XrVpnService : VpnService() {
         // Unblock startVpn's initial-trust wait now that we have an SSID verdict.
         firstCapsSignal?.complete(Unit)
 
+        maybeDisarmOverride(raw, currentDefaultIsWifi)
+
         val trusted = isTrusted(raw)
         when (_stateFlow.value.phase) {
             Phase.Paused -> {
@@ -760,10 +836,12 @@ class XrVpnService : VpnService() {
                 }
             }
             Phase.Connected, Phase.Finalizing -> {
-                if (trusted && network != overrideNetwork) {
+                if (shouldAutoPause(raw)) {
                     pendingSwitch = false
                     scope.launch { requestPause(raw) }
-                } else if (!trusted && pendingSwitch) {
+                } else if (pendingSwitch) {
+                    // Covers a same-SSID reconnect under an active override too:
+                    // the tunnel stays up, but the netId changed, so re-bind.
                     pendingSwitch = false
                     NativeBridge.nativeJournalLog(
                         "INFO", "net", "смена сети: перепривязка туннеля к новому аплинку",
@@ -863,10 +941,12 @@ class XrVpnService : VpnService() {
         val previous = currentDefaultNetwork
         currentDefaultNetwork = network
         // A real switch — owe a re-bind (deferred until onCapabilities tells us
-        // the new network isn't trusted; see maybeEvaluate).
+        // the new network isn't trusted; see maybeEvaluate). The user override
+        // deliberately survives this point: a Wi-Fi reconnect changes the netId
+        // without leaving the network, so the SSID-keyed override is only
+        // re-checked once capabilities arrive (maybeDisarmOverride).
         if (previous != null && previous != network) {
             pendingSwitch = true
-            overrideNetwork = null
         }
     }
 
@@ -962,7 +1042,7 @@ class XrVpnService : VpnService() {
             currentDefaultIsWifi = false
             pausedNetwork = null
             pendingSwitch = false
-            overrideNetwork = null
+            overrideSsid = null
             try {
                 cm?.unregisterNetworkCallback(cb)
             } catch (_: IllegalArgumentException) {
