@@ -675,8 +675,8 @@ class XrVpnService : VpnService() {
      *  on the current trusted network until it changes. */
     fun resumeOnTrustedNetwork() = resumeOverride()
 
-    /** UI (тумблер «VPN в этой сети») / notification action «Пауза здесь»:
-     *  drop the override and put the tunnel back on auto-pause on the current
+    /** UI («Выключить здесь» на главной кнопке) / notification action: drop
+     *  the override and put the tunnel back on auto-pause on the current
      *  trusted network. This is the way back from "включить здесь" without a
      *  disconnect (XR-049). */
     fun pauseOnTrustedNetwork() = pauseOverride()
@@ -1289,7 +1289,7 @@ class XrVpnService : VpnService() {
             builder.addAction(
                 Notification.Action.Builder(
                     Icon.createWithResource(this, R.drawable.ic_notification),
-                    "Пауза здесь",
+                    "Выключить здесь",
                     pauseIntent,
                 ).build()
             )

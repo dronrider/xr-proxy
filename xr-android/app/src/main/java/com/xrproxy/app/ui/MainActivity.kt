@@ -28,6 +28,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -592,6 +593,41 @@ fun ConnectionSection(
         )
     }
 
+    // Контекст доверенной сети даём компактными строками под статусом, по
+    // образцу строки «через X (резерв)»: без карточки метрики и кнопка
+    // остаются на месте, а само действие живёт в главной кнопке (XR-049).
+    if (state.paused) {
+        Spacer(Modifier.height(4.dp))
+        Text(
+            state.pausedSsid?.let { "Доверенная сеть «$it»" } ?: "Доверенная сеть",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            "трафик идёт напрямую, VPN включится сам при уходе из сети",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.outline,
+            textAlign = TextAlign.Center,
+        )
+        if (state.restrictedNetwork) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "В этой сети есть ограничения: включите VPN, если что-то не открывается",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFFFFA726),
+                textAlign = TextAlign.Center,
+            )
+        }
+    }
+    if (state.connected && state.overrideSsid != null) {
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "включено вручную · доверенная сеть «${state.overrideSsid}»",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.tertiary,
+        )
+    }
+
     // Version
     val context = LocalContext.current
     val versionName = remember {
@@ -619,19 +655,29 @@ fun ConnectionSection(
 
     Spacer(Modifier.height(12.dp))
 
-    // Connect / Disconnect button
+    // Главная кнопка меняет состояние по контексту (XR-049): на паузе в
+    // доверенной сети это «Включить здесь» (override), при включённом вручную
+    // туннеле «Выключить здесь» (возврат в авто-паузу). Полный стоп из этих
+    // состояний остаётся в уведомлении («Отключить») и по уходу из сети.
+    val trustedForcedOn = state.connected && state.overrideSsid != null
     val btnColor = when {
-        state.connected || state.paused -> MaterialTheme.colorScheme.error
+        state.paused -> MaterialTheme.colorScheme.primary
+        state.connected -> MaterialTheme.colorScheme.error
         state.connecting -> MaterialTheme.colorScheme.tertiary
         else -> MaterialTheme.colorScheme.primary
     }
     val btnTextColor = when {
-        state.connected || state.paused -> MaterialTheme.colorScheme.onError
+        state.connected -> MaterialTheme.colorScheme.onError
         else -> MaterialTheme.colorScheme.onPrimary
     }
     Button(
         onClick = {
-            if (state.connected || state.connecting || state.paused) onDisconnect() else onConnect()
+            when {
+                state.paused -> onResumeHere()
+                trustedForcedOn -> onPauseHere()
+                state.connected || state.connecting -> onDisconnect()
+                else -> onConnect()
+            }
         },
         modifier = Modifier.fillMaxWidth(0.7f).height(56.dp),
         shape = RoundedCornerShape(28.dp),
@@ -639,88 +685,14 @@ fun ConnectionSection(
     ) {
         val btnText = when {
             state.connecting -> "Cancel"
-            state.connected || state.paused -> "Disconnect"
+            state.paused -> "Включить здесь"
+            trustedForcedOn -> "Выключить здесь"
+            state.connected -> "Disconnect"
             else -> "Connect"
         }
         Text(btnText, style = MaterialTheme.typography.titleMedium)
     }
 
-    // Trusted network: ONE card for both sides of the auto-pause. Paused =
-    // VPN intentionally off (the router behind this Wi-Fi already proxies),
-    // switched on = the user forced the tunnel up here. A single toggle flips
-    // the mode in place, no Disconnect/Connect cycle needed (XR-049). The card
-    // stays visible while the forced tunnel is coming up (override armed,
-    // transitional phase) so the toggle doesn't blink away mid-switch.
-    val trustedCardVisible = state.paused ||
-        (state.overrideSsid != null && state.phase != ConnectPhase.Stopping &&
-            (state.connected || state.connecting))
-    if (trustedCardVisible) {
-        val forcedOn = !state.paused
-        val trustedSsid = if (state.paused) state.pausedSsid else state.overrideSsid
-        Spacer(Modifier.height(24.dp))
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.surfaceVariant,
-            ),
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Shield, null, tint = MaterialTheme.colorScheme.primary)
-                    Spacer(Modifier.width(12.dp))
-                    Column {
-                        Text(
-                            trustedSsid?.let { "Доверенная сеть «$it»" } ?: "Доверенная сеть",
-                            style = MaterialTheme.typography.titleSmall,
-                        )
-                        Text(
-                            if (forcedOn) "VPN включён вручную"
-                            else "VPN на паузе, трафик идёт напрямую",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-
-                if (state.paused && state.restrictedNetwork) {
-                    Spacer(Modifier.height(12.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Warning, null, tint = Color(0xFFFFA726))
-                        Spacer(Modifier.width(12.dp))
-                        Text(
-                            "В этой сети есть ограничения, часть ресурсов сейчас " +
-                                "недоступна. Включите VPN, если что-то не открывается.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Color(0xFFFFA726),
-                        )
-                    }
-                }
-
-                Spacer(Modifier.height(12.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        "VPN в этой сети",
-                        style = MaterialTheme.typography.bodyMedium,
-                        modifier = Modifier.weight(1f),
-                    )
-                    Switch(
-                        checked = forcedOn,
-                        onCheckedChange = { on -> if (on) onResumeHere() else onPauseHere() },
-                        enabled = state.paused || state.connected,
-                    )
-                }
-                Text(
-                    if (forcedOn) "При смене сети VPN снова начнёт управляться сам"
-                    else "VPN включится сам при уходе из этой сети",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.outline,
-                )
-            }
-        }
-    }
 
     // Statistics
     if (state.connected) {
