@@ -645,9 +645,18 @@ fun ConnectionSection(
         Text(btnText, style = MaterialTheme.typography.titleMedium)
     }
 
-    // Paused on a trusted network: explicit "tunnel intentionally off" block
-    // with the restriction warning and an override (task 3b-2 §1.1, §2).
-    if (state.paused) {
+    // Trusted network: ONE card for both sides of the auto-pause. Paused =
+    // VPN intentionally off (the router behind this Wi-Fi already proxies),
+    // switched on = the user forced the tunnel up here. A single toggle flips
+    // the mode in place, no Disconnect/Connect cycle needed (XR-049). The card
+    // stays visible while the forced tunnel is coming up (override armed,
+    // transitional phase) so the toggle doesn't blink away mid-switch.
+    val trustedCardVisible = state.paused ||
+        (state.overrideSsid != null && state.phase != ConnectPhase.Stopping &&
+            (state.connected || state.connecting))
+    if (trustedCardVisible) {
+        val forcedOn = !state.paused
+        val trustedSsid = if (state.paused) state.pausedSsid else state.overrideSsid
         Spacer(Modifier.height(24.dp))
         Card(
             modifier = Modifier.fillMaxWidth(),
@@ -661,26 +670,26 @@ fun ConnectionSection(
                     Spacer(Modifier.width(12.dp))
                     Column {
                         Text(
-                            state.pausedSsid?.let { "Доверенная сеть «$it»" } ?: "Доверенная сеть",
+                            trustedSsid?.let { "Доверенная сеть «$it»" } ?: "Доверенная сеть",
                             style = MaterialTheme.typography.titleSmall,
                         )
                         Text(
-                            "VPN на паузе — трафик идёт напрямую через эту сеть",
+                            if (forcedOn) "VPN включён вручную"
+                            else "VPN на паузе, трафик идёт напрямую",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                 }
 
-                if (state.restrictedNetwork) {
+                if (state.paused && state.restrictedNetwork) {
                     Spacer(Modifier.height(12.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.Warning, null, tint = Color(0xFFFFA726))
                         Spacer(Modifier.width(12.dp))
                         Text(
-                            "В этой сети есть ограничения — часть ресурсов сейчас " +
-                                "недоступна. Включите VPN здесь, если что-то не " +
-                                "открывается.",
+                            "В этой сети есть ограничения, часть ресурсов сейчас " +
+                                "недоступна. Включите VPN, если что-то не открывается.",
                             style = MaterialTheme.typography.bodySmall,
                             color = Color(0xFFFFA726),
                         )
@@ -688,53 +697,24 @@ fun ConnectionSection(
                 }
 
                 Spacer(Modifier.height(12.dp))
-                OutlinedButton(onClick = onResumeHere, modifier = Modifier.fillMaxWidth()) {
-                    Text("Включить здесь")
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "VPN в этой сети",
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Switch(
+                        checked = forcedOn,
+                        onCheckedChange = { on -> if (on) onResumeHere() else onPauseHere() },
+                        enabled = state.paused || state.connected,
+                    )
                 }
-                Spacer(Modifier.height(4.dp))
                 Text(
-                    "Поднимется сам при уходе из сети",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.outline,
-                )
-            }
-        }
-    }
-
-    // Connected on a trusted network by explicit user choice ("Включить
-    // здесь"): mirror card with the way back to the auto-pause, so returning
-    // doesn't require a disconnect (XR-049).
-    if (state.connected && state.overrideSsid != null) {
-        Spacer(Modifier.height(24.dp))
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.surfaceVariant,
-            ),
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Shield, null, tint = MaterialTheme.colorScheme.primary)
-                    Spacer(Modifier.width(12.dp))
-                    Column {
-                        Text(
-                            "Доверенная сеть «${state.overrideSsid}»",
-                            style = MaterialTheme.typography.titleSmall,
-                        )
-                        Text(
-                            "VPN включён здесь по вашему выбору",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-                Spacer(Modifier.height(12.dp))
-                OutlinedButton(onClick = onPauseHere, modifier = Modifier.fillMaxWidth()) {
-                    Text("Вернуть паузу")
-                }
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "Авто-пауза вернётся сама при смене сети",
+                    if (forcedOn) "При смене сети VPN снова начнёт управляться сам"
+                    else "VPN включится сам при уходе из этой сети",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.outline,
                 )

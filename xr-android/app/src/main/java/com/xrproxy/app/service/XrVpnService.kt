@@ -675,23 +675,27 @@ class XrVpnService : VpnService() {
      *  on the current trusted network until it changes. */
     fun resumeOnTrustedNetwork() = resumeOverride()
 
-    /** UI ("Вернуть паузу") / notification action: drop the override and put
-     *  the tunnel back on auto-pause on the current trusted network. This is
-     *  the way back from "включить здесь" without a disconnect (XR-049). */
+    /** UI (тумблер «VPN в этой сети») / notification action «Пауза здесь»:
+     *  drop the override and put the tunnel back on auto-pause on the current
+     *  trusted network. This is the way back from "включить здесь" without a
+     *  disconnect (XR-049). */
     fun pauseOnTrustedNetwork() = pauseOverride()
 
     private fun pauseOverride() {
-        setOverrideSsid(null)
         NativeBridge.nativeJournalLog(
-            "INFO", "net", "«вернуть паузу»: override снят, возвращаю авто-паузу",
+            "INFO", "net", "VPN выключен в доверенной сети: override снят, возвращаю авто-паузу",
         )
         val raw = usableSsid(currentRawSsid) ?: usableSsid(currentWifiSsidRaw())
-        if (isTrusted(raw)) {
-            scope.launch { requestPause(raw) }
+        scope.launch {
+            // Pause first, drop the override after: the trusted-network card is
+            // keyed on (paused || override), clearing the override up front
+            // would blink it away for the moment the pause takes to land. If
+            // the SSID is unreadable or no longer trusted there is nothing to
+            // pause right now; with the override gone the regular watcher
+            // re-pauses on its own as soon as it sees a trusted SSID again.
+            if (isTrusted(raw)) requestPause(raw)
+            setOverrideSsid(null)
         }
-        // SSID unreadable or no longer trusted: nothing to pause right now;
-        // with the override gone the regular watcher re-pauses on its own as
-        // soon as it sees a trusted SSID again.
     }
 
     private suspend fun requestPause(rawSsid: String?) {
@@ -740,8 +744,8 @@ class XrVpnService : VpnService() {
     }
 
     /** Single write path for the override: keeps the volatile field and the
-     *  published state in sync, so the UI card ("Вернуть паузу") appears and
-     *  disappears together with the actual behavior. */
+     *  published state in sync, so the trusted-network card and its toggle
+     *  follow the actual behavior. */
     private fun setOverrideSsid(ssid: String?) {
         if (overrideSsid == ssid) return
         overrideSsid = ssid
@@ -1285,7 +1289,7 @@ class XrVpnService : VpnService() {
             builder.addAction(
                 Notification.Action.Builder(
                     Icon.createWithResource(this, R.drawable.ic_notification),
-                    "Вернуть паузу",
+                    "Пауза здесь",
                     pauseIntent,
                 ).build()
             )
