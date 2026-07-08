@@ -7,6 +7,7 @@ use axum::response::Html;
 use axum::Json;
 use base64::Engine;
 use serde::Deserialize;
+use xr_proto::invite_url::build_https_url;
 use xr_proto::preset::{Invite, InviteInfo, InvitePayload};
 
 use crate::config::InviteDefaults;
@@ -72,8 +73,15 @@ pub async fn view_invite(
         _ => status,
     };
 
-    // QR code via inline SVG from qrserver API (simple, no JS needed)
-    let qr_data = format!("/api/v1/invite/{}/claim", token);
+    // QR кодирует каноническую ссылку https://<host>/invite/<token> (LLD-04):
+    // относительный путь приложение не парсит. Хост берём из hub_url инвайта,
+    // при пустом из дефолтов конфига хаба.
+    let hub_url = if invite.payload.hub_url.is_empty() {
+        state.config.invites.defaults.hub_url.as_str()
+    } else {
+        invite.payload.hub_url.as_str()
+    };
+    let qr_data = build_https_url(hub_url, &token);
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -308,4 +316,107 @@ pub async fn revoke_invite(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use tokio::sync::RwLock;
+
+    use super::*;
+
+    const TOKEN: &str = "abcdefghij0123456789AB";
+
+    fn state_with_invite(payload_hub_url: &str, default_hub_url: &str) -> Arc<AppState> {
+        let mut config: crate::config::HubConfig =
+            toml::from_str("[server]\n[admin]\nusers = []").unwrap();
+        config.invites.defaults.hub_url = default_hub_url.into();
+
+        let invite = Invite {
+            token: TOKEN.into(),
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            expires_at: "2099-01-01T00:00:00+00:00".into(),
+            consumed_at: None,
+            claimed_by_ip: None,
+            one_time: true,
+            comment: String::new(),
+            payload: InvitePayload {
+                server_address: "203.0.113.10".into(),
+                server_port: 8443,
+                obfuscation_key: String::new(),
+                modifier: "positional_xor_rotate".into(),
+                salt: 0,
+                preset: "russia".into(),
+                hub_url: payload_hub_url.into(),
+                servers: Vec::new(),
+            },
+            share_ids: Vec::new(),
+        };
+
+        let mut invites = HashMap::new();
+        invites.insert(invite.token.clone(), invite);
+
+        Arc::new(AppState {
+            presets: RwLock::new(HashMap::new()),
+            invites: RwLock::new(invites),
+            shares: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashMap::new()),
+            config,
+            signing: None,
+        })
+    }
+
+    /// Вытащить содержимое QR из HTML страницы /view: значение параметра
+    /// data в src картинки qrserver, percent-декодированное обратно.
+    fn qr_data_from_view(html: &str) -> String {
+        let start = html.find("&amp;data=").expect("no qr data in html") + "&amp;data=".len();
+        let end = start + html[start..].find('"').expect("unterminated img src");
+        percent_decode(&html[start..end])
+    }
+
+    fn percent_decode(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap();
+                out.push(u8::from_str_radix(hex, 16).unwrap());
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    async fn view_html(state: Arc<AppState>) -> String {
+        let Html(html) = view_invite(State(state), extract::Path(TOKEN.to_string()))
+            .await
+            .expect("view_invite failed");
+        html
+    }
+
+    // Регрессия XR-032: QR кодировал относительный claim-путь, который
+    // parse_invite_link не принимает (нет схемы и хоста).
+    #[tokio::test]
+    async fn qr_encodes_canonical_invite_url() {
+        let state = state_with_invite("https://hub.example.com", "");
+        let qr = qr_data_from_view(&view_html(state).await);
+
+        assert_eq!(qr, format!("https://hub.example.com/invite/{TOKEN}"));
+        let link = xr_proto::invite_url::parse_invite_link(&qr).expect("app must parse qr");
+        assert_eq!(link.hub_url(), "https://hub.example.com");
+        assert_eq!(link.token(), TOKEN);
+    }
+
+    #[tokio::test]
+    async fn qr_host_falls_back_to_hub_config() {
+        let state = state_with_invite("", "https://fallback.example.com/");
+        let qr = qr_data_from_view(&view_html(state).await);
+
+        assert_eq!(qr, format!("https://fallback.example.com/invite/{TOKEN}"));
+    }
 }
