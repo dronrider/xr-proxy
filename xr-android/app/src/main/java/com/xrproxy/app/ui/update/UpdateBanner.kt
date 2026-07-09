@@ -30,7 +30,7 @@ import com.xrproxy.app.ui.components.formatBytes
 
 /**
  * Actionable update banner (LLD-12 §2.3). Renders nothing for the passive
- * states (Idle / Checking / UpToDate) so it can be dropped at the top of a
+ * states (Idle / UpToDate) so it can be dropped at the top of a
  * tab and only appears when there is something to act on.
  */
 @Composable
@@ -158,7 +158,7 @@ fun UpdateBanner(
             }
         }
 
-        else -> {} // Idle / Checking / UpToDate — nothing actionable.
+        else -> {} // Idle / UpToDate: nothing actionable.
     }
 }
 
@@ -171,10 +171,11 @@ fun UpdateBanner(
 fun UpdateCheckControls(
     state: UpdateUiState,
     currentVersionName: String,
+    checking: Boolean,
     onCheck: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val busy = state is UpdateUiState.Checking || state is UpdateUiState.Downloading
+    val busy = checking || state is UpdateUiState.Downloading
     Column(modifier.fillMaxWidth()) {
         Text(
             "Обновление приложения",

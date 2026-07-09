@@ -77,7 +77,6 @@ sealed interface OnboardingState {
 /** APK self-update UI state (LLD-12 §2.3). */
 sealed interface UpdateUiState {
     object Idle : UpdateUiState
-    object Checking : UpdateUiState
     /** Transient: shown only after a *manual* check that found nothing newer. */
     object UpToDate : UpdateUiState
     data class Available(val release: UpdateManager.Release) : UpdateUiState
@@ -188,6 +187,13 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private val _updateDeferred = MutableStateFlow(false)
     val updateDeferred: StateFlow<Boolean> = _updateDeferred
     private var deferredVersionCode = 0L
+
+    // Занятость РУЧНОЙ проверки: только спиннер кнопки «Проверить обновления».
+    // Отдельный флаг вместо состояния Checking, чтобы уже известное
+    // предложение не пропадало на время перепроверки (закреплённый баннер
+    // сверху «Серверов» дёргал страницу, а точка мигала).
+    private val _updateChecking = MutableStateFlow(false)
+    val updateChecking: StateFlow<Boolean> = _updateChecking
 
     // Small de-dup window between *automatic* checks, NOT a throttle: the
     // triggers are already rare key events (app brought to foreground, fresh
@@ -654,10 +660,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             if (manual) emitMessage("Для проверки обновлений нужен сервер с хабом", UiSeverity.Info)
             return
         }
-        // Never interrupt an in-flight download / install.
+        // Never interrupt an in-flight download / install. Припаркованное
+        // ReadyToInstall не в счёт: перепроверка может найти релиз ещё новее.
         when (_updateState.value) {
-            is UpdateUiState.Downloading, is UpdateUiState.ReadyToInstall,
-            is UpdateUiState.Installing -> return
+            is UpdateUiState.Downloading, is UpdateUiState.Installing -> return
             else -> {}
         }
         // A background check already retrying covers this trigger.
@@ -676,8 +682,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             // Ручная проверка главнее фоновой: гасим её ретраи, чтобы поздний
             // фоновый результат не переписал показанный пользователю ответ.
             autoUpdateJob?.cancel()
-            // Spinner only for an explicit user check; the launch check is silent.
-            _updateState.value = UpdateUiState.Checking
+            // Спиннер только у явной проверки; состояние предложения не
+            // трогаем, баннер и точка не мигают на время перепроверки.
+            _updateChecking.value = true
         }
         val job = viewModelScope.launch {
             // Фоновая проверка ретраит с бэкофом до потолка, пока не получит
@@ -722,8 +729,17 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                         // and do NOT stamp the rate-limit, so the next trigger is
                         // free to try too.
                         if (manual) {
-                            _updateState.value =
-                                UpdateUiState.Error(friendlyUpdateError(result.error))
+                            // Известное предложение ошибкой перепроверки не
+                            // затираем (баннер и точка остаются), ошибка уходит
+                            // в снекбар; без предложения она встаёт в секцию
+                            // обновления на «Серверах».
+                            when (_updateState.value) {
+                                is UpdateUiState.Available, is UpdateUiState.ReadyToInstall ->
+                                    emitMessage(friendlyUpdateError(result.error), UiSeverity.Error)
+                                else ->
+                                    _updateState.value =
+                                        UpdateUiState.Error(friendlyUpdateError(result.error))
+                            }
                             return@launch
                         }
                     }
@@ -731,6 +747,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 attempt++
             }
         }
+        // Спиннер кнопки гаснет и при отмене (уход в фон, onCleared).
+        if (manual) job.invokeOnCompletion { _updateChecking.value = false }
         if (!manual) autoUpdateJob = job
     }
 

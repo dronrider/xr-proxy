@@ -171,6 +171,7 @@ fun MainScreen(
     val journalMaxFiles by viewModel.journalMaxFiles.collectAsState()
     val updateState by viewModel.updateState.collectAsState()
     val updateDeferred by viewModel.updateDeferred.collectAsState()
+    val updateChecking by viewModel.updateChecking.collectAsState()
 
     // Location permission for reading the current Wi-Fi SSID (auto-pause,
     // task 3b-2). FINE_LOCATION is the cross-version path that unredacts the
@@ -561,6 +562,7 @@ fun MainScreen(
                 UpdateCheckControls(
                     state = updateState,
                     currentVersionName = appVersion,
+                    checking = updateChecking,
                     onCheck = { viewModel.checkForUpdates(manual = true) },
                 )
                 Spacer(Modifier.height(16.dp))
