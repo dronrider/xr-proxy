@@ -42,10 +42,13 @@ fun UpdateBanner(
     onRetry: () -> Unit,
     modifier: Modifier = Modifier,
     deferred: Boolean = false,
+    pinned: Boolean = false,
 ) {
     // «Позже» прячет баннер с главной до следующей сессии или более нового
-    // релиза; предложение обновиться остаётся на «Серверах» (XR-041).
-    if (deferred &&
+    // релиза; закреплённый вариант на «Серверах» (pinned) не прячется и
+    // «Позже» не предлагает: предложение там живёт, пока обновление не
+    // поставлено (XR-041).
+    if (!pinned && deferred &&
         (state is UpdateUiState.Available || state is UpdateUiState.ReadyToInstall)
     ) {
         return
@@ -77,7 +80,7 @@ fun UpdateBanner(
                 Spacer(Modifier.height(12.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = onUpdate, modifier = Modifier.weight(1f)) { Text("Обновить") }
-                    TextButton(onClick = onDismiss) { Text("Позже") }
+                    if (!pinned) TextButton(onClick = onDismiss) { Text("Позже") }
                 }
             }
         }
@@ -130,7 +133,7 @@ fun UpdateBanner(
                 Spacer(Modifier.height(12.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = onInstall, modifier = Modifier.weight(1f)) { Text("Установить") }
-                    TextButton(onClick = onDismiss) { Text("Позже") }
+                    if (!pinned) TextButton(onClick = onDismiss) { Text("Позже") }
                 }
             }
         }
@@ -169,8 +172,6 @@ fun UpdateCheckControls(
     state: UpdateUiState,
     currentVersionName: String,
     onCheck: () -> Unit,
-    onUpdate: () -> Unit,
-    onInstall: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val busy = state is UpdateUiState.Checking || state is UpdateUiState.Downloading
@@ -188,55 +189,10 @@ fun UpdateCheckControls(
             )
         }
 
-        // The actionable result is rendered INLINE here, directly under the
-        // header — so "Обновить" / "Установить" are visible right where the
-        // user tapped, without scrolling past the check button below.
+        // Доступное обновление здесь не дублируем: его карточка закреплена
+        // сверху вкладки (pinned UpdateBanner), тут остаются только ручная
+        // проверка и её статусы «актуально»/ошибка (XR-041).
         when (state) {
-            is UpdateUiState.Available -> {
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    "Доступна версия ${state.release.versionName} · ${formatBytes(state.release.sizeBytes)}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-                if (state.release.notes.isNotBlank()) {
-                    Spacer(Modifier.height(4.dp))
-                    Text(state.release.notes, style = MaterialTheme.typography.bodySmall)
-                }
-                Spacer(Modifier.height(8.dp))
-                // Без «Позже»: предложение на этой вкладке живёт, пока
-                // обновление не поставлено (XR-041), прятать его нечем.
-                Button(onClick = onUpdate, modifier = Modifier.fillMaxWidth()) { Text("Обновить") }
-            }
-            is UpdateUiState.Downloading -> {
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    "Загрузка ${state.release.versionName}…",
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Spacer(Modifier.height(8.dp))
-                if (state.progress >= 0f) {
-                    LinearProgressIndicator(progress = state.progress, modifier = Modifier.fillMaxWidth())
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        "${(state.progress * 100).toInt()}%",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                } else {
-                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                }
-            }
-            is UpdateUiState.ReadyToInstall -> {
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    "Обновление ${state.release.versionName} готово",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-                Spacer(Modifier.height(8.dp))
-                Button(onClick = onInstall, modifier = Modifier.fillMaxWidth()) { Text("Установить") }
-            }
             is UpdateUiState.UpToDate -> {
                 Spacer(Modifier.height(4.dp))
                 Text(

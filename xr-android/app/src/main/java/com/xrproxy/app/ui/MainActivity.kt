@@ -506,6 +506,20 @@ fun MainScreen(
                     .verticalScroll(rememberScrollState()),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
+                // По точке на иконке пользователь приходит сюда: предложение
+                // обновиться встречает сверху, а не в конце страницы за
+                // скроллом (XR-041). Закреплено: «Позже» его не прячет.
+                if (updateState.updatePending) {
+                    UpdateBanner(
+                        state = updateState,
+                        onUpdate = { viewModel.startUpdateDownload() },
+                        onInstall = { viewModel.installReadyUpdate() },
+                        onDismiss = { viewModel.dismissUpdate() },
+                        onRetry = { viewModel.checkForUpdates(manual = true) },
+                        modifier = Modifier.padding(top = 16.dp),
+                        pinned = true,
+                    )
+                }
                 ServersSection(
                     servers = servers,
                     activeId = activeId,
@@ -548,8 +562,6 @@ fun MainScreen(
                     state = updateState,
                     currentVersionName = appVersion,
                     onCheck = { viewModel.checkForUpdates(manual = true) },
-                    onUpdate = { viewModel.startUpdateDownload() },
-                    onInstall = { viewModel.installReadyUpdate() },
                 )
                 Spacer(Modifier.height(16.dp))
             }
