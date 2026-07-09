@@ -13,6 +13,12 @@ import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.core.content.ContextCompat
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -25,6 +31,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -412,9 +419,25 @@ fun MainScreen(
                         // Точка «есть непоставленное обновление» видна с любой
                         // вкладки (XR-041); сами контролы обновления живут здесь,
                         // на «Серверах», поэтому тап по вкладке ведёт к действию.
+                        // Мягкая пульсация прозрачности, чтобы точку заметили;
+                        // alpha читается в graphicsLayer, анимация не гоняет
+                        // рекомпозицию.
                         BadgedBox(badge = {
                             if (updateState.updatePending) {
-                                Badge(containerColor = MaterialTheme.colorScheme.primary)
+                                val pulse by rememberInfiniteTransition(label = "updateDot")
+                                    .animateFloat(
+                                        initialValue = 1f,
+                                        targetValue = 0.25f,
+                                        animationSpec = infiniteRepeatable(
+                                            animation = tween(900, easing = FastOutSlowInEasing),
+                                            repeatMode = RepeatMode.Reverse,
+                                        ),
+                                        label = "updateDotAlpha",
+                                    )
+                                Badge(
+                                    containerColor = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.graphicsLayer { alpha = pulse },
+                                )
                             }
                         }) { Icon(Icons.Default.Dns, null) }
                     },
