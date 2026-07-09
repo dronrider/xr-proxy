@@ -507,20 +507,24 @@ fun MainScreen(
                     .verticalScroll(rememberScrollState()),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                // По точке на иконке пользователь приходит сюда: предложение
-                // обновиться встречает сверху, а не в конце страницы за
-                // скроллом (XR-041). Закреплено: «Позже» его не прячет.
-                if (updateState.updatePending) {
-                    UpdateBanner(
-                        state = updateState,
-                        onUpdate = { viewModel.startUpdateDownload() },
-                        onInstall = { viewModel.installReadyUpdate() },
-                        onDismiss = { viewModel.dismissUpdate() },
-                        onRetry = { viewModel.checkForUpdates(manual = true) },
-                        modifier = Modifier.padding(top = 16.dp),
-                        pinned = true,
-                    )
+                // Блок обновления первым на странице (XR-041, компоновка
+                // владельца): точка приводит сюда, и пользователь сразу видит
+                // текущую версию и предложение обновиться, без скролла.
+                val appVersion = remember {
+                    try {
+                        permissionContext.packageManager
+                            .getPackageInfo(permissionContext.packageName, 0).versionName ?: ""
+                    } catch (_: Exception) { "" }
                 }
+                UpdateCheckControls(
+                    state = updateState,
+                    currentVersionName = appVersion,
+                    checking = updateChecking,
+                    onCheck = { viewModel.checkForUpdates(manual = true) },
+                    onUpdate = { viewModel.startUpdateDownload() },
+                    onInstall = { viewModel.installReadyUpdate() },
+                    modifier = Modifier.padding(top = 8.dp),
+                )
                 ServersSection(
                     servers = servers,
                     activeId = activeId,
@@ -551,19 +555,6 @@ fun MainScreen(
                     maxKb = journalMaxKb,
                     maxFiles = journalMaxFiles,
                     onChange = { kb, files -> viewModel.setJournalRotation(kb, files) },
-                )
-                Spacer(Modifier.height(8.dp))
-                val appVersion = remember {
-                    try {
-                        permissionContext.packageManager
-                            .getPackageInfo(permissionContext.packageName, 0).versionName ?: ""
-                    } catch (_: Exception) { "" }
-                }
-                UpdateCheckControls(
-                    state = updateState,
-                    currentVersionName = appVersion,
-                    checking = updateChecking,
-                    onCheck = { viewModel.checkForUpdates(manual = true) },
                 )
                 Spacer(Modifier.height(16.dp))
             }

@@ -27,6 +27,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.xrproxy.app.ui.UpdateUiState
 import com.xrproxy.app.ui.components.formatBytes
+import com.xrproxy.app.ui.updatePending
 
 /**
  * Actionable update banner (LLD-12 §2.3). Renders nothing for the passive
@@ -163,9 +164,11 @@ fun UpdateBanner(
 }
 
 /**
- * "Проверить обновления" control + inline status for the Servers tab. The
- * actionable states (download/install) are handled by [UpdateBanner] rendered
- * alongside; this is just the trigger + a one-line status.
+ * Блок «Обновление приложения» для вкладки «Серверы» (XR-041): текущая
+ * версия и, пока висит обновление, закреплённый [UpdateBanner]. Кнопка
+ * «Проверить обновления» в этот момент прячется: искать нечего, предложение
+ * уже на экране. Без обновления остаются ручная проверка и её статусы
+ * «актуально»/ошибка.
  */
 @Composable
 fun UpdateCheckControls(
@@ -173,9 +176,10 @@ fun UpdateCheckControls(
     currentVersionName: String,
     checking: Boolean,
     onCheck: () -> Unit,
+    onUpdate: () -> Unit,
+    onInstall: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val busy = checking || state is UpdateUiState.Downloading
     Column(modifier.fillMaxWidth()) {
         Text(
             "Обновление приложения",
@@ -190,44 +194,52 @@ fun UpdateCheckControls(
             )
         }
 
-        // Доступное обновление здесь не дублируем: его карточка закреплена
-        // сверху вкладки (pinned UpdateBanner), тут остаются только ручная
-        // проверка и её статусы «актуально»/ошибка (XR-041).
-        when (state) {
-            is UpdateUiState.UpToDate -> {
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "У вас актуальная версия",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.primary,
-                )
+        if (state.updatePending) {
+            Spacer(Modifier.height(8.dp))
+            UpdateBanner(
+                state = state,
+                onUpdate = onUpdate,
+                onInstall = onInstall,
+                onDismiss = {}, // pinned: «Позже» не рендерится
+                onRetry = {},   // pinned: карточки ошибки здесь не бывает
+                pinned = true,
+            )
+        } else {
+            when (state) {
+                is UpdateUiState.UpToDate -> {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "У вас актуальная версия",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+                is UpdateUiState.Error -> {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        state.message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+                else -> {}
             }
-            is UpdateUiState.Error -> {
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    state.message,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
-            else -> {}
-        }
-
-        Spacer(Modifier.height(8.dp))
-        OutlinedButton(
-            onClick = onCheck,
-            enabled = !busy,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            if (busy) {
-                CircularProgressIndicator(
-                    modifier = Modifier.height(18.dp).width(18.dp),
-                    strokeWidth = 2.dp,
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(if (state is UpdateUiState.Downloading) "Загрузка…" else "Проверка…")
-            } else {
-                Text("Проверить обновления")
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = onCheck,
+                enabled = !checking,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                if (checking) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.height(18.dp).width(18.dp),
+                        strokeWidth = 2.dp,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("Проверка…")
+                } else {
+                    Text("Проверить обновления")
+                }
             }
         }
     }
