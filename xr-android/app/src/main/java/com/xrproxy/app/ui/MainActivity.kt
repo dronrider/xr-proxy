@@ -403,19 +403,19 @@ fun MainScreen(
                             }
                         }) { Icon(Icons.AutoMirrored.Filled.List, null) }
                     },
-                    label = { Text("Log") },
+                    label = { Text("Журнал") },
                 )
                 NavigationBarItem(
                     selected = currentTab == 2,
                     onClick = { currentTab = 2 },
                     icon = { Icon(Icons.Default.Dns, null) },
-                    label = { Text("Servers") },
+                    label = { Text("Серверы") },
                 )
                 NavigationBarItem(
                     selected = currentTab == 3,
                     onClick = { currentTab = 3 },
                     icon = { Icon(Icons.Default.Folder, null) },
-                    label = { Text("Files") },
+                    label = { Text("Файлы") },
                 )
             }
         }
