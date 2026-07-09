@@ -186,7 +186,12 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     // it. A deliberate re-open minutes later still checks — that was the bug with
     // the old multi-hour floor (it ate the very event the user cares about).
     private val autoUpdateCheckDedupMs = 60L * 1000
-    private val keyLastUpdateCheck = "last_update_check_ms"
+    // Метка последней внятной проверки живёт В ПАМЯТИ процесса, не в prefs:
+    // дедуп защищает только от дублей триггеров внутри одной сессии, а само
+    // Available-состояние перезапуск не переживает. Персистентная метка
+    // глушила проверку свежего процесса, и рестарт в пределах 60с после
+    // успешной проверки оставался без баннера и точки вовсе (XR-041).
+    private var lastUpdateCheckDoneMs = 0L
     // Одна фоновая проверка за раз: она ретраит с бэкофом, и второй триггер,
     // прилетевший посреди ретраев, не должен запускать параллельный прогон
     // (XR-024). Job вместо флага, чтобы уход в фон гасил ретраи cancel'ом.
@@ -656,7 +661,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         // used to poison the window so the banner never appeared until much later
         // (XR-024). So we stamp on Available/UpToDate only, inside the loop.
         val now = System.currentTimeMillis()
-        if (!manual && now - prefs.getLong(keyLastUpdateCheck, 0L) < autoUpdateCheckDedupMs) return
+        if (!manual && now - lastUpdateCheckDoneMs < autoUpdateCheckDedupMs) return
         if (manual) {
             // Ручная проверка главнее фоновой: гасим её ретраи, чтобы поздний
             // фоновый результат не переписал показанный пользователю ответ.
@@ -678,7 +683,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 val result = withContext(Dispatchers.IO) { updateManager.check(hubUrl) }
                 when (result) {
                     is UpdateManager.CheckResult.Available -> {
-                        prefs.edit().putLong(keyLastUpdateCheck, System.currentTimeMillis()).apply()
+                        lastUpdateCheckDoneMs = System.currentTimeMillis()
                         // If this APK was already downloaded and verified in a
                         // prior session, offer "Установить" directly instead of
                         // re-downloading. Re-hashing the cached file stays on IO.
@@ -692,7 +697,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                         return@launch
                     }
                     is UpdateManager.CheckResult.UpToDate -> {
-                        prefs.edit().putLong(keyLastUpdateCheck, System.currentTimeMillis()).apply()
+                        lastUpdateCheckDoneMs = System.currentTimeMillis()
                         _updateState.value =
                             if (manual) UpdateUiState.UpToDate else UpdateUiState.Idle
                         return@launch
