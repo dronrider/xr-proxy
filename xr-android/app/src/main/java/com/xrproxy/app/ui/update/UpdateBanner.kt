@@ -1,26 +1,29 @@
 package com.xrproxy.app.ui.update
 
-import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -30,30 +33,18 @@ import com.xrproxy.app.ui.components.formatBytes
 import com.xrproxy.app.ui.updatePending
 
 /**
- * Actionable update banner (LLD-12 §2.3). Renders nothing for the passive
- * states (Idle / UpToDate) so it can be dropped at the top of a
- * tab and only appears when there is something to act on.
+ * Карточка обновления в блоке «Обновление приложения» на «Серверах»
+ * (LLD-12 §2.3, XR-041): доступный релиз, прогресс загрузки, готовность к
+ * установке. Предложение живёт, пока обновление не поставлено, поэтому
+ * кнопок «скрыть» здесь нет; пассивные состояния не рендерятся.
  */
 @Composable
 fun UpdateBanner(
     state: UpdateUiState,
     onUpdate: () -> Unit,
     onInstall: () -> Unit,
-    onDismiss: () -> Unit,
-    onRetry: () -> Unit,
     modifier: Modifier = Modifier,
-    deferred: Boolean = false,
-    pinned: Boolean = false,
 ) {
-    // «Позже» прячет баннер с главной до следующей сессии или более нового
-    // релиза; закреплённый вариант на «Серверах» (pinned) не прячется и
-    // «Позже» не предлагает: предложение там живёт, пока обновление не
-    // поставлено (XR-041).
-    if (!pinned && deferred &&
-        (state is UpdateUiState.Available || state is UpdateUiState.ReadyToInstall)
-    ) {
-        return
-    }
     when (state) {
         is UpdateUiState.Available -> Card(
             modifier = modifier.fillMaxWidth(),
@@ -79,10 +70,7 @@ fun UpdateBanner(
                     Text(state.release.notes, style = MaterialTheme.typography.bodySmall)
                 }
                 Spacer(Modifier.height(12.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = onUpdate, modifier = Modifier.weight(1f)) { Text("Обновить") }
-                    if (!pinned) TextButton(onClick = onDismiss) { Text("Позже") }
-                }
+                Button(onClick = onUpdate, modifier = Modifier.fillMaxWidth()) { Text("Обновить") }
             }
         }
 
@@ -132,34 +120,63 @@ fun UpdateBanner(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Spacer(Modifier.height(12.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = onInstall, modifier = Modifier.weight(1f)) { Text("Установить") }
-                    if (!pinned) TextButton(onClick = onDismiss) { Text("Позже") }
-                }
+                Button(onClick = onInstall, modifier = Modifier.fillMaxWidth()) { Text("Установить") }
             }
         }
 
-        is UpdateUiState.Error -> Card(
-            modifier = modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.errorContainer,
-            ),
+        else -> {} // Idle / UpToDate / Error: показываются в UpdateCheckControls.
+    }
+}
+
+/**
+ * Компактное уведомление на главной (XR-041, дизайн владельца): одна строка
+ * вместо большого баннера, чтобы о новой версии было видно больше, чем точку,
+ * но без дубля предложения. Тап ведёт на «Серверы» к самому предложению,
+ * крестик закрывает уведомление для этой версии насовсем (точка остаётся).
+ */
+@Composable
+fun UpdateNotice(
+    state: UpdateUiState,
+    onOpen: () -> Unit,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val text = when (state) {
+        is UpdateUiState.Available -> "Доступно обновление ${state.release.versionName}"
+        is UpdateUiState.ReadyToInstall -> "Обновление ${state.release.versionName} готово"
+        else -> return
+    }
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .clickable(onClick = onOpen)
+                .padding(start = 12.dp, top = 4.dp, bottom = 4.dp, end = 4.dp),
         ) {
-            Column(Modifier.padding(16.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Error, null, tint = MaterialTheme.colorScheme.error)
-                    Spacer(Modifier.width(12.dp))
-                    Text(state.message, style = MaterialTheme.typography.bodyMedium)
-                }
-                Spacer(Modifier.height(12.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = onRetry) { Text("Повторить") }
-                    TextButton(onClick = onDismiss) { Text("Закрыть") }
-                }
+            Icon(
+                Icons.Default.SystemUpdate,
+                null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.weight(1f),
+            )
+            IconButton(onClick = onClose) {
+                Icon(
+                    Icons.Default.Close,
+                    "Закрыть",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
-
-        else -> {} // Idle / UpToDate: nothing actionable.
     }
 }
 
@@ -210,9 +227,6 @@ fun UpdateCheckControls(
                 state = state,
                 onUpdate = onUpdate,
                 onInstall = onInstall,
-                onDismiss = {}, // pinned: «Позже» не рендерится
-                onRetry = {},   // pinned: карточки ошибки здесь не бывает
-                pinned = true,
             )
         } else {
             when (state) {

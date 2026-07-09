@@ -66,8 +66,8 @@ import com.xrproxy.app.ui.servers.JournalSection
 import com.xrproxy.app.ui.servers.ServersSection
 import com.xrproxy.app.ui.theme.XrTheme
 import com.xrproxy.app.ui.trusted.TrustedNetworksSection
-import com.xrproxy.app.ui.update.UpdateBanner
 import com.xrproxy.app.ui.update.UpdateCheckControls
+import com.xrproxy.app.ui.update.UpdateNotice
 import kotlinx.coroutines.launch
 
 private val COUNT_SUFFIX_RE = Regex(" \\(\u00D7(\\d+)\\)\$")
@@ -473,15 +473,17 @@ fun MainScreen(
                     .verticalScroll(rememberScrollState()),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                UpdateBanner(
-                    state = updateState,
-                    onUpdate = { viewModel.startUpdateDownload() },
-                    onInstall = { viewModel.installReadyUpdate() },
-                    onDismiss = { viewModel.dismissUpdate() },
-                    onRetry = { viewModel.checkForUpdates(manual = true) },
-                    modifier = Modifier.padding(top = 16.dp),
-                    deferred = updateDeferred,
-                )
+                // Компактное уведомление вместо большого баннера (XR-041,
+                // дизайн владельца): само предложение живёт на «Серверах»,
+                // тап ведёт туда, крестик закрывает для этой версии насовсем.
+                if (!updateDeferred) {
+                    UpdateNotice(
+                        state = updateState,
+                        onOpen = { currentTab = 2 },
+                        onClose = { viewModel.dismissUpdate() },
+                        modifier = Modifier.padding(top = 16.dp),
+                    )
+                }
                 ConnectionSection(
                     state = state,
                     activeServer = activeServer,

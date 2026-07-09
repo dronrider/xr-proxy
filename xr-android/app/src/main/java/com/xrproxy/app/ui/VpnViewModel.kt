@@ -178,15 +178,15 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private val _updateState = MutableStateFlow<UpdateUiState>(UpdateUiState.Idle)
     val updateState: StateFlow<UpdateUiState> = _updateState
 
-    // «Позже» откладывает обновление, а не отказывается от него (выбор
-    // владельца, XR-041): баннер уходит с главной и точка перестаёт
-    // пульсировать, но предложение на «Серверах» и сама точка остаются,
-    // пока обновление не поставлено. Живёт в памяти сессии: новый запуск
-    // приложения снова показывает баннер, более новый релиз снимает
-    // отсрочку сам (см. deferredVersionCode).
+    // Крестик на уведомлении главной закрывает его для этой версии насовсем
+    // (выбор владельца, XR-041): уведомление и пульс точки уходят, но сама
+    // точка и предложение на «Серверах» остаются, пока обновление не
+    // поставлено. Версия закрытого хранится в prefs и переживает перезапуск;
+    // более новый релиз показывает уведомление снова.
+    private val keyDeferredVersionCode = "update_deferred_code"
     private val _updateDeferred = MutableStateFlow(false)
     val updateDeferred: StateFlow<Boolean> = _updateDeferred
-    private var deferredVersionCode = 0L
+    private var deferredVersionCode = prefs.getLong(keyDeferredVersionCode, 0L)
 
     // Занятость РУЧНОЙ проверки: только спиннер кнопки «Проверить обновления».
     // Отдельный флаг вместо состояния Checking, чтобы уже известное
@@ -810,20 +810,14 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun dismissUpdate() {
-        when (val s = _updateState.value) {
-            is UpdateUiState.Available -> {
-                deferredVersionCode = s.release.versionCode
-                _updateDeferred.value = true
-            }
-            is UpdateUiState.ReadyToInstall -> {
-                deferredVersionCode = s.release.versionCode
-                _updateDeferred.value = true
-            }
-            // Ошибку и «у вас актуальная версия» «Позже»/«Закрыть» просто прячут.
-            is UpdateUiState.Error, UpdateUiState.UpToDate ->
-                _updateState.value = UpdateUiState.Idle
-            else -> {}
+        val release = when (val s = _updateState.value) {
+            is UpdateUiState.Available -> s.release
+            is UpdateUiState.ReadyToInstall -> s.release
+            else -> return
         }
+        deferredVersionCode = release.versionCode
+        prefs.edit().putLong(keyDeferredVersionCode, release.versionCode).apply()
+        _updateDeferred.value = true
     }
 
     private fun friendlyUpdateError(code: String): String = when {
