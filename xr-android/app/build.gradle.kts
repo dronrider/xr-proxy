@@ -30,7 +30,13 @@ android {
             commandLine("git", "describe", "--always", "--dirty", "--abbrev=7")
         }.standardOutput.asText.get().trim()
         val buildStamp = SimpleDateFormat("HHmm").format(Date())
-        versionName = "0.1.0-$gitDescribe-$buildStamp"
+        // Релизное имя приходит снаружи (`xrVersionName`, как и versionCode):
+        // тогда «Текущая версия» в приложении совпадает с именем релиза на
+        // хабе (0.55.0), а не выглядит чужой dev-строкой рядом с ним. Без
+        // проперти остаётся dev-схема с хешем.
+        val releaseVersionName = (project.findProperty("xrVersionName") as String?)
+            ?.takeIf { it.isNotBlank() }
+        versionName = releaseVersionName ?: "0.1.0-$gitDescribe-$buildStamp"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
