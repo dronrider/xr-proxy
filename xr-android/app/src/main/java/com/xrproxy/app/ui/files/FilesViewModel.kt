@@ -13,6 +13,7 @@ import com.xrproxy.app.model.ShareGrant
 import com.xrproxy.app.service.ShareSyncScheduler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -29,10 +30,17 @@ import java.io.File
  */
 class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val store = ShareStore.create(app)
+    // Opening the store means EncryptedSharedPreferences: a Keystore IPC plus
+    // a file decrypt, up to seconds on a cold process. Doing that in the
+    // constructor froze the first frame of the Files tab (XR-093), so it is
+    // built on IO and everything reaches it through store().
+    private val storeDeferred = viewModelScope.async(Dispatchers.IO) { ShareStore.create(app) }
     private val repo = ShareRepository(app)
 
-    val configs: StateFlow<List<ShareConfig>> = store.shares
+    private suspend fun store(): ShareStore = storeDeferred.await()
+
+    private val _configs = MutableStateFlow<List<ShareConfig>>(emptyList())
+    val configs: StateFlow<List<ShareConfig>> = _configs
 
     /** Live progress of the running sync/download. */
     data class Progress(
@@ -47,6 +55,14 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     data class UiState(
         val hubShares: List<ShareGrant> = emptyList(),
         val loadingHub: Boolean = false,
+        /** True once the share store has loaded: before that an empty [configs]
+         *  means "still opening", not "no shares", and the empty-state text
+         *  must not flash. */
+        val storeReady: Boolean = false,
+        /** True when the last invite refresh failed on the network layer
+         *  (airplane mode, hub unreachable): the saved shares stay usable and
+         *  the list is marked stale instead of toasting an error (XR-093). */
+        val hubOffline: Boolean = false,
         val openShareId: String? = null,
         val currentPath: String = "",
         val manifest: List<ManifestEntry> = emptyList(),
@@ -78,6 +94,14 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui
 
+    init {
+        viewModelScope.launch {
+            val store = store()
+            _ui.update { it.copy(storeReady = true) }
+            store.shares.collect { _configs.value = it }
+        }
+    }
+
     fun consumeMessage() = _ui.update { it.copy(message = null) }
     fun consumeOpenEvent() = _ui.update { it.copy(openFileEvent = null) }
 
@@ -85,7 +109,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
     fun refreshHub(hubUrl: String?, inviteToken: String?) {
         if (hubUrl.isNullOrBlank() || inviteToken.isNullOrBlank()) {
-            _ui.update { it.copy(message = "Нет инвайта — добавьте сервер по инвайту") }
+            _ui.update { it.copy(message = "Нет инвайта, добавьте сервер по инвайту") }
             return
         }
         _ui.update { it.copy(loadingHub = true) }
@@ -96,12 +120,24 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             result.onSuccess { runCatching { reconcileShares(it) } }
             _ui.update { st ->
                 result.fold(
-                    onSuccess = { st.copy(hubShares = it, loadingHub = false) },
-                    onFailure = { st.copy(loadingHub = false, message = "Шары по инвайту: ${it.message}") },
+                    onSuccess = { st.copy(hubShares = it, loadingHub = false, hubOffline = false) },
+                    onFailure = {
+                        // No network (airplane mode, hub down): the saved shares
+                        // still work, so mark the list stale instead of toasting
+                        // an error over usable content (XR-093). A non-network
+                        // failure is a real answer (expired invite, bad hub) and
+                        // stays visible.
+                        if (it.isOffline()) st.copy(loadingHub = false, hubOffline = true)
+                        else st.copy(loadingHub = false, message = "Шары по инвайту: ${it.message}")
+                    },
                 )
             }
         }
     }
+
+    /** The native layer reports transport-level failures as "network: ..."
+     *  (no route, DNS, connect timeout); everything else came from the hub. */
+    private fun Throwable.isOffline(): Boolean = message?.startsWith("network") == true
 
     /**
      * Refresh of the invite carries the agent's current address/port/token. If a
@@ -110,7 +146,8 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
      * place so we stop hitting the stale address. The user's selection and sync
      * toggle are kept; a remove + re-add is no longer needed.
      */
-    private fun reconcileShares(grants: List<ShareGrant>) {
+    private suspend fun reconcileShares(grants: List<ShareGrant>) {
+        val store = store()
         grants.forEach { g ->
             val existing = store.get(g.shareId) ?: return@forEach
             if (existing.addr != g.addr || existing.port != g.port ||
@@ -127,14 +164,18 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun addShare(grant: ShareGrant) {
-        store.upsert(ShareConfig.fromGrant(grant))
-        _ui.update { it.copy(message = "Шара «${grant.name}» добавлена") }
+        viewModelScope.launch {
+            store().upsert(ShareConfig.fromGrant(grant))
+            _ui.update { it.copy(message = "Шара «${grant.name}» добавлена") }
+        }
     }
 
     fun removeShare(shareId: String) {
-        store.remove(shareId)
-        rescheduleIfNeeded()
-        if (_ui.value.openShareId == shareId) closeShare()
+        viewModelScope.launch {
+            store().remove(shareId)
+            rescheduleIfNeeded()
+            if (_ui.value.openShareId == shareId) closeShare()
+        }
     }
 
     // ── explorer ────────────────────────────────────────────────────
@@ -184,7 +225,11 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun setSelected(shareId: String, path: String, selected: Boolean) {
-        store.update(shareId) { cfg ->
+        viewModelScope.launch { applySelection(shareId, path, selected) }
+    }
+
+    private suspend fun applySelection(shareId: String, path: String, selected: Boolean) {
+        store().update(shareId) { cfg ->
             val sel = cfg.selection.toMutableSet()
             sel.removeAll { it == path || it.startsWith("$path/") }
             if (selected) sel.add(path)
@@ -197,21 +242,24 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
      *  treated exactly like a ticked + synced file (kept locally, re-mirrored when
      *  the toggle is on, never pruned as an ad-hoc copy). */
     fun downloadAndOpen(config: ShareConfig, entry: ManifestEntry) {
-        setSelected(config.shareId, entry.path, true)
-        localFile(config, entry.path)?.let {
-            _ui.update { st -> st.copy(openFileEvent = it) }
-            return
-        }
-        // A download writes, so settle where it lands first (only on the very
-        // first sync of this share); an already-downloaded file opened above.
-        if (!config.storageChosen) {
-            promptStorage(config.shareId, Pending.Download(config.shareId, entry))
-            return
-        }
-        if (_ui.value.busyShareId != null) return
-        _ui.update { it.copy(busyShareId = config.shareId, progress = preparing()) }
-        val poll = launchPolling()
         viewModelScope.launch {
+            // Selection lands before the download starts: a mirror pass running
+            // in between would prune a file that is not selected yet.
+            applySelection(config.shareId, entry.path, true)
+            val existing = withContext(Dispatchers.IO) { localFile(config, entry.path) }
+            if (existing != null) {
+                _ui.update { st -> st.copy(openFileEvent = existing) }
+                return@launch
+            }
+            // A download writes, so settle where it lands first (only on the very
+            // first sync of this share); an already-downloaded file opened above.
+            if (!config.storageChosen) {
+                promptStorage(config.shareId, Pending.Download(config.shareId, entry))
+                return@launch
+            }
+            if (_ui.value.busyShareId != null) return@launch
+            _ui.update { it.copy(busyShareId = config.shareId, progress = preparing()) }
+            val poll = launchPolling()
             val err = withContext(Dispatchers.IO) { repo.downloadOne(config, entry) }
             poll.cancel()
             val local = withContext(Dispatchers.IO) { repo.localPaths(config) }
@@ -229,28 +277,31 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun localFile(config: ShareConfig, relPath: String): File? =
+    /** Hits the filesystem (destDir does mkdirs), so call from Dispatchers.IO. */
+    private fun localFile(config: ShareConfig, relPath: String): File? =
         repo.fileFor(config, relPath).takeIf { it.isFile }
 
     // ── sync + transfer control ─────────────────────────────────────
 
     fun setSyncEnabled(shareId: String, enabled: Boolean) {
-        val cfg = store.get(shareId) ?: return
-        if (enabled && !cfg.hasToken) {
-            _ui.update { it.copy(message = "Нет токена доступа") }
-            return
-        }
-        // Enabling background sync starts writing files, so settle the storage
-        // directory first (once per share).
-        if (enabled && !cfg.storageChosen) {
-            promptStorage(shareId, Pending.EnableSync(shareId))
-            return
-        }
-        store.update(shareId) { it.copy(syncEnabled = enabled) }
-        rescheduleIfNeeded()
-        if (enabled) {
-            ShareSyncScheduler.syncNow(getApplication())
-            _ui.update { it.copy(message = "Синк включён (зеркалит выбранное, удаляет лишнее)") }
+        viewModelScope.launch {
+            val cfg = store().get(shareId) ?: return@launch
+            if (enabled && !cfg.hasToken) {
+                _ui.update { it.copy(message = "Нет токена доступа") }
+                return@launch
+            }
+            // Enabling background sync starts writing files, so settle the storage
+            // directory first (once per share).
+            if (enabled && !cfg.storageChosen) {
+                promptStorage(shareId, Pending.EnableSync(shareId))
+                return@launch
+            }
+            store().update(shareId) { it.copy(syncEnabled = enabled) }
+            rescheduleIfNeeded()
+            if (enabled) {
+                withContext(Dispatchers.IO) { ShareSyncScheduler.syncNow(getApplication()) }
+                _ui.update { it.copy(message = "Синк включён (зеркалит выбранное, удаляет лишнее)") }
+            }
         }
     }
 
@@ -322,32 +373,35 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
      * runs.
      */
     fun chooseStorage(shareId: String, parentPath: String?) {
-        val cfg = store.get(shareId) ?: return
-        val newPath = parentPath?.let { File(it, repo.shareSubdir(cfg)).absolutePath }
-        val newDir = repo.dirFor(newPath, shareId)
-        if (repo.destDir(cfg).absolutePath == newDir.absolutePath) {
-            store.update(shareId) { it.copy(storagePath = newPath, storageChosen = true) }
-            _ui.update { it.copy(storageDialogFor = null, storagePromptMode = false) }
-            runPending(shareId)
-            return
-        }
-        if (_ui.value.busyShareId != null) {
-            _ui.update { it.copy(message = "Идёт передача, попробуйте позже") }
-            return
-        }
-        _ui.update {
-            it.copy(
-                storageDialogFor = null, storagePromptMode = false,
-                busyShareId = shareId, progress = preparing(),
-            )
-        }
-        val poll = launchPolling()
         viewModelScope.launch {
+            val cfg = store().get(shareId) ?: return@launch
+            val newPath = parentPath?.let { File(it, repo.shareSubdir(cfg)).absolutePath }
+            val newDir = repo.dirFor(newPath, shareId)
+            val samePlace = withContext(Dispatchers.IO) {
+                repo.destDir(cfg).absolutePath == newDir.absolutePath
+            }
+            if (samePlace) {
+                store().update(shareId) { it.copy(storagePath = newPath, storageChosen = true) }
+                _ui.update { it.copy(storageDialogFor = null, storagePromptMode = false) }
+                runPending(shareId)
+                return@launch
+            }
+            if (_ui.value.busyShareId != null) {
+                _ui.update { it.copy(message = "Идёт передача, попробуйте позже") }
+                return@launch
+            }
+            _ui.update {
+                it.copy(
+                    storageDialogFor = null, storagePromptMode = false,
+                    busyShareId = shareId, progress = preparing(),
+                )
+            }
+            val poll = launchPolling()
             val outcome = withContext(Dispatchers.IO) { repo.migrateStorage(cfg, newDir) }
             poll.cancel()
             val persisted = outcome.ok && !outcome.cancelled
-            if (persisted) store.update(shareId) { it.copy(storagePath = newPath, storageChosen = true) }
-            val fresh = store.get(shareId)
+            if (persisted) store().update(shareId) { it.copy(storagePath = newPath, storageChosen = true) }
+            val fresh = store().get(shareId)
             val local = if (_ui.value.openShareId == shareId && fresh != null) {
                 withContext(Dispatchers.IO) { repo.localPaths(fresh) }
             } else {
@@ -365,13 +419,13 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Re-dispatch the action the first-sync prompt deferred, now that the share's
      *  config is updated (storageChosen = true, so it won't prompt again). */
-    private fun runPending(shareId: String) {
+    private suspend fun runPending(shareId: String) {
         val p = pending ?: return
         pending = null
         if (p.shareIdOf() != shareId) return
         when (p) {
-            is Pending.Download -> store.get(p.shareId)?.let { downloadAndOpen(it, p.entry) }
-            is Pending.Sync -> store.get(p.shareId)?.let { syncNow(it) }
+            is Pending.Download -> store().get(p.shareId)?.let { downloadAndOpen(it, p.entry) }
+            is Pending.Sync -> store().get(p.shareId)?.let { syncNow(it) }
             is Pending.EnableSync -> setSyncEnabled(p.shareId, true)
         }
     }
@@ -433,12 +487,18 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun rescheduleIfNeeded() {
-        if (store.enabledShares().isNotEmpty()) ShareSyncScheduler.schedulePeriodic(getApplication())
+    // The scheduler goes through WorkManager, and its first getInstance in the
+    // process opens a Room database. That is another main-thread stall (XR-093),
+    // so both hops run on IO.
+
+    private suspend fun rescheduleIfNeeded() = withContext(Dispatchers.IO) {
+        if (store().enabledShares().isNotEmpty()) ShareSyncScheduler.schedulePeriodic(getApplication())
         else ShareSyncScheduler.cancelPeriodic(getApplication())
     }
 
     fun syncAllNow() {
-        if (store.enabledShares().isNotEmpty()) ShareSyncScheduler.syncNow(getApplication())
+        viewModelScope.launch(Dispatchers.IO) {
+            if (store().enabledShares().isNotEmpty()) ShareSyncScheduler.syncNow(getApplication())
+        }
     }
 }

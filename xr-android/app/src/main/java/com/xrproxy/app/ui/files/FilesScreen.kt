@@ -233,6 +233,15 @@ private fun ShareListView(
                 }
             }
         }
+        if (ui.hubOffline) {
+            item {
+                Text(
+                    "Хаб недоступен, показан сохранённый список",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
         ui.progress?.let { p -> item { ProgressBar(p) { vm.cancelTransfer() } } }
         if (ui.loadingHub) item { CircularProgressIndicator(modifier = Modifier.padding(8.dp)) }
 
@@ -253,10 +262,13 @@ private fun ShareListView(
         }
 
         item { SectionLabel("Мои шары") }
-        if (configs.isEmpty()) {
+        // Until the store has loaded, an empty list means "still opening", so
+        // hold the empty-state text back instead of flashing it.
+        if (configs.isEmpty() && ui.storeReady) {
             item {
                 Text(
-                    "Пока нет шар. Обнови список и добавь нужные.",
+                    if (ui.hubOffline) "Сети нет, а сохранённых шар пока нет"
+                    else "Пока нет шар. Обнови список и добавь нужные.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(8.dp),
                 )
