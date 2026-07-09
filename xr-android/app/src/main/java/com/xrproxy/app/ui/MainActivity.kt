@@ -408,7 +408,16 @@ fun MainScreen(
                 NavigationBarItem(
                     selected = currentTab == 2,
                     onClick = { currentTab = 2 },
-                    icon = { Icon(Icons.Default.Dns, null) },
+                    icon = {
+                        // Точка «есть непоставленное обновление» видна с любой
+                        // вкладки (XR-041); сами контролы обновления живут здесь,
+                        // на «Серверах», поэтому тап по вкладке ведёт к действию.
+                        BadgedBox(badge = {
+                            if (updateState.updatePending) {
+                                Badge(containerColor = MaterialTheme.colorScheme.primary)
+                            }
+                        }) { Icon(Icons.Default.Dns, null) }
+                    },
                     label = { Text("Серверы") },
                 )
                 NavigationBarItem(

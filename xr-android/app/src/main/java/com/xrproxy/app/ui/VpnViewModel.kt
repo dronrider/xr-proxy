@@ -90,6 +90,12 @@ sealed interface UpdateUiState {
     data class Error(val message: String) : UpdateUiState
 }
 
+/** Есть непоставленное обновление: пока оно висит, на иконке вкладки
+ *  «Серверы» горит точка, чтобы индикация была видна с любой вкладки (XR-041). */
+val UpdateUiState.updatePending: Boolean
+    get() = this is UpdateUiState.Available || this is UpdateUiState.Downloading ||
+        this is UpdateUiState.ReadyToInstall || this is UpdateUiState.Installing
+
 data class VpnUiState(
     val phase: ConnectPhase = ConnectPhase.Idle,
     val state: String = "Disconnected",
@@ -181,9 +187,16 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     // the old multi-hour floor (it ate the very event the user cares about).
     private val autoUpdateCheckDedupMs = 60L * 1000
     private val keyLastUpdateCheck = "last_update_check_ms"
-    // One background check at a time: it retries with backoff, so a second
-    // trigger arriving mid-retry must not launch a parallel run (XR-024).
-    @Volatile private var updateCheckInFlight = false
+    // Одна фоновая проверка за раз: она ретраит с бэкофом, и второй триггер,
+    // прилетевший посреди ретраев, не должен запускать параллельный прогон
+    // (XR-024). Job вместо флага, чтобы уход в фон гасил ретраи cancel'ом.
+    private var autoUpdateJob: Job? = null
+    // Плановая перепроверка, пока приложение на переднем плане: длинная сессия
+    // иначе не узнает о релизе до следующего перезахода в приложение (XR-041).
+    private val updateRecheckMs = 6L * 60 * 60 * 1000
+    private var updateRecheckJob: Job? = null
+    // Читается из binder-потока ConnectivityManager, отсюда volatile.
+    @Volatile private var appForeground = false
 
     // Checks for updates on a real app foreground (background→foreground) — the
     // key "user opened the app" event, fired once per transition, NOT on rotation
@@ -192,7 +205,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     // covered too. Removed in onCleared.
     private val foregroundObserver = object : DefaultLifecycleObserver {
         override fun onStart(owner: LifecycleOwner) {
+            appForeground = true
             checkForUpdates(manual = false)
+            startUpdateRecheck()
             // Re-run the restriction probe when the user opens the app while
             // paused, so a stale "network restricted" warning doesn't linger
             // until the next periodic re-probe.
@@ -207,7 +222,28 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         override fun onStop(owner: LifecycleOwner) {
+            appForeground = false
             stopLogPolling()
+            stopUpdateRecheck()
+            // Ретраи за спиной не нужны: баннер всё равно некому показывать, а
+            // следующий выход на передний план запускает свежую проверку.
+            autoUpdateJob?.cancel()
+            autoUpdateJob = null
+        }
+    }
+
+    // Появление дефолтной сети (в том числе смена её на поднятый VPN) это
+    // повод повторить проверку обновлений: холодный старт часто стреляет
+    // раньше связности, и без сети ретраи уходят в молоко (XR-041).
+    private val connectivityManager =
+        application.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+
+    private val updateNetworkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            if (!appForeground) return
+            // Колбэк приходит из binder-потока, вся логика проверки живёт на
+            // main: перекидываем через viewModelScope.
+            viewModelScope.launch { checkForUpdates(manual = false) }
         }
     }
 
@@ -313,13 +349,15 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
-        // Проверка обновлений — событийная, на КЛЮЧЕВЫЕ события: выход
+        // Проверка обновлений событийная, на КЛЮЧЕВЫЕ события: выход
         // приложения на передний план (ProcessLifecycleOwner, реальный
-        // background→foreground) и свежий переход в Connected (applyServiceState).
-        // Оба редкие, поэтому без большого пола — только 60с дедуп от двойного
-        // срабатывания. addObserver при уже STARTED сразу дёргает onStart →
-        // первый открыв тоже покрыт.
+        // background->foreground), свежий переход в Connected (applyServiceState)
+        // и появление дефолтной сети (updateNetworkCallback). События редкие,
+        // поэтому без большого пола, только 60с дедуп от двойного срабатывания.
+        // addObserver при уже STARTED сразу дёргает onStart, так что первое
+        // открытие тоже покрыто.
         ProcessLifecycleOwner.get().lifecycle.addObserver(foregroundObserver)
+        runCatching { connectivityManager.registerDefaultNetworkCallback(updateNetworkCallback) }
     }
 
     private fun initialOnboardingState(): OnboardingState =
@@ -328,6 +366,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         ProcessLifecycleOwner.get().lifecycle.removeObserver(foregroundObserver)
+        runCatching { connectivityManager.unregisterNetworkCallback(updateNetworkCallback) }
         serviceObserverJob?.cancel()
         if (isBound) {
             try { getApplication<Application>().unbindService(bindConnection) } catch (_: Exception) {}
@@ -607,7 +646,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             else -> {}
         }
         // A background check already retrying covers this trigger.
-        if (!manual && updateCheckInFlight) return
+        if (!manual && autoUpdateJob?.isActive == true) return
+        // В фоне не проверяем: показывать баннер некому, а бессрочные ретраи
+        // жгли бы сеть за спиной. Выход на передний план сам запустит проверку.
+        if (!manual && !appForeground) return
         // Rate-limit only CONCLUSIVE background checks (60s) so a burst of events
         // doesn't spam the hub. A FAILED attempt must not count: the cold-start
         // trigger often fires before connectivity is up, and stamping on a failure
@@ -615,56 +657,76 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         // (XR-024). So we stamp on Available/UpToDate only, inside the loop.
         val now = System.currentTimeMillis()
         if (!manual && now - prefs.getLong(keyLastUpdateCheck, 0L) < autoUpdateCheckDedupMs) return
-        // Spinner only for an explicit user check; the launch check is silent.
-        if (manual) _updateState.value = UpdateUiState.Checking
-        viewModelScope.launch {
-            updateCheckInFlight = true
-            try {
-                // Background checks retry with backoff: a single silent failure on
-                // a not-yet-ready network used to leave the user without the banner
-                // until a later trigger happened to succeed.
-                val backoffMs = longArrayOf(0L, 4_000L, 12_000L, 30_000L)
-                val attempts = if (manual) 1 else backoffMs.size
-                for (i in 0 until attempts) {
-                    if (i > 0) delay(backoffMs[i])
-                    val result = withContext(Dispatchers.IO) { updateManager.check(hubUrl) }
-                    when (result) {
-                        is UpdateManager.CheckResult.Available -> {
-                            prefs.edit().putLong(keyLastUpdateCheck, System.currentTimeMillis()).apply()
-                            // If this APK was already downloaded and verified in a
-                            // prior session, offer "Установить" directly instead of
-                            // re-downloading. Re-hashing the cached file stays on IO.
-                            val cached = withContext(Dispatchers.IO) {
-                                updateManager.cachedVerifiedApk(result.release)
-                            }
-                            _updateState.value = if (cached != null)
-                                UpdateUiState.ReadyToInstall(result.release, cached)
-                            else
-                                UpdateUiState.Available(result.release)
-                            return@launch
+        if (manual) {
+            // Ручная проверка главнее фоновой: гасим её ретраи, чтобы поздний
+            // фоновый результат не переписал показанный пользователю ответ.
+            autoUpdateJob?.cancel()
+            // Spinner only for an explicit user check; the launch check is silent.
+            _updateState.value = UpdateUiState.Checking
+        }
+        val job = viewModelScope.launch {
+            // Фоновая проверка ретраит с бэкофом до потолка, пока не получит
+            // внятный ответ. Раньше четыре попытки укладывались в ~46 секунд, и
+            // хаб, недоступный чуть дольше (сеть поднялась поздно, VPS мигнул),
+            // оставлял пользователя без баннера до следующего события (XR-041).
+            // Уход приложения в фон гасит цикл (onStop); ручная проверка идёт
+            // одной попыткой и отвечает ошибкой сразу.
+            val backoffMs = longArrayOf(0L, 4_000L, 12_000L, 30_000L, 60_000L, 180_000L, 300_000L)
+            var attempt = 0
+            while (true) {
+                if (attempt > 0) delay(backoffMs[minOf(attempt, backoffMs.lastIndex)])
+                val result = withContext(Dispatchers.IO) { updateManager.check(hubUrl) }
+                when (result) {
+                    is UpdateManager.CheckResult.Available -> {
+                        prefs.edit().putLong(keyLastUpdateCheck, System.currentTimeMillis()).apply()
+                        // If this APK was already downloaded and verified in a
+                        // prior session, offer "Установить" directly instead of
+                        // re-downloading. Re-hashing the cached file stays on IO.
+                        val cached = withContext(Dispatchers.IO) {
+                            updateManager.cachedVerifiedApk(result.release)
                         }
-                        is UpdateManager.CheckResult.UpToDate -> {
-                            prefs.edit().putLong(keyLastUpdateCheck, System.currentTimeMillis()).apply()
+                        _updateState.value = if (cached != null)
+                            UpdateUiState.ReadyToInstall(result.release, cached)
+                        else
+                            UpdateUiState.Available(result.release)
+                        return@launch
+                    }
+                    is UpdateManager.CheckResult.UpToDate -> {
+                        prefs.edit().putLong(keyLastUpdateCheck, System.currentTimeMillis()).apply()
+                        _updateState.value =
+                            if (manual) UpdateUiState.UpToDate else UpdateUiState.Idle
+                        return@launch
+                    }
+                    is UpdateManager.CheckResult.Failed -> {
+                        // Manual: surface the error now. Background: keep retrying
+                        // and do NOT stamp the rate-limit, so the next trigger is
+                        // free to try too.
+                        if (manual) {
                             _updateState.value =
-                                if (manual) UpdateUiState.UpToDate else UpdateUiState.Idle
+                                UpdateUiState.Error(friendlyUpdateError(result.error))
                             return@launch
-                        }
-                        is UpdateManager.CheckResult.Failed -> {
-                            // Manual: surface the error now. Background: keep retrying
-                            // and do NOT stamp the rate-limit, so the next trigger is
-                            // free to try too.
-                            if (manual) {
-                                _updateState.value =
-                                    UpdateUiState.Error(friendlyUpdateError(result.error))
-                                return@launch
-                            }
                         }
                     }
                 }
-            } finally {
-                updateCheckInFlight = false
+                attempt++
             }
         }
+        if (!manual) autoUpdateJob = job
+    }
+
+    private fun startUpdateRecheck() {
+        if (updateRecheckJob != null) return
+        updateRecheckJob = viewModelScope.launch {
+            while (true) {
+                delay(updateRecheckMs)
+                checkForUpdates(manual = false)
+            }
+        }
+    }
+
+    private fun stopUpdateRecheck() {
+        updateRecheckJob?.cancel()
+        updateRecheckJob = null
     }
 
     /** Download + Rust-verify the available release, then hand off to install. */
