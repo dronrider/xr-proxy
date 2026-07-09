@@ -510,25 +510,29 @@ fun MainScreen(
                     .verticalScroll(rememberScrollState()),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                // Блок обновления первым на странице (XR-041, компоновка
-                // владельца): точка приводит сюда, и пользователь сразу видит
-                // текущую версию и предложение обновиться, без скролла.
+                // Блок обновления кочует (XR-041, выбор владельца): пока висит
+                // обновление, он первый на странице и точка приводит прямо к
+                // нему; без обновления уезжает в конец, верх остаётся за
+                // серверами, частой операцией вкладки.
                 val appVersion = remember {
                     try {
                         permissionContext.packageManager
                             .getPackageInfo(permissionContext.packageName, 0).versionName ?: ""
                     } catch (_: Exception) { "" }
                 }
-                UpdateCheckControls(
-                    state = updateState,
-                    currentVersionName = appVersion,
-                    buildInfo = "${BuildConfig.BUILD_TIME} · ${BuildConfig.GIT_HASH}",
-                    checking = updateChecking,
-                    onCheck = { viewModel.checkForUpdates(manual = true) },
-                    onUpdate = { viewModel.startUpdateDownload() },
-                    onInstall = { viewModel.installReadyUpdate() },
-                    modifier = Modifier.padding(top = 8.dp),
-                )
+                val updateBlock: @Composable () -> Unit = {
+                    UpdateCheckControls(
+                        state = updateState,
+                        currentVersionName = appVersion,
+                        buildInfo = "${BuildConfig.BUILD_TIME} · ${BuildConfig.GIT_HASH}",
+                        checking = updateChecking,
+                        onCheck = { viewModel.checkForUpdates(manual = true) },
+                        onUpdate = { viewModel.startUpdateDownload() },
+                        onInstall = { viewModel.installReadyUpdate() },
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+                if (updateState.updatePending) updateBlock()
                 ServersSection(
                     servers = servers,
                     activeId = activeId,
@@ -560,6 +564,7 @@ fun MainScreen(
                     maxFiles = journalMaxFiles,
                     onChange = { kb, files -> viewModel.setJournalRotation(kb, files) },
                 )
+                if (!updateState.updatePending) updateBlock()
                 Spacer(Modifier.height(16.dp))
             }
             3 -> FilesScreen(
