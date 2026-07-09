@@ -170,6 +170,7 @@ fun MainScreen(
     val journalMaxKb by viewModel.journalMaxKb.collectAsState()
     val journalMaxFiles by viewModel.journalMaxFiles.collectAsState()
     val updateState by viewModel.updateState.collectAsState()
+    val updateDeferred by viewModel.updateDeferred.collectAsState()
 
     // Location permission for reading the current Wi-Fi SSID (auto-pause,
     // task 3b-2). FINE_LOCATION is the cross-version path that unredacts the
@@ -424,20 +425,26 @@ fun MainScreen(
                         // рекомпозицию.
                         BadgedBox(badge = {
                             if (updateState.updatePending) {
-                                val pulse by rememberInfiniteTransition(label = "updateDot")
-                                    .animateFloat(
-                                        initialValue = 1f,
-                                        targetValue = 0.25f,
-                                        animationSpec = infiniteRepeatable(
-                                            animation = tween(900, easing = FastOutSlowInEasing),
-                                            repeatMode = RepeatMode.Reverse,
-                                        ),
-                                        label = "updateDotAlpha",
+                                if (updateDeferred) {
+                                    // После «Позже» точка остаётся тихим
+                                    // напоминанием, уже без пульса.
+                                    Badge(containerColor = MaterialTheme.colorScheme.primary)
+                                } else {
+                                    val pulse by rememberInfiniteTransition(label = "updateDot")
+                                        .animateFloat(
+                                            initialValue = 1f,
+                                            targetValue = 0.25f,
+                                            animationSpec = infiniteRepeatable(
+                                                animation = tween(900, easing = FastOutSlowInEasing),
+                                                repeatMode = RepeatMode.Reverse,
+                                            ),
+                                            label = "updateDotAlpha",
+                                        )
+                                    Badge(
+                                        containerColor = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.graphicsLayer { alpha = pulse },
                                     )
-                                Badge(
-                                    containerColor = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.graphicsLayer { alpha = pulse },
-                                )
+                                }
                             }
                         }) { Icon(Icons.Default.Dns, null) }
                     },
@@ -471,6 +478,7 @@ fun MainScreen(
                     onDismiss = { viewModel.dismissUpdate() },
                     onRetry = { viewModel.checkForUpdates(manual = true) },
                     modifier = Modifier.padding(top = 16.dp),
+                    deferred = updateDeferred,
                 )
                 ConnectionSection(
                     state = state,
@@ -542,7 +550,6 @@ fun MainScreen(
                     onCheck = { viewModel.checkForUpdates(manual = true) },
                     onUpdate = { viewModel.startUpdateDownload() },
                     onInstall = { viewModel.installReadyUpdate() },
-                    onDismiss = { viewModel.dismissUpdate() },
                 )
                 Spacer(Modifier.height(16.dp))
             }

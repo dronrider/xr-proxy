@@ -41,7 +41,15 @@ fun UpdateBanner(
     onDismiss: () -> Unit,
     onRetry: () -> Unit,
     modifier: Modifier = Modifier,
+    deferred: Boolean = false,
 ) {
+    // «Позже» прячет баннер с главной до следующей сессии или более нового
+    // релиза; предложение обновиться остаётся на «Серверах» (XR-041).
+    if (deferred &&
+        (state is UpdateUiState.Available || state is UpdateUiState.ReadyToInstall)
+    ) {
+        return
+    }
     when (state) {
         is UpdateUiState.Available -> Card(
             modifier = modifier.fillMaxWidth(),
@@ -163,7 +171,6 @@ fun UpdateCheckControls(
     onCheck: () -> Unit,
     onUpdate: () -> Unit,
     onInstall: () -> Unit,
-    onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val busy = state is UpdateUiState.Checking || state is UpdateUiState.Downloading
@@ -197,10 +204,9 @@ fun UpdateCheckControls(
                     Text(state.release.notes, style = MaterialTheme.typography.bodySmall)
                 }
                 Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = onUpdate, modifier = Modifier.weight(1f)) { Text("Обновить") }
-                    TextButton(onClick = onDismiss) { Text("Позже") }
-                }
+                // Без «Позже»: предложение на этой вкладке живёт, пока
+                // обновление не поставлено (XR-041), прятать его нечем.
+                Button(onClick = onUpdate, modifier = Modifier.fillMaxWidth()) { Text("Обновить") }
             }
             is UpdateUiState.Downloading -> {
                 Spacer(Modifier.height(8.dp))
@@ -229,10 +235,7 @@ fun UpdateCheckControls(
                     color = MaterialTheme.colorScheme.primary,
                 )
                 Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = onInstall, modifier = Modifier.weight(1f)) { Text("Установить") }
-                    TextButton(onClick = onDismiss) { Text("Позже") }
-                }
+                Button(onClick = onInstall, modifier = Modifier.fillMaxWidth()) { Text("Установить") }
             }
             is UpdateUiState.UpToDate -> {
                 Spacer(Modifier.height(4.dp))

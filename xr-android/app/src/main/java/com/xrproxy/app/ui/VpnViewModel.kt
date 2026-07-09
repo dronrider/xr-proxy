@@ -179,6 +179,16 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private val _updateState = MutableStateFlow<UpdateUiState>(UpdateUiState.Idle)
     val updateState: StateFlow<UpdateUiState> = _updateState
 
+    // «Позже» откладывает обновление, а не отказывается от него (выбор
+    // владельца, XR-041): баннер уходит с главной и точка перестаёт
+    // пульсировать, но предложение на «Серверах» и сама точка остаются,
+    // пока обновление не поставлено. Живёт в памяти сессии: новый запуск
+    // приложения снова показывает баннер, более новый релиз снимает
+    // отсрочку сам (см. deferredVersionCode).
+    private val _updateDeferred = MutableStateFlow(false)
+    val updateDeferred: StateFlow<Boolean> = _updateDeferred
+    private var deferredVersionCode = 0L
+
     // Small de-dup window between *automatic* checks, NOT a throttle: the
     // triggers are already rare key events (app brought to foreground, fresh
     // connect), so we check on each one. This only coalesces a near-simultaneous
@@ -694,12 +704,17 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                             UpdateUiState.ReadyToInstall(result.release, cached)
                         else
                             UpdateUiState.Available(result.release)
+                        // Отсрочка «Позже» держится на том же релизе; более
+                        // новый снова показывает баннер и пульс.
+                        _updateDeferred.value =
+                            result.release.versionCode <= deferredVersionCode
                         return@launch
                     }
                     is UpdateManager.CheckResult.UpToDate -> {
                         lastUpdateCheckDoneMs = System.currentTimeMillis()
                         _updateState.value =
                             if (manual) UpdateUiState.UpToDate else UpdateUiState.Idle
+                        _updateDeferred.value = false
                         return@launch
                     }
                     is UpdateManager.CheckResult.Failed -> {
@@ -777,7 +792,20 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun dismissUpdate() {
-        _updateState.value = UpdateUiState.Idle
+        when (val s = _updateState.value) {
+            is UpdateUiState.Available -> {
+                deferredVersionCode = s.release.versionCode
+                _updateDeferred.value = true
+            }
+            is UpdateUiState.ReadyToInstall -> {
+                deferredVersionCode = s.release.versionCode
+                _updateDeferred.value = true
+            }
+            // Ошибку и «у вас актуальная версия» «Позже»/«Закрыть» просто прячут.
+            is UpdateUiState.Error, UpdateUiState.UpToDate ->
+                _updateState.value = UpdateUiState.Idle
+            else -> {}
+        }
     }
 
     private fun friendlyUpdateError(code: String): String = when {
