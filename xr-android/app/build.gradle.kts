@@ -38,6 +38,13 @@ android {
             ?.takeIf { it.isNotBlank() }
         versionName = releaseVersionName ?: "0.1.0-$gitDescribe-$buildStamp"
 
+        // Дата сборки и коммит уходят в BuildConfig отдельно от versionName:
+        // версия у релиза чистая (0.57.0), а ориентир «какая именно сборка
+        // стоит» даёт строка «Сборка: ...» в блоке обновления (XR-041).
+        val buildTime = SimpleDateFormat("dd.MM.yyyy HH:mm").format(Date())
+        buildConfigField("String", "BUILD_TIME", "\"$buildTime\"")
+        buildConfigField("String", "GIT_HASH", "\"$gitDescribe\"")
+
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }

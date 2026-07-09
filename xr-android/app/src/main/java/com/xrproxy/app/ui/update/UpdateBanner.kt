@@ -174,6 +174,7 @@ fun UpdateBanner(
 fun UpdateCheckControls(
     state: UpdateUiState,
     currentVersionName: String,
+    buildInfo: String,
     checking: Boolean,
     onCheck: () -> Unit,
     onUpdate: () -> Unit,
@@ -189,6 +190,15 @@ fun UpdateCheckControls(
         if (currentVersionName.isNotBlank()) {
             Text(
                 "Текущая версия: $currentVersionName",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        // Ориентир, какая именно сборка установлена: дата и коммит, versionName
+        // у релиза этой информации больше не несёт (XR-041).
+        if (buildInfo.isNotBlank()) {
+            Text(
+                "Сборка: $buildInfo",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

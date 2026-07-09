@@ -40,6 +40,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
+import com.xrproxy.app.BuildConfig
 import com.xrproxy.app.data.ServerProfile
 import com.xrproxy.app.model.HealthLevel
 import com.xrproxy.app.ui.components.DebugSection
@@ -519,6 +520,7 @@ fun MainScreen(
                 UpdateCheckControls(
                     state = updateState,
                     currentVersionName = appVersion,
+                    buildInfo = "${BuildConfig.BUILD_TIME} · ${BuildConfig.GIT_HASH}",
                     checking = updateChecking,
                     onCheck = { viewModel.checkForUpdates(manual = true) },
                     onUpdate = { viewModel.startUpdateDownload() },
