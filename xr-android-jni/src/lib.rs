@@ -1064,12 +1064,16 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeInviteShares(
 /// Fetch a share's manifest from the agent (presenting the token). Returns the
 /// ShareManifest JSON (`{"entries":[{path,size,mtime,sha256}...]}`) or
 /// `{"error":".."}`. Used to populate the file picker for one-time download.
+/// `agent_pubkey` is the base64 identity key from the grant; the agent's
+/// manifest signature is verified against it, fail-closed (XR-046). Empty
+/// string skips the pinning (no key to check against).
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeFetchManifest(
     mut env: JNIEnv,
     _class: JClass,
     agent_url: JString,
     token_json: JString,
+    agent_pubkey: JString,
     timeout_ms: jlong,
 ) -> jstring {
     let agent_url = match read_jstring(&mut env, &agent_url) {
@@ -1080,9 +1084,13 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeFetchManifest
         Ok(t) => t,
         Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
     };
+    let agent_pubkey = match read_jstring(&mut env, &agent_pubkey) {
+        Ok(s) => s,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
     let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
 
-    let json = match with_onboarding_runtime(sync::fetch_manifest(&agent_url, &token, timeout)) {
+    let json = match with_onboarding_runtime(sync::fetch_manifest(&agent_url, &token, &agent_pubkey, timeout)) {
         Ok(Ok(manifest)) => serde_json::to_string(&manifest)
             .unwrap_or_else(|e| json_error(&format!("serialize: {e}"))),
         Ok(Err(e)) | Err(e) => {
@@ -1206,12 +1214,15 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePlanSync(
 /// only the plan (`{"plan":{"fetch":[...],"delete":[...]}}`) so the UI can warn
 /// about deletions; with `dry_run` false it applies and also returns the report
 /// (`{"plan":..,"report":{"fetched":[...],"deleted":[...],"failed":[...]}}`).
+/// `agent_pubkey` pins the agent identity for the manifest fetch (XR-046), as
+/// in `nativeFetchManifest`.
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
     mut env: JNIEnv,
     _class: JClass,
     agent_url: JString,
     token_json: JString,
+    agent_pubkey: JString,
     dest_dir: JString,
     selection_json: JString,
     dry_run: jboolean,
@@ -1223,6 +1234,10 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
     };
     let token = match read_jstring(&mut env, &token_json).and_then(|s| parse_token(&s)) {
         Ok(t) => t,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let agent_pubkey = match read_jstring(&mut env, &agent_pubkey) {
+        Ok(s) => s,
         Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
     };
     let dest = match read_jstring(&mut env, &dest_dir) {
@@ -1242,6 +1257,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
     let json = match with_onboarding_runtime(sync::sync_share_selected(
         &agent_url,
         &token,
+        &agent_pubkey,
         &dest,
         selection.as_ref(),
         dry,
