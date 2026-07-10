@@ -46,6 +46,13 @@ BYPASS=$(grep -E '^bypass_ips' "$CONFIG" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\
 
 # Управляем только форвардом из LAN.
 "$NFT" add rule ip xr_killswitch forward iifname != "$LAN" accept
+# Ответы уже принятых соединений пропускаем (XR-100): без этого киллсвитч
+# съедал reply-пакеты входящих порт-форвардов (шара xr-share отвечала
+# внешнему клиенту на эфемерный порт, которого нет в EXCLUDE_PORTS, и
+# соединение молча висло; до VPS ответы доходили только из-за accept по их
+# адресам ниже). Утечку это не открывает: новый прямой коннект из LAN это
+# state new, он по-прежнему падает в drop.
+"$NFT" add rule ip xr_killswitch forward ct state established,related accept
 # Локальные назначения (LAN-to-LAN, инфраструктура) не трогаем.
 "$NFT" add rule ip xr_killswitch forward ip daddr '{ 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 127.0.0.0/8, 169.254.0.0/16 }' accept
 # Туннельные эндпоинты.
