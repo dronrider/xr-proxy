@@ -28,6 +28,7 @@ use tokio::time::Duration;
 
 use crate::protocol::{
     decode_mux_payload, encode_mux_payload, Codec, Command, Frame, TargetAddr,
+    CLOSE_REASON_CONNECT_FAIL, CLOSE_REASON_RESOLVE_FAIL,
 };
 
 // ── Constants ───────────────────────────────────────────────────────
@@ -75,6 +76,143 @@ const DEAD_LINK_TIMEOUT: Duration = Duration::from_secs(75);
 /// поимённо и превратился в failover, а не в немой таймаут пула (XR-086).
 const OPEN_STEP_TIMEOUT: Duration = Duration::from_secs(4);
 const MUX_PROTOCOL_VERSION: u8 = 1;
+
+// ── Relay health (XR-094) ───────────────────────────────────────────
+
+/// Длина одного бакета окна исходов relay. Смотрим текущий бакет плюс
+/// предыдущий, то есть картина живёт 30-60с: достаточно быстро для failover
+/// «в пределах минуты» и достаточно долго, чтобы одиночные сбои растворялись
+/// в фоне успешных стримов.
+const RELAY_WINDOW: Duration = Duration::from_secs(30);
+/// Минимум сбоев одного класса в окне, ниже которого деградацию не объявляем:
+/// фон одиночных connect timeout (мусорные IP, закрытые порты) и редких
+/// NXDOMAIN не должен дёргать failover.
+const RELAY_FAIL_MIN: u32 = 5;
+
+#[derive(Default, Clone, Copy)]
+struct RelayBucket {
+    /// Стримы с доменным таргетом, получившие хотя бы один Data-кадр.
+    domain_ok: u32,
+    /// Все стримы, получившие хотя бы один Data-кадр (домены + IP).
+    total_ok: u32,
+    resolve_fail: u32,
+    connect_fail: u32,
+}
+
+struct RelayWindow {
+    cur_start: tokio::time::Instant,
+    cur: RelayBucket,
+    prev: RelayBucket,
+}
+
+impl RelayWindow {
+    /// Прокрутить окно: устаревший текущий бакет уезжает в prev, совсем
+    /// старая история выбрасывается.
+    fn rotate(&mut self) {
+        let elapsed = self.cur_start.elapsed();
+        if elapsed < RELAY_WINDOW {
+            return;
+        }
+        self.prev = if elapsed < RELAY_WINDOW * 2 {
+            self.cur
+        } else {
+            RelayBucket::default()
+        };
+        self.cur = RelayBucket::default();
+        self.cur_start = tokio::time::Instant::now();
+    }
+}
+
+/// Исходы relay глазами клиента: успехи (стрим получил данные) против сбоев
+/// установки relay на сервере (причина из Close, см. `CLOSE_REASON_*`).
+///
+/// Закрывает дыру health из XR-094: у сервера с мёртвым DNS или egress туннель
+/// и keepalive живы, ConnectAck приходит, и ни breaker, ни dead-link-детект
+/// (XR-083) не срабатывают, хотя каждый Connect кончается relay error и
+/// полезная работа нулевая. Здесь live-трафик сам становится health-сигналом.
+///
+/// Resolve-сбои сравниваются только с доменными успехами: при мёртвом DNS
+/// IP-таргеты (например, CIDR-роутинг Telegram) продолжают работать и не
+/// должны маскировать полностью лежащие домены.
+pub struct RelayHealth {
+    inner: std::sync::Mutex<RelayWindow>,
+}
+
+impl RelayHealth {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(RelayWindow {
+                cur_start: tokio::time::Instant::now(),
+                cur: RelayBucket::default(),
+                prev: RelayBucket::default(),
+            }),
+        }
+    }
+
+    pub fn record_success(&self, domain: bool) {
+        let mut w = self.inner.lock().unwrap();
+        w.rotate();
+        w.cur.total_ok += 1;
+        if domain {
+            w.cur.domain_ok += 1;
+        }
+    }
+
+    pub fn record_resolve_fail(&self) {
+        let mut w = self.inner.lock().unwrap();
+        w.rotate();
+        w.cur.resolve_fail += 1;
+    }
+
+    pub fn record_connect_fail(&self) {
+        let mut w = self.inner.lock().unwrap();
+        w.rotate();
+        w.cur.connect_fail += 1;
+    }
+
+    /// Relay сервера деградировал: сбоев одного класса в окне не меньше
+    /// `RELAY_FAIL_MIN` и строго больше, чем сопоставимых успехов. Требование
+    /// «больше успехов» отсекает фон (единичные мёртвые домены и IP есть
+    /// всегда), минимум по счёту отсекает малую выборку.
+    pub fn degraded(&self) -> bool {
+        let mut w = self.inner.lock().unwrap();
+        w.rotate();
+        let domain_ok = w.cur.domain_ok + w.prev.domain_ok;
+        let total_ok = w.cur.total_ok + w.prev.total_ok;
+        let resolve_fail = w.cur.resolve_fail + w.prev.resolve_fail;
+        let connect_fail = w.cur.connect_fail + w.prev.connect_fail;
+        (resolve_fail >= RELAY_FAIL_MIN && resolve_fail > domain_ok)
+            || (connect_fail >= RELAY_FAIL_MIN && connect_fail > total_ok)
+    }
+
+    /// Сбросить окно. Вызывается при уходе с деградировавшего сервера и при
+    /// смене сети: после возврата деградацию должен подтвердить свежий
+    /// трафик, а не хвост старых сбоев.
+    pub fn reset(&self) {
+        let mut w = self.inner.lock().unwrap();
+        w.cur = RelayBucket::default();
+        w.prev = RelayBucket::default();
+        w.cur_start = tokio::time::Instant::now();
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> (u32, u32, u32, u32) {
+        let mut w = self.inner.lock().unwrap();
+        w.rotate();
+        (
+            w.cur.domain_ok + w.prev.domain_ok,
+            w.cur.total_ok + w.prev.total_ok,
+            w.cur.resolve_fail + w.prev.resolve_fail,
+            w.cur.connect_fail + w.prev.connect_fail,
+        )
+    }
+}
+
+impl Default for RelayHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ── Outgoing frame ──────────────────────────────────────────────────
 
@@ -277,13 +415,23 @@ pub struct NewStream {
     pub payload: Vec<u8>,
 }
 
+/// Приёмная сторона зарегистрированного стрима плюс состояние для учёта
+/// исходов relay (XR-094).
+struct StreamEntry {
+    tx: mpsc::Sender<Vec<u8>>,
+    /// Первый Data-кадр уже пришёл (relay-успех засчитан, повторно не считаем).
+    got_data: bool,
+    /// Таргет стрима это домен: успех идёт и в доменный счётчик здоровья.
+    domain: bool,
+}
+
 /// Manages a multiplexed TCP connection with multiple logical streams.
 pub struct Multiplexer {
     /// Балк-план: Command::Data и Close (Close ордерится за Data того же стрима).
     writer_tx: mpsc::Sender<OutFrame>,
     /// Контрольный план (приоритет в writer'е): Connect/ConnectAck/Ping/Pong.
     ctrl_tx: mpsc::Sender<OutFrame>,
-    streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    streams: Arc<Mutex<HashMap<u32, StreamEntry>>>,
     next_stream_id: AtomicU32,
     alive: Arc<AtomicBool>,
     _close_notify: Arc<Notify>,
@@ -306,7 +454,17 @@ impl Multiplexer {
     where
         S: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
     {
-        Self::new_inner(stream, codec, 1) // client uses odd stream IDs
+        Self::new_inner(stream, codec, 1, None) // client uses odd stream IDs
+    }
+
+    /// Клиентский мультиплексор с учётом исходов relay в общем здоровье пула
+    /// (XR-094): причины из Close и первые Data-кадры стримов записываются в
+    /// `health`, по нему `ServerPool` ловит «туннель жив, работа не идёт».
+    pub fn new_client_tracked<S>(stream: S, codec: Codec, health: Arc<RelayHealth>) -> Arc<Self>
+    where
+        S: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
+    {
+        Self::new_inner(stream, codec, 1, Some(health))
     }
 
     /// Create a server-side multiplexer over an established TCP connection.
@@ -314,16 +472,21 @@ impl Multiplexer {
     where
         S: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
     {
-        Self::new_inner(stream, codec, 2) // server uses even stream IDs
+        Self::new_inner(stream, codec, 2, None) // server uses even stream IDs
     }
 
-    fn new_inner<S>(stream: S, codec: Codec, first_stream_id: u32) -> Arc<Self>
+    fn new_inner<S>(
+        stream: S,
+        codec: Codec,
+        first_stream_id: u32,
+        relay_health: Option<Arc<RelayHealth>>,
+    ) -> Arc<Self>
     where
         S: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
     {
         let (writer_tx, writer_rx) = mpsc::channel::<OutFrame>(WRITER_CHANNEL_SIZE);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<OutFrame>(CTRL_CHANNEL_SIZE);
-        let streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>> =
+        let streams: Arc<Mutex<HashMap<u32, StreamEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let close_notify = Arc::new(Notify::new());
@@ -341,7 +504,7 @@ impl Multiplexer {
             let codec = codec.clone();
             let reader_ctrl = ctrl_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = reader_task(read_half, codec, streams.clone(), reader_ctrl, new_stream_tx).await {
+                if let Err(e) = reader_task(read_half, codec, streams.clone(), reader_ctrl, new_stream_tx, relay_health).await {
                     tracing::debug!("mux reader ended: {}", e);
                 }
                 alive.store(false, Ordering::Relaxed);
@@ -385,7 +548,10 @@ impl Multiplexer {
         stream_id: u32,
     ) -> MuxStream {
         let (data_tx, data_rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
-        self.streams.lock().await.insert(stream_id, data_tx);
+        self.streams.lock().await.insert(
+            stream_id,
+            StreamEntry { tx: data_tx, got_data: false, domain: false },
+        );
 
         MuxStream {
             stream_id,
@@ -456,9 +622,10 @@ impl Multiplexer {
 async fn reader_task<R: AsyncReadExt + Unpin>(
     mut reader: R,
     codec: Codec,
-    streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    streams: Arc<Mutex<HashMap<u32, StreamEntry>>>,
     ctrl_tx: mpsc::Sender<OutFrame>,
     new_stream_tx: mpsc::Sender<NewStream>,
+    relay_health: Option<Arc<RelayHealth>>,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; 65536 + 256];
     let mut filled = 0;
@@ -488,7 +655,7 @@ async fn reader_task<R: AsyncReadExt + Unpin>(
                 loop {
                     match codec.decode_frame(&buf[..filled])? {
                         Some((frame, consumed)) => {
-                            dispatch_frame(&frame, &streams, &ctrl_tx, &new_stream_tx).await;
+                            dispatch_frame(&frame, &streams, &ctrl_tx, &new_stream_tx, &relay_health).await;
                             buf.copy_within(consumed..filled, 0);
                             filled -= consumed;
                         }
@@ -536,9 +703,10 @@ async fn reader_task<R: AsyncReadExt + Unpin>(
 
 async fn dispatch_frame(
     frame: &Frame,
-    streams: &Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    streams: &Arc<Mutex<HashMap<u32, StreamEntry>>>,
     ctrl_tx: &mpsc::Sender<OutFrame>,
     new_stream_tx: &mpsc::Sender<NewStream>,
+    relay_health: &Option<Arc<RelayHealth>>,
 ) {
     match frame.command {
         Command::Ping => {
@@ -557,12 +725,22 @@ async fn dispatch_frame(
             if let Ok((stream_id, data)) = decode_mux_payload(&frame.payload) {
                 let mut remove = false;
                 {
-                    let streams_guard = streams.lock().await;
-                    if let Some(tx) = streams_guard.get(&stream_id) {
+                    let mut streams_guard = streams.lock().await;
+                    if let Some(entry) = streams_guard.get_mut(&stream_id) {
+                        // Первый Data-кадр стрима это доказательство, что relay
+                        // на сервере реально отработал (resolve + connect до
+                        // апстрима), засчитываем успех в здоровье (XR-094).
+                        // ConnectAck не считается: сервер шлёт его ДО resolve.
+                        if frame.command == Command::Data && !entry.got_data {
+                            entry.got_data = true;
+                            if let Some(h) = relay_health {
+                                h.record_success(entry.domain);
+                            }
+                        }
                         // NEVER use send().await here — it blocks the reader task
                         // and deadlocks ALL other streams. Use try_send; if the
                         // channel is full, the stream consumer is stuck — kill it.
-                        match tx.try_send(data.to_vec()) {
+                        match entry.tx.try_send(data.to_vec()) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 tracing::warn!("mux stream {} channel full, closing", stream_id);
@@ -580,15 +758,28 @@ async fn dispatch_frame(
             }
         }
         Command::Close => {
-            if let Ok((stream_id, _)) = decode_mux_payload(&frame.payload) {
-                streams.lock().await.remove(&stream_id);
+            if let Ok((stream_id, reason)) = decode_mux_payload(&frame.payload) {
+                let removed = streams.lock().await.remove(&stream_id);
+                // Ненулевая причина в Close = установка relay на VPS упала
+                // (см. CLOSE_REASON_*). Считаем сбой в здоровье сервера, но
+                // только для ещё зарегистрированного стрима, чтобы дубль
+                // Close не удвоил счёт (XR-094).
+                if removed.is_some() {
+                    if let (Some(h), Some(&code)) = (relay_health, reason.first()) {
+                        match code {
+                            CLOSE_REASON_RESOLVE_FAIL => h.record_resolve_fail(),
+                            CLOSE_REASON_CONNECT_FAIL => h.record_connect_fail(),
+                            _ => {}
+                        }
+                    }
+                }
             }
         }
         Command::Connect => {
             if let Ok((stream_id, data)) = decode_mux_payload(&frame.payload) {
                 let streams_guard = streams.lock().await;
-                if let Some(tx) = streams_guard.get(&stream_id) {
-                    let _ = tx.try_send(data.to_vec());
+                if let Some(entry) = streams_guard.get(&stream_id) {
+                    let _ = entry.tx.try_send(data.to_vec());
                 } else {
                     drop(streams_guard);
                     // Инструментация XR-086: при переполнении канала new_stream
@@ -768,7 +959,14 @@ pub async fn mux_open_stream(
     // зависания «open timed out, 0 пакетов на сервер»).
     match tokio::time::timeout(OPEN_STEP_TIMEOUT, mux.streams.lock()).await {
         Ok(mut streams) => {
-            streams.insert(stream_id, data_tx);
+            streams.insert(
+                stream_id,
+                StreamEntry {
+                    tx: data_tx,
+                    got_data: false,
+                    domain: matches!(target, TargetAddr::Domain(..)),
+                },
+            );
         }
         Err(_) => {
             tracing::warn!("mux_open_stream wedged >4s taking streams lock (deadlock?)");
@@ -844,7 +1042,7 @@ pub async fn mux_open_stream(
 /// future (bounded-таймаут в `ServerPool::open_stream`). Очистка идёт в
 /// отдельном таске: `streams` за async-Mutex, синхронный Drop его не залочит.
 struct StreamRegGuard {
-    streams: Option<Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>>,
+    streams: Option<Arc<Mutex<HashMap<u32, StreamEntry>>>>,
     stream_id: u32,
 }
 
@@ -1055,6 +1253,159 @@ mod tests {
             flood.is_ok(),
             "reader must keep draining the socket under a full writer channel (no deadlock)"
         );
+    }
+
+    /// XR-094: Close с причиной от сервера (relay упал на resolve/connect)
+    /// должен записываться в `RelayHealth`, а дубль Close по уже снятому
+    /// стриму не должен удваивать счёт.
+    #[tokio::test]
+    async fn test_close_reason_records_relay_failure() {
+        let (client_io, server_io) = duplex(65536);
+        let codec = test_codec();
+        let health = Arc::new(RelayHealth::new());
+        let client_mux =
+            Multiplexer::new_client_tracked(client_io, codec.clone(), health.clone());
+        let server_mux = Multiplexer::new_server(server_io, codec.clone());
+
+        // Сервер: принять Connect, ответить ConnectAck, затем Close с причиной
+        // resolve-сбоя (ровно как mux_handler при мёртвом DNS), и Close-дубль.
+        let server_task = tokio::spawn(async move {
+            let mut rx = server_mux.take_new_stream_rx().await.unwrap();
+            let ns = rx.recv().await.unwrap();
+            server_mux
+                .send_frame(ns.stream_id, Command::ConnectAck, vec![0])
+                .await
+                .unwrap();
+            server_mux
+                .send_frame(
+                    ns.stream_id,
+                    Command::Close,
+                    vec![crate::protocol::CLOSE_REASON_RESOLVE_FAIL],
+                )
+                .await
+                .unwrap();
+            server_mux
+                .send_frame(
+                    ns.stream_id,
+                    Command::Close,
+                    vec![crate::protocol::CLOSE_REASON_RESOLVE_FAIL],
+                )
+                .await
+                .unwrap();
+        });
+
+        let target = TargetAddr::Domain("dead-dns.example".to_string(), 443);
+        let mut stream = mux_open_stream(&client_mux, &target).await.unwrap();
+        // Стрим закрывается без единого байта данных.
+        assert!(stream.recv().await.is_none());
+        server_task.await.unwrap();
+
+        // Дать reader'у дожевать Close-дубль.
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if health.snapshot().2 >= 1 {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (domain_ok, total_ok, resolve_fail, connect_fail) = health.snapshot();
+        assert_eq!(resolve_fail, 1, "resolve-сбой считается один раз, дубль Close не удваивает");
+        assert_eq!((domain_ok, total_ok, connect_fail), (0, 0, 0));
+    }
+
+    /// XR-094: первый Data-кадр стрима засчитывает relay-успех ровно один раз
+    /// (доменный таргет идёт и в доменный счётчик), ConnectAck успехом не
+    /// считается: сервер шлёт его до resolve.
+    #[tokio::test]
+    async fn test_first_data_counts_relay_success_once() {
+        let (client_io, server_io) = duplex(65536);
+        let codec = test_codec();
+        let health = Arc::new(RelayHealth::new());
+        let client_mux =
+            Multiplexer::new_client_tracked(client_io, codec.clone(), health.clone());
+        let server_mux = Multiplexer::new_server(server_io, codec.clone());
+
+        let server_task = tokio::spawn(async move {
+            let mut rx = server_mux.take_new_stream_rx().await.unwrap();
+            let ns = rx.recv().await.unwrap();
+            let stream = server_mux.register_stream(ns.stream_id).await;
+            server_mux
+                .send_frame(ns.stream_id, Command::ConnectAck, vec![0])
+                .await
+                .unwrap();
+            stream.send(b"first").await.unwrap();
+            stream.send(b"second").await.unwrap();
+        });
+
+        let target = TargetAddr::Domain("alive.example".to_string(), 443);
+        let mut stream = mux_open_stream(&client_mux, &target).await.unwrap();
+        assert_eq!(stream.recv().await.unwrap(), b"first");
+        assert_eq!(stream.recv().await.unwrap(), b"second");
+        server_task.await.unwrap();
+
+        let (domain_ok, total_ok, resolve_fail, connect_fail) = health.snapshot();
+        assert_eq!(
+            (domain_ok, total_ok),
+            (1, 1),
+            "успех считается по первому Data-кадру и только один раз"
+        );
+        assert_eq!((resolve_fail, connect_fail), (0, 0));
+    }
+
+    /// Порог деградации: меньше RELAY_FAIL_MIN сбоев это фон (одиночные
+    /// connect timeout по DoD XR-094 не переключают), на пороге деградация.
+    #[tokio::test]
+    async fn test_relay_health_min_failures() {
+        let health = RelayHealth::new();
+        for _ in 0..RELAY_FAIL_MIN - 1 {
+            health.record_connect_fail();
+        }
+        assert!(!health.degraded(), "фон одиночных сбоев не деградация");
+        health.record_connect_fail();
+        assert!(health.degraded(), "порог сбоев без успехов = деградация");
+    }
+
+    /// Сбои на фоне преобладающих успехов не объявляют деградацию, а мёртвый
+    /// DNS не маскируется живыми IP-стримами: resolve-сбои сравниваются
+    /// только с доменными успехами.
+    #[tokio::test]
+    async fn test_relay_health_success_majority_wins() {
+        let health = RelayHealth::new();
+        for _ in 0..RELAY_FAIL_MIN {
+            health.record_resolve_fail();
+        }
+        for _ in 0..RELAY_FAIL_MIN + 1 {
+            health.record_success(true);
+        }
+        assert!(
+            !health.degraded(),
+            "resolve-сбои при большинстве доменных успехов это фон"
+        );
+
+        let dns_dead = RelayHealth::new();
+        for _ in 0..RELAY_FAIL_MIN {
+            dns_dead.record_resolve_fail();
+        }
+        for _ in 0..100 {
+            dns_dead.record_success(false); // IP-таргеты (CIDR-роутинг) живы
+        }
+        assert!(
+            dns_dead.degraded(),
+            "живые IP-стримы не должны маскировать полностью мёртвый DNS"
+        );
+    }
+
+    /// Окно исходов скользит: старые сбои протухают, деградация не висит
+    /// вечно после единичного всплеска.
+    #[tokio::test(start_paused = true)]
+    async fn test_relay_health_window_expires() {
+        let health = RelayHealth::new();
+        for _ in 0..RELAY_FAIL_MIN {
+            health.record_resolve_fail();
+        }
+        assert!(health.degraded());
+        tokio::time::advance(RELAY_WINDOW * 2 + Duration::from_secs(1)).await;
+        assert!(!health.degraded(), "сбои старше окна не считаются");
     }
 
     /// Регрессия XR-086 (head-of-line контрольных кадров): контрольный кадр

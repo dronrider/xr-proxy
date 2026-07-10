@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
-use crate::mux::{mux_handshake_client, mux_open_stream, Multiplexer, MuxStream};
+use crate::mux::{mux_handshake_client, mux_open_stream, Multiplexer, MuxStream, RelayHealth};
 use crate::protocol::{Codec, TargetAddr};
 
 /// Factory for creating TCP connections to the server.
@@ -91,6 +91,11 @@ pub struct MuxPool {
     /// Monotonic base for `down_until_ms`. `Instant` can't be stored in an
     /// atomic, so we keep a fixed origin and measure elapsed millis against it.
     created: Instant,
+    /// Исходы relay этого сервера по live-трафику (XR-094): общий для всех
+    /// слотов счётчик успехов и relay-сбоев (причины из Close). По нему
+    /// `ServerPool` ловит сервер с мёртвым DNS/egress, у которого туннель и
+    /// keepalive живы, а сама работа падает.
+    relay_health: Arc<RelayHealth>,
 }
 
 impl MuxPool {
@@ -113,7 +118,21 @@ impl MuxPool {
             next: AtomicUsize::new(0),
             down_until_ms: AtomicU64::new(0),
             created: Instant::now(),
+            relay_health: Arc::new(RelayHealth::new()),
         })
+    }
+
+    /// Relay активного сервера деградировал по live-трафику: Connect'ы
+    /// формально успешны (ConnectAck приходит), но сама работа (resolve или
+    /// connect до апстрима на VPS) массово падает. Порог и окно см.
+    /// `RelayHealth::degraded`.
+    pub fn relay_degraded(&self) -> bool {
+        self.relay_health.degraded()
+    }
+
+    /// Доступ к счётчикам исходов relay (сброс окна из `ServerPool`, тесты).
+    pub(crate) fn relay_health(&self) -> &Arc<RelayHealth> {
+        &self.relay_health
     }
 
     /// Number of slots in the pool.
@@ -394,7 +413,11 @@ impl MuxPool {
         let mut stream = (self.connect_fn)().await?;
         match mux_handshake_client(&mut stream, &self.codec).await {
             Ok(true) => {
-                let mux = Multiplexer::new_client(stream, self.codec.clone());
+                let mux = Multiplexer::new_client_tracked(
+                    stream,
+                    self.codec.clone(),
+                    self.relay_health.clone(),
+                );
                 *guard = Some(mux.clone());
                 tracing::info!("mux slot {} connection established", idx);
                 Ok(mux)
@@ -453,6 +476,8 @@ impl MuxPool {
             self.invalidate_slot(idx).await;
         }
         self.clear_breaker();
+        // Исходы relay набраны на прежней сети и устарели вместе с ней.
+        self.relay_health.reset();
     }
 
     async fn invalidate_slot(&self, idx: usize) {

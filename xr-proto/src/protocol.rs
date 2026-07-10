@@ -46,6 +46,14 @@ pub enum Command {
     Pong = 8,
 }
 
+/// Причина закрытия стрима в payload Close (байт после stream_id), сервер ->
+/// клиент. Пустой payload это обычное закрытие; старые клиенты лишний байт
+/// игнорируют. Ненулевая причина значит, что установка relay на VPS упала до
+/// первого байта данных, и клиентский пул считает по ним деградацию сервера
+/// (XR-094: мёртвый DNS/egress при живом туннеле).
+pub const CLOSE_REASON_RESOLVE_FAIL: u8 = 1;
+pub const CLOSE_REASON_CONNECT_FAIL: u8 = 2;
+
 impl Command {
     fn from_byte(b: u8) -> Option<Self> {
         // Lower 5 bits = command, upper 3 bits = magic

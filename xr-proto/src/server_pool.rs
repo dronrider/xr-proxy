@@ -168,6 +168,10 @@ impl ServerSlot {
         st.up_since = None;
     }
 
+    fn is_down(&self) -> bool {
+        matches!(self.state.lock().unwrap().health, HealthState::Down { .. })
+    }
+
     fn up_for(&self) -> Option<Duration> {
         self.state.lock().unwrap().up_since.map(|t| t.elapsed())
     }
@@ -490,6 +494,8 @@ impl ServerPool {
     }
 
     async fn health_tick(&self) {
+        self.relay_degradation_tick();
+
         let active = self.active_index();
 
         // Тёплый профиль держит резервы поднятыми: warmup наполняет пустые
@@ -534,6 +540,35 @@ impl ServerPool {
                 }
             }
         }
+    }
+
+    /// Failover по деградации relay (XR-094): у сервера с мёртвым DNS или
+    /// egress туннель и keepalive живы, ConnectAck приходит, поэтому ни
+    /// breaker, ни dead-link-детект, ни ограниченный по времени open_stream
+    /// не срабатывают, но каждый Connect кончается relay error и полезная
+    /// работа нулевая. Здесь такой активный сервер помечается Down и
+    /// активность уезжает на следующий живой. Возврат идёт обычным failback
+    /// с hold-down; если сервер «мигает» (failback -> тут же снова
+    /// деградация), включается тот же анти-флаппинг-штраф, что в XR-082.
+    fn relay_degradation_tick(&self) {
+        let active = self.active_index();
+        if self.slots.len() < 2 || !self.slots[active].pool.relay_degraded() {
+            return;
+        }
+        let Some(to) = self.walk_order(active).skip(1).find(|&i| !self.slots[i].is_down())
+        else {
+            // Уходить некуда (остальные и так Down): продолжаем хромать на
+            // деградировавшем, он хотя бы туннелирует IP-таргеты.
+            return;
+        };
+        self.slots[active].mark_down();
+        if self.slots[active].active_for().is_some_and(|d| d < FAILBACK_FLAP_WINDOW) {
+            self.slots[active].penalize_flap(self.profile.failback_hold);
+        }
+        // Окно счётчиков чистим: после failback деградацию должен подтвердить
+        // свежий трафик, а не хвост старых сбоев.
+        self.slots[active].pool.relay_health().reset();
+        self.switch_active(active, to, "failover (relay degraded)");
     }
 }
 
@@ -593,6 +628,57 @@ mod tests {
                             .send_frame(ns.stream_id, Command::ConnectAck, vec![0])
                             .await;
                         let _ = mux.register_stream(ns.stream_id).await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Сервер «с мёртвым DNS» (инцидент XR-094): mux-handshake и ConnectAck
+    /// работают, но каждый стрим тут же закрывается причиной resolve-сбоя,
+    /// как настоящий mux_handler, у которого упал резолвер.
+    async fn spawn_relay_failing_server() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let codec = test_codec();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let mut filled = 0;
+                    let init = loop {
+                        let Ok(n) = sock.read(&mut buf[filled..]).await else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        filled += n;
+                        match codec.decode_frame(&buf[..filled]) {
+                            Ok(Some((frame, _))) => break frame,
+                            Ok(None) => continue,
+                            Err(_) => return,
+                        }
+                    };
+                    if !mux_handshake_server(&mut sock, &codec, &init)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        return;
+                    }
+                    let mux = Multiplexer::new_server(sock, codec.clone());
+                    let Some(mut rx) = mux.take_new_stream_rx().await else { return };
+                    while let Some(ns) = rx.recv().await {
+                        let _ = mux
+                            .send_frame(ns.stream_id, Command::ConnectAck, vec![0])
+                            .await;
+                        let _ = mux
+                            .send_frame(
+                                ns.stream_id,
+                                Command::Close,
+                                vec![crate::protocol::CLOSE_REASON_RESOLVE_FAIL],
+                            )
+                            .await;
                     }
                 });
             }
@@ -886,6 +972,136 @@ mod tests {
             "failover must be reported to the host log, got: {:?}",
             *log
         );
+    }
+
+    /// Регрессия XR-094 (инцидент 2026-07-10): у сервера с мёртвым DNS туннель
+    /// и ConnectAck живы, но каждый relay кончается resolve-ошибкой, и обычный
+    /// failover (по ошибке/таймауту open_stream) не срабатывает. Пул обязан
+    /// увести активность на резерв по статистике relay-сбоев из live-трафика.
+    /// На коде без учёта relay-исходов health_tick оставляет active=primary.
+    #[tokio::test]
+    async fn test_relay_degraded_active_fails_over_to_backup() {
+        let dns_dead = spawn_relay_failing_server().await;
+        let healthy = spawn_test_server().await;
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_cb = events.clone();
+        let pool = ServerPool::new(
+            vec![
+                slot("dns-dead", connect_to(dns_dead, Arc::new(AtomicU32::new(0)))),
+                slot("backup", connect_to(healthy, Arc::new(AtomicU32::new(0)))),
+            ],
+            PoolProfile::mobile(),
+            Some(Arc::new(move |msg: &str| {
+                events_cb.lock().unwrap().push(msg.to_string());
+            })),
+        );
+
+        // Живой трафик: открытия «успешны» (ConnectAck приходит), но каждый
+        // стрим закрывается relay-ошибкой без единого байта данных.
+        for _ in 0..8 {
+            let mut s = pool
+                .open_stream(&target())
+                .await
+                .expect("open проходит, падает только relay");
+            assert!(
+                s.recv().await.is_none(),
+                "данных нет, сервер закрыл стрим relay-ошибкой"
+            );
+        }
+        assert_eq!(
+            pool.active_index(),
+            0,
+            "сам по себе open_stream деградацию не ловит (в этом и дыра)"
+        );
+
+        pool.health_tick().await;
+        assert_eq!(
+            pool.active_index(),
+            1,
+            "health_tick обязан увести трафик с деградировавшего по relay primary"
+        );
+        assert!(pool.is_backup_active());
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| m.contains("relay degraded") && m.contains("backup")),
+            "failover по деградации должен уйти событием в журнал"
+        );
+    }
+
+    /// XR-094 + XR-082: деградация relay сразу после failback (primary «мигает»
+    /// живым туннелем при мёртвом relay) получает тот же анти-флаппинг-штраф,
+    /// что и обычное мигание, чтобы качели failback -> деградация -> failover
+    /// замедлялись экспоненциально.
+    #[tokio::test]
+    async fn test_relay_degradation_after_failback_is_penalized() {
+        let addr = spawn_test_server().await;
+        let pool = ServerPool::new(
+            vec![
+                slot("primary", connect_to(addr, Arc::new(AtomicU32::new(0)))),
+                slot("backup", connect_to(addr, Arc::new(AtomicU32::new(0)))),
+            ],
+            PoolProfile::mobile(),
+            None,
+        );
+        // Свежий failback: primary только что стал активным.
+        pool.slots[0].note_became_active();
+        // Relay-сбои по live-трафику (так их записал бы mux из Close с причиной).
+        for _ in 0..10 {
+            pool.slots[0].pool.relay_health().record_resolve_fail();
+        }
+
+        pool.health_tick().await;
+        assert_eq!(pool.active_index(), 1);
+        assert!(
+            pool.slots[0].failback_suppressed(),
+            "деградировавший сразу после failback слот попадает под штраф"
+        );
+    }
+
+    /// Единственному серверу деградация relay ничего не меняет: уходить
+    /// некуда, он продолжает хотя бы туннелировать IP-таргеты.
+    #[tokio::test]
+    async fn test_relay_degradation_single_server_stays() {
+        let addr = spawn_test_server().await;
+        let pool = ServerPool::new(
+            vec![slot("only", connect_to(addr, Arc::new(AtomicU32::new(0))))],
+            PoolProfile::mobile(),
+            None,
+        );
+        for _ in 0..10 {
+            pool.slots[0].pool.relay_health().record_resolve_fail();
+        }
+        pool.health_tick().await;
+        assert_eq!(pool.active_index(), 0);
+        assert_eq!(
+            pool.server_health(0),
+            Some(HealthState::Up),
+            "единственный сервер не помечается Down: уходить некуда"
+        );
+    }
+
+    /// Когда все резервы уже Down, деградировавший активный остаётся на месте
+    /// (хромать лучше, чем переключиться на заведомо мёртвое).
+    #[tokio::test]
+    async fn test_relay_degradation_all_backups_down_stays() {
+        let addr = spawn_test_server().await;
+        let pool = ServerPool::new(
+            vec![
+                slot("primary", connect_to(addr, Arc::new(AtomicU32::new(0)))),
+                slot("backup", connect_to(addr, Arc::new(AtomicU32::new(0)))),
+            ],
+            PoolProfile::mobile(),
+            None,
+        );
+        pool.slots[1].mark_down();
+        for _ in 0..10 {
+            pool.slots[0].pool.relay_health().record_resolve_fail();
+        }
+        pool.health_tick().await;
+        assert_eq!(pool.active_index(), 0, "уходить некуда, активный остаётся");
     }
 
     /// XR-082: если только что сделанный failback тут же откатывается реальным
