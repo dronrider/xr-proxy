@@ -1215,7 +1215,8 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePlanSync(
 /// about deletions; with `dry_run` false it applies and also returns the report
 /// (`{"plan":..,"report":{"fetched":[...],"deleted":[...],"failed":[...]}}`).
 /// `agent_pubkey` pins the agent identity for the manifest fetch (XR-046), as
-/// in `nativeFetchManifest`.
+/// in `nativeFetchManifest`. `index_path` names the persistent hash-index file
+/// (XR-098) so a warm rescan skips re-hashing; empty = scan without an index.
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
     mut env: JNIEnv,
@@ -1224,6 +1225,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
     token_json: JString,
     agent_pubkey: JString,
     dest_dir: JString,
+    index_path: JString,
     selection_json: JString,
     dry_run: jboolean,
     timeout_ms: jlong,
@@ -1244,6 +1246,10 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
         Ok(s) => PathBuf::from(s),
         Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
     };
+    let index_path: Option<PathBuf> = match read_jstring(&mut env, &index_path) {
+        Ok(s) if !s.trim().is_empty() => Some(PathBuf::from(s)),
+        _ => None,
+    };
     // Selection: JSON array of chosen paths / folder prefixes; empty = whole share.
     let selection: Option<HashSet<String>> = match read_jstring(&mut env, &selection_json) {
         Ok(s) if !s.trim().is_empty() && s.trim() != "[]" => {
@@ -1260,6 +1266,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
         &agent_pubkey,
         &dest,
         selection.as_ref(),
+        index_path.as_deref(),
         dry,
         timeout,
     )) {
