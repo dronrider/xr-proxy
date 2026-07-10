@@ -6,9 +6,11 @@ edition.workspace = true
 [features]
 default = []
 geoip = ["maxminddb"]
-# Token sign/verify for file-sharing (LLD-19). Gated so the size-constrained
-# OpenWRT xr-client never links ed25519; xr-hub and xr-share opt in. Tests
-# compile the crypto unconditionally via the ed25519-dalek dev-dependency.
+# Sign/verify для файлообмена (LLD-19): токены, мандаты агента и подпись
+# манифеста (XR-046). Включают xr-hub, xr-share и xr-core (проверка манифеста
+# на потребителе), так что через xr-core фича доезжает и до xr-client; это не
+# утяжеляет его, ed25519-dalek и так в зависимостях xr-core (update.rs). Тесты
+# компилируют крипто безусловно через dev-dependency.
 share = ["dep:ed25519-dalek"]
 
 [dependencies]
