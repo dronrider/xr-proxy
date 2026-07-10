@@ -644,14 +644,17 @@ pub async fn list_invite_shares(
 /// One-shot mirror: fetch the manifest, scan `dest_root`, diff, and (unless
 /// `dry_run`) apply. This is what a background sync job calls; `dry_run` returns
 /// the plan only, so the UI can warn about deletions before committing.
+/// `agent_pubkey` pins the agent identity for the manifest fetch (see
+/// [`fetch_manifest`]).
 pub async fn sync_share(
     agent_url: &str,
     token: &ShareToken,
+    agent_pubkey: &str,
     dest_root: &Path,
     dry_run: bool,
     timeout: Duration,
 ) -> Result<SyncResult, String> {
-    sync_share_selected(agent_url, token, dest_root, None, dry_run, timeout).await
+    sync_share_selected(agent_url, token, agent_pubkey, dest_root, None, dry_run, timeout).await
 }
 
 /// [`sync_share`] limited to a selected subset of the share (§9.6). `selection`
@@ -659,12 +662,13 @@ pub async fn sync_share(
 pub async fn sync_share_selected(
     agent_url: &str,
     token: &ShareToken,
+    agent_pubkey: &str,
     dest_root: &Path,
     selection: Option<&HashSet<String>>,
     dry_run: bool,
     timeout: Duration,
 ) -> Result<SyncResult, String> {
-    let manifest = fetch_manifest(agent_url, token, timeout).await?;
+    let manifest = fetch_manifest(agent_url, token, agent_pubkey, timeout).await?;
     let local = scan_local_dir(dest_root).map_err(|e| format!("scan: {e}"))?;
     let plan = plan_with_selection(&manifest, &local, selection);
     if dry_run {
@@ -683,11 +687,22 @@ pub async fn sync_share_selected(
 }
 
 /// GET the agent's manifest, presenting `token` (verified by the agent offline).
+///
+/// `agent_pubkey` is the base64 identity key pinned from the grant (XR-046).
+/// When non-empty the agent's signature headers are **required** and verified
+/// over the exact body bytes before parsing: without this a MITM on the plain
+/// HTTP data-path could rewrite a file and its hash together, and the SHA-256
+/// download check would happily confirm the substitution. Fail-closed, so a
+/// stripped signature is also a rejection. An empty `agent_pubkey` skips the
+/// check (no pin to verify against).
 pub async fn fetch_manifest(
     agent_url: &str,
     token: &ShareToken,
+    agent_pubkey: &str,
     timeout: Duration,
 ) -> Result<ShareManifest, String> {
+    use xr_proto::share::{MANIFEST_SIGNED_AT_HEADER, MANIFEST_SIG_HEADER};
+
     let client = http_client(timeout)?;
     let url = format!("{}/manifest", agent_url.trim_end_matches('/'));
     let resp = client
@@ -699,9 +714,31 @@ pub async fn fetch_manifest(
     if !resp.status().is_success() {
         return Err(format!("http_{}", resp.status().as_u16()));
     }
-    resp.json::<ShareManifest>()
-        .await
-        .map_err(|e| format!("parse: {e}"))
+    let sig = resp
+        .headers()
+        .get(MANIFEST_SIG_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let signed_at = resp
+        .headers()
+        .get(MANIFEST_SIGNED_AT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    let body = resp.bytes().await.map_err(|e| format!("read: {e}"))?;
+
+    if !agent_pubkey.is_empty() {
+        let key = xr_proto::share::parse_agent_pubkey(agent_pubkey)
+            .map_err(|e| format!("agent_pubkey: {e}"))?;
+        let (Some(sig), Some(signed_at)) = (sig, signed_at) else {
+            // Either a pre-XR-046 agent or a stripped signature; the two are
+            // indistinguishable here, so both are refused.
+            return Err("manifest_unsigned".into());
+        };
+        xr_proto::share::verify_share_manifest(&sig, &key, &token.share_id, signed_at, &body)
+            .map_err(|e| format!("manifest_signature: {e}"))?;
+    }
+
+    serde_json::from_slice::<ShareManifest>(&body).map_err(|e| format!("parse: {e}"))
 }
 
 /// Download one entry to `dest_root`, streaming + verifying SHA-256, and only
@@ -1179,5 +1216,121 @@ mod tests {
         let missing = dir.path().join("nope");
         let rep = migrate_dir(&missing, dir.path()).unwrap();
         assert_eq!(rep.moved, 0);
+    }
+
+    // ── fetch_manifest signature pinning (XR-046) ────────────────────
+
+    /// One-shot canned HTTP server: accepts a single connection, ignores the
+    /// request, answers with `response`. Returns the base URL.
+    async fn serve_once(response: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn http_response(body: &str, extra_headers: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{extra_headers}connection: close\r\n\r\n{body}",
+            body.len(),
+        )
+    }
+
+    fn test_token(share_id: &str) -> ShareToken {
+        ShareToken { share_id: share_id.into(), exp: u64::MAX, signature: "sig".into() }
+    }
+
+    fn signed_headers(key: &ed25519_dalek::SigningKey, share_id: &str, signed_at: u64, body: &str) -> String {
+        use xr_proto::share::{sign_share_manifest, MANIFEST_SIGNED_AT_HEADER, MANIFEST_SIG_HEADER};
+        let sig = sign_share_manifest(key, share_id, signed_at, body.as_bytes());
+        format!("{MANIFEST_SIG_HEADER}: {sig}\r\n{MANIFEST_SIGNED_AT_HEADER}: {signed_at}\r\n")
+    }
+
+    fn agent_key() -> (ed25519_dalek::SigningKey, String) {
+        use base64::Engine;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[21u8; 32]);
+        let pub_b64 =
+            base64::engine::general_purpose::STANDARD.encode(key.verifying_key().as_bytes());
+        (key, pub_b64)
+    }
+
+    const MANIFEST_BODY: &str =
+        r#"{"entries":[{"path":"a.txt","size":5,"mtime":1,"sha256":"aa"}]}"#;
+
+    #[tokio::test]
+    async fn fetch_manifest_verifies_pinned_signature() {
+        let (key, pub_b64) = agent_key();
+        let url = serve_once(http_response(
+            MANIFEST_BODY,
+            &signed_headers(&key, "s1", 1234, MANIFEST_BODY),
+        ))
+        .await;
+        let m = fetch_manifest(&url, &test_token("s1"), &pub_b64, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(m.entries.len(), 1);
+        assert_eq!(m.entries[0].path, "a.txt");
+    }
+
+    #[tokio::test]
+    async fn fetch_manifest_rejects_tampered_body() {
+        // The MITM scenario XR-046 closes: the body (a hash inside it) was
+        // rewritten in flight, the signature no longer matches. Passes only
+        // with verification in place; the pre-XR-046 code accepted this.
+        let (key, pub_b64) = agent_key();
+        let forged = MANIFEST_BODY.replace("\"aa\"", "\"bb\"");
+        let url =
+            serve_once(http_response(&forged, &signed_headers(&key, "s1", 1234, MANIFEST_BODY)))
+                .await;
+        let err = fetch_manifest(&url, &test_token("s1"), &pub_b64, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("manifest_signature"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_manifest_rejects_wrong_share_replay() {
+        // A valid manifest of share s2, signed by the same agent, replayed for
+        // a request about s1: the share_id binding must reject it.
+        let (key, pub_b64) = agent_key();
+        let url = serve_once(http_response(
+            MANIFEST_BODY,
+            &signed_headers(&key, "s2", 1234, MANIFEST_BODY),
+        ))
+        .await;
+        let err = fetch_manifest(&url, &test_token("s1"), &pub_b64, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("manifest_signature"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_manifest_rejects_stripped_signature() {
+        // No signature headers while a key is pinned: either an old agent or a
+        // MITM stripping headers; both are refused (fail closed).
+        let (_key, pub_b64) = agent_key();
+        let url = serve_once(http_response(MANIFEST_BODY, "")).await;
+        let err = fetch_manifest(&url, &test_token("s1"), &pub_b64, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(err, "manifest_unsigned");
+    }
+
+    #[tokio::test]
+    async fn fetch_manifest_without_pin_skips_verification() {
+        // An empty agent_pubkey means there is nothing to verify against; the
+        // legacy unverified path must keep working.
+        let url = serve_once(http_response(MANIFEST_BODY, "")).await;
+        let m = fetch_manifest(&url, &test_token("s1"), "", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(m.entries.len(), 1);
     }
 }
