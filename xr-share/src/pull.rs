@@ -38,9 +38,11 @@ pub struct PullArgs {
     /// Take everything without prompting.
     #[arg(long)]
     pub all: bool,
-    /// Non-interactive selection: comma-separated manifest paths.
+    /// Non-interactive selection: a manifest path per occurrence (repeatable).
+    /// A value that matches no path exactly is treated as a comma-separated
+    /// list (the legacy form), so names containing commas are selectable too.
     #[arg(long)]
-    pub select: Option<String>,
+    pub select: Vec<String>,
     /// Reach agents over https (default http; the distributed agent serves HTTP).
     #[arg(long)]
     pub https: bool,
@@ -115,17 +117,20 @@ pub fn pull(args: PullArgs) -> Result<()> {
     Ok(())
 }
 
-/// Which manifest paths to download: `--all`, `--select a,b`, or interactive.
+/// Which manifest paths to download: `--all`, `--select`, or interactive.
 fn choose(manifest: &ShareManifest, args: &PullArgs, share_name: &str) -> Result<HashSet<String>> {
     if args.all {
         return Ok(manifest.entries.iter().map(|e| e.path.clone()).collect());
     }
-    if let Some(sel) = &args.select {
-        return Ok(sel
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect());
+    if !args.select.is_empty() {
+        let set = select_paths(&args.select, manifest);
+        // A piece that matched nothing is either a typo or another share of the
+        // same invite; say so instead of silently downloading zero files
+        // (XR-106: the old behaviour was a bare "Готово: 0 файлов").
+        for miss in set.iter().filter(|p| !manifest.entries.iter().any(|e| &e.path == *p)) {
+            eprintln!("[{share_name}] предупреждение: не найдено в шаре: {miss}");
+        }
+        return Ok(set);
     }
     // Interactive: numbered list, blank/"all" selects everything.
     println!("\nШара «{share_name}»: отметь файлы (номера через пробел или запятую, Enter = все):");
@@ -150,6 +155,28 @@ fn choose(manifest: &ShareManifest, args: &PullArgs, share_name: &str) -> Result
         set.insert(e.path.clone());
     }
     Ok(set)
+}
+
+/// Resolve `--select` values against the manifest. A value equal to an entry
+/// path is taken whole, even with commas inside (XR-106: a comma is a legal
+/// filename character); only otherwise it is split as the legacy
+/// comma-separated list. Unmatched pieces are kept, the caller reports them.
+fn select_paths(values: &[String], manifest: &ShareManifest) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for v in values {
+        let v = v.trim();
+        if v.is_empty() {
+            continue;
+        }
+        if manifest.entries.iter().any(|e| e.path == v) {
+            set.insert(v.to_string());
+        } else {
+            set.extend(
+                v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+            );
+        }
+    }
+    set
 }
 
 /// GET the share manifest, verifying the agent's signature headers against the
@@ -307,6 +334,52 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xr_proto::share::ShareManifestEntry;
+
+    fn manifest_of(paths: &[&str]) -> ShareManifest {
+        ShareManifest {
+            entries: paths
+                .iter()
+                .map(|p| ShareManifestEntry {
+                    path: p.to_string(),
+                    size: 1,
+                    mtime: 0,
+                    sha256: String::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn select_keeps_comma_name_when_exact() {
+        // XR-106: a filename containing a comma must be selectable whole; the
+        // pre-fix code always split on commas and matched nothing.
+        let m = manifest_of(&["a [5 2026, RUS].torrent", "b.txt"]);
+        let set = select_paths(&["a [5 2026, RUS].torrent".to_string()], &m);
+        assert_eq!(set.len(), 1);
+        assert!(set.contains("a [5 2026, RUS].torrent"));
+    }
+
+    #[test]
+    fn select_legacy_comma_list_still_splits() {
+        // The documented list form keeps working when nothing matches exactly.
+        let m = manifest_of(&["a.txt", "b.txt"]);
+        let set = select_paths(&["a.txt, b.txt".to_string()], &m);
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("a.txt") && set.contains("b.txt"));
+    }
+
+    #[test]
+    fn select_repeats_and_skips_empty() {
+        let m = manifest_of(&["a.txt", "b, c.txt"]);
+        let set = select_paths(&["a.txt".to_string(), "b, c.txt".to_string(), " ".to_string()], &m);
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("b, c.txt"));
+        // A typo stays in the set (the caller warns about it, and the download
+        // filter drops it), it must not silently vanish.
+        let set = select_paths(&["nope.txt".to_string()], &m);
+        assert!(set.contains("nope.txt"));
+    }
 
     #[test]
     fn safe_join_blocks_traversal() {
