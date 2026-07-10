@@ -366,7 +366,7 @@ private fun ExplorerView(
             Switch(checked = cfg.syncEnabled, onCheckedChange = { vm.setSyncEnabled(cfg.shareId, it) })
         }
         Breadcrumbs(cfg.name, ui.currentPath) { vm.navigateTo(it) }
-        if (ui.offlineLocal) {
+        if (ui.offlineLocal && ui.manifest.isNotEmpty()) {
             Text(
                 "Офлайн: показаны только скачанные файлы",
                 fontSize = 11.sp,
@@ -380,6 +380,10 @@ private fun ExplorerView(
 
         when {
             ui.manifestLoading -> CircularProgressIndicator(modifier = Modifier.padding(16.dp))
+            ui.manifest.isEmpty() && ui.offlineLocal -> Text(
+                "Сети нет, а скачанных файлов пока нет", modifier = Modifier.padding(16.dp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             level.isEmpty() -> Text(
                 "Папка пуста", modifier = Modifier.padding(16.dp),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,

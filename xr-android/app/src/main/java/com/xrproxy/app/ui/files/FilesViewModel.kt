@@ -67,8 +67,10 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         val currentPath: String = "",
         val manifest: List<ManifestEntry> = emptyList(),
         val manifestLoading: Boolean = false,
-        /** True when the manifest is the local-files fallback (agent unreachable):
-         *  only already-downloaded files are shown. */
+        /** True when the list shows the local files, not the agent's manifest:
+         *  right after opening a share (cache-first, until the fresh manifest
+         *  lands) and after an offline fetch failure. Combined with an empty
+         *  [manifest] it renders the "no network, nothing downloaded" state. */
         val offlineLocal: Boolean = false,
         val localPaths: Set<String> = emptySet(),
         val busyShareId: String? = null,
@@ -184,27 +186,43 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update {
             it.copy(
                 openShareId = config.shareId, currentPath = "",
-                manifest = emptyList(), manifestLoading = true,
+                manifest = emptyList(), manifestLoading = true, offlineLocal = false,
             )
         }
         viewModelScope.launch {
-            val (result, localManifest) = withContext(Dispatchers.IO) {
-                repo.fetchManifest(config) to repo.localManifest(config)
-            }
+            // Cache-first (XR-059): the already-downloaded files show up right
+            // away, the fresh manifest replaces them when the fetch lands. The
+            // old fetch-then-fallback order kept a spinner up for the whole
+            // manifest timeout when the VPN is up but the server unreachable:
+            // the local smoltcp stack accepts the connect (SYN-ACK before the
+            // upstream), so the connect-timeout never fires.
+            val localManifest = withContext(Dispatchers.IO) { repo.localManifest(config) }
             val local = localManifest.map { it.path }.toSet()
+            if (localManifest.isNotEmpty()) {
+                _ui.update { st ->
+                    if (st.openShareId != config.shareId) return@update st
+                    st.copy(manifest = localManifest, manifestLoading = false, localPaths = local, offlineLocal = true)
+                }
+            }
+            val result = withContext(Dispatchers.IO) { repo.fetchManifest(config) }
             _ui.update { st ->
                 if (st.openShareId != config.shareId) return@update st
                 result.fold(
                     onSuccess = {
                         st.copy(manifest = it, manifestLoading = false, localPaths = local, offlineLocal = false)
                     },
-                    onFailure = {
-                        // Agent unreachable (offline): still let the user browse and open
-                        // what was already downloaded, from the local files.
-                        if (localManifest.isNotEmpty()) {
-                            st.copy(manifest = localManifest, manifestLoading = false, localPaths = local, offlineLocal = true)
-                        } else {
-                            st.copy(manifestLoading = false, localPaths = local, message = "Манифест: ${it.message}")
+                    onFailure = { e ->
+                        when {
+                            // The agent answered (expired token, http_4xx): a real
+                            // error the user should see, unlike a mere no-network.
+                            !e.isOffline() ->
+                                st.copy(manifestLoading = false, message = "Манифест: ${e.message}")
+                            // Offline with the local list already on screen: the
+                            // "Офлайн" mark says it all, no toast on top.
+                            localManifest.isNotEmpty() -> st
+                            // Offline and nothing downloaded: an honest empty
+                            // state instead of a raw error (rendered in-place).
+                            else -> st.copy(manifestLoading = false, offlineLocal = true)
                         }
                     },
                 )
