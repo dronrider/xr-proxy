@@ -227,12 +227,15 @@ object NativeBridge {
      *  `{"plan":..,"report":{"fetched":[...],"deleted":[...],"failed":[...]}}`.
      *  Mirror is true-mirror: files gone on the server are deleted locally.
      *  [agentPubkey] pins the agent identity for the manifest fetch (XR-046),
-     *  as in [nativeFetchManifest]. */
+     *  as in [nativeFetchManifest]. [indexPath] names the persistent hash-index
+     *  file (XR-098) so a warm rescan is a stat-walk instead of re-hashing the
+     *  whole share; empty = scan without an index. */
     external fun nativeSyncShare(
         agentUrl: String,
         tokenJson: String,
         agentPubkey: String,
         destDir: String,
+        indexPath: String,
         selectionJson: String,
         dryRun: Boolean,
         timeoutMs: Long,

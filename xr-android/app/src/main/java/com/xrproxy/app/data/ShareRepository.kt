@@ -156,7 +156,7 @@ class ShareRepository(private val context: Context) {
         val token = config.tokenJson ?: return SyncOutcome(0, 0, 0, "no token")
         val res = NativeBridge.nativeSyncShare(
             config.agentBaseUrl, token, config.agentPubkey, destDir(config).absolutePath,
-            config.selectionJson(), false, XFER_TIMEOUT_MS,
+            hashIndexPath(config), config.selectionJson(), false, XFER_TIMEOUT_MS,
         )
         return runCatching {
             val o = JSONObject(res)
@@ -171,6 +171,16 @@ class ShareRepository(private val context: Context) {
             )
         }.getOrElse { SyncOutcome(0, 0, 0, it.message ?: "sync error") }
     }
+
+    /** The share's persistent hash-index file (XR-098). Lives in the app's
+     *  private [Context.getFilesDir], never inside the share directory: that one
+     *  is walked by [localPaths]/[localManifest] for the UI, cleaned by the
+     *  true-mirror delete, and may sit on user-visible shared storage. Keyed by
+     *  shareId with share-relative entries inside, so a storage-directory change
+     *  (XR-043) does not invalidate it. */
+    private fun hashIndexPath(config: ShareConfig): String =
+        File(File(context.filesDir, "share-index").apply { mkdirs() }, sanitize(config.shareId) + ".json")
+            .absolutePath
 
     private fun sanitize(s: String): String = s.replace(Regex("[^A-Za-z0-9_.-]"), "_")
 
