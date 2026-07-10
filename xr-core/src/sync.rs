@@ -286,15 +286,126 @@ pub fn safe_dest(root: &Path, rel: &str) -> Option<PathBuf> {
 /// Scan a local directory into [`LocalFile`]s (relative forward-slash paths +
 /// SHA-256). Symlinks are skipped. Used to compute local state before a diff.
 pub fn scan_local_dir(root: &Path) -> std::io::Result<Vec<LocalFile>> {
-    let mut out = Vec::new();
-    if root.exists() {
-        scan_dir(root, root, &mut out)?;
+    scan_local_dir_indexed(root, &mut HashIndex::new())
+}
+
+// ── Persistent hash index (XR-098, LLD-24) ──────────────────────────
+//
+// Re-hashing every local file on every sync holds a multi-GB share in
+// "preparing" for tens of seconds and burns battery on each background cycle.
+// Like the agent's HashCache (xr-share manifest.rs) a file is re-hashed only
+// when its (size, mtime) changed, but the consumer's index also survives
+// process restarts by persisting to a JSON file. Keys are share-relative:
+// a storage migration (XR-043) renames files, which keeps mtime but changes
+// the root, so absolute keys would invalidate the whole index at once.
+
+const HASH_INDEX_VERSION: u32 = 1;
+
+/// Per-share persistent `(relative path, size, mtime) -> sha256` index. Purely
+/// an accelerator for [`scan_local_dir_indexed`]: losing or corrupting it costs
+/// one full re-hash, never correctness. Like the agent's cache, it deliberately
+/// misses a swapped file with identical size and mtime.
+#[derive(Serialize, Deserialize)]
+pub struct HashIndex {
+    version: u32,
+    entries: HashMap<String, HashIndexEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HashIndexEntry {
+    size: u64,
+    mtime: i64,
+    sha256: String,
+}
+
+impl Default for HashIndex {
+    fn default() -> Self {
+        Self::new()
     }
+}
+
+impl HashIndex {
+    pub fn new() -> Self {
+        Self { version: HASH_INDEX_VERSION, entries: HashMap::new() }
+    }
+
+    /// Load from `path`. A missing, unreadable, corrupt or foreign file (bad
+    /// JSON, unknown version) yields an empty index: a full re-hash instead of
+    /// trusting questionable entries, and no error to propagate.
+    pub fn load(path: &Path) -> Self {
+        let Ok(bytes) = std::fs::read(path) else { return Self::new() };
+        match serde_json::from_slice::<Self>(&bytes) {
+            Ok(ix) if ix.version == HASH_INDEX_VERSION => ix,
+            _ => Self::new(),
+        }
+    }
+
+    /// Persist atomically (unique temp file + rename), so a concurrent load
+    /// never sees a torn file and concurrent savers (foreground tap + background
+    /// worker before the transfer lock) can only lose to each other's complete
+    /// snapshot. Failure to save is not fatal to a sync; callers may ignore it.
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension(format!("tmp{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+        let bytes = serde_json::to_vec(self).map_err(std::io::Error::other)?;
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+    }
+
+    fn lookup(&self, rel: &str, size: u64, mtime: i64) -> Option<&str> {
+        self.entries
+            .get(rel)
+            .filter(|e| e.size == size && e.mtime == mtime)
+            .map(|e| e.sha256.as_str())
+    }
+
+    fn insert(&mut self, rel: String, size: u64, mtime: i64, sha256: String) {
+        self.entries.insert(rel, HashIndexEntry { size, mtime, sha256 });
+    }
+
+    fn remove(&mut self, rel: &str) {
+        self.entries.remove(rel);
+    }
+}
+
+fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Like [`scan_local_dir`], but hashing goes through a persistent [`HashIndex`]:
+/// a file whose `(size, mtime)` matches the index reuses the stored hash, so a
+/// warm scan is a stat-walk with no content reads. The index is rebuilt from
+/// what the walk actually saw, dropping entries for files that no longer exist.
+pub fn scan_local_dir_indexed(
+    root: &Path,
+    index: &mut HashIndex,
+) -> std::io::Result<Vec<LocalFile>> {
+    let mut out = Vec::new();
+    let mut fresh = HashIndex::new();
+    if root.exists() {
+        scan_dir(root, root, index, &mut fresh, &mut out)?;
+    }
+    *index = fresh;
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
 }
 
-fn scan_dir(root: &Path, dir: &Path, out: &mut Vec<LocalFile>) -> std::io::Result<()> {
+fn scan_dir(
+    root: &Path,
+    dir: &Path,
+    index: &HashIndex,
+    fresh: &mut HashIndex,
+    out: &mut Vec<LocalFile>,
+) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let ft = entry.file_type()?;
@@ -303,7 +414,7 @@ fn scan_dir(root: &Path, dir: &Path, out: &mut Vec<LocalFile>) -> std::io::Resul
         }
         let path = entry.path();
         if ft.is_dir() {
-            scan_dir(root, &path, out)?;
+            scan_dir(root, &path, index, fresh, out)?;
         } else if ft.is_file() {
             let rel = path
                 .strip_prefix(root)
@@ -312,11 +423,14 @@ fn scan_dir(root: &Path, dir: &Path, out: &mut Vec<LocalFile>) -> std::io::Resul
                 .map(|c| c.as_os_str().to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
-            out.push(LocalFile {
-                path: rel,
-                sha256: sha256_file(&path)?,
-                size: entry.metadata()?.len(),
-            });
+            let meta = entry.metadata()?;
+            let (size, mtime) = (meta.len(), mtime_secs(&meta));
+            let sha256 = match index.lookup(&rel, size, mtime) {
+                Some(hash) => hash.to_string(),
+                None => sha256_file(&path)?,
+            };
+            fresh.insert(rel.clone(), size, mtime, sha256.clone());
+            out.push(LocalFile { path: rel, sha256, size });
         }
     }
     Ok(())
@@ -654,22 +768,33 @@ pub async fn sync_share(
     dry_run: bool,
     timeout: Duration,
 ) -> Result<SyncResult, String> {
-    sync_share_selected(agent_url, token, agent_pubkey, dest_root, None, dry_run, timeout).await
+    sync_share_selected(agent_url, token, agent_pubkey, dest_root, None, None, dry_run, timeout)
+        .await
 }
 
 /// [`sync_share`] limited to a selected subset of the share (§9.6). `selection`
 /// is the set of manifest paths to mirror; `None` mirrors the whole tree.
+/// `index_path` names the persistent [`HashIndex`] file (XR-098); `None` scans
+/// without one, re-hashing everything.
 pub async fn sync_share_selected(
     agent_url: &str,
     token: &ShareToken,
     agent_pubkey: &str,
     dest_root: &Path,
     selection: Option<&HashSet<String>>,
+    index_path: Option<&Path>,
     dry_run: bool,
     timeout: Duration,
 ) -> Result<SyncResult, String> {
     let manifest = fetch_manifest(agent_url, token, agent_pubkey, timeout).await?;
-    let local = scan_local_dir(dest_root).map_err(|e| format!("scan: {e}"))?;
+    let mut index = index_path.map(HashIndex::load).unwrap_or_default();
+    let local = scan_local_dir_indexed(dest_root, &mut index).map_err(|e| format!("scan: {e}"))?;
+    // Persist right after the scan: the expensive hashing just happened, and a
+    // failed or cancelled transfer below must not lose the warmed cache. This
+    // also lets a dry run warm the index for the next real sync.
+    if let Some(p) = index_path {
+        let _ = index.save(p);
+    }
     let plan = plan_with_selection(&manifest, &local, selection);
     if dry_run {
         return Ok(SyncResult { plan, report: None });
@@ -683,7 +808,40 @@ pub async fn sync_share_selected(
         None => return Err("busy".into()),
     };
     let report = apply_plan(agent_url, token, &plan, dest_root, timeout).await;
+    if let Some(p) = index_path {
+        index_apply_report(&mut index, &plan, &report, dest_root);
+        let _ = index.save(p);
+    }
     Ok(SyncResult { plan, report: Some(report) })
+}
+
+/// Fold an apply outcome into the index: a fetched file's hash was already
+/// verified against the manifest entry during download, so a stat is enough to
+/// record it and the next scan will not re-read multi-GB downloads. An entry
+/// the agent had not hashed yet (empty sha256, the XR-097 cold cache) is
+/// skipped and picked up by the next scan instead. Deleted paths leave the
+/// index.
+fn index_apply_report(index: &mut HashIndex, plan: &SyncPlan, report: &ApplyReport, dest_root: &Path) {
+    let by_path: HashMap<&str, &ShareManifestEntry> =
+        plan.fetch.iter().map(|e| (e.path.as_str(), e)).collect();
+    for rel in &report.fetched {
+        let Some(entry) = by_path.get(rel.as_str()) else { continue };
+        if entry.sha256.is_empty() {
+            continue;
+        }
+        let Some(dest) = safe_dest(dest_root, rel) else { continue };
+        if let Ok(meta) = std::fs::metadata(&dest) {
+            index.insert(
+                rel.clone(),
+                meta.len(),
+                mtime_secs(&meta),
+                entry.sha256.to_ascii_lowercase(),
+            );
+        }
+    }
+    for rel in &report.deleted {
+        index.remove(rel);
+    }
 }
 
 /// GET the agent's manifest, presenting `token` (verified by the agent offline).
@@ -1148,6 +1306,114 @@ mod tests {
         assert_eq!(plan.fetch.iter().map(|e| e.path.clone()).collect::<Vec<_>>(), vec!["sub/b.bin"]);
     }
 
+    // ── HashIndex (XR-098) ────────────────────────────────────────────
+
+    /// Rewrite `path` with same-length `content`, restoring the original mtime.
+    /// A `(size, mtime)` index then treats the file as unchanged, which is how
+    /// tests prove a scan served the hash from the index instead of re-reading.
+    fn rewrite_keeping_mtime(path: &Path, content: &[u8]) {
+        let mtime = std::fs::metadata(path).unwrap().modified().unwrap();
+        assert_eq!(std::fs::metadata(path).unwrap().len(), content.len() as u64);
+        std::fs::write(path, content).unwrap();
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(mtime).unwrap();
+    }
+
+    #[test]
+    fn indexed_scan_reuses_hash_without_rereading() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("a.bin");
+        std::fs::write(&file, b"hello").unwrap();
+
+        let mut index = HashIndex::new();
+        let cold = scan_local_dir_indexed(root.path(), &mut index).unwrap();
+
+        // Swap the content keeping (size, mtime): the warm scan must return the
+        // cached hash, proving the content was not re-read. The pre-index scan
+        // re-hashed every file on every pass (the 40-second "preparing").
+        rewrite_keeping_mtime(&file, b"HELLO");
+        let warm = scan_local_dir_indexed(root.path(), &mut index).unwrap();
+        assert_eq!(cold, warm, "warm scan must serve the hash from the index");
+    }
+
+    #[test]
+    fn hash_index_persists_between_instances() {
+        let root = tempfile::tempdir().unwrap();
+        let aux = tempfile::tempdir().unwrap();
+        let ix_path = aux.path().join("share.json");
+        std::fs::write(root.path().join("a.txt"), b"hello").unwrap();
+
+        let mut index = HashIndex::load(&ix_path); // missing file -> empty index
+        let cold = scan_local_dir_indexed(root.path(), &mut index).unwrap();
+        index.save(&ix_path).unwrap();
+
+        // A fresh instance (new process in real life) still avoids re-reading.
+        rewrite_keeping_mtime(&root.path().join("a.txt"), b"WORLD");
+        let mut reloaded = HashIndex::load(&ix_path);
+        let warm = scan_local_dir_indexed(root.path(), &mut reloaded).unwrap();
+        assert_eq!(cold, warm, "reloaded index must serve cached hashes");
+    }
+
+    #[test]
+    fn hash_index_rejects_corrupt_or_foreign_file() {
+        let root = tempfile::tempdir().unwrap();
+        let aux = tempfile::tempdir().unwrap();
+        let ix_path = aux.path().join("share.json");
+        std::fs::write(root.path().join("a.txt"), b"hello").unwrap();
+
+        let mut index = HashIndex::new();
+        let cold = scan_local_dir_indexed(root.path(), &mut index).unwrap();
+        rewrite_keeping_mtime(&root.path().join("a.txt"), b"WORLD");
+
+        // Corrupt JSON and an unknown version must both fall back to an empty
+        // index, i.e. an honest full re-hash that sees the new content.
+        for junk in [&b"{ not json"[..], &br#"{"version":999,"entries":{}}"#[..]] {
+            std::fs::write(&ix_path, junk).unwrap();
+            let mut loaded = HashIndex::load(&ix_path);
+            assert!(loaded.entries.is_empty(), "junk index must load empty");
+            let rescanned = scan_local_dir_indexed(root.path(), &mut loaded).unwrap();
+            assert_ne!(rescanned[0].sha256, cold[0].sha256, "must re-hash for real");
+        }
+    }
+
+    #[test]
+    fn hash_index_prunes_deleted_files() {
+        let root = tempfile::tempdir().unwrap();
+        let aux = tempfile::tempdir().unwrap();
+        let ix_path = aux.path().join("share.json");
+        std::fs::write(root.path().join("a.txt"), b"stay").unwrap();
+        std::fs::write(root.path().join("b.txt"), b"gone").unwrap();
+
+        let mut index = HashIndex::new();
+        scan_local_dir_indexed(root.path(), &mut index).unwrap();
+        std::fs::remove_file(root.path().join("b.txt")).unwrap();
+        scan_local_dir_indexed(root.path(), &mut index).unwrap();
+        index.save(&ix_path).unwrap();
+
+        let reloaded = HashIndex::load(&ix_path);
+        assert!(reloaded.entries.contains_key("a.txt"));
+        assert!(!reloaded.entries.contains_key("b.txt"), "deleted file must leave the index");
+    }
+
+    #[test]
+    fn hash_index_relative_keys_survive_root_move() {
+        // A storage migration (XR-043) renames files: mtime survives, the root
+        // changes. Relative keys must keep the cache warm across the move.
+        let parent = tempfile::tempdir().unwrap();
+        let old_root = parent.path().join("A");
+        std::fs::create_dir_all(old_root.join("sub")).unwrap();
+        std::fs::write(old_root.join("sub/f.bin"), b"hello").unwrap();
+
+        let mut index = HashIndex::new();
+        let before = scan_local_dir_indexed(&old_root, &mut index).unwrap();
+
+        let new_root = parent.path().join("B");
+        std::fs::rename(&old_root, &new_root).unwrap();
+        rewrite_keeping_mtime(&new_root.join("sub/f.bin"), b"HELLO");
+        let after = scan_local_dir_indexed(&new_root, &mut index).unwrap();
+        assert_eq!(before, after, "moved root must still hit the index");
+    }
+
     // ── migrate_dir (XR-043) ─────────────────────────────────────────
 
     fn read(p: &Path) -> String {
@@ -1332,5 +1598,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(m.entries.len(), 1);
+    }
+
+    // ── sync_share_selected with a persistent index (XR-098) ─────────
+
+    /// Multi-request sibling of [`serve_once`]: answers `/manifest` with
+    /// `manifest_body` and any other GET (a `/file/...` download) with
+    /// `file_body`, for as many connections as the test makes.
+    async fn serve_share(manifest_body: String, file_body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let body = if buf[..n].starts_with(b"GET /manifest") {
+                    manifest_body.clone()
+                } else {
+                    file_body.to_string()
+                };
+                let _ = sock.write_all(http_response(&body, "").as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    const HELLO_SHA: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    #[tokio::test]
+    async fn sync_with_index_records_download_and_skips_rehash() {
+        let dest = tempfile::tempdir().unwrap();
+        let aux = tempfile::tempdir().unwrap();
+        let ix_path = aux.path().join("share.json");
+        let manifest_body = format!(
+            r#"{{"entries":[{{"path":"a.txt","size":5,"mtime":1,"sha256":"{HELLO_SHA}"}}]}}"#
+        );
+
+        let url = serve_share(manifest_body.clone(), "hello").await;
+        let res = sync_share_selected(
+            &url, &test_token("s1"), "", dest.path(), None, Some(&ix_path), false,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.report.unwrap().fetched, vec!["a.txt".to_string()]);
+
+        // The verified download landed in the persisted index right away.
+        let index = HashIndex::load(&ix_path);
+        let meta = std::fs::metadata(dest.path().join("a.txt")).unwrap();
+        assert_eq!(index.lookup("a.txt", meta.len(), mtime_secs(&meta)), Some(HELLO_SHA));
+
+        // Second sync must be a no-op via the index: swap the content keeping
+        // (size, mtime). An honest re-hash would see a changed file and
+        // re-fetch; the indexed scan matches the manifest and plans nothing.
+        rewrite_keeping_mtime(&dest.path().join("a.txt"), b"XXXXX");
+        let url2 = serve_share(manifest_body, "hello").await;
+        let res2 = sync_share_selected(
+            &url2, &test_token("s1"), "", dest.path(), None, Some(&ix_path), false,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(res2.plan.is_empty(), "warm sync must plan nothing: {:?}", res2.plan);
     }
 }
