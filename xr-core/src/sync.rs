@@ -153,6 +153,11 @@ pub fn transfer_snapshot() -> TransferSnapshot {
 pub struct LocalFile {
     pub path: String,
     pub sha256: String,
+    /// Size in bytes: the fallback change signal for manifest entries whose
+    /// hash the agent has not computed yet (XR-097). `default` keeps older
+    /// serialized producers without the field parseable.
+    #[serde(default)]
+    pub size: u64,
 }
 
 /// The diff: what to download and what to remove to make local match the server.
@@ -172,7 +177,9 @@ impl SyncPlan {
 
 /// Pure diff between the server manifest and local state. SHA-256 is the change
 /// signal: a path present both sides with equal hash is a no-op; differing hash
-/// → fetch; present only on server → fetch; present only locally → delete.
+/// → fetch; present only on server → fetch; present only locally → delete. An
+/// entry whose hash the agent has not computed yet (empty sha256, cold cache)
+/// falls back to size comparison instead of re-fetching (XR-097).
 /// Output is sorted for determinism.
 pub fn plan_sync(manifest: &ShareManifest, local: &[LocalFile]) -> SyncPlan {
     plan_with_selection(manifest, local, None)
@@ -201,9 +208,9 @@ pub fn plan_with_selection(
     local: &[LocalFile],
     selection: Option<&HashSet<String>>,
 ) -> SyncPlan {
-    let local_by_path: HashMap<&str, &str> = local
+    let local_by_path: HashMap<&str, &LocalFile> = local
         .iter()
-        .map(|f| (f.path.as_str(), f.sha256.as_str()))
+        .map(|f| (f.path.as_str(), f))
         .collect();
 
     // Desired = manifest entries the selection covers (everything, if no selection).
@@ -218,7 +225,14 @@ pub fn plan_with_selection(
         .iter()
         .filter(|e| match local_by_path.get(e.path.as_str()) {
             // Identical hash → already have it.
-            Some(local_sha) => !local_sha.eq_ignore_ascii_case(&e.sha256),
+            Some(l) if !e.sha256.is_empty() => !l.sha256.eq_ignore_ascii_case(&e.sha256),
+            // The agent has not hashed this file yet (a fresh agent serves the
+            // listing with empty sha256 while its cache warms up, see xr-share
+            // build_listing), so size is the only change signal left. Treating
+            // the empty hash as "changed" re-downloaded whole shares right
+            // after an agent restart (XR-097); a same-size change slips this
+            // round and is caught by the next sync once the cache is warm.
+            Some(l) => l.size != e.size,
             // Not present locally → new.
             None => true,
         })
@@ -301,6 +315,7 @@ fn scan_dir(root: &Path, dir: &Path, out: &mut Vec<LocalFile>) -> std::io::Resul
             out.push(LocalFile {
                 path: rel,
                 sha256: sha256_file(&path)?,
+                size: entry.metadata()?.len(),
             });
         }
     }
@@ -921,7 +936,10 @@ mod tests {
         }
     }
     fn local(path: &str, sha: &str) -> LocalFile {
-        LocalFile { path: path.into(), sha256: sha.into() }
+        local_sized(path, sha, 10)
+    }
+    fn local_sized(path: &str, sha: &str, size: u64) -> LocalFile {
+        LocalFile { path: path.into(), sha256: sha.into(), size }
     }
     fn manifest(entries: Vec<ShareManifestEntry>) -> ShareManifest {
         ShareManifest { entries }
@@ -942,6 +960,27 @@ mod tests {
         let plan = plan_sync(&m, &[local("a.txt", "oldhash")]);
         assert_eq!(plan.fetch.len(), 1);
         assert_eq!(plan.fetch[0].sha256, "NEWHASH");
+        assert!(plan.delete.is_empty());
+    }
+
+    #[test]
+    fn test_plan_sync_unhashed_manifest_keeps_local() {
+        // A freshly (re)started agent serves the listing before its hash cache
+        // warms up: sha256 comes empty ("not known yet", see xr-share
+        // build_listing). An intact local file must not re-fetch on that
+        // (XR-097: sync right after an agent restart re-downloaded the whole
+        // selection).
+        let m = manifest(vec![entry("a.txt", "")]);
+        let plan = plan_sync(&m, &[local("a.txt", "realhash")]);
+        assert!(plan.is_empty(), "unhashed manifest entry must not refetch an intact local file");
+    }
+
+    #[test]
+    fn test_plan_sync_unhashed_manifest_size_change_refetches() {
+        // With the hash unknown, size is the only change signal left.
+        let m = manifest(vec![entry("a.txt", "")]); // entry size is 10
+        let plan = plan_sync(&m, &[local_sized("a.txt", "realhash", 11)]);
+        assert_eq!(plan.fetch.len(), 1);
         assert!(plan.delete.is_empty());
     }
 
