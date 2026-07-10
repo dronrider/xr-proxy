@@ -236,20 +236,31 @@ xrReleasePublicKey=<публичный_base64>
 > переустановка на каждом устройстве (новый pinned release-ключ роли не играет,
 > речь про подпись самого пакета).
 
-> ⚠️ **Бампайте `versionCode`** в `app/build.gradle.kts` при каждом релизе и
-> передавайте то же число в `--version-code`. Приложение предлагает обновление
-> только когда `version_code` манифеста **строго больше** установленного;
-> манифест с меньшим/равным кодом (в т.ч. replay старого) игнорируется.
+> ⚠️ **Бампайте `versionCode` на каждый релиз.** Версия в файлы репозитория не
+> зашита, а передаётся сборке гредл-пропертями `xrVersionCode` и
+> `xrVersionName` (см. команду ниже); то же число уходит в `--version-code` при
+> подписи. Приложение предлагает обновление только когда `version_code`
+> манифеста **строго больше** установленного; манифест с меньшим/равным кодом
+> (в т.ч. replay старого) игнорируется. Без `xrVersionName` сборка останется с
+> dev-именем версии (`0.1.0-<commit>-NNNN`).
 
-### 1. Подписать релиз (на машине владельца, офлайн-ключ)
+### 1. Собрать и подписать релиз (на машине владельца, офлайн-ключ)
 
-После сборки APK (`xr-android/build.sh --release`):
+```bash
+cd xr-android
+ORG_GRADLE_PROJECT_xrVersionCode=<N> \
+ORG_GRADLE_PROJECT_xrVersionName=<X.Y.Z> \
+ORG_GRADLE_PROJECT_xrReleasePublicKey=<публичный_base64> \
+./build.sh --release
+```
+
+Затем подпись манифеста:
 
 ```bash
 xr-hub sign-release \
-  --apk path/to/app-release.apk \
-  --version 0.2.0 \
-  --version-code 12 \
+  --apk xr-android/app/build/outputs/apk/release/app-release.apk \
+  --version <X.Y.Z> \
+  --version-code <N> \
   --key ~/.xr/release.key \
   --base-url https://xr-hub.example.com \
   --notes "Multi-VPS failover, панель здоровья" \
@@ -259,6 +270,11 @@ xr-hub sign-release \
 Команда считает SHA-256 и размер APK, формирует `manifest.json`, подписывает
 его **локально** приватным ключом и пишет рядом `manifest.sig`, а также копию
 APK как `<version>.apk`. Хаб ничего не подписывает — у него release-ключа нет.
+
+`--out` с отдельной директорией не косметика: заливать надо из неё, а не из
+`apk/release/`. Следующая сборка молча перепишет `app-release.apk`, и фоновая
+заливка прямо из выходной директории однажды утаскивает недописанный файл
+(ловили на живом релизе).
 
 ### 2. Выложить файлы на хаб
 
@@ -271,6 +287,14 @@ scp -P 8822 release-staging/manifest.json release-staging/manifest.sig \
             release-staging/0.2.0.apk \
             root@<vps>:/var/lib/xr-hub/releases/
 ```
+
+Если хабов больше одного (основной плюс failover-standby с тем же
+`server_name`, как у нас), релиз выкладывается на **каждый**: паритет держится
+руками, и забытый резерв после переключения DNS продолжит раздавать старую
+версию. Перед перезаписью сохранить старые `manifest.json`/`manifest.sig` в
+`*.bak.<ts>` рядом, это и есть весь откат (старые `<version>.apk` с диска не
+удаляются). Многомегабайтный APK на медленный канал удобнее лить
+`rsync --partial --inplace`: докачает после обрыва вместо рестарта с нуля.
 
 Каталог можно переопределить в конфиге:
 
