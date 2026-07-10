@@ -22,14 +22,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{Path as AxPath, Request, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Json, Router};
-use ed25519_dalek::VerifyingKey;
+use axum::Router;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
-use xr_proto::share::{verify_share_token, ShareManifest};
+use xr_proto::share::{
+    sign_share_manifest, verify_share_token, ShareManifest, MANIFEST_SIGNED_AT_HEADER,
+    MANIFEST_SIG_HEADER,
+};
 
 use crate::auth::extract_token;
 use crate::manifest::{
@@ -108,10 +111,14 @@ pub fn build_shares(entries: &[crate::config::ShareEntry]) -> SharesMap {
 
 /// Runtime state. `shares` is swappable for hot reload; `hub_key` is fixed;
 /// `hash_cache` is shared by every manifest build (and the background warmer).
+/// `identity` signs served manifests (XR-046); `None` for a legacy config
+/// without a key, then manifests go out unsigned and a pinning consumer
+/// rejects them.
 pub struct AgentState {
     pub shares: RwLock<Arc<SharesMap>>,
     pub hub_key: VerifyingKey,
     pub hash_cache: HashCache,
+    pub identity: Option<SigningKey>,
 }
 
 impl AgentState {
@@ -169,7 +176,7 @@ async fn get_manifest(
     State(state): State<Arc<AgentState>>,
     AxPath(share_id): AxPath<String>,
     req: Request,
-) -> Result<Json<ShareManifest>, (StatusCode, &'static str)> {
+) -> Result<Response, (StatusCode, &'static str)> {
     manifest_response(state, share_id, req).await
 }
 
@@ -186,7 +193,7 @@ async fn serve_file(
 async fn get_manifest_legacy(
     State(state): State<Arc<AgentState>>,
     req: Request,
-) -> Result<Json<ShareManifest>, (StatusCode, &'static str)> {
+) -> Result<Response, (StatusCode, &'static str)> {
     let share_id = token_share_id(&req)?;
     manifest_response(state, share_id, req).await
 }
@@ -209,7 +216,7 @@ async fn manifest_response(
     state: Arc<AgentState>,
     share_id: String,
     req: Request,
-) -> Result<Json<ShareManifest>, (StatusCode, &'static str)> {
+) -> Result<Response, (StatusCode, &'static str)> {
     if !state.snapshot().contains_key(&share_id) {
         return Err((StatusCode::NOT_FOUND, "no such share"));
     }
@@ -219,22 +226,46 @@ async fn manifest_response(
     // warmer fills hashes in the background. Still off the async runtime because
     // the directory walk/stat is blocking I/O (a slow/network drive must not
     // stall other requests).
+    let st = state.clone();
+    let sid = share_id.clone();
     let built = tokio::task::spawn_blocking(move || -> anyhow::Result<ShareManifest> {
-        let shares = state.snapshot();
+        let shares = st.snapshot();
         let share = shares
-            .get(&share_id)
+            .get(&sid)
             .ok_or_else(|| anyhow::anyhow!("share removed during build"))?;
-        share.listing(&state.hash_cache)
+        share.listing(&st.hash_cache)
     })
     .await;
     match built {
-        Ok(Ok(manifest)) => Ok(Json(manifest)),
+        Ok(Ok(manifest)) => Ok(signed_manifest_response(&state, &share_id, &manifest)),
         Ok(Err(e)) => {
             tracing::error!("manifest build failed: {e:#}");
             Err((StatusCode::INTERNAL_SERVER_ERROR, "manifest error"))
         }
         Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "manifest task failed")),
     }
+}
+
+/// Serialize the manifest **once** and sign those exact bytes (XR-046): the
+/// signature and its timestamp travel as response headers, the body stays the
+/// plain manifest JSON, so a pre-signing consumer keeps working while a pinning
+/// one verifies the bytes it actually received. Re-serializing on the consumer
+/// is never needed, hence no canonicalization to drift.
+fn signed_manifest_response(state: &AgentState, share_id: &str, manifest: &ShareManifest) -> Response {
+    let body = match serde_json::to_vec(manifest) {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "manifest encode").into_response(),
+    };
+    let mut resp = Response::builder().header(header::CONTENT_TYPE, "application/json");
+    if let Some(key) = &state.identity {
+        let signed_at = now_unix();
+        let sig = sign_share_manifest(key, share_id, signed_at, &body);
+        resp = resp
+            .header(MANIFEST_SIG_HEADER, sig)
+            .header(MANIFEST_SIGNED_AT_HEADER, signed_at.to_string());
+    }
+    resp.body(Body::from(body))
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "manifest response").into_response())
 }
 
 async fn file_response(state: &AgentState, share_id: &str, rel: &str, req: Request) -> Response {
@@ -282,6 +313,7 @@ mod tests {
             shares: RwLock::new(Arc::new(shares)),
             hub_key: key.verifying_key(),
             hash_cache: HashCache::new(),
+            identity: Some(SigningKey::from_bytes(&[77u8; 32])),
         })
     }
 
@@ -353,6 +385,65 @@ mod tests {
         // Any other path inside a file share is refused.
         let r = app.oneshot(get_with_token("/F/file/other.txt", Some(&tok))).await.unwrap();
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn manifest_signature_covers_served_bytes() {
+        // The signature headers must verify against the pinned agent key, the
+        // requested share_id and the exact body bytes, and against nothing else
+        // (XR-046: a MITM rewriting a hash, or replaying another share's
+        // listing, must not verify).
+        let key = SigningKey::from_bytes(&[8u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hi").unwrap();
+        let mut shares = SharesMap::new();
+        shares.insert("A".into(), ShareRoot { path: dir.path().canonicalize().unwrap(), is_file: false });
+        let state = state_with(shares, &key);
+        let agent_vk = state.identity.as_ref().unwrap().verifying_key();
+        let app = router(state);
+
+        let tok = sign_share_token(&key, "A", now_unix() + 1000);
+        let r = app.oneshot(get_with_token("/A/manifest", Some(&tok))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let sig = r.headers()[MANIFEST_SIG_HEADER].to_str().unwrap().to_string();
+        let signed_at: u64 =
+            r.headers()[MANIFEST_SIGNED_AT_HEADER].to_str().unwrap().parse().unwrap();
+        let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+
+        use xr_proto::share::verify_share_manifest;
+        assert!(verify_share_manifest(&sig, &agent_vk, "A", signed_at, &body).is_ok());
+
+        // Tampered body -> reject.
+        let mut forged = body.to_vec();
+        forged[0] ^= 1;
+        assert!(verify_share_manifest(&sig, &agent_vk, "A", signed_at, &forged).is_err());
+        // Replayed under a different share id -> reject.
+        assert!(verify_share_manifest(&sig, &agent_vk, "B", signed_at, &body).is_err());
+    }
+
+    #[tokio::test]
+    async fn manifest_unsigned_without_identity() {
+        // A legacy config without an identity key still serves the listing,
+        // just without signature headers (the pinning consumer then refuses it).
+        let key = SigningKey::from_bytes(&[10u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hi").unwrap();
+        let mut shares = SharesMap::new();
+        shares.insert("A".into(), ShareRoot { path: dir.path().canonicalize().unwrap(), is_file: false });
+        let state = Arc::new(AgentState {
+            shares: RwLock::new(Arc::new(shares)),
+            hub_key: key.verifying_key(),
+            hash_cache: HashCache::new(),
+            identity: None,
+        });
+        let app = router(state);
+
+        let tok = sign_share_token(&key, "A", now_unix() + 1000);
+        let r = app.oneshot(get_with_token("/A/manifest", Some(&tok))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(r.headers().get(MANIFEST_SIG_HEADER).is_none());
+        assert!(r.headers().get(MANIFEST_SIGNED_AT_HEADER).is_none());
     }
 
     #[tokio::test]

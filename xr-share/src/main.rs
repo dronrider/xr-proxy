@@ -142,6 +142,22 @@ async fn run(path: &Path) -> Result<()> {
     let hub_key = cfg.hub_verifying_key()?;
     let bind_addr: SocketAddr = cfg.listen.parse().context("invalid listen address")?;
 
+    // Manifest signing identity (XR-046). Absence is tolerated so a legacy
+    // config keeps serving, but consumers that pin agent_pubkey will refuse the
+    // unsigned listing, hence the loud warning.
+    let identity = cfg.identity_signing_key(path)?;
+    match &identity {
+        Some(key) => {
+            let pub_b64 =
+                base64::engine::general_purpose::STANDARD.encode(key.verifying_key().as_bytes());
+            tracing::info!("manifest signing enabled (agent identity {pub_b64})");
+        }
+        None => tracing::warn!(
+            "no identity key (config identity_key / identity.key next to it): manifests are \
+             served UNSIGNED and pinning consumers will reject them; re-run `xr-share install`"
+        ),
+    }
+
     // Resolve the configured shares. An empty set is allowed (the agent runs and
     // waits for `xr-share share <path>` to add one, picked up by hot-reload).
     let shares = server::build_shares(&cfg.resolved_shares());
@@ -155,6 +171,7 @@ async fn run(path: &Path) -> Result<()> {
         shares: RwLock::new(Arc::new(shares)),
         hub_key,
         hash_cache: manifest::HashCache::new(),
+        identity,
     });
 
     // Hot reload: pick up `share`/`unshare` edits to the config without restart.

@@ -17,7 +17,10 @@ use clap::Args;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use xr_proto::share::ShareManifest;
+use xr_proto::share::{
+    parse_agent_pubkey, verify_share_manifest, ShareManifest, MANIFEST_SIGNED_AT_HEADER,
+    MANIFEST_SIG_HEADER,
+};
 
 const HUB_DEFAULT: &str = "https://xr-hub.zoobr.top";
 
@@ -52,6 +55,11 @@ struct InviteShareDto {
     name: String,
     addr: String,
     port: u16,
+    /// Base64 identity key of the agent; the manifest signature is verified
+    /// against it (XR-046). Tolerated absent for an older hub, then the
+    /// manifest is accepted unverified.
+    #[serde(default)]
+    agent_pubkey: String,
     token: String,
 }
 
@@ -75,7 +83,7 @@ pub fn pull(args: PullArgs) -> Result<()> {
             }
         }
         let base = format!("{scheme}://{}:{}/{}", s.addr, s.port, s.share_id);
-        let manifest: ShareManifest = get_json(&format!("{base}/manifest"), Some(&s.token))
+        let manifest = fetch_manifest_verified(&format!("{base}/manifest"), s)
             .with_context(|| format!("манифест шары «{}»", s.name))?;
         if manifest.entries.is_empty() {
             println!("[{}] пусто", s.name);
@@ -142,6 +150,42 @@ fn choose(manifest: &ShareManifest, args: &PullArgs, share_name: &str) -> Result
         set.insert(e.path.clone());
     }
     Ok(set)
+}
+
+/// GET the share manifest, verifying the agent's signature headers against the
+/// `agent_pubkey` pinned in the grant (XR-046). The data-path is plain HTTP, so
+/// without this check a MITM could rewrite a file and its hash together and the
+/// SHA-256 verification below would confirm the substitution. Fail-closed when
+/// a key is pinned: a missing signature (old agent or stripped headers) is a
+/// refusal with a pointer at updating the agent.
+fn fetch_manifest_verified(url: &str, share: &InviteShareDto) -> Result<ShareManifest> {
+    let resp = match ureq::get(url)
+        .set("Authorization", &format!("Bearer {}", share.token))
+        .timeout(Duration::from_secs(30))
+        .call()
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            bail!("HTTP {code}: {}", r.into_string().unwrap_or_default())
+        }
+        Err(e) => bail!("сеть: {e}"),
+    };
+    let sig = resp.header(MANIFEST_SIG_HEADER).map(str::to_string);
+    let signed_at = resp
+        .header(MANIFEST_SIGNED_AT_HEADER)
+        .and_then(|s| s.parse::<u64>().ok());
+    let body = resp.into_string().context("чтение ответа")?;
+
+    if !share.agent_pubkey.is_empty() {
+        let key = parse_agent_pubkey(&share.agent_pubkey)
+            .map_err(|e| anyhow::anyhow!("agent_pubkey из гранта: {e}"))?;
+        let (Some(sig), Some(signed_at)) = (sig, signed_at) else {
+            bail!("агент не подписал манифест: обнови xr-share на стороне агента");
+        };
+        verify_share_manifest(&sig, &key, &share.share_id, signed_at, body.as_bytes())
+            .map_err(|e| anyhow::anyhow!("подпись манифеста не сошлась ({e}): возможна подмена по пути"))?;
+    }
+    serde_json::from_str(&body).context("разбор JSON манифеста")
 }
 
 /// GET a JSON body, optionally with a bearer token. Maps a 4xx/5xx to a clear

@@ -88,6 +88,13 @@ Token is presented as a URL-safe base64 blob of the hub's `ShareToken` JSON, via
 `share_id`, not expired, valid signature); otherwise `401`/`403`. Tokens are never
 logged.
 
+The manifest response is signed with the agent's identity key (XR-046): the
+`x-xr-manifest-sig` / `x-xr-manifest-signed-at` headers carry an ed25519
+signature over the exact body bytes plus the share id, and consumers verify it
+against the `agent_pubkey` pinned from the grant. Without the identity key
+(config `identity_key` or `identity.key` next to the config) the agent serves
+unsigned and pinning consumers refuse the listing.
+
 ## Setup
 
 ```sh

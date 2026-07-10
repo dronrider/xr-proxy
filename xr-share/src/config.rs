@@ -10,9 +10,11 @@
 //! The legacy single-share form (`dir` + `share_id` at top level) is still
 //! accepted and folded into the share list, so a v1 config keeps working.
 
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use base64::Engine;
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -82,6 +84,36 @@ impl AgentConfig {
         VerifyingKey::from_bytes(&arr).context("invalid hub_pubkey")
     }
 
+    /// The agent's identity signing key, used to sign manifests (XR-046). Two
+    /// storage places exist historically: `identity_key` inside the config (the
+    /// `install` flow) and an `identity.key` file next to the config (the `init`
+    /// flow). `Ok(None)` when neither is present (a hand-written legacy config):
+    /// the agent then serves unsigned manifests and a pinning consumer rejects
+    /// them. A key that is present but undecodable is an error, not a silent
+    /// downgrade to unsigned.
+    pub fn identity_signing_key(&self, config_path: &Path) -> Result<Option<SigningKey>> {
+        let b64 = match &self.identity_key {
+            Some(k) => k.clone(),
+            None => {
+                let file = config_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("identity.key");
+                match std::fs::read_to_string(&file) {
+                    Ok(s) => s,
+                    Err(_) => return Ok(None),
+                }
+            }
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .context("decoding identity key base64")?;
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|v: Vec<u8>| anyhow::anyhow!("identity key must be 32 bytes, got {}", v.len()))?;
+        Ok(Some(SigningKey::from_bytes(&arr)))
+    }
+
     /// The full share list: `[[share]]` entries plus the legacy `dir`+`share_id`
     /// pair (if present and not already listed), so v1 and v2 configs both work.
     pub fn resolved_shares(&self) -> Vec<ShareEntry> {
@@ -137,6 +169,33 @@ mod tests {
         assert_eq!(shares.len(), 1);
         assert_eq!(shares[0].share_id, "legacy");
         assert_eq!(shares[0].path, "/srv/share");
+    }
+
+    #[test]
+    fn identity_key_from_config_or_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(key.to_bytes());
+
+        let mut cfg: AgentConfig =
+            toml::from_str("listen = \"0.0.0.0:8443\"\nhub_pubkey = \"QQ==\"").unwrap();
+
+        // Neither config field nor identity.key file -> None (unsigned legacy).
+        assert!(cfg.identity_signing_key(&cfg_path).unwrap().is_none());
+
+        // The init flow's identity.key file next to the config.
+        std::fs::write(dir.path().join("identity.key"), format!("{b64}\n")).unwrap();
+        let loaded = cfg.identity_signing_key(&cfg_path).unwrap().unwrap();
+        assert_eq!(loaded.to_bytes(), key.to_bytes());
+
+        // An inline identity_key (the install flow) wins over the file.
+        cfg.identity_key = Some(b64);
+        assert!(cfg.identity_signing_key(&cfg_path).unwrap().is_some());
+
+        // A present-but-broken key is an error, not silent unsigned serving.
+        cfg.identity_key = Some("@@@".into());
+        assert!(cfg.identity_signing_key(&cfg_path).is_err());
     }
 
     #[test]
