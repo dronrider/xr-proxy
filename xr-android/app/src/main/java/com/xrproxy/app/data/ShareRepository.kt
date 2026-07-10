@@ -115,10 +115,16 @@ class ShareRepository(private val context: Context) {
     fun inviteShares(hubUrl: String, inviteToken: String): Result<List<ShareGrant>> =
         ShareGrant.listFrom(NativeBridge.nativeInviteShares(hubUrl, inviteToken, INVITE_TIMEOUT_MS))
 
-    /** A share's file listing from the agent (token-gated). */
+    /** A share's file listing from the agent (token-gated). The manifest
+     *  signature is verified in Rust against the pinned [ShareConfig.agentPubkey]
+     *  (XR-046), so a tampered or unsigned listing surfaces here as an error. */
     fun fetchManifest(config: ShareConfig): Result<List<ManifestEntry>> {
         val token = config.tokenJson ?: return Result.failure(IllegalStateException("no token"))
-        return parseManifest(NativeBridge.nativeFetchManifest(config.agentBaseUrl, token, MANIFEST_TIMEOUT_MS))
+        return parseManifest(
+            NativeBridge.nativeFetchManifest(
+                config.agentBaseUrl, token, config.agentPubkey, MANIFEST_TIMEOUT_MS,
+            ),
+        )
     }
 
     /** One-time download of a single file into the share's app directory.
@@ -149,7 +155,7 @@ class ShareRepository(private val context: Context) {
         if (config.selection.isEmpty()) return SyncOutcome(0, 0, 0)
         val token = config.tokenJson ?: return SyncOutcome(0, 0, 0, "no token")
         val res = NativeBridge.nativeSyncShare(
-            config.agentBaseUrl, token, destDir(config).absolutePath,
+            config.agentBaseUrl, token, config.agentPubkey, destDir(config).absolutePath,
             config.selectionJson(), false, XFER_TIMEOUT_MS,
         )
         return runCatching {

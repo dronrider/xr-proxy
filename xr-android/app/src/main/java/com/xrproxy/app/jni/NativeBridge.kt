@@ -191,8 +191,16 @@ object NativeBridge {
 
     /** Fetch a share's manifest from the agent (presents [tokenJson]). Returns
      *  `{"entries":[{path,size,mtime,sha256}...]}` or `{"error":".."}`. Used to
-     *  populate the file picker for one-time download. */
-    external fun nativeFetchManifest(agentUrl: String, tokenJson: String, timeoutMs: Long): String
+     *  populate the file picker for one-time download. [agentPubkey] is the
+     *  identity key pinned from the grant: the agent's manifest signature is
+     *  verified against it, fail-closed (XR-046). The `manifest_unsigned` /
+     *  `manifest_signature` errors mean an old agent or a tampered reply. */
+    external fun nativeFetchManifest(
+        agentUrl: String,
+        tokenJson: String,
+        agentPubkey: String,
+        timeoutMs: Long,
+    ): String
 
     /** Pure diff for SAF storage. [manifestJson] is the agent manifest;
      *  [localJson] is `[{"path":..,"sha256":..}...]` the caller enumerated from
@@ -217,10 +225,13 @@ object NativeBridge {
      *  returns only the plan (`{"plan":{"fetch":[...],"delete":[...]}}`) so the UI
      *  can warn about deletions; with [dryRun] false it applies and also returns
      *  `{"plan":..,"report":{"fetched":[...],"deleted":[...],"failed":[...]}}`.
-     *  Mirror is true-mirror: files gone on the server are deleted locally. */
+     *  Mirror is true-mirror: files gone on the server are deleted locally.
+     *  [agentPubkey] pins the agent identity for the manifest fetch (XR-046),
+     *  as in [nativeFetchManifest]. */
     external fun nativeSyncShare(
         agentUrl: String,
         tokenJson: String,
+        agentPubkey: String,
         destDir: String,
         selectionJson: String,
         dryRun: Boolean,
