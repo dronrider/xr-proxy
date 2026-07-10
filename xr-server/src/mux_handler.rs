@@ -11,7 +11,9 @@ use tokio::net::TcpStream;
 use tokio::time::Duration;
 
 use xr_proto::mux::{mux_handshake_server, Multiplexer};
-use xr_proto::protocol::{Codec, Command, Frame, TargetAddr};
+use xr_proto::protocol::{
+    Codec, Command, Frame, TargetAddr, CLOSE_REASON_CONNECT_FAIL, CLOSE_REASON_RESOLVE_FAIL,
+};
 
 const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -87,11 +89,19 @@ async fn handle_mux_client_lt(
             let addr_str = addr_display(&target_addr);
             let client_addr_clone = client_addr;
             tokio::spawn(async move {
-                if let Err(e) = relay_stream(mux_stream, target_addr).await {
-                    tracing::debug!("{} sid={} {} relay error: {}", client_addr_clone, stream_id, addr_str, e);
-                }
-                // Send Close to notify the client.
-                let _ = mux_clone.send_frame(stream_id, Command::Close, Vec::new()).await;
+                let reason = match relay_stream(mux_stream, target_addr).await {
+                    Ok(()) => None,
+                    Err(e) => {
+                        tracing::debug!("{} sid={} {} relay error: {}", client_addr_clone, stream_id, addr_str, e);
+                        e.close_reason()
+                    }
+                };
+                // Send Close to notify the client. Сбой установки relay (resolve
+                // или connect до апстрима) уезжает причиной в payload: по ней
+                // клиентский пул считает деградацию сервера (XR-094). Старые
+                // клиенты лишний байт игнорируют.
+                let payload = reason.map_or_else(Vec::new, |r| vec![r]);
+                let _ = mux_clone.send_frame(stream_id, Command::Close, payload).await;
             });
         }
         Ok::<(), io::Error>(())
@@ -121,6 +131,36 @@ async fn handle_mux_client_lt(
     }
 }
 
+/// Ошибка relay с классом фазы: сбой установки (resolve или connect до
+/// апстрима) отличаем от ошибок уже идущего обмена. Первый уходит клиенту
+/// причиной в Close и служит сигналом здоровья VPS (XR-094), вторые это
+/// обычная жизнь стримов (пир оборвал, идл) и в здоровье не считаются.
+enum RelayError {
+    Resolve(io::Error),
+    Connect(io::Error),
+    Io(io::Error),
+}
+
+impl RelayError {
+    fn close_reason(&self) -> Option<u8> {
+        match self {
+            RelayError::Resolve(_) => Some(CLOSE_REASON_RESOLVE_FAIL),
+            RelayError::Connect(_) => Some(CLOSE_REASON_CONNECT_FAIL),
+            RelayError::Io(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RelayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelayError::Resolve(e) => write!(f, "resolve: {}", e),
+            RelayError::Connect(e) => write!(f, "connect: {}", e),
+            RelayError::Io(e) => e.fmt(f),
+        }
+    }
+}
+
 /// Relay data between a MuxStream and a target TCP connection.
 ///
 /// MuxStream is split so the upstream (target→mux) and downstream
@@ -130,15 +170,26 @@ async fn handle_mux_client_lt(
 async fn relay_stream(
     mux_stream: xr_proto::mux::MuxStream,
     target_addr: TargetAddr,
-) -> io::Result<()> {
+) -> Result<(), RelayError> {
     // Resolve and connect to target.
-    let target_sockaddr = resolve_target(&target_addr).await?;
-    let mut target = tokio::time::timeout(
+    let target_sockaddr = resolve_target(&target_addr)
+        .await
+        .map_err(RelayError::Resolve)?;
+    let mut target = match tokio::time::timeout(
         TARGET_CONNECT_TIMEOUT,
         TcpStream::connect(target_sockaddr),
     )
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "target connect timeout"))??;
+    {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => return Err(RelayError::Connect(e)),
+        Err(_) => {
+            return Err(RelayError::Connect(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "target connect timeout",
+            )))
+        }
+    };
 
     configure_target(&target);
 
@@ -176,7 +227,7 @@ async fn relay_stream(
     });
 
     match result.await {
-        Ok(r) => r,
+        Ok(r) => r.map_err(RelayError::Io),
         Err(_) => Ok(()),
     }
 }
@@ -219,11 +270,117 @@ mod tests {
     use tokio::net::TcpListener;
     use xr_proto::mux::mux_handshake_client;
     use xr_proto::obfuscation::{ModifierStrategy, Obfuscator};
+    use xr_proto::protocol::{decode_mux_payload, encode_mux_payload};
 
     fn test_codec() -> Codec {
         let key = b"test-key-32-bytes-long-enough!!!".to_vec();
         let obfs = Obfuscator::new(key, 0xDEADBEEF, ModifierStrategy::PositionalXorRotate);
         Codec::new(obfs, 0, 0)
+    }
+
+    /// Поднять handle_mux_client_lt на локальном листенере и вернуть клиентский
+    /// сокет с пройденным mux-handshake.
+    async fn start_mux_server(codec: Codec) -> TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let scodec = codec.clone();
+        tokio::spawn(async move {
+            let (mut sock, peer) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 512];
+            let mut filled = 0;
+            let init = loop {
+                let n = sock.read(&mut buf[filled..]).await.unwrap();
+                assert!(n > 0, "клиент закрылся до MuxInit");
+                filled += n;
+                if let Some((f, _)) = scodec.decode_frame(&buf[..filled]).unwrap() {
+                    break f;
+                }
+            };
+            let _ =
+                handle_mux_client_lt(sock, peer, scodec, &init, Duration::from_secs(60)).await;
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        assert!(
+            mux_handshake_client(&mut client, &codec).await.unwrap(),
+            "handshake ok"
+        );
+        client
+    }
+
+    /// Читать кадры, пока не придёт Close (ConnectAck и прочее пропускаются).
+    async fn read_until_close(sock: &mut TcpStream, codec: &Codec) -> Frame {
+        let mut buf = vec![0u8; 4096];
+        let mut filled = 0;
+        loop {
+            while let Some((frame, consumed)) = codec.decode_frame(&buf[..filled]).unwrap() {
+                buf.copy_within(consumed..filled, 0);
+                filled -= consumed;
+                if frame.command == Command::Close {
+                    return frame;
+                }
+            }
+            let n = tokio::time::timeout(Duration::from_secs(15), sock.read(&mut buf[filled..]))
+                .await
+                .expect("сервер обязан прислать Close")
+                .unwrap();
+            assert!(n > 0, "сервер закрыл сокет без Close");
+            filled += n;
+        }
+    }
+
+    /// XR-094: сбой connect до апстрима уезжает клиенту причиной в payload
+    /// Close. Порт от только что закрытого листенера гарантирует быстрый
+    /// connection refused без DNS.
+    #[tokio::test]
+    async fn relay_connect_failure_close_carries_reason() {
+        let codec = test_codec();
+        let mut client = start_mux_server(codec.clone()).await;
+
+        let dead_port = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let target = TargetAddr::Ip(format!("127.0.0.1:{}", dead_port).parse().unwrap());
+        let wire = codec
+            .encode_frame(Command::Connect, &encode_mux_payload(1, &target.encode()))
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, &wire).await.unwrap();
+
+        let close = read_until_close(&mut client, &codec).await;
+        let (sid, reason) = decode_mux_payload(&close.payload).unwrap();
+        assert_eq!(sid, 1);
+        assert_eq!(
+            reason,
+            [CLOSE_REASON_CONNECT_FAIL],
+            "connect-сбой должен прийти причиной {} в Close",
+            CLOSE_REASON_CONNECT_FAIL
+        );
+    }
+
+    /// XR-094 (инцидент 2026-07-10): resolve-сбой (мёртвый DNS на VPS) уезжает
+    /// клиенту причиной 1 в Close. Домен в зарезервированном TLD .invalid не
+    /// резолвится нигде; если резолвер недоступен целиком, это тот же класс
+    /// ошибки resolve, причина не меняется.
+    #[tokio::test]
+    async fn relay_resolve_failure_close_carries_reason() {
+        let codec = test_codec();
+        let mut client = start_mux_server(codec.clone()).await;
+
+        let target = TargetAddr::Domain("xr094-canary.invalid".to_string(), 443);
+        let wire = codec
+            .encode_frame(Command::Connect, &encode_mux_payload(1, &target.encode()))
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, &wire).await.unwrap();
+
+        let close = read_until_close(&mut client, &codec).await;
+        let (sid, reason) = decode_mux_payload(&close.payload).unwrap();
+        assert_eq!(sid, 1);
+        assert_eq!(
+            reason,
+            [CLOSE_REASON_RESOLVE_FAIL],
+            "resolve-сбой должен прийти причиной {} в Close",
+            CLOSE_REASON_RESOLVE_FAIL
+        );
     }
 
     /// Регрессия XR-086 (корень «намертво, лечит только рестарт»): когда accept-петля
