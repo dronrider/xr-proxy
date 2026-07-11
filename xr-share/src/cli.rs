@@ -58,6 +58,11 @@ pub struct ShareArgs {
     /// reaches it (the access anchor, §9.5). Repeatable.
     #[arg(long = "invite")]
     pub invites: Vec<String>,
+    /// Mark the share reachable through the hub's relay (LLD-23 §2.4): for an
+    /// agent behind NAT, consumers fall back to the relay when the direct address
+    /// is unreachable. Needs a hub with a relay configured.
+    #[arg(long)]
+    pub relay: bool,
 }
 
 /// `xr-share install` — set up the binary + service with **no** folder binding.
@@ -92,15 +97,18 @@ pub fn install(config_path: &Path, args: InstallArgs) -> Result<()> {
     let identity = SigningKey::generate(&mut rand::thread_rng());
     let agent_pub = setup::b64(identity.verifying_key().as_bytes());
 
-    let agent_credential = match args.token.as_deref() {
+    let (agent_credential, relay_cfg) = match args.token.as_deref() {
         Some(token) => {
-            let cred = exchange(&hub, token, &agent_pub).context("обмен reg-токена на мандат")?;
+            let (cred, relay) = exchange(&hub, token, &agent_pub).context("обмен reg-токена на мандат")?;
             println!("  ✓ мандат агента получен (можно шарить без админки)");
-            Some(cred)
+            if relay.is_some() {
+                println!("  ✓ relay-дескриптор получен (шары за NAT доступны через relay)");
+            }
+            (Some(cred), relay.map(|d| crate::config::RelayAgentConfig::from_descriptor(&d)))
         }
         None => {
             println!("  ! без --token мандата нет: запросишь его позже через `install --token <reg-токен>`");
-            None
+            (None, None)
         }
     };
 
@@ -111,6 +119,7 @@ pub fn install(config_path: &Path, args: InstallArgs) -> Result<()> {
         agent_credential,
         identity_key: Some(setup::b64(&identity.to_bytes())),
         tls: None,
+        relay: relay_cfg,
         shares: Vec::new(),
         dir: None,
         share_id: None,
@@ -167,11 +176,22 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     if let Some(addr) = args.addr.as_deref() {
         body["addr"] = serde_json::json!(addr);
     }
+    if args.relay {
+        body["via_relay"] = serde_json::json!(true);
+    }
     let resp = hub_post(&format!("{}/api/v1/share/add", hub.trim_end_matches('/')), &body)
         .context("регистрация шары в хабе")?;
     let share_id = str_field(&resp, "share_id")?;
     let addr = str_field(&resp, "addr")?;
     let token = str_field(&resp, "token")?;
+
+    // A relay-reachable share gets the relay descriptor back; store it so the
+    // running agent brings up its reverse tunnel (LLD-23 §2.4).
+    if let Some(relay) = resp.get("relay").filter(|v| !v.is_null()) {
+        let desc: xr_proto::share::RelayDescriptor =
+            serde_json::from_value(relay.clone()).context("разбор relay-дескриптора")?;
+        cfg.relay = Some(crate::config::RelayAgentConfig::from_descriptor(&desc));
+    }
 
     // Persist the share locally; the running agent hot-reloads it.
     normalize_legacy(&mut cfg);
@@ -276,11 +296,23 @@ pub fn unshare(config_path: &Path, target: &str) -> Result<()> {
 
 // ── hub client ──────────────────────────────────────────────────────
 
-/// Trade a reg-token for an agent credential blob (`POST /share/exchange`).
-fn exchange(hub: &str, token: &str, agent_pubkey: &str) -> Result<String> {
+/// Trade a reg-token for an agent credential blob (`POST /share/exchange`),
+/// plus the hub's relay descriptor if it advertises one (LLD-23 §2.4).
+fn exchange(
+    hub: &str,
+    token: &str,
+    agent_pubkey: &str,
+) -> Result<(String, Option<xr_proto::share::RelayDescriptor>)> {
     let body = serde_json::json!({ "token": token, "agent_pubkey": agent_pubkey });
     let resp = hub_post(&format!("{}/api/v1/share/exchange", hub.trim_end_matches('/')), &body)?;
-    Ok(str_field(&resp, "credential")?)
+    let cred = str_field(&resp, "credential")?;
+    let relay = resp
+        .get("relay")
+        .filter(|v| !v.is_null())
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()
+        .context("разбор relay-дескриптора")?;
+    Ok((cred, relay))
 }
 
 fn hub_post(url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {

@@ -8,6 +8,8 @@ mod cli;
 mod config;
 mod manifest;
 mod pull;
+#[cfg(feature = "relay")]
+mod relay;
 mod safepath;
 mod server;
 mod setup;
@@ -178,6 +180,9 @@ async fn run(path: &Path) -> Result<()> {
     spawn_config_watcher(state.clone(), path.to_path_buf());
     // Keep manifests cheap to serve even for large shares.
     spawn_manifest_warmer(state.clone());
+    // Reverse tunnel to the relay for shares behind NAT (LLD-23), only in a build
+    // with the `relay` feature and a configured relay + credential + identity.
+    spawn_relay_uplink(&cfg, path, state.clone());
 
     let app = server::router(state);
 
@@ -209,6 +214,41 @@ async fn run(path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Bring up the relay reverse tunnel (LLD-23) when the build supports it and the
+/// config has a relay, a credential and an identity. Missing pieces are logged,
+/// not fatal: the agent still serves its direct listener.
+#[cfg(feature = "relay")]
+fn spawn_relay_uplink(cfg: &AgentConfig, path: &Path, state: Arc<AgentState>) {
+    let Some(relay) = cfg.relay.clone() else { return };
+    if !relay::relay_obf_ok(&relay.obf) {
+        tracing::warn!("relay configured but obfuscation params are invalid; reverse tunnel disabled");
+        return;
+    }
+    let (Some(cred), Ok(Some(identity))) = (cfg.agent_credential.clone(), cfg.identity_signing_key(path))
+    else {
+        tracing::warn!(
+            "relay configured but no agent_credential/identity; reverse tunnel disabled \
+             (re-run `xr-share install --token`)"
+        );
+        return;
+    };
+    match relay::spawn(state, relay, cred, identity) {
+        Ok(()) => tracing::info!("relay reverse tunnel enabled"),
+        Err(e) => tracing::warn!("relay reverse tunnel disabled: {e:#}"),
+    }
+}
+
+/// Direct-only build: a `[relay]` in the config can't be honoured, say so once.
+#[cfg(not(feature = "relay"))]
+fn spawn_relay_uplink(cfg: &AgentConfig, _path: &Path, _state: Arc<AgentState>) {
+    if cfg.relay.is_some() {
+        tracing::warn!(
+            "config has a [relay] block, but this build has no relay support \
+             (rebuild with `--features relay` to reach shares behind NAT)"
+        );
+    }
 }
 
 /// Poll the config file's mtime and swap in the new share set when it changes,

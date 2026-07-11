@@ -12,6 +12,20 @@ default = []
 # `init`) already uses ring. Enable on Linux when you want the agent to
 # terminate TLS itself instead of running behind a terminator.
 tls = ["dep:axum-server"]
+# Реверс-туннель к relay для шар за NAT (LLD-23): исходящий mux к relay,
+# регистрация, обслуживание реверс-стримов тем же роутером поверх identity-TLS
+# (self-signed из ed25519 identity-ключа через rcgen на ring). Опционально:
+# rcgen/tokio-rustls утяжеляют кросс-сборку под Windows/musl (XR-105), по
+# умолчанию агент собирается без них. Крипто-бэкенд ring, как и у остального
+# кросс-кода.
+relay = [
+    "dep:rcgen",
+    "dep:tokio-rustls",
+    "dep:hyper",
+    "dep:hyper-util",
+    "xr-proto/relay-tls",
+    "ed25519-dalek/pkcs8",
+]
 
 [dependencies]
 xr-proto = { path = "../xr-proto", features = ["share"] }
@@ -37,5 +51,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 
+# Реверс-туннель к relay (feature `relay`, default off): identity-TLS сервер над
+# реверс-стримами mux. ring-бэкенд, чтобы кросс-сборка не тянула aws-lc.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["server", "tokio", "service"], optional = true }
+
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+# Full relay data-path e2e (relay.rs tests, only built with `--features relay`):
+# a real relay, the agent uplink, and a pinned-TLS consumer over the loopback
+# forwarder. reqwest is the Android consumer's transport (xr-core).
+xr-relay = { path = "../xr-relay" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
