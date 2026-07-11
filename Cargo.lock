@@ -3342,6 +3342,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "xr-relay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "ed25519-dalek",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "xr-proto",
+]
+
+[[package]]
 name = "xr-server"
 version = "0.1.0"
 dependencies = [
