@@ -113,6 +113,12 @@ pub struct ShareRecord {
     /// Optional note.
     #[serde(default)]
     pub comment: String,
+    /// Reachable through the hub's relay (LLD-23 §2.4). When set, the hub mints a
+    /// [`RelayToken`] and puts a [`RelayGrant`] in the consumer's grant so it can
+    /// fall back to the relay if the direct address is unreachable. `#[serde(default)]`
+    /// keeps records written before this field loadable (they default to direct).
+    #[serde(default)]
+    pub via_relay: bool,
 }
 
 /// The public view of a share handed to a consumer by the hub: enough to reach
@@ -1114,6 +1120,7 @@ mod tests {
             agent_pubkey: "QQ==".into(),
             created_at: "2026-06-24T00:00:00Z".into(),
             comment: "vacation".into(),
+            via_relay: false,
         };
         let json = serde_json::to_string(&rec).unwrap();
         for forbidden in ["entries", "files", "content", "data", "manifest", "sha256", "bytes"] {
@@ -1135,6 +1142,7 @@ mod tests {
             agent_pubkey: "QQ==".into(),
             created_at: "2026-06-24T00:00:00Z".into(),
             comment: "secret note".into(),
+            via_relay: true,
         };
         let json = serde_json::to_string(&rec.info()).unwrap();
         assert!(!json.contains("owner"));

@@ -189,6 +189,7 @@ pub async fn add(
         agent_pubkey: cred.agent_pubkey.clone(),
         created_at: chrono::Utc::now().to_rfc3339(),
         comment: "self-shared (v2)".into(),
+        via_relay: false,
     };
     storage::save_share(Path::new(&state.config.server.data_dir), &share)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
