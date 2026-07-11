@@ -50,6 +50,7 @@ fn main() {
         agent_pubkey: "QWdlbnRQdWJLZXlQbGFjZWhvbGRlcjEyMzQ1Njc4OTA=".into(),
         created_at: "2026-06-24T12:00:00Z".into(),
         comment: "фотки с поездки".into(),
+        via_relay: false,
     };
     println!("=== ShareRecord (hub-stored — index entry, NO file bytes) ===");
     println!("{}\n", pretty(&record));
