@@ -1,6 +1,9 @@
 # LLD-05 — Android Rules Editor
 
-**Статус:** Draft
+**Статус:** Implemented (XR-047, 2026-07-11). Реализация адаптирована под
+четырёхвкладочное приложение: редактор открывается секцией с вкладки
+«Серверы», а не отдельной вкладкой; правила глобальные, а не per-profile;
+отличия и сценарий проверки в [tasks/XR-047.md](../tasks/XR-047.md).
 **Область:** `xr-android` (новая вкладка Rules), `xr-core` (слияние правил с пресетом), `xr-proto` (структура `UserRule`)
 **Зависимости:** [LLD-01](01-control-plane.md) — использует `Preset`, `PresetSummary`, модель merge из §3.10. [LLD-02](02-android-reliability.md) — VpnViewModel / bind-service архитектура. [LLD-06](06-android-visual.md) — `XrTheme`, `ShieldArrowIcon`, палитра.
 **Связанные документы:** [ARCHITECTURE.md §6.2](../ARCHITECTURE.md)
