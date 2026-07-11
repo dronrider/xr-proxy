@@ -68,7 +68,10 @@ pub async fn open_relay_stream(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     stream.send(&hello).await?;
     match stream.recv().await {
-        Some(reply) if reply.first() == Some(&RELAY_HELLO_OK) => Ok(stream),
+        // Exactly the one verdict byte: the relay never coalesces spliced data
+        // into the OK frame, so anything longer is a protocol violation, not
+        // payload to silently drop.
+        Some(reply) if reply == [RELAY_HELLO_OK] => Ok(stream),
         _ => Err(io::Error::new(
             io::ErrorKind::ConnectionRefused,
             "relay: source unavailable",
