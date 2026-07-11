@@ -349,7 +349,7 @@ impl HashIndex {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension(format!("tmp{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+        let tmp = tmp_sibling(path, SEQ.fetch_add(1, Ordering::Relaxed));
         let bytes = serde_json::to_vec(self).map_err(std::io::Error::other)?;
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, path).inspect_err(|_| {
@@ -357,14 +357,18 @@ impl HashIndex {
         })
     }
 
-    fn lookup(&self, rel: &str, size: u64, mtime: i64) -> Option<&str> {
+    fn lookup(&self, rel: &str, size: u64, mtime: Option<i64>) -> Option<&str> {
+        let mtime = mtime?;
         self.entries
             .get(rel)
             .filter(|e| e.size == size && e.mtime == mtime)
             .map(|e| e.sha256.as_str())
     }
 
-    fn insert(&mut self, rel: String, size: u64, mtime: i64, sha256: String) {
+    /// An unknown mtime cannot be a trustworthy key (a made-up 0 would alias
+    /// every such file), so nothing is cached and the file re-hashes each scan.
+    fn insert(&mut self, rel: String, size: u64, mtime: Option<i64>, sha256: String) {
+        let Some(mtime) = mtime else { return };
         self.entries.insert(rel, HashIndexEntry { size, mtime, sha256 });
     }
 
@@ -373,12 +377,23 @@ impl HashIndex {
     }
 }
 
-fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
+/// Modification time in whole seconds; `None` when the filesystem cannot say,
+/// which the index treats as a miss rather than trusting a made-up key.
+fn mtime_secs(meta: &std::fs::Metadata) -> Option<i64> {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+}
+
+/// Unique same-directory sibling for an atomic save. Appends to the full file
+/// name instead of swapping the extension, so sibling indexes (`a.json`,
+/// `a.dat`) can never meet on the same temp path.
+fn tmp_sibling(path: &Path, seq: u64) -> PathBuf {
+    let mut name =
+        path.file_name().map(|n| n.to_os_string()).unwrap_or_else(|| "index".into());
+    name.push(format!(".tmp{seq}"));
+    path.with_file_name(name)
 }
 
 /// Like [`scan_local_dir`], but hashing goes through a persistent [`HashIndex`]:
@@ -1374,6 +1389,25 @@ mod tests {
             let rescanned = scan_local_dir_indexed(root.path(), &mut loaded).unwrap();
             assert_ne!(rescanned[0].sha256, cold[0].sha256, "must re-hash for real");
         }
+    }
+
+    #[test]
+    fn unknown_mtime_is_a_miss_not_a_key() {
+        let mut ix = HashIndex::new();
+        ix.insert("a".into(), 5, Some(7), "h".into());
+        assert_eq!(ix.lookup("a", 5, Some(7)), Some("h"));
+        assert_eq!(ix.lookup("a", 5, None), None, "unknown mtime must never hit");
+        ix.insert("b".into(), 5, None, "h2".into());
+        assert!(!ix.entries.contains_key("b"), "unknown mtime must not be cached");
+    }
+
+    #[test]
+    fn save_tmp_sibling_keeps_the_full_file_name() {
+        // `with_extension` would collapse `a.json` and `a.dat` into the same
+        // `a.tmpN` space; appending keeps sibling indexes apart by construction.
+        let a = tmp_sibling(Path::new("/x/a.json"), 7);
+        assert_eq!(a, Path::new("/x/a.json.tmp7"));
+        assert_ne!(a, tmp_sibling(Path::new("/x/a.dat"), 7));
     }
 
     #[test]
