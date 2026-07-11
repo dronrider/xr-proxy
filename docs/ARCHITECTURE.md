@@ -109,8 +109,8 @@ Cargo-workspace + Android-модуль:
   конфликтуют с прямыми (XR-103). `MuxStream::into_io()` даёт
   `AsyncRead + AsyncWrite` поверх стрима (для hyper на агенте и слепого сплайса
   на relay).
-- [relay_client.rs](../xr-proto/src/relay_client.rs) (фича `share`) — клиент
-  relay для потребителя (LLD-23): mux к relay, `open_relay_stream` (Connect на
+- [relay_client.rs](../xr-proto/src/relay_client.rs) (фича `share`) вводит
+  клиент relay для потребителя (LLD-23): mux к relay, `open_relay_stream` (Connect на
   псевдо-таргет `xr-relay:connect`, hello с relay-токеном первым Data-кадром,
   ждёт байт `OK`), `LoopbackForwarder` (listener на `127.0.0.1:0`, каждое
   принятое соединение становится relay-стримом; HTTP-стек потребителя не
@@ -317,24 +317,25 @@ Kotlin + Jetpack Compose, Material3, MVVM без DI-фреймворка.
 периодический sanity-check раз в 5 минут. Кэш пресета живёт в
 `filesDir/presets/<name>.json`.
 
-### 4.7 xr-relay — слепой транзит шар за NAT (LLD-23, XR-103)
+### 4.7 xr-relay: слепой транзит шар за NAT (LLD-23, XR-103)
 
 Отдельный сервис на тех же VPS, что и прокси (не хаб, не xr-server: юр-чистота
 хаба и другая модель угроз прокси-выхода). Собран из тех же кирпичей `xr-proto`
 (Codec, Multiplexer, паттерны accept/semaphore). Байты не читает и не хранит.
 
-- [config.rs](../xr-relay/src/config.rs) — блок `[relay]`: адрес/порт,
+- [config.rs](../xr-relay/src/config.rs) описывает блок `[relay]`: адрес/порт,
   обфускация (общая с деплоем), `hub_pubkey` (проверка мандатов и токенов
   офлайн, приватного ключа хаба у relay нет), лимиты.
-- [registry.rs](../xr-relay/src/registry.rs) — `AgentRegistry`
+- [registry.rs](../xr-relay/src/registry.rs) вводит `AgentRegistry`
   (`agent_pubkey -> mux`, вытеснение дубля с глушением старого mux,
   generation-guard на снятии), `Counters` (байты per share, §2.6), `IpCaps`
   (кап регистраций с одного IP).
-- [lib.rs](../xr-relay/src/lib.rs) — `handle_connection` различает роль
+- В [lib.rs](../xr-relay/src/lib.rs) `handle_connection` различает роль
   соединения по первому стриму: `xr-relay:register` (агент, challenge-response,
   реестр, стрим-liveness) против `xr-relay:connect` (потребитель, hello с
   relay-токеном, поиск агента, реверс-стрим `xr-relay:reverse`, слепой сплайс
-  через `copy_bidirectional`). Агент офлайн -> Close с `CLOSE_REASON_AGENT_OFFLINE`.
+  через `copy_bidirectional`). Агент офлайн -> Close с `CLOSE_REASON_AGENT_OFFLINE`,
+  исчерпанные транзитные слоты -> `CLOSE_REASON_RELAY_BUSY`.
 
 Сигналинг на хабе: блок `[relay]` в конфиге, признак `via_relay` у шары,
 дескриптор relay агенту (ответы `exchange`/`add`) и потребителю (relay-плечо в
@@ -344,7 +345,7 @@ Kotlin + Jetpack Compose, Material3, MVVM без DI-фреймворка.
 **Не реализовано в XR-103 (data-path):** обслуживание реверс-стримов агентом
 поверх identity-TLS (`xr-share`) и pinned-TLS verifier у потребителя
 (`xr-core`/`xr-share pull`). Транзит и сигналинг готовы, оконечный E2E-TLS до
-агента — следующий шаг (тянет rustls/rcgen в релизно-хрупкую сборку агента).
+агента это следующий шаг (тянет rustls/rcgen в релизно-хрупкую сборку агента).
 
 ## 5. Протоколы
 
