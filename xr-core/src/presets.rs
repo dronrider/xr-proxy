@@ -6,6 +6,14 @@ use std::time::Duration;
 use xr_proto::config::RoutingConfig;
 use xr_proto::preset::{Preset, PresetSummary};
 
+/// Исход [`PresetCache::refresh`]: обновились до новой версии либо локальная
+/// уже актуальна. Ошибки (сеть, 404, битый JSON) идут отдельной веткой Err.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    Updated(u64),
+    UpToDate(u64),
+}
+
 /// Caches a single preset locally and fetches updates from the hub.
 pub struct PresetCache {
     cache_dir: PathBuf,
@@ -57,37 +65,43 @@ impl PresetCache {
     /// Fetch preset from hub if newer version available.
     /// Returns true if cache was updated.
     pub async fn fetch_if_stale(&mut self, timeout: Duration) -> bool {
-        let client = match reqwest::Client::builder()
+        match self.refresh(timeout).await {
+            Ok(RefreshOutcome::Updated(_)) => true,
+            Ok(RefreshOutcome::UpToDate(v)) => {
+                tracing::debug!("preset '{}' is up to date (v{})", self.preset_name, v);
+                false
+            }
+            Err(e) => {
+                tracing::warn!("preset '{}' refresh failed: {}", self.preset_name, e);
+                false
+            }
+        }
+    }
+
+    /// То же, что [`fetch_if_stale`], но с внятным исходом: ручная кнопка
+    /// «Обновить сейчас» должна отличать «актуален» от «хаб недоступен»,
+    /// bool этого не умеет.
+    pub async fn refresh(&mut self, timeout: Duration) -> Result<RefreshOutcome, String> {
+        let client = reqwest::Client::builder()
             .timeout(timeout)
             .danger_accept_invalid_certs(false)
             .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("failed to build HTTP client: {}", e);
-                return false;
-            }
-        };
+            .map_err(|e| format!("http client: {}", e))?;
 
         // Check version list first.
         let summaries_url = format!("{}/api/v1/presets", self.hub_url);
-        let summaries: Vec<PresetSummary> = match client.get(&summaries_url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.json().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("failed to parse presets list: {}", e);
-                    return false;
-                }
-            },
-            Ok(resp) => {
-                tracing::warn!("hub returned {} for presets list", resp.status());
-                return false;
-            }
-            Err(e) => {
-                tracing::info!("hub unreachable for preset check: {}", e);
-                return false;
-            }
-        };
+        let resp = client
+            .get(&summaries_url)
+            .send()
+            .await
+            .map_err(|e| format!("network: {}", e))?;
+        if !resp.status().is_success() {
+            return Err(format!("http_{}", resp.status().as_u16()));
+        }
+        let summaries: Vec<PresetSummary> = resp
+            .json()
+            .await
+            .map_err(|e| format!("bad presets list: {}", e))?;
 
         let remote_version = summaries
             .iter()
@@ -98,19 +112,10 @@ impl PresetCache {
 
         match (remote_version, local_version) {
             (Some(remote), Some(local)) if remote <= local => {
-                tracing::debug!(
-                    "preset '{}' is up to date (v{})",
-                    self.preset_name,
-                    local
-                );
-                return false;
+                return Ok(RefreshOutcome::UpToDate(local));
             }
             (None, _) => {
-                tracing::warn!(
-                    "preset '{}' not found on hub",
-                    self.preset_name
-                );
-                return false;
+                return Err("not_found".into());
             }
             _ => {}
         }
@@ -120,23 +125,18 @@ impl PresetCache {
             "{}/api/v1/presets/{}",
             self.hub_url, self.preset_name
         );
-        let preset: Preset = match client.get(&preset_url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.json().await {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("failed to parse preset: {}", e);
-                    return false;
-                }
-            },
-            Ok(resp) => {
-                tracing::warn!("hub returned {} for preset", resp.status());
-                return false;
-            }
-            Err(e) => {
-                tracing::warn!("failed to fetch preset: {}", e);
-                return false;
-            }
-        };
+        let resp = client
+            .get(&preset_url)
+            .send()
+            .await
+            .map_err(|e| format!("network: {}", e))?;
+        if !resp.status().is_success() {
+            return Err(format!("http_{}", resp.status().as_u16()));
+        }
+        let preset: Preset = resp
+            .json()
+            .await
+            .map_err(|e| format!("bad preset: {}", e))?;
 
         tracing::info!(
             "fetched preset '{}' v{} from hub",
@@ -149,8 +149,9 @@ impl PresetCache {
             tracing::warn!("failed to save preset cache: {}", e);
         }
 
+        let version = preset.version;
         self.cached = Some(preset);
-        true
+        Ok(RefreshOutcome::Updated(version))
     }
 
     /// Get the cached routing config, if any.
