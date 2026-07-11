@@ -12,3 +12,4 @@ pub mod share;
 pub mod sni;
 pub mod tunnel;
 pub mod udp_relay;
+pub mod user_rule;
