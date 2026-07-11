@@ -289,6 +289,17 @@ pub fn scan_local_dir(root: &Path) -> std::io::Result<Vec<LocalFile>> {
     scan_local_dir_indexed(root, &mut HashIndex::new())
 }
 
+/// Share-relative forward-slash path of `path` under `root`: the form manifest
+/// entries, plans and the hash index key on.
+fn rel_slash(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 // ── Persistent hash index (XR-098, LLD-24) ──────────────────────────
 //
 // Re-hashing every local file on every sync holds a multi-GB share in
@@ -431,13 +442,15 @@ fn scan_dir(
         if ft.is_dir() {
             scan_dir(root, &path, index, fresh, out)?;
         } else if ft.is_file() {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
+            // An in-flight download leftover is not local state: hashing a
+            // multi-GB partial re-reads it on every sync (it grows between
+            // attempts, so the index never matches), and once listed it lands
+            // in plan.delete, where a cancelled retry wipes the resume
+            // progress (XR-107).
+            if entry.file_name().to_string_lossy().ends_with(PART_SUFFIX) {
+                continue;
+            }
+            let rel = rel_slash(root, &path);
             let meta = entry.metadata()?;
             let (size, mtime) = (meta.len(), mtime_secs(&meta));
             let sha256 = match index.lookup(&rel, size, mtime) {
@@ -461,7 +474,9 @@ fn scan_dir(
 // seen as already-present on the next sync and never re-fetched.
 
 /// Suffix [`download_entry`] gives an in-flight download. Such a leftover is
-/// incomplete, so migration drops it instead of moving half a file.
+/// incomplete: the scan skips it, migration drops it instead of moving half a
+/// file, and [`remove_orphan_partials`] sweeps it once its target leaves the
+/// manifest.
 const PART_SUFFIX: &str = ".xrsync-part";
 
 /// Outcome of [`migrate_dir`]. `moved`/`bytes` count relocated files; `conflicts`
@@ -517,13 +532,7 @@ fn collect_dir(root: &Path, dir: &Path, out: &mut Vec<MigFile>) -> std::io::Resu
             if entry.file_name().to_string_lossy().ends_with(PART_SUFFIX) {
                 continue;
             }
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
+            let rel = rel_slash(root, &path);
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             out.push(MigFile { abs: path, rel, size });
         }
@@ -823,6 +832,7 @@ pub async fn sync_share_selected(
         None => return Err("busy".into()),
     };
     let report = apply_plan(agent_url, token, &plan, dest_root, timeout).await;
+    remove_orphan_partials(dest_root, &manifest, selection);
     if let Some(p) = index_path {
         index_apply_report(&mut index, &plan, &report, dest_root);
         let _ = index.save(p);
@@ -1062,6 +1072,56 @@ pub async fn apply_plan(
     }
 
     report
+}
+
+/// Sweep `.xrsync-part` leftovers whose target the manifest (within the
+/// selection) no longer covers. The scan does not list partials, so an orphan
+/// would otherwise sit on disk forever; one whose target is still covered
+/// stays, it is the Range-resume progress of the next fetch. A share file
+/// that itself ends in the suffix is covered by its own path and untouched.
+fn remove_orphan_partials(
+    root: &Path,
+    manifest: &ShareManifest,
+    selection: Option<&HashSet<String>>,
+) {
+    let covered: HashSet<&str> = manifest
+        .entries
+        .iter()
+        .filter(|e| path_selected(&e.path, selection))
+        .map(|e| e.path.as_str())
+        .collect();
+    let mut orphans = Vec::new();
+    collect_orphan_partials(root, root, &covered, &mut orphans);
+    for path in orphans {
+        if std::fs::remove_file(&path).is_ok() {
+            prune_empty_dirs(root, &path);
+        }
+    }
+}
+
+fn collect_orphan_partials(
+    root: &Path,
+    dir: &Path,
+    covered: &HashSet<&str>,
+    out: &mut Vec<PathBuf>,
+) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if ft.is_dir() {
+            collect_orphan_partials(root, &path, covered, out);
+        } else if ft.is_file() {
+            let rel = rel_slash(root, &path);
+            let Some(target) = rel.strip_suffix(PART_SUFFIX) else { continue };
+            if !covered.contains(rel.as_str()) && !covered.contains(target) {
+                out.push(path);
+            }
+        }
+    }
 }
 
 /// Remove now-empty parent directories up to (not including) `root`.
@@ -1319,6 +1379,60 @@ mod tests {
         let partial: Vec<_> = local.iter().filter(|f| f.path == "a.txt").cloned().collect();
         let plan = plan_sync(&m, &partial);
         assert_eq!(plan.fetch.iter().map(|e| e.path.clone()).collect::<Vec<_>>(), vec!["sub/b.bin"]);
+    }
+
+    #[test]
+    fn scan_skips_download_partials() {
+        // A cancelled download leaves a multi-GB `.xrsync-part` behind. Listing
+        // it would re-hash it on every sync and, worse, put it in plan.delete,
+        // where the delete pass of a re-cancelled retry wipes the resume
+        // progress (XR-107).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.bin"), b"done").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/b.bin.xrsync-part"), b"half").unwrap();
+
+        let local = scan_local_dir(dir.path()).unwrap();
+        assert_eq!(
+            local.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["a.bin"]
+        );
+
+        // Through the plan: the pending fetch stays, no mirror-delete appears.
+        let m = manifest(vec![entry("a.bin", &local[0].sha256), entry("sub/b.bin", "x")]);
+        let plan = plan_sync(&m, &local);
+        assert!(plan.delete.is_empty(), "partial must not be mirror-deleted");
+        assert_eq!(
+            plan.fetch.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            vec!["sub/b.bin"]
+        );
+    }
+
+    #[test]
+    fn orphan_partials_swept_when_target_leaves_manifest() {
+        // With partials invisible to the scan, one whose file left the share
+        // needs its own sweep or it lives forever.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/gone.bin.xrsync-part"), b"orphan").unwrap();
+        std::fs::write(dir.path().join("keep.bin.xrsync-part"), b"resume").unwrap();
+        std::fs::write(dir.path().join("named.xrsync-part"), b"real").unwrap();
+
+        let m = manifest(vec![entry("keep.bin", "k"), entry("named.xrsync-part", "n")]);
+        remove_orphan_partials(dir.path(), &m, None);
+
+        // The orphan is gone together with its now-empty directory ...
+        assert!(!dir.path().join("sub").exists());
+        // ... the resumable partial of a still-covered target stays ...
+        assert!(dir.path().join("keep.bin.xrsync-part").exists());
+        // ... and a share file that itself ends in the suffix is untouched.
+        assert!(dir.path().join("named.xrsync-part").exists());
+
+        // Unticking the target orphans its partial the same way.
+        let sel: HashSet<String> = ["named.xrsync-part".to_string()].into_iter().collect();
+        remove_orphan_partials(dir.path(), &m, Some(&sel));
+        assert!(!dir.path().join("keep.bin.xrsync-part").exists());
+        assert!(dir.path().join("named.xrsync-part").exists());
     }
 
     // ── HashIndex (XR-098) ────────────────────────────────────────────
