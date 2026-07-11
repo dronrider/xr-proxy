@@ -377,16 +377,27 @@ ip_ranges = ["91.108.56.0/22", "2001:b28:f23d::/48"]
 `Router::resolve()`. Поддержка: exact, wildcard (`*.domain`), CIDR (IPv4/IPv6),
 GeoIP (за feature-flag).
 
-На роутере конфиг лежит в `/etc/xr-proxy/config.toml`, на Android —
-генерируется в `VpnViewModel.buildRoutingToml()` из захардкоженного пресета +
-ручной ввод в режиме `custom`.
+На роутере конфиг лежит в `/etc/xr-proxy/config.toml`. На Android локальных
+захардкоженных пресетов нет (XR-047): пресет приходит с хаба, а пользовательские
+правила редактируются на экране «Правила» (вкладка «Серверы») и хранятся
+глобальным упорядоченным списком в `filesDir/user_rules.json`. При Connect
+`VpnViewModel.buildConfigJson` кладёт их в конфиг движка массивом `user_rules`
+(`[{action, pattern}]` плюс `default_action`), JNI-слой конвертирует его в
+`RoutingConfig` через `xr_proto::user_rule::to_routing_config`. Валидация
+паттернов (домен / `*.wildcard` / CIDR) одна на всех:
+`xr_proto::user_rule::classify_pattern`, из Kotlin она дёргается через
+`nativeClassifyPattern`; кнопка «Обновить сейчас» на карточке пресета идёт в
+`nativeRefreshPreset` и пишет в тот же дисковый кэш, что и движок.
 
 ### 6.2 Пресеты и override'ы
 
 - Пресеты хранятся централизованно в `xr-hub` (файлы JSON на диске),
   версионируются, опционально подписываются ed25519.
-- Клиент (OpenWRT и Android) указывает `[hub] preset = "russia"` и локальные
-  `[[routing.rules]]` как override'ы с более высоким приоритетом.
+- Клиент указывает пресет хаба и локальные override'ы с более высоким
+  приоритетом: OpenWRT — `[hub] preset = "russia"` плюс `[[routing.rules]]`
+  в TOML, Android — пресет из инвайта (`hubPreset` профиля) плюс глобальный
+  `user_rules.json` (правила пользователя срабатывают первыми, первое
+  совпадение выигрывает).
 - При старте клиент делает `GET /api/v1/presets/:name` (forced fetch, timeout 2 с),
   кэширует результат локально. Фоновая задача раз в `refresh_interval_secs`
   сверяет версию по `ETag`. Обновлённые правила применяются **hot-swap'ом**
