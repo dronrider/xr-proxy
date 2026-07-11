@@ -39,6 +39,13 @@ pub struct AgentConfig {
     /// HTTP (dev / behind a TLS terminator).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
+    /// Relay for shares behind NAT (LLD-23 §2.4). Handed to the agent by the hub
+    /// at `install`/`share`; when present the agent keeps an outgoing reverse
+    /// tunnel to the relay and serves reverse-streams over identity-TLS. Absent
+    /// means direct-only. Served only in a build with the `relay` feature; a
+    /// default build parses it but logs that it's ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayAgentConfig>,
     /// The shares this agent serves. Each `[[share]]` is a `share_id` + path.
     #[serde(default, rename = "share")]
     pub shares: Vec<ShareEntry>,
@@ -61,6 +68,32 @@ pub struct ShareEntry {
     /// Optional human label (echoed back to the operator by `list`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+/// The relay this agent tunnels through for NAT'd shares (LLD-23 §2.4). Mirror
+/// of the hub's relay descriptor: dial address plus the mux obfuscation params
+/// (shared with the relay and the consumer so all three build the same codec).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RelayAgentConfig {
+    pub addr: String,
+    pub port: u16,
+    /// Named `obfuscation` in TOML (matching the hub/relay configs), carried as
+    /// `obf` on the wire descriptor.
+    #[serde(rename = "obfuscation")]
+    pub obf: xr_proto::share::RelayObf,
+}
+
+impl RelayAgentConfig {
+    /// `host:port` for dialing the relay (used by the reverse-tunnel uplink).
+    #[cfg(feature = "relay")]
+    pub fn dial(&self) -> String {
+        format!("{}:{}", self.addr, self.port)
+    }
+
+    /// Build from a hub-issued relay descriptor (captured at `install`/`share`).
+    pub fn from_descriptor(d: &xr_proto::share::RelayDescriptor) -> Self {
+        Self { addr: d.addr.clone(), port: d.port, obf: d.obf.clone() }
+    }
 }
 
 /// Read only by the `tls` feature; kept parseable in HTTP-only builds so a
@@ -209,6 +242,7 @@ mod tests {
             agent_credential: Some("blob".into()),
             identity_key: Some("priv".into()),
             tls: None,
+            relay: None,
             shares: vec![ShareEntry { share_id: "a".into(), path: "/srv/x".into(), name: Some("X".into()) }],
             dir: None,
             share_id: None,
