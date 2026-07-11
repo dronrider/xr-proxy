@@ -10,6 +10,35 @@ pub struct HubConfig {
     pub signing: Option<SigningConfig>,
     #[serde(default)]
     pub invites: InvitesConfig,
+    /// The relay this hub advertises for NAT'd shares (LLD-23 §2.4). One relay per
+    /// hub in MVP. Absent means the hub has no relay: `via_relay` shares still work
+    /// on their direct address, they just get no relay fallback in the grant.
+    #[serde(default)]
+    pub relay: Option<HubRelayConfig>,
+}
+
+/// The relay descriptor the hub hands to agents (in `exchange`/`add`) and to
+/// consumers (in grants). The obfuscation params must match the relay's own
+/// config so all three build the same mux codec (LLD-23 §3.5).
+#[derive(Debug, Clone, Deserialize)]
+pub struct HubRelayConfig {
+    pub addr: String,
+    pub port: u16,
+    /// Named `obfuscation` in TOML (matching the relay's own config), carried as
+    /// `obf` on the wire descriptor.
+    #[serde(rename = "obfuscation")]
+    pub obf: xr_proto::share::RelayObf,
+}
+
+impl HubRelayConfig {
+    /// Project to the wire descriptor handed to the agent.
+    pub fn descriptor(&self) -> xr_proto::share::RelayDescriptor {
+        xr_proto::share::RelayDescriptor {
+            addr: self.addr.clone(),
+            port: self.port,
+            obf: self.obf.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
