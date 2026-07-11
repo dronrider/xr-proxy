@@ -415,7 +415,7 @@ impl AsyncRead for MuxStreamIo {
             match this.rx.poll_recv(cx) {
                 Poll::Ready(Some(data)) => {
                     // Empty payloads (e.g. a bare ConnectAck routed here) carry no
-                    // bytes — skip rather than signal EOF.
+                    // bytes, so skip rather than signal EOF.
                     if data.is_empty() {
                         continue;
                     }

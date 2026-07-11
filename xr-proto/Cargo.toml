@@ -11,10 +11,11 @@ geoip = ["maxminddb"]
 # на потребителе), так что через xr-core фича доезжает и до xr-client; это не
 # утяжеляет его, ed25519-dalek и так в зависимостях xr-core (update.rs). Тесты
 # компилируют крипто безусловно через dev-dependency.
-share = ["dep:ed25519-dalek"]
+share = ["dep:ed25519-dalek", "dep:serde_json"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", optional = true }
 toml = "0.8"
 base64 = "0.22"
 rand = "0.8"
