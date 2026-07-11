@@ -240,7 +240,7 @@ impl RelayGrant {
 /// agent (LLD-23 §3.7). Bound to a `share_id` **and** the target `agent_pubkey`,
 /// expires at `exp`, carries a detached ed25519 signature over
 /// [`relay_token_signing_bytes`]. The relay verifies it offline with the hub's
-/// pinned key — a distinct, coarser gate than the [`ShareToken`] the agent still
+/// pinned key. It is a distinct, coarser gate than the [`ShareToken`] the agent still
 /// checks end-to-end. A distinct domain prefix keeps it from ever being replayed
 /// as a share token or agent credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
