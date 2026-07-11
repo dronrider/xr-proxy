@@ -254,6 +254,21 @@ pub struct RelayToken {
     pub signature: String,
 }
 
+/// The agent's answer to the relay's registration challenge (LLD-23 §2.1): its
+/// hub-signed [`AgentCredential`] plus an ed25519 signature over the relay's
+/// nonce made with the **identity key**. Together they prove both "the hub
+/// vouches for this pubkey" (credential) and "I hold the matching private key"
+/// (nonce signature), so the relay admits the mux into the registry under
+/// `credential.agent_pubkey`. The nonce is single-use and unpredictable, so this
+/// is replay-safe without any clock (LLD-23 §5.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayRegister {
+    pub credential: AgentCredential,
+    /// Base64 (standard) of the 64-byte ed25519 signature over
+    /// [`relay_register_signing_bytes`].
+    pub nonce_sig: String,
+}
+
 impl ShareRecord {
     /// Project to the consumer-facing [`ShareInfo`] (drops owner/comment/time).
     pub fn info(&self) -> ShareInfo {
@@ -294,6 +309,17 @@ pub fn agent_credential_signing_bytes(agent_pubkey: &str, exp: u64) -> Vec<u8> {
 /// replayed as a share token or agent credential.
 pub fn relay_token_signing_bytes(share_id: &str, agent_pubkey: &str, exp: u64) -> Vec<u8> {
     format!("xr-relay-token\nv1\n{share_id}\n{agent_pubkey}\n{exp}").into_bytes()
+}
+
+/// The exact bytes an agent signs to answer the relay's registration challenge
+/// (LLD-23 §2.1): a domain prefix followed by the relay's raw nonce. The prefix
+/// keeps a captured registration signature from being replayable as any other
+/// ed25519 signature in the system; the nonce being single-use keeps it from
+/// being replayed as another registration.
+pub fn relay_register_signing_bytes(nonce: &[u8]) -> Vec<u8> {
+    let mut bytes = b"xr-relay-register\nv1\n".to_vec();
+    bytes.extend_from_slice(nonce);
+    bytes
 }
 
 /// Response header carrying the agent's detached manifest signature (base64 of
@@ -434,12 +460,42 @@ impl core::fmt::Display for RelayTokenError {
 
 impl std::error::Error for RelayTokenError {}
 
+/// Why a [`verify_relay_register`] check failed (LLD-23 §2.1). The relay logs the
+/// variant and drops the connection; every variant means "do not admit".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayRegisterError {
+    /// The embedded [`AgentCredential`] didn't verify against the hub key.
+    BadCredential,
+    /// `credential.agent_pubkey` was not a valid ed25519 key.
+    MalformedKey,
+    /// `nonce_sig` was not valid base64 or not 64 bytes.
+    MalformedSignature,
+    /// The nonce signature didn't verify against the credential's key (the
+    /// registrant does not hold the private key it claims).
+    BadSignature,
+}
+
+impl core::fmt::Display for RelayRegisterError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = match self {
+            Self::BadCredential => "agent credential does not verify",
+            Self::MalformedKey => "malformed agent public key",
+            Self::MalformedSignature => "malformed registration signature",
+            Self::BadSignature => "registration nonce signature does not verify",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::error::Error for RelayRegisterError {}
+
 #[cfg(any(feature = "share", test))]
 mod crypto {
     use super::{
-        agent_credential_signing_bytes, manifest_signing_bytes, relay_token_signing_bytes,
-        token_signing_bytes, AgentCredential, AgentCredentialError, ManifestSigError, RelayToken,
-        RelayTokenError, ShareToken, ShareTokenError,
+        agent_credential_signing_bytes, manifest_signing_bytes, relay_register_signing_bytes,
+        relay_token_signing_bytes, token_signing_bytes, AgentCredential, AgentCredentialError,
+        ManifestSigError, RelayRegister, RelayRegisterError, RelayToken, RelayTokenError,
+        ShareToken, ShareTokenError,
     };
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
@@ -576,6 +632,49 @@ mod crypto {
             .map_err(|_| RelayTokenError::BadSignature)
     }
 
+    /// Answer a relay registration challenge (LLD-23 §2.1): sign the relay's
+    /// `nonce` with the **identity key** and bundle it with the hub-issued
+    /// `credential`. The agent calls this on the register stream.
+    pub fn sign_relay_register(
+        identity: &SigningKey,
+        credential: &AgentCredential,
+        nonce: &[u8],
+    ) -> RelayRegister {
+        let sig = identity.sign(&relay_register_signing_bytes(nonce));
+        RelayRegister {
+            credential: credential.clone(),
+            nonce_sig: base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()),
+        }
+    }
+
+    /// Verify a registration answer (LLD-23 §2.1) at wall-clock `now_unix` against
+    /// the `nonce` the relay just sent. On success returns the proven
+    /// `agent_pubkey` (base64) the mux registers under. Fails closed: a bad hub
+    /// mandate, a malformed key/signature, or a nonce signature that doesn't
+    /// match the credential's key all reject.
+    pub fn verify_relay_register(
+        reg: &RelayRegister,
+        hub_key: &VerifyingKey,
+        nonce: &[u8],
+        now_unix: u64,
+    ) -> Result<String, RelayRegisterError> {
+        verify_agent_credential(&reg.credential, hub_key, now_unix)
+            .map_err(|_| RelayRegisterError::BadCredential)?;
+        let agent_key = parse_agent_pubkey(&reg.credential.agent_pubkey)
+            .map_err(|_| RelayRegisterError::MalformedKey)?;
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(reg.nonce_sig.trim())
+            .map_err(|_| RelayRegisterError::MalformedSignature)?;
+        let sig_arr: [u8; 64] = sig_bytes
+            .try_into()
+            .map_err(|_| RelayRegisterError::MalformedSignature)?;
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        agent_key
+            .verify(&relay_register_signing_bytes(nonce), &signature)
+            .map_err(|_| RelayRegisterError::BadSignature)?;
+        Ok(reg.credential.agent_pubkey.clone())
+    }
+
     /// Sign a manifest as served (XR-046): the **agent's identity key** over
     /// [`manifest_signing_bytes`]. Returns the base64 signature for the
     /// [`MANIFEST_SIG_HEADER`](super::MANIFEST_SIG_HEADER) response header;
@@ -626,9 +725,9 @@ mod crypto {
 
 #[cfg(any(feature = "share", test))]
 pub use crypto::{
-    parse_agent_pubkey, sign_agent_credential, sign_relay_token, sign_share_manifest,
-    sign_share_token, verify_agent_credential, verify_relay_token, verify_share_manifest,
-    verify_share_token,
+    parse_agent_pubkey, sign_agent_credential, sign_relay_register, sign_relay_token,
+    sign_share_manifest, sign_share_token, verify_agent_credential, verify_relay_register,
+    verify_relay_token, verify_share_manifest, verify_share_token,
 };
 
 #[cfg(test)]
@@ -894,6 +993,64 @@ mod tests {
             verify_relay_token(&bad, &vk, "share-1", agent, 4999),
             Err(RelayTokenError::MalformedSignature)
         );
+    }
+
+    #[test]
+    fn test_relay_register_challenge_response() {
+        // The hub issues the agent's credential; the agent answers the relay's
+        // nonce challenge with its identity key. A valid answer proves the pubkey.
+        let hub = hub_key();
+        let hub_vk = hub.verifying_key();
+        let identity = SigningKey::from_bytes(&[13u8; 32]);
+        let agent_pk = base64::engine::general_purpose::STANDARD
+            .encode(identity.verifying_key().as_bytes());
+        let cred = sign_agent_credential(&hub, &agent_pk, 5000);
+        let nonce = [7u8; 32];
+
+        let reg = sign_relay_register(&identity, &cred, &nonce);
+        assert_eq!(
+            verify_relay_register(&reg, &hub_vk, &nonce, 4999),
+            Ok(agent_pk.clone())
+        );
+
+        // Replay against a different nonce -> BadSignature (nonce is single-use).
+        assert_eq!(
+            verify_relay_register(&reg, &hub_vk, &[9u8; 32], 4999),
+            Err(RelayRegisterError::BadSignature)
+        );
+
+        // A credential the hub never signed -> BadCredential.
+        let forged_hub = SigningKey::from_bytes(&[99u8; 32]);
+        let forged_cred = sign_agent_credential(&forged_hub, &agent_pk, 5000);
+        let forged_reg = sign_relay_register(&identity, &forged_cred, &nonce);
+        assert_eq!(
+            verify_relay_register(&forged_reg, &hub_vk, &nonce, 4999),
+            Err(RelayRegisterError::BadCredential)
+        );
+
+        // Right credential but the nonce signed by a key that isn't the
+        // credential's identity -> BadSignature (does not hold the private key).
+        let impostor = SigningKey::from_bytes(&[14u8; 32]);
+        let impostor_reg = sign_relay_register(&impostor, &cred, &nonce);
+        assert_eq!(
+            verify_relay_register(&impostor_reg, &hub_vk, &nonce, 4999),
+            Err(RelayRegisterError::BadSignature)
+        );
+
+        // Expired credential -> BadCredential.
+        assert_eq!(
+            verify_relay_register(&reg, &hub_vk, &nonce, 5001),
+            Err(RelayRegisterError::BadCredential)
+        );
+    }
+
+    #[test]
+    fn relay_register_domain_separated() {
+        // The registration signing bytes must not collide with any token form.
+        let r = relay_register_signing_bytes(b"nonce");
+        assert_ne!(r, token_signing_bytes("nonce", 0));
+        assert_ne!(r, relay_token_signing_bytes("nonce", "a", 0));
+        assert_ne!(r, manifest_signing_bytes("nonce", 0, b""));
     }
 
     #[test]
