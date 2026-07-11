@@ -225,7 +225,11 @@ fn parse_config(json: &str) -> Result<VpnConfig, String> {
     let padding_max = get_num("padding_max").unwrap_or(128) as u8;
     let on_server_down = get_str("on_server_down").unwrap_or_else(|_| "block".into());
 
-    let routing = if let Ok(toml_str) = get_str("routing_toml") {
+    // Пользовательские правила (LLD-05): массив `user_rules` главнее
+    // `routing_toml`. Легаси-ветка с TOML остаётся для старых конфигов.
+    let routing = if let Some(cfg) = parse_user_rules(json) {
+        cfg
+    } else if let Ok(toml_str) = get_str("routing_toml") {
         toml::from_str::<RoutingConfig>(&toml_str).unwrap_or_else(|e| {
             tracing::warn!("Failed to parse routing TOML: {}", e);
             default_routing()
@@ -289,6 +293,25 @@ fn parse_servers(json: &str) -> Vec<xr_proto::config::ServerEntry> {
             })
         })
         .collect()
+}
+
+/// Собирает `RoutingConfig` из массива `user_rules` (LLD-05): `[{"action":
+/// "proxy","pattern":"*.github.com"}, ...]` плюс строка `default_action`
+/// рядом (по умолчанию "direct"). `None`, когда ключа нет вовсе (легаси-конфиг
+/// со старым приложением). Битые записи выбрасывает `to_routing_config`
+/// с WARN, старт туннеля они не валят.
+fn parse_user_rules(json: &str) -> Option<RoutingConfig> {
+    let value = serde_json::from_str::<serde_json::Value>(json).ok()?;
+    let arr = value.get("user_rules")?.as_array()?;
+    let rules: Vec<xr_proto::user_rule::UserRule> = arr
+        .iter()
+        .filter_map(|item| serde_json::from_value(item.clone()).ok())
+        .collect();
+    let default_action = value
+        .get("default_action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("direct");
+    Some(xr_proto::user_rule::to_routing_config(&rules, default_action))
 }
 
 /// Extract the `dns_resolvers` JSON array of strings, e.g.
@@ -866,6 +889,86 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeApplyInvite(
             "errors": [e],
         })
         .to_string(),
+    };
+    jstring_into_raw(&mut env, json)
+}
+
+// ── Редактор правил (LLD-05, XR-047) ────────────────────────────────
+
+/// Классифицировать паттерн пользовательского правила. Валидация одна на
+/// Rust и Kotlin, поэтому UI зовёт её сюда, а не дублирует regex'ами.
+/// Возвращает JSON: `{"kind":"domain|wildcard|cidr4|cidr6","normalized":".."}`
+/// либо `{"kind":"invalid","error":"текст для пользователя"}`.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeClassifyPattern(
+    mut env: JNIEnv,
+    _class: JClass,
+    raw: JString,
+) -> jstring {
+    let raw_str = match read_jstring(&mut env, &raw) {
+        Ok(s) => s,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let normalized = xr_proto::user_rule::normalize_pattern(&raw_str);
+    let json = match xr_proto::user_rule::classify_pattern(&normalized) {
+        Ok(kind) => serde_json::json!({
+            "kind": kind.as_str(),
+            "normalized": normalized,
+        })
+        .to_string(),
+        Err(e) => serde_json::json!({
+            "kind": "invalid",
+            "error": e.to_string(),
+        })
+        .to_string(),
+    };
+    jstring_into_raw(&mut env, json)
+}
+
+/// Форсированный fetch пресета с хаба («Обновить сейчас» на карточке
+/// пресета). Обновляет тот же дисковый кэш, из которого движок собирает
+/// merged-роутер при старте и фоновом рефреше. Возвращает JSON:
+/// `{"updated":bool,"version":N}` либо `{"error":".."}` (сеть, not_found).
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeRefreshPreset(
+    mut env: JNIEnv,
+    _class: JClass,
+    hub_url: JString,
+    preset: JString,
+    cache_dir: JString,
+    timeout_ms: jlong,
+) -> jstring {
+    let hub_url = match read_jstring(&mut env, &hub_url) {
+        Ok(s) => s,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let preset = match read_jstring(&mut env, &preset) {
+        Ok(s) => s,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let cache_dir = match read_jstring(&mut env, &cache_dir) {
+        Ok(s) => PathBuf::from(s),
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+
+    let result = with_onboarding_runtime(async {
+        let mut cache = xr_core::presets::PresetCache::new(&cache_dir, &hub_url, &preset);
+        cache.load_from_disk();
+        cache.refresh(timeout).await
+    });
+    let json = match result {
+        Ok(Ok(outcome)) => {
+            let (updated, version) = match outcome {
+                xr_core::presets::RefreshOutcome::Updated(v) => (true, v),
+                xr_core::presets::RefreshOutcome::UpToDate(v) => (false, v),
+            };
+            serde_json::json!({ "updated": updated, "version": version }).to_string()
+        }
+        Ok(Err(e)) | Err(e) => {
+            journal_log("WARN", "rules", &format!("обновление пресета {}: {}", preset, e));
+            json_error(&e)
+        }
     };
     jstring_into_raw(&mut env, json)
 }
@@ -1460,6 +1563,59 @@ domains = ["youtube.com", "*.youtube.com"]"#;
     fn parse_dns_resolvers_with_whitespace() {
         let json = r#"{"dns_resolvers": [ "1.1.1.1" , "8.8.4.4" ]}"#;
         assert_eq!(parse_dns_resolvers(json), vec!["1.1.1.1", "8.8.4.4"]);
+    }
+
+    /// Пользовательские правила (LLD-05): массив `user_rules` главнее
+    /// `routing_toml`, порядок сохраняется, домены и CIDR расходятся по полям.
+    #[test]
+    fn parse_config_user_rules_take_precedence_over_toml() {
+        let json = r#"{
+            "server_address": "1.2.3.4",
+            "server_port": 8443,
+            "obfuscation_key": "a2V5",
+            "routing_toml": "default_action = \"proxy\"",
+            "default_action": "direct",
+            "user_rules": [
+                {"action": "direct", "pattern": "youtube.com"},
+                {"action": "proxy", "pattern": "*.github.corp"},
+                {"action": "proxy", "pattern": "10.0.0.0/8"}
+            ]
+        }"#;
+        let cfg = parse_config(json).unwrap();
+        assert_eq!(cfg.routing.default_action, "direct");
+        assert_eq!(cfg.routing.rules.len(), 3);
+        assert_eq!(cfg.routing.rules[0].domains, vec!["youtube.com"]);
+        assert_eq!(cfg.routing.rules[0].action, "direct");
+        assert_eq!(cfg.routing.rules[2].ip_ranges, vec!["10.0.0.0/8"]);
+    }
+
+    /// Пустой список правил это валидный конфиг: только default_action,
+    /// пресет хаба доклеится в движке.
+    #[test]
+    fn parse_config_empty_user_rules() {
+        let json = r#"{
+            "server_address": "1.2.3.4",
+            "server_port": 8443,
+            "obfuscation_key": "a2V5",
+            "default_action": "direct",
+            "user_rules": []
+        }"#;
+        let cfg = parse_config(json).unwrap();
+        assert_eq!(cfg.routing.default_action, "direct");
+        assert!(cfg.routing.rules.is_empty());
+    }
+
+    /// Легаси-конфиг без `user_rules` идёт по старой ветке routing_toml.
+    #[test]
+    fn parse_config_without_user_rules_falls_back_to_toml() {
+        let json = r#"{
+            "server_address": "1.2.3.4",
+            "server_port": 8443,
+            "obfuscation_key": "a2V5",
+            "routing_toml": "default_action = \"proxy\""
+        }"#;
+        let cfg = parse_config(json).unwrap();
+        assert_eq!(cfg.routing.default_action, "proxy");
     }
 
     /// Пул серверов в JNI-конфиге (LLD-10): массив объектов, порядок в массиве
