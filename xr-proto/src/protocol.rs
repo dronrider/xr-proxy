@@ -59,6 +59,9 @@ pub const CLOSE_REASON_CONNECT_FAIL: u8 = 2;
 /// таймаут-минуты. Старые клиенты лишний байт в Close игнорируют, wire
 /// совместим.
 pub const CLOSE_REASON_AGENT_OFFLINE: u8 = 3;
+/// Relay -> потребитель: транзитных слотов нет (`max_streams` исчерпан). Отдельный
+/// код, чтобы перегруз relay в логах и диагностике не выглядел как агент-офлайн.
+pub const CLOSE_REASON_RELAY_BUSY: u8 = 4;
 
 impl Command {
     fn from_byte(b: u8) -> Option<Self> {

@@ -17,15 +17,20 @@ pub mod registry;
 
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
 use xr_proto::mux::{mux_handshake_server, mux_open_stream, Multiplexer};
-use xr_proto::protocol::{Codec, Command, Frame, TargetAddr, CLOSE_REASON_AGENT_OFFLINE};
+use xr_proto::protocol::{
+    Codec, Command, Frame, TargetAddr, CLOSE_REASON_AGENT_OFFLINE, CLOSE_REASON_RELAY_BUSY,
+};
 use xr_proto::relay_client::{
     RELAY_CONNECT_TARGET, RELAY_HELLO_OK, RELAY_REGISTER_TARGET, RELAY_REVERSE_TARGET,
 };
@@ -91,7 +96,11 @@ pub async fn serve(
         let (tcp, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
+                // A persistent accept error (EMFILE and friends) would spin this
+                // loop hot and flood the log; a short breather lets descriptors
+                // free up while the agent tunnels stay alive.
                 tracing::warn!("relay accept failed: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
@@ -262,15 +271,62 @@ async fn handle_register(
     Ok(())
 }
 
+/// Passthrough io that counts the bytes read off the inner end into a shared
+/// total. Wrapping both splice ends counts both transit directions as the bytes
+/// flow, so the per-share total survives any splice outcome (peer reset, the
+/// lifetime cap), unlike `copy_bidirectional`'s return value, which is lost on
+/// error and timeout.
+struct CountedIo<T> {
+    inner: T,
+    moved: Arc<AtomicU64>,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for CountedIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            this.moved.fetch_add((buf.filled().len() - before) as u64, Ordering::Relaxed);
+        }
+        poll
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for CountedIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// Handle one consumer transit stream (LLD-23 §2.2): read the hello token, verify
 /// it offline, find the agent, open a reverse-stream and splice. Failures answer
-/// with `Close` (agent offline gets [`CLOSE_REASON_AGENT_OFFLINE`]).
+/// with `Close` (agent offline gets [`CLOSE_REASON_AGENT_OFFLINE`], an exhausted
+/// stream cap [`CLOSE_REASON_RELAY_BUSY`]).
 async fn handle_connect(stream_id: u32, mux: Arc<Multiplexer>, state: Arc<RelayState>) {
     let permit = match state.stream_sem.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
             tracing::warn!("relay stream cap reached, refusing");
-            let _ = mux.send_frame(stream_id, Command::Close, Vec::new()).await;
+            let _ = mux
+                .send_frame(stream_id, Command::Close, vec![CLOSE_REASON_RELAY_BUSY])
+                .await;
             return;
         }
     };
@@ -334,14 +390,15 @@ async fn handle_connect(stream_id: u32, mux: Arc<Multiplexer>, state: Arc<RelayS
     if consumer.send(&[RELAY_HELLO_OK]).await.is_err() {
         return;
     }
-    let mut c_io = consumer.into_io();
-    let mut a_io = reverse.into_io();
-    let moved =
-        tokio::time::timeout(state.splice_lifetime, tokio::io::copy_bidirectional(&mut c_io, &mut a_io))
-            .await;
-    if let Ok(Ok((a2b, b2a))) = moved {
-        state.counters.add(&token.share_id, a2b + b2a);
-    }
+    let moved = Arc::new(AtomicU64::new(0));
+    let mut c_io = CountedIo { inner: consumer.into_io(), moved: moved.clone() };
+    let mut a_io = CountedIo { inner: reverse.into_io(), moved: moved.clone() };
+    let _ = tokio::time::timeout(
+        state.splice_lifetime,
+        tokio::io::copy_bidirectional(&mut c_io, &mut a_io),
+    )
+    .await;
+    state.counters.add(&token.share_id, moved.load(Ordering::Relaxed));
     drop(permit);
 }
 
@@ -369,9 +426,18 @@ mod tests {
 
     /// Start a relay on an ephemeral port; returns its address and shared state.
     async fn start_relay(hub: &SigningKey) -> (SocketAddr, Arc<RelayState>) {
+        start_relay_tuned(hub, 64, Duration::from_secs(30)).await
+    }
+
+    /// Same, with the stream cap and splice lifetime under test control.
+    async fn start_relay_tuned(
+        hub: &SigningKey,
+        max_streams: usize,
+        splice_lifetime: Duration,
+    ) -> (SocketAddr, Arc<RelayState>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let state = RelayState::new(hub.verifying_key(), 64, 8, Duration::from_secs(30));
+        let state = RelayState::new(hub.verifying_key(), max_streams, 8, splice_lifetime);
         let s = state.clone();
         let codec = test_codec();
         tokio::spawn(async move { serve(listener, codec, s, 64).await });
@@ -515,5 +581,54 @@ mod tests {
             got.extend_from_slice(&stream.recv().await.unwrap());
         }
         assert_eq!(got, blob, "opaque bytes must pass through the splice unchanged");
+    }
+
+    /// Regression: bytes moved before the splice is cut must reach the counter.
+    /// Only a clean `copy_bidirectional` exit used to be counted, so the lifetime
+    /// cap (and any io error) discarded everything already transited.
+    #[tokio::test]
+    async fn test_counters_survive_splice_lifetime_cut() {
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let identity = SigningKey::from_bytes(&[7u8; 32]);
+        let agent_pk = b64(identity.verifying_key().as_bytes());
+        // A tiny lifetime: the cap cuts the splice, not either side closing.
+        let (relay_addr, state) = start_relay_tuned(&hub, 64, Duration::from_millis(200)).await;
+        let _agent = spawn_agent(relay_addr, &hub, identity).await;
+
+        let token = sign_relay_token(&hub, "share-cut", &agent_pk, now_unix() + 3600);
+        let mux = connect_relay_mux(&relay_addr.to_string(), test_codec()).await.unwrap();
+        let mut stream = open_relay_stream(&mux, &token).await.unwrap();
+
+        stream.send(b"bytes before the cut").await.unwrap();
+        assert_eq!(stream.recv().await.unwrap(), b"bytes before the cut");
+
+        // Keep the stream open until the cap fires and the total shows up.
+        for _ in 0..100 {
+            if state.counters.get("share-cut") > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state.counters.get("share-cut") > 0,
+            "bytes transited before the cut must be counted"
+        );
+    }
+
+    /// An exhausted stream cap refuses the consumer (Close with
+    /// [`CLOSE_REASON_RELAY_BUSY`]) instead of hanging or dropping the connection.
+    #[tokio::test]
+    async fn test_relay_stream_cap_refuses() {
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let identity = SigningKey::from_bytes(&[7u8; 32]);
+        let agent_pk = b64(identity.verifying_key().as_bytes());
+        let (relay_addr, _state) = start_relay_tuned(&hub, 0, Duration::from_secs(30)).await;
+        let _agent = spawn_agent(relay_addr, &hub, identity).await;
+
+        let token = sign_relay_token(&hub, "share-1", &agent_pk, now_unix() + 3600);
+        let mux = connect_relay_mux(&relay_addr.to_string(), test_codec()).await.unwrap();
+        // The refusal lands before ConnectAck, so it surfaces as a failed open
+        // (not the post-hello ConnectionRefused mapping).
+        assert!(open_relay_stream(&mux, &token).await.is_err());
     }
 }

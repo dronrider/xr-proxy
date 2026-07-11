@@ -7,7 +7,7 @@ pub mod obfuscation;
 pub mod preset;
 pub mod protocol;
 /// Consumer-side relay client (LLD-23). Gated with the `share` feature (and in
-/// tests) — only file-sharing consumers/agents pull it, never the OpenWRT client.
+/// tests): only file-sharing consumers/agents pull it, never the OpenWRT client.
 #[cfg(any(feature = "share", test))]
 pub mod relay_client;
 pub mod routing;
