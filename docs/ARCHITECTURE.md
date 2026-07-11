@@ -342,10 +342,30 @@ Kotlin + Jetpack Compose, Material3, MVVM без DI-фреймворка.
 гранте с минтом `RelayToken`). Потребитель пробует прямой адрес первым, relay
 последним (модель перебора XR-050).
 
-**Не реализовано в XR-103 (data-path):** обслуживание реверс-стримов агентом
-поверх identity-TLS (`xr-share`) и pinned-TLS verifier у потребителя
-(`xr-core`/`xr-share pull`). Транзит и сигналинг готовы, оконечный E2E-TLS до
-агента это следующий шаг (тянет rustls/rcgen в релизно-хрупкую сборку агента).
+Оконечный E2E-TLS (LLD-23 §2.3) поверх сплайса: агент серверит реверс-стримы
+через тот же axum-роутер по identity-TLS (self-signed сертификат из ed25519
+identity-ключа, rcgen на ring), потребитель проверяет не CA-цепочку, а
+`SPKI == agent_pubkey` из гранта (кастомный rustls-verifier, имя хоста
+игнорируется). Relay видит только шифртекст, подмена сертификата ломает пиннинг.
+
+- [relay_tls.rs](../xr-proto/src/relay_tls.rs) (фича `relay-tls`) даёт verifier
+  и билдеры rustls-конфигов на ring; rustls уже в дереве через reqwest,
+  кросс-сборка не страдает. Генерация сертификата (rcgen) сюда не тащится.
+- В [relay.rs](../xr-share/src/relay.rs) (фича `relay`, default off) агент держит
+  исходящий mux к relay с экспоненциальным бэкофом, регистрируется
+  (challenge-response), обслуживает реверс-стримы поверх identity-TLS через hyper.
+  Фича off по умолчанию: rcgen/tokio-rustls/hyper утяжеляют кросс-сборку агента
+  под Windows/musl (XR-105), обычная сборка без них.
+- В [sync.rs](../xr-core/src/sync.rs) `sync_share_grant` пробует прямой адрес
+  первым и падает на relay (pinned-TLS поверх loopback-forwarder) только при
+  недостижимости прямого (порядок XR-050). Прямой путь plain-HTTP с целостностью
+  по подписи манифеста (XR-046), relay-путь с E2E-TLS.
+
+**Осталось за пределами XR-103:** JNI/Kotlin проброс relay-плеча гранта в
+`sync_share_grant` на Android; identity-TLS на прямом листенере агента (сейчас
+прямой путь plain-HTTP, целостность закрыта подписью манифеста); relay-fallback в
+десктопном `xr-share pull`; отметка «через relay» в Admin SPA (данные уже
+отдаются, нужен пересбор встроенного SPA).
 
 ## 5. Протоколы
 
