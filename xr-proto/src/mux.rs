@@ -18,11 +18,14 @@
 //! (head-of-line, корень XR-086).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::Duration;
 
@@ -310,11 +313,248 @@ impl MuxStream {
     }
 }
 
+impl MuxStream {
+    /// Adapt this stream into an `AsyncRead + AsyncWrite` handle (LLD-23 §3.4),
+    /// so hyper can `serve_connection` over a reverse-stream on the agent and the
+    /// relay can `tokio::io::copy` two streams into each other (the blind splice).
+    /// Consumes the stream; Close travels on shutdown or on drop of the io handle,
+    /// exactly as [`MuxStream`] does. Panics if the stream was already `split()`.
+    pub fn into_io(mut self) -> MuxStreamIo {
+        let rx = self.rx.take().expect("MuxStream already split");
+        self.detached = true; // husk drop must not also send Close
+        MuxStreamIo {
+            stream_id: self.stream_id,
+            rx,
+            writer_tx: self.writer_tx.clone(),
+            alive: self.alive.clone(),
+            read_buf: Vec::new(),
+            read_pos: 0,
+            write_fut: None,
+            write_len: 0,
+            close_fut: None,
+            closed: self.closed,
+        }
+    }
+}
+
 impl Drop for MuxStream {
     fn drop(&mut self) {
         if self.detached {
             return;
         }
+        if !self.closed && self.alive.load(Ordering::Relaxed) {
+            close_on_drop(&self.writer_tx, self.stream_id);
+        }
+    }
+}
+
+// ── MuxStreamIo: AsyncRead + AsyncWrite over one stream ──────────────
+
+/// Max Data payload per frame emitted by the io adapter. Below the mux payload
+/// cap (65535 minus the 4-byte stream_id prefix); 16 KiB matches typical socket
+/// reads and keeps single frames small enough not to starve the ctrl plane.
+const IO_WRITE_CHUNK: usize = 16 * 1024;
+
+fn mux_broken() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "mux stream closed")
+}
+
+/// [`MuxStream`] presented as an `AsyncRead + AsyncWrite` byte channel. Reads pull
+/// whole Data payloads off the per-stream channel and keep any tail that didn't
+/// fit the caller's buffer; writes chunk into Data frames on the same bulk plane
+/// as `MuxStream::send`. Shutdown (or drop) sends Close.
+///
+/// The write path takes the fast `try_send` when the writer channel has room and
+/// only boxes a send future when it is full, so the common case allocates nothing
+/// beyond the payload copy the wire needs anyway.
+pub struct MuxStreamIo {
+    stream_id: u32,
+    rx: mpsc::Receiver<Vec<u8>>,
+    writer_tx: mpsc::Sender<OutFrame>,
+    alive: Arc<AtomicBool>,
+    /// Tail of the last received payload that didn't fit the caller's buffer.
+    read_buf: Vec<u8>,
+    read_pos: usize,
+    /// In-flight Data send, present only after the writer channel was full.
+    write_fut: Option<Pin<Box<dyn Future<Output = Result<(), ()>> + Send>>>,
+    /// Length promised to the caller for the in-flight `write_fut`.
+    write_len: usize,
+    /// In-flight Close send during shutdown.
+    close_fut: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    closed: bool,
+}
+
+impl MuxStreamIo {
+    pub fn stream_id(&self) -> u32 {
+        self.stream_id
+    }
+}
+
+impl AsyncRead for MuxStreamIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        // Serve the leftover tail before pulling a fresh payload.
+        if this.read_pos < this.read_buf.len() {
+            let n = (this.read_buf.len() - this.read_pos).min(buf.remaining());
+            buf.put_slice(&this.read_buf[this.read_pos..this.read_pos + n]);
+            this.read_pos += n;
+            if this.read_pos >= this.read_buf.len() {
+                this.read_buf.clear();
+                this.read_pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+        loop {
+            match this.rx.poll_recv(cx) {
+                Poll::Ready(Some(data)) => {
+                    // Empty payloads (e.g. a bare ConnectAck routed here) carry no
+                    // bytes — skip rather than signal EOF.
+                    if data.is_empty() {
+                        continue;
+                    }
+                    let n = data.len().min(buf.remaining());
+                    buf.put_slice(&data[..n]);
+                    if n < data.len() {
+                        this.read_buf = data;
+                        this.read_pos = n;
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+                // Channel closed = peer Close or dead mux: clean EOF.
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for MuxStreamIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        // Finish a send that returned Pending last time.
+        if let Some(fut) = this.write_fut.as_mut() {
+            return match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.write_fut = None;
+                    Poll::Ready(Ok(this.write_len))
+                }
+                Poll::Ready(Err(())) => {
+                    this.write_fut = None;
+                    Poll::Ready(Err(mux_broken()))
+                }
+                Poll::Pending => Poll::Pending,
+            };
+        }
+        if !this.alive.load(Ordering::Relaxed) {
+            return Poll::Ready(Err(mux_broken()));
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let n = buf.len().min(IO_WRITE_CHUNK);
+        let frame = OutFrame {
+            stream_id: this.stream_id,
+            command: Command::Data,
+            payload: buf[..n].to_vec(),
+        };
+        match this.writer_tx.try_send(frame) {
+            Ok(()) => Poll::Ready(Ok(n)),
+            Err(mpsc::error::TrySendError::Full(frame)) => {
+                let tx = this.writer_tx.clone();
+                this.write_len = n;
+                this.write_fut =
+                    Some(Box::pin(async move { tx.send(frame).await.map_err(|_| ()) }));
+                match this.write_fut.as_mut().unwrap().as_mut().poll(cx) {
+                    Poll::Ready(Ok(())) => {
+                        this.write_fut = None;
+                        Poll::Ready(Ok(n))
+                    }
+                    Poll::Ready(Err(())) => {
+                        this.write_fut = None;
+                        Poll::Ready(Err(mux_broken()))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(mux_broken())),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        // Data is flushed by the writer task once it leaves the channel; the only
+        // buffered state here is an in-flight send, so drive it to completion.
+        if let Some(fut) = this.write_fut.as_mut() {
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.write_fut = None;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(())) => {
+                    this.write_fut = None;
+                    Poll::Ready(Err(mux_broken()))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        // Let a pending Data send finish before Close, or it would overtake still
+        // unwritten Data of this stream (same ordering rule as MuxStream::close).
+        if let Some(fut) = this.write_fut.as_mut() {
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => this.write_fut = None,
+                Poll::Ready(Err(())) => {
+                    this.write_fut = None;
+                    return Poll::Ready(Err(mux_broken()));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        if this.closed {
+            return Poll::Ready(Ok(()));
+        }
+        if this.close_fut.is_none() {
+            let tx = this.writer_tx.clone();
+            let sid = this.stream_id;
+            this.close_fut = Some(Box::pin(async move {
+                let _ = tx
+                    .send(OutFrame {
+                        stream_id: sid,
+                        command: Command::Close,
+                        payload: Vec::new(),
+                    })
+                    .await;
+            }));
+        }
+        match this.close_fut.as_mut().unwrap().as_mut().poll(cx) {
+            Poll::Ready(()) => {
+                this.close_fut = None;
+                this.closed = true;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for MuxStreamIo {
+    fn drop(&mut self) {
         if !self.closed && self.alive.load(Ordering::Relaxed) {
             close_on_drop(&self.writer_tx, self.stream_id);
         }
@@ -1157,6 +1397,83 @@ mod tests {
         let response = client_stream.recv().await.unwrap();
         assert_eq!(response, b"hello from server");
 
+        server_task.await.unwrap();
+    }
+
+    /// XR-103 / LLD-23 §3.4: обе стороны mux открывают стримы, id не сталкиваются.
+    /// Инициатор соединения (client) берёт нечётные id, акцептор (server) чётные,
+    /// поэтому реверс-стрим relay->агент не конфликтует с прямыми стримами. Тут
+    /// клиент открывает прямой стрим, сервер реверс-стрим; каждый принимающий шлёт
+    /// ConnectAck, чтобы открытие вернулось.
+    #[tokio::test]
+    async fn test_mux_stream_id_parity() {
+        let (client_io, server_io) = duplex(65536);
+        let codec = test_codec();
+        let client_mux = Multiplexer::new_client(client_io, codec.clone());
+        let server_mux = Multiplexer::new_server(server_io, codec.clone());
+
+        let s = server_mux.clone();
+        let server_accept = tokio::spawn(async move {
+            let mut rx = s.take_new_stream_rx().await.unwrap();
+            let ns = rx.recv().await.unwrap();
+            let _stream = s.register_stream(ns.stream_id).await;
+            s.send_frame(ns.stream_id, Command::ConnectAck, vec![0]).await.unwrap();
+            ns.stream_id
+        });
+        let c = client_mux.clone();
+        let client_accept = tokio::spawn(async move {
+            let mut rx = c.take_new_stream_rx().await.unwrap();
+            let ns = rx.recv().await.unwrap();
+            let _stream = c.register_stream(ns.stream_id).await;
+            c.send_frame(ns.stream_id, Command::ConnectAck, vec![0]).await.unwrap();
+            ns.stream_id
+        });
+
+        let target = TargetAddr::Domain("x".into(), 1);
+        let fwd = mux_open_stream(&client_mux, &target).await.unwrap();
+        let rev = mux_open_stream(&server_mux, &target).await.unwrap();
+
+        let (fwd_id, rev_id) = (fwd.stream_id(), rev.stream_id());
+        assert_eq!(fwd_id % 2, 1, "инициатор (client) открывает нечётные id");
+        assert_eq!(rev_id % 2, 0, "акцептор (server) открывает чётные id");
+        assert_ne!(fwd_id, rev_id);
+
+        assert_eq!(server_accept.await.unwrap(), fwd_id);
+        assert_eq!(client_accept.await.unwrap(), rev_id);
+    }
+
+    /// XR-103 / LLD-23 §3.4: `MuxStream::into_io()` даёт AsyncRead+AsyncWrite,
+    /// поверх которого едет hyper (на агенте) и слепой сплайс (на relay). Тут
+    /// сервер эхом отражает байты через свой io-адаптер, клиент шлёт и читает.
+    #[tokio::test]
+    async fn test_mux_stream_io_roundtrip() {
+        let (client_io, server_io) = duplex(65536);
+        let codec = test_codec();
+        let client_mux = Multiplexer::new_client(client_io, codec.clone());
+        let server_mux = Multiplexer::new_server(server_io, codec.clone());
+
+        let s = server_mux.clone();
+        let server_task = tokio::spawn(async move {
+            let mut rx = s.take_new_stream_rx().await.unwrap();
+            let ns = rx.recv().await.unwrap();
+            let stream = s.register_stream(ns.stream_id).await;
+            s.send_frame(ns.stream_id, Command::ConnectAck, vec![0]).await.unwrap();
+            let mut io = stream.into_io();
+            let mut buf = vec![0u8; 64];
+            let n = io.read(&mut buf).await.unwrap();
+            io.write_all(&buf[..n]).await.unwrap();
+            io.flush().await.unwrap();
+            io.shutdown().await.unwrap();
+        });
+
+        let target = TargetAddr::Domain("x".into(), 1);
+        let stream = mux_open_stream(&client_mux, &target).await.unwrap();
+        let mut io = stream.into_io();
+        io.write_all(b"ping over io").await.unwrap();
+        io.flush().await.unwrap();
+        let mut got = vec![0u8; 64];
+        let n = io.read(&mut got).await.unwrap();
+        assert_eq!(&got[..n], b"ping over io");
         server_task.await.unwrap();
     }
 

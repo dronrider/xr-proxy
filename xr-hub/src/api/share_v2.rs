@@ -389,6 +389,7 @@ pub async fn invite_shares(
                 agent_pubkey: rec.agent_pubkey.clone(),
                 token: encode_blob(&token),
                 exp,
+                relay: None,
             });
         }
     }
