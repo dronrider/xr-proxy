@@ -77,7 +77,9 @@ Cargo-workspace + Android-модуль:
 | [xr-server/](../xr-server/) | Бинарь для VPS. Туннельный сервер, UDP relay, DPI fallback. |
 | [xr-android-jni/](../xr-android-jni/) | JNI-мост Kotlin ↔ xr-core. |
 | [xr-android/](../xr-android/) | Android-приложение (Compose + MVVM), использует `xr-core` через JNI. |
-| *planned* `xr-hub/` | Control-plane сервис (пресеты, инвайты, Admin UI). |
+| [xr-hub/](../xr-hub/) | Control-plane сервис (пресеты, инвайты, шары, Admin UI). |
+| [xr-share/](../xr-share/) | Агент файлообмена (LLD-19): раздаёт директорию read-only, подписывает манифест, проверяет токены офлайн. |
+| [xr-relay/](../xr-relay/) | Слепой транзит шар за NAT (LLD-23, XR-103): реестр агентов, регистрация, проверка relay-токенов, сплайс без чтения содержимого. |
 
 ## 4. Компоненты
 
@@ -102,6 +104,24 @@ Cargo-workspace + Android-модуль:
   default 4); стримы балансируются round-robin, при обрыве слота open_stream
   failover'ит на следующий, мёртвый слот переподнимается лениво. Это убирает
   HoL-blocking одного TCP — потеря пакета на одном туннеле не тормозит остальные.
+  Id стримов делятся по чётности: инициатор соединения (клиент) берёт нечётные,
+  акцептор (сервер/relay) чётные, поэтому реверс-стримы relay->агент не
+  конфликтуют с прямыми (XR-103). `MuxStream::into_io()` даёт
+  `AsyncRead + AsyncWrite` поверх стрима (для hyper на агенте и слепого сплайса
+  на relay).
+- [relay_client.rs](../xr-proto/src/relay_client.rs) (фича `share`) — клиент
+  relay для потребителя (LLD-23): mux к relay, `open_relay_stream` (Connect на
+  псевдо-таргет `xr-relay:connect`, hello с relay-токеном первым Data-кадром,
+  ждёт байт `OK`), `LoopbackForwarder` (listener на `127.0.0.1:0`, каждое
+  принятое соединение становится relay-стримом; HTTP-стек потребителя не
+  меняется). Псевдо-таргеты `xr-relay:*` не резолвятся в сеть, SSRF исключён
+  конструктивно.
+- [share.rs](../xr-proto/src/share.rs) relay-типы (LLD-23): `RelayToken`
+  (домен `xr-relay-token`, привязан к share_id+agent_pubkey), `RelayDescriptor`
+  / `RelayObf` (адрес + обфускация, `codec()` строит общий `Codec`),
+  `RelayGrant` (relay-плечо гранта), `RelayRegister` (challenge-response
+  регистрации агента: мандат хаба + подпись nonce identity-ключом), признак
+  `via_relay` в `ShareRecord`. Подпись/проверка за фичой `share`.
 - [server_pool.rs](../xr-proto/src/server_pool.rs) вводит `ServerPool`
   (LLD-10): пул *серверов* поверх нескольких `MuxPool` (по одному на VPS), строгий
   primary/backup по приоритету (не балансировка). `open_stream` идёт в пул
@@ -296,6 +316,35 @@ Kotlin + Jetpack Compose, Material3, MVVM без DI-фреймворка.
 читаются в `buildConfigJson` и включают в движке PresetCache +
 периодический sanity-check раз в 5 минут. Кэш пресета живёт в
 `filesDir/presets/<name>.json`.
+
+### 4.7 xr-relay — слепой транзит шар за NAT (LLD-23, XR-103)
+
+Отдельный сервис на тех же VPS, что и прокси (не хаб, не xr-server: юр-чистота
+хаба и другая модель угроз прокси-выхода). Собран из тех же кирпичей `xr-proto`
+(Codec, Multiplexer, паттерны accept/semaphore). Байты не читает и не хранит.
+
+- [config.rs](../xr-relay/src/config.rs) — блок `[relay]`: адрес/порт,
+  обфускация (общая с деплоем), `hub_pubkey` (проверка мандатов и токенов
+  офлайн, приватного ключа хаба у relay нет), лимиты.
+- [registry.rs](../xr-relay/src/registry.rs) — `AgentRegistry`
+  (`agent_pubkey -> mux`, вытеснение дубля с глушением старого mux,
+  generation-guard на снятии), `Counters` (байты per share, §2.6), `IpCaps`
+  (кап регистраций с одного IP).
+- [lib.rs](../xr-relay/src/lib.rs) — `handle_connection` различает роль
+  соединения по первому стриму: `xr-relay:register` (агент, challenge-response,
+  реестр, стрим-liveness) против `xr-relay:connect` (потребитель, hello с
+  relay-токеном, поиск агента, реверс-стрим `xr-relay:reverse`, слепой сплайс
+  через `copy_bidirectional`). Агент офлайн -> Close с `CLOSE_REASON_AGENT_OFFLINE`.
+
+Сигналинг на хабе: блок `[relay]` в конфиге, признак `via_relay` у шары,
+дескриптор relay агенту (ответы `exchange`/`add`) и потребителю (relay-плечо в
+гранте с минтом `RelayToken`). Потребитель пробует прямой адрес первым, relay
+последним (модель перебора XR-050).
+
+**Не реализовано в XR-103 (data-path):** обслуживание реверс-стримов агентом
+поверх identity-TLS (`xr-share`) и pinned-TLS verifier у потребителя
+(`xr-core`/`xr-share pull`). Транзит и сигналинг готовы, оконечный E2E-TLS до
+агента — следующий шаг (тянет rustls/rcgen в релизно-хрупкую сборку агента).
 
 ## 5. Протоколы
 
@@ -520,7 +569,7 @@ GeoIP (за feature-flag).
 | 20 | [20-router-remote-management.md](lld/20-router-remote-management.md) | Удалённое управление роутерами поверх реестра LLD-17: подписанные команды из закрытого enum (`apply_preset`/`update_config` по белому списку полей/`reload`/`restart`/`deregister`) через тот же исходящий poll, верификация закреплённым ключом, least-privilege (не shell), аудит-лог. Компрометация VPS не равна RCE без офлайн-ключа подписи. | Шаги 17 (LLD-17), 2 (LLD-01), 16 (LLD-16) | Draft |
 | 21 | [21-messenger.md](lld/21-messenger.md) | Мессенджер как сервис экосистемы (болванка на будущее): чат поверх федерации хабов (не глобальный сервер, класс Matrix), E2E-группы (ориентир MLS), ориентир по фичам Signal. Отличия: быстрый перенос истории, продвинутый поиск и срезы, кворум групп, глубокая кастомизация, маскировка иконки, эфемерность по политике, эффективные треды. Спорные фичи (кворум, свой/готовый федеративный протокол, камера-детекция, ключ бэкапа) в открытых вопросах LLD, обсуждаются. Далёкий сервис. | XR-058, XR-030/074, XR-061 | Draft |
 | 22 | [22-router-load-balancing.md](lld/22-router-load-balancing.md) | Балансировка устройств по VPS на роутере (XR-080): ключ это LAN source IP, правила «IP/CIDR -> сервер» плюс weighted rendezvous для устройств без правила, стабильный exit-IP на устройство. Слой выбора дома над механикой отказа LLD-10 (дом, если стабильно жив -> глобальный порядок), без per-device состояния. Роутер-only; Android получит тот же ключевой API после per-app туннеля XR-016 (ключ UID). | Шаг 10 (LLD-10) | Draft |
-| 23 | [23-share-relay-nat.md](lld/23-share-relay-nat.md) | Доступ к шаре без белого IP (XR-035): агент за NAT держит исходящий обфусцированный mux-туннель к отдельному сервису `xr-relay`, потребитель приходит туда с relay-токеном хаба, relay слепо сплайсит стримы; E2E это pinned TLS до агента (SPKI == agent_pubkey), хаб остаётся чистым сигналингом. Hole-punching отдельной фазой после XR-064, relay остаётся fallback'ом. | LLD-19, шаг 2 (LLD-01); стык с XR-046/XR-050 | Draft |
+| 23 | [23-share-relay-nat.md](lld/23-share-relay-nat.md) | Доступ к шаре без белого IP (XR-035): агент за NAT держит исходящий обфусцированный mux-туннель к отдельному сервису `xr-relay`, потребитель приходит туда с relay-токеном хаба, relay слепо сплайсит стримы; E2E это pinned TLS до агента (SPKI == agent_pubkey), хаб остаётся чистым сигналингом. Hole-punching отдельной фазой после XR-064, relay остаётся fallback'ом. | LLD-19, шаг 2 (LLD-01); стык с XR-046/XR-050 | XR-103: транзит (`xr-relay`), протокол (`xr-proto`) и сигналинг (`xr-hub`) готовы; оконечный identity-TLS у агента и pinned-verifier у потребителя осталось |
 | 24 | [24-share-hash-index.md](lld/24-share-hash-index.md) | Локальный индекс хэшей для синка шары (XR-098): персистентный `(отн. путь, size, mtime) -> sha256` в `xr-core/sync.rs` по образцу агентского `HashCache`, тёплый скан это stat-обход без пересчёта SHA-256; файл индекса в `filesDir/share-index/<shareId>.json`, битый/чужой файл даёт полный пересчёт; хэш скачанного кладётся в индекс сразу (верифицирован при скачивании). | LLD-19; стык с XR-043/XR-097 | Implemented |
 
 **Предварительный порядок реализации второго пакета (C6+):** LLD-03 ✓ →
