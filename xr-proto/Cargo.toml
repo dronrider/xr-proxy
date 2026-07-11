@@ -12,6 +12,11 @@ geoip = ["maxminddb"]
 # утяжеляет его, ed25519-dalek и так в зависимостях xr-core (update.rs). Тесты
 # компилируют крипто безусловно через dev-dependency.
 share = ["dep:ed25519-dalek", "dep:serde_json"]
+# Оконечный E2E-TLS relay-пути (LLD-23 §2.3): пиннинг-verifier потребителя
+# (SPKI == agent_pubkey) и билдеры rustls-конфигов. rustls на ring уже в дереве
+# через reqwest (xr-core/xr-client), кросс-компилируется везде; rcgen (генерация
+# сертификата на агенте) сюда НЕ тащим, он живёт в xr-share за фичей `relay`.
+relay-tls = ["share", "dep:rustls", "dep:x509-cert"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -22,13 +27,17 @@ rand = "0.8"
 tracing = "0.1"
 maxminddb = { version = "0.24", optional = true }
 ed25519-dalek = { version = "2", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+x509-cert = { version = "0.2", optional = true }
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros", "sync"] }
 url = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "net", "io-util"] }
 ed25519-dalek = "2"
 serde_json = "1"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 
 # Demo of the share types + token sign/verify (LLD-19). Uses the gated crypto,
 # so it only builds with the `share` feature — keeps `cargo test --workspace`
