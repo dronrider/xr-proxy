@@ -47,3 +47,19 @@ hub_url = "https://xr-hub.example.com"
 # address = "BACKUP_SERVER_IP"
 # port = 8443
 # priority = 1
+
+# Relay для шар за NAT (LLD-23, XR-103). Хаб раздаёт этот дескриптор агентам
+# (при exchange/share) и потребителям (в грантах на via_relay-шары), минтит
+# relay-токены транзита. Без блока via_relay-шары работают только по прямому
+# адресу, relay-fallback в грант не попадёт. Обфускация обязана совпадать с
+# конфигом самого relay (configs/relay.toml).
+#
+# [relay]
+# addr = "relay.example.com"        # адрес xr-relay (обычно тот же VPS)
+# port = 8444
+# [relay.obfuscation]
+# key = "YOUR_BASE64_KEY"
+# modifier = "positional_xor_rotate"
+# salt = 0xDEADBEEF
+# padding_min = 16
+# padding_max = 128
