@@ -810,7 +810,64 @@ pub async fn sync_share_selected(
     dry_run: bool,
     timeout: Duration,
 ) -> Result<SyncResult, String> {
-    let manifest = fetch_manifest(agent_url, token, agent_pubkey, timeout).await?;
+    let client = http_client(timeout)?;
+    run_sync(&client, agent_url, token, agent_pubkey, dest_root, selection, index_path, dry_run).await
+}
+
+/// Mirror a share from its [`ShareGrant`], trying the **direct** address first
+/// and falling back to the **relay** only if the direct path is unreachable
+/// (LLD-23 §2.4, the XR-050 order). The direct path is plain HTTP with the
+/// manifest signature pinning integrity (XR-046); the relay path runs pinned
+/// TLS end to end to the agent (SPKI == `agent_pubkey`), so the relay sees only
+/// ciphertext. A grant with no relay leg behaves exactly as before.
+pub async fn sync_share_grant(
+    grant: &ShareGrant,
+    dest_root: &Path,
+    selection: Option<&HashSet<String>>,
+    index_path: Option<&Path>,
+    dry_run: bool,
+    timeout: Duration,
+) -> Result<SyncResult, String> {
+    let token = decode_share_token(&grant.token)?;
+    let direct_base = format!("http://{}:{}/{}", grant.addr, grant.port, grant.share_id);
+    let plain = http_client(timeout)?;
+    match run_sync(&plain, &direct_base, &token, &grant.agent_pubkey, dest_root, selection, index_path, dry_run).await {
+        Ok(r) => Ok(r),
+        // Only an unreachable direct address is worth the (double-egress) relay;
+        // an auth/signature/HTTP error is a real answer, not a reason to retry.
+        Err(e) if is_unreachable(&e) => {
+            let Some(relay) = &grant.relay else { return Err(e) };
+            let leg = RelayLeg::open(relay).await?;
+            let client = pinned_client(&grant.agent_pubkey, timeout)?;
+            let base = format!("https://{}/{}", leg.local_addr(), grant.share_id);
+            let out = run_sync(&client, &base, &token, &grant.agent_pubkey, dest_root, selection, index_path, dry_run).await;
+            drop(leg); // stop the loopback forwarder once the transfer is done
+            out
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// A connect/timeout failure (as opposed to an authoritative HTTP/signature
+/// answer): only this warrants falling back to the relay.
+fn is_unreachable(err: &str) -> bool {
+    err.starts_with("network:")
+}
+
+/// The core mirror over an already-chosen transport (`client` + `base_url`):
+/// fetch the manifest, scan, diff, and (unless `dry_run`) apply.
+#[allow(clippy::too_many_arguments)]
+async fn run_sync(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &ShareToken,
+    agent_pubkey: &str,
+    dest_root: &Path,
+    selection: Option<&HashSet<String>>,
+    index_path: Option<&Path>,
+    dry_run: bool,
+) -> Result<SyncResult, String> {
+    let manifest = fetch_manifest_with(client, base_url, token, agent_pubkey).await?;
     let mut index = index_path.map(HashIndex::load).unwrap_or_default();
     let local = scan_local_dir_indexed(dest_root, &mut index).map_err(|e| format!("scan: {e}"))?;
     // Persist right after the scan: the expensive hashing just happened, and a
@@ -831,7 +888,7 @@ pub async fn sync_share_selected(
         Some(g) => g,
         None => return Err("busy".into()),
     };
-    let report = apply_plan(agent_url, token, &plan, dest_root, timeout).await;
+    let report = apply_plan_with(client, base_url, token, &plan, dest_root).await;
     remove_orphan_partials(dest_root, &manifest, selection);
     if let Some(p) = index_path {
         index_apply_report(&mut index, &plan, &report, dest_root);
@@ -884,9 +941,20 @@ pub async fn fetch_manifest(
     agent_pubkey: &str,
     timeout: Duration,
 ) -> Result<ShareManifest, String> {
+    let client = http_client(timeout)?;
+    fetch_manifest_with(&client, agent_url, token, agent_pubkey).await
+}
+
+/// [`fetch_manifest`] over an already-built client and base URL, so the caller
+/// picks the transport (plain direct or pinned-TLS relay, LLD-23).
+async fn fetch_manifest_with(
+    client: &reqwest::Client,
+    agent_url: &str,
+    token: &ShareToken,
+    agent_pubkey: &str,
+) -> Result<ShareManifest, String> {
     use xr_proto::share::{MANIFEST_SIGNED_AT_HEADER, MANIFEST_SIG_HEADER};
 
-    let client = http_client(timeout)?;
     let url = format!("{}/manifest", agent_url.trim_end_matches('/'));
     let resp = client
         .get(&url)
@@ -934,6 +1002,19 @@ pub async fn download_entry(
     dest_root: &Path,
     timeout: Duration,
 ) -> Result<(), String> {
+    let client = http_client(timeout)?;
+    download_entry_with(&client, agent_url, token, entry, dest_root).await
+}
+
+/// [`download_entry`] over an already-built client and base URL (transport
+/// chosen by the caller, LLD-23).
+async fn download_entry_with(
+    client: &reqwest::Client,
+    agent_url: &str,
+    token: &ShareToken,
+    entry: &ShareManifestEntry,
+    dest_root: &Path,
+) -> Result<(), String> {
     let dest = safe_dest(dest_root, &entry.path).ok_or_else(|| format!("unsafe path: {}", entry.path))?;
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent)
@@ -961,7 +1042,6 @@ pub async fn download_entry(
         }
     }
 
-    let client = http_client(timeout)?;
     let url = format!("{}/file/{}", agent_url.trim_end_matches('/'), encode_path(&entry.path));
     let mut req = client.get(&url).bearer_auth(token_blob(token));
     if resume_from > 0 {
@@ -1041,6 +1121,28 @@ pub async fn apply_plan(
     dest_root: &Path,
     timeout: Duration,
 ) -> ApplyReport {
+    let client = match http_client(timeout) {
+        Ok(c) => c,
+        Err(e) => {
+            let mut report = ApplyReport::default();
+            for entry in &plan.fetch {
+                report.failed.push((entry.path.clone(), e.clone()));
+            }
+            return report;
+        }
+    };
+    apply_plan_with(&client, agent_url, token, plan, dest_root).await
+}
+
+/// [`apply_plan`] over an already-built client and base URL (transport chosen by
+/// the caller, LLD-23).
+async fn apply_plan_with(
+    client: &reqwest::Client,
+    agent_url: &str,
+    token: &ShareToken,
+    plan: &SyncPlan,
+    dest_root: &Path,
+) -> ApplyReport {
     let mut report = ApplyReport::default();
 
     for (i, entry) in plan.fetch.iter().enumerate() {
@@ -1049,7 +1151,7 @@ pub async fn apply_plan(
             break;
         }
         transfer_file(&entry.path, i);
-        match download_entry(agent_url, token, entry, dest_root, timeout).await {
+        match download_entry_with(client, agent_url, token, entry, dest_root).await {
             Ok(()) => report.fetched.push(entry.path.clone()),
             Err(e) => report.failed.push((entry.path.clone(), e)),
         }
@@ -1149,6 +1251,54 @@ fn http_client(timeout: Duration) -> Result<reqwest::Client, String> {
         .map_err(|e| format!("http client: {e}"))
 }
 
+/// A reqwest client that trusts exactly the agent behind `agent_pubkey` (base64
+/// Ed25519), for the relay path where TLS is end-to-end and pinned to the key
+/// (LLD-23 §2.3). The hostname is irrelevant (we dial a loopback forwarder), the
+/// pin is on the key.
+fn pinned_client(agent_pubkey: &str, timeout: Duration) -> Result<reqwest::Client, String> {
+    let tls = xr_proto::relay_tls::pinned_client_config(agent_pubkey)?;
+    reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(timeout)
+        .build()
+        .map_err(|e| format!("pinned http client: {e}"))
+}
+
+/// A live relay leg for the consumer: the loopback forwarder that turns local
+/// TCP connections into relay streams to the agent (LLD-23 §2.2). Held for the
+/// duration of a transfer; dropping it stops the forwarder.
+struct RelayLeg {
+    _fwd: xr_proto::relay_client::LoopbackForwarder,
+    local_addr: std::net::SocketAddr,
+}
+
+impl RelayLeg {
+    async fn open(grant: &xr_proto::share::RelayGrant) -> Result<Self, String> {
+        let endpoint = std::sync::Arc::new(
+            xr_proto::relay_client::RelayEndpoint::from_grant(grant).map_err(|e| format!("relay grant: {e}"))?,
+        );
+        let fwd = xr_proto::relay_client::LoopbackForwarder::spawn(endpoint)
+            .await
+            .map_err(|e| format!("relay forwarder: {e}"))?;
+        let local_addr = fwd.local_addr();
+        Ok(Self { _fwd: fwd, local_addr })
+    }
+
+    fn local_addr(&self) -> std::net::SocketAddr {
+        self.local_addr
+    }
+}
+
+/// Decode a grant's access-token blob (base64url-nopad JSON) into a [`ShareToken`].
+fn decode_share_token(blob: &str) -> Result<ShareToken, String> {
+    use base64::Engine as _;
+    let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(blob.trim())
+        .map_err(|e| format!("token base64url: {e}"))?;
+    serde_json::from_slice(&json).map_err(|e| format!("token json: {e}"))
+}
+
 /// Encode a ShareToken into the URL-safe base64 blob the agent expects
 /// (`Authorization: Bearer <blob>`; base64url-no-pad of the JSON).
 fn token_blob(token: &ShareToken) -> String {
@@ -1196,6 +1346,62 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── relay transport (LLD-23 consumer side) ──────────────────────────
+
+    fn token_blob_of(share_id: &str) -> String {
+        use base64::Engine as _;
+        let t = ShareToken { share_id: share_id.into(), exp: 9_999_999_999, signature: "sig".into() };
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&t).unwrap())
+    }
+
+    #[test]
+    fn decode_share_token_roundtrips() {
+        let t = decode_share_token(&token_blob_of("S")).unwrap();
+        assert_eq!(t.share_id, "S");
+        assert!(decode_share_token("@@@").is_err());
+    }
+
+    #[test]
+    fn pinned_client_needs_a_valid_key() {
+        use base64::Engine as _;
+        let good = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        assert!(pinned_client(&good, Duration::from_secs(5)).is_ok());
+        // Not 32 bytes / not base64 -> a clear error, not a panic.
+        assert!(pinned_client("QQ==", Duration::from_secs(5)).is_err());
+        assert!(pinned_client("@@@", Duration::from_secs(5)).is_err());
+    }
+
+    #[test]
+    fn is_unreachable_only_matches_network_errors() {
+        assert!(is_unreachable("network: connection refused"));
+        assert!(!is_unreachable("http_403"));
+        assert!(!is_unreachable("manifest_unsigned"));
+        assert!(!is_unreachable("manifest_signature: bad"));
+    }
+
+    /// A grant with no relay leg and an unreachable direct address surfaces the
+    /// direct network error unchanged: the relay path is not invented when it
+    /// isn't offered, and the direct path is otherwise untouched (LLD-23 §2.4).
+    #[tokio::test]
+    async fn grant_without_relay_reports_direct_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let grant = ShareGrant {
+            share_id: "S".into(),
+            name: "S".into(),
+            // 127.0.0.1:1 refuses fast; no relay leg.
+            addr: "127.0.0.1".into(),
+            port: 1,
+            agent_pubkey: String::new(),
+            token: token_blob_of("S"),
+            exp: 9_999_999_999,
+            relay: None,
+        };
+        let err = sync_share_grant(&grant, dir.path(), None, None, false, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(is_unreachable(&err), "expected a direct network error, got {err}");
+    }
 
     fn entry(path: &str, sha: &str) -> ShareManifestEntry {
         ShareManifestEntry {
