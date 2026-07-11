@@ -110,9 +110,6 @@ class ServerRepository(private val prefs: SharedPreferences) {
             modifier = prefs.getString("modifier", "positional_xor_rotate")
                 ?: "positional_xor_rotate",
             salt = prefs.getString("salt", "3735928559")?.toLongOrNull() ?: 0xDEADBEEFL,
-            routingPreset = prefs.getString("routing_preset", "russia") ?: "russia",
-            customDomains = prefs.getString("custom_domains", "") ?: "",
-            customIpRanges = prefs.getString("custom_ip_ranges", "") ?: "",
             hubUrl = hubUrl,
             hubPreset = prefs.getString("hub_preset", "") ?: "",
             trustedPublicKey = prefs.getString("trusted_public_key", "") ?: "",
@@ -146,9 +143,6 @@ class ServerRepository(private val prefs: SharedPreferences) {
         put("obfuscation_key", p.obfuscationKey)
         put("modifier", p.modifier)
         put("salt", p.salt)
-        put("routing_preset", p.routingPreset)
-        put("custom_domains", p.customDomains)
-        put("custom_ip_ranges", p.customIpRanges)
         put("hub_url", p.hubUrl)
         put("hub_preset", p.hubPreset)
         put("trusted_public_key", p.trustedPublicKey)
@@ -166,9 +160,6 @@ class ServerRepository(private val prefs: SharedPreferences) {
         obfuscationKey = j.optString("obfuscation_key", ""),
         modifier = j.optString("modifier", "positional_xor_rotate"),
         salt = j.optLong("salt", 0xDEADBEEFL),
-        routingPreset = j.optString("routing_preset", "russia"),
-        customDomains = j.optString("custom_domains", ""),
-        customIpRanges = j.optString("custom_ip_ranges", ""),
         hubUrl = j.optString("hub_url", ""),
         hubPreset = j.optString("hub_preset", ""),
         trustedPublicKey = j.optString("trusted_public_key", ""),

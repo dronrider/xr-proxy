@@ -131,11 +131,13 @@ private fun ServerCard(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    Text(
-                        server.presetLabel,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
+                    if (server.presetLabel.isNotBlank()) {
+                        Text(
+                            server.presetLabel,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
                 }
                 val sourceLabel = when (server.source) {
                     ServerSource.Invite -> "Invite"

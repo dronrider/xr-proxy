@@ -145,6 +145,24 @@ object NativeBridge {
         timeoutMs: Long,
     ): String
 
+    // ── Редактор правил (LLD-05, XR-047) ────────────────────────────
+
+    /** Классифицировать паттерн пользовательского правила. Валидация одна
+     *  на Rust и Kotlin, UI дублирующих regex'ов не держит. Возвращает JSON
+     *  `{"kind":"domain|wildcard|cidr4|cidr6","normalized":".."}` либо
+     *  `{"kind":"invalid","error":"текст для пользователя"}`. */
+    external fun nativeClassifyPattern(raw: String): String
+
+    /** Форсированный fetch пресета с хаба («Обновить сейчас»). Пишет в тот же
+     *  дисковый кэш, из которого движок собирает merged-роутер. Возвращает
+     *  `{"updated":bool,"version":N}` либо `{"error":".."}`. */
+    external fun nativeRefreshPreset(
+        hubUrl: String,
+        preset: String,
+        cacheDir: String,
+        timeoutMs: Long,
+    ): String
+
     // ── APK self-update (LLD-12) ────────────────────────────────────
 
     /**

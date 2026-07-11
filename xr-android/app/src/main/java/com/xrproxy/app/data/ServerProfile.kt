@@ -26,9 +26,6 @@ data class ServerProfile(
     val obfuscationKey: String = "",
     val modifier: String = "positional_xor_rotate",
     val salt: Long = 0xDEADBEEFL,
-    val routingPreset: String = "russia",
-    val customDomains: String = "",
-    val customIpRanges: String = "",
     val hubUrl: String = "",
     val hubPreset: String = "",
     val trustedPublicKey: String = "",
@@ -60,11 +57,8 @@ data class ServerProfile(
             }
         }
 
+    /** Метка правил на чипе и карточке: имя пресета хаба, пусто без хаба.
+     *  Локальный хардкод пресетов удалён в XR-047, правда живёт на хабе. */
     val presetLabel: String
-        get() = when (routingPreset) {
-            "russia" -> "Russia"
-            "proxy_all" -> "Proxy all"
-            "custom" -> "Custom"
-            else -> routingPreset
-        }
+        get() = hubPreset
 }

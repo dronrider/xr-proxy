@@ -16,11 +16,15 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
+import com.xrproxy.app.data.CachedPreset
 import com.xrproxy.app.data.JournalSettings
+import com.xrproxy.app.data.PresetCacheReader
 import com.xrproxy.app.data.ProfileEndpoint
 import com.xrproxy.app.data.ServerProfile
 import com.xrproxy.app.data.ServerRepository
 import com.xrproxy.app.data.ServerSource
+import com.xrproxy.app.data.UserRule
+import com.xrproxy.app.data.UserRulesStore
 import com.xrproxy.app.jni.NativeBridge
 import com.xrproxy.app.model.HealthLevel
 import com.xrproxy.app.service.XrVpnService
@@ -94,6 +98,13 @@ sealed interface UpdateUiState {
 val UpdateUiState.updatePending: Boolean
     get() = this is UpdateUiState.Available || this is UpdateUiState.Downloading ||
         this is UpdateUiState.ReadyToInstall || this is UpdateUiState.Installing
+
+/** Исход «Обновить сейчас» на карточке пресета (LLD-05 §3.3). */
+sealed interface PresetRefresh {
+    data class Updated(val version: Long) : PresetRefresh
+    data class UpToDate(val version: Long) : PresetRefresh
+    data class Failed(val message: String) : PresetRefresh
+}
 
 data class VpnUiState(
     val phase: ConnectPhase = ConnectPhase.Idle,
@@ -643,6 +654,62 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         tryBind(autoCreate = false)
     }
 
+    // ── Правила маршрутизации (LLD-05, XR-047) ──────────────────────
+
+    private val _userRules = MutableStateFlow(
+        UserRulesStore.load(application.filesDir)
+    )
+    /** Глобальный упорядоченный список «моих правил»: поверх пресета любого
+     *  активного сервера, первое совпадение выигрывает. */
+    val userRules: StateFlow<List<UserRule>> = _userRules
+
+    /** Сохранить новый список целиком: состояние сразу, диск в фоне.
+     *  Применение на лету не делаем (LLD-05 §3.10) — правила попадут в
+     *  движок при следующем Connect через [buildConfigJson]. */
+    fun saveUserRules(rules: List<UserRule>) {
+        val capped = rules.take(UserRulesStore.MAX_RULES)
+        _userRules.value = capped
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                UserRulesStore.save(getApplication<Application>().filesDir, capped)
+            } catch (e: Exception) {
+                emitMessage("Не удалось сохранить правила: ${e.message}", UiSeverity.Error)
+            }
+        }
+    }
+
+    /** Кэшированный пресет активного сервера для карточки/просмотра/TOML. */
+    fun readCachedPreset(presetName: String): CachedPreset? =
+        PresetCacheReader.read(presetCacheDir, presetName)
+
+    /** Форсированный fetch пресета с хаба («Обновить сейчас»). */
+    suspend fun refreshPresetNow(): PresetRefresh {
+        val server = repo.activeServer()
+        val hubUrl = server?.hubUrl?.takeIf { it.isNotBlank() }
+        val preset = server?.hubPreset?.takeIf { it.isNotBlank() }
+        if (hubUrl == null || preset == null) {
+            return PresetRefresh.Failed("У сервера не настроен хаб или пресет")
+        }
+        val json = withContext(Dispatchers.IO) {
+            NativeBridge.nativeRefreshPreset(hubUrl, preset, presetCacheDir.absolutePath, 5_000L)
+        }
+        val obj = runCatching { JSONObject(json) }.getOrNull()
+            ?: return PresetRefresh.Failed("Ошибка ответа хаба")
+        obj.optString("error").takeIf { it.isNotBlank() }?.let { code ->
+            return PresetRefresh.Failed(friendlyPresetError(code, preset))
+        }
+        val version = obj.optLong("version", 0)
+        return if (obj.optBoolean("updated")) PresetRefresh.Updated(version)
+        else PresetRefresh.UpToDate(version)
+    }
+
+    private fun friendlyPresetError(code: String, preset: String): String = when {
+        code == "not_found" -> "Пресета «$preset» больше нет на хабе"
+        code.startsWith("network") -> "Хаб недоступен. Проверьте интернет"
+        code.startsWith("http_") -> "Ошибка хаба: ${code.removePrefix("http_")}"
+        else -> "Не удалось обновить пресет: $code"
+    }
+
     // ── APK self-update (LLD-12) ────────────────────────────────────
 
     /** Hub of the active server, or null when none is configured. */
@@ -944,7 +1011,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 obfuscationKey = payload.optString("obfuscation_key"),
                 modifier = payload.optString("modifier", "positional_xor_rotate"),
                 salt = payload.optLong("salt", 0xDEADBEEFL),
-                routingPreset = presetName.ifBlank { "russia" },
                 hubUrl = hubFromPayload,
                 hubPreset = presetName,
                 trustedPublicKey = publicKey,
@@ -1126,7 +1192,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     // ── Config building ─────────────────────────────────────────────
 
     private fun buildConfigJson(server: ServerProfile): String {
-        val routingToml = buildRoutingToml(server)
+        // Мои правила уезжают массивом user_rules (LLD-05): движок соберёт
+        // merged-роутер сам, докачав пресет хаба из hub_* полей ниже.
+        val userRulesJson = UserRulesStore.toConfigJson(_userRules.value).toString()
         val systemDns = collectSystemDnsServers()
         val dnsArray = systemDns.joinToString(", ") { "\"$it\"" }
         val hubFields = if (server.hubUrl.isNotBlank() && server.hubPreset.isNotBlank()) {
@@ -1158,7 +1226,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 "salt": ${server.salt},
                 "padding_min": 16,
                 "padding_max": 128,
-                "routing_toml": "${routingToml.replace("\"", "\\\"").replace("\n", "\\n")}",
+                "default_action": "direct",
+                "user_rules": $userRulesJson,
                 "on_server_down": "${if (_failClosed.value) "block" else "direct"}",
                 "dns_resolvers": [$dnsArray]$hubFields
             }
@@ -1184,103 +1253,4 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         return result
     }
 
-    private fun buildRoutingToml(server: ServerProfile): String = when (server.routingPreset) {
-        "proxy_all" -> "default_action = \"proxy\"\n"
-        "russia" -> PRESET_RUSSIA
-        "custom" -> buildCustomRoutingToml(server)
-        else -> PRESET_RUSSIA
-    }
-
-    private fun buildCustomRoutingToml(server: ServerProfile): String {
-        val sb = StringBuilder()
-        sb.appendLine("default_action = \"direct\"")
-        val domains = server.customDomains.lines().map { it.trim() }.filter { it.isNotBlank() }
-        val ipRanges = server.customIpRanges.lines().map { it.trim() }.filter { it.isNotBlank() }
-        if (domains.isNotEmpty() || ipRanges.isNotEmpty()) {
-            sb.appendLine("[[rules]]")
-            sb.appendLine("action = \"proxy\"")
-            if (domains.isNotEmpty()) {
-                sb.append("domains = [")
-                sb.append(domains.joinToString(", ") { "\"$it\"" })
-                sb.appendLine("]")
-            }
-            if (ipRanges.isNotEmpty()) {
-                sb.append("ip_ranges = [")
-                sb.append(ipRanges.joinToString(", ") { "\"$it\"" })
-                sb.appendLine("]")
-            }
-        }
-        return sb.toString()
-    }
-
-    companion object {
-        val PRESET_RUSSIA = """
-default_action = "direct"
-[[rules]]
-action = "proxy"
-domains = ["youtube.com", "*.youtube.com", "youtu.be", "*.googlevideo.com", "*.ytimg.com", "youtube-nocookie.com", "*.youtube-nocookie.com", "*.ggpht.com"]
-[[rules]]
-action = "proxy"
-domains = ["facebook.com", "*.facebook.com", "fbcdn.net", "*.fbcdn.net", "instagram.com", "*.instagram.com", "*.cdninstagram.com", "threads.net", "*.threads.net", "whatsapp.com", "*.whatsapp.com", "whatsapp.net", "*.whatsapp.net", "wa.me", "messenger.com", "*.messenger.com", "meta.com", "*.meta.com"]
-[[rules]]
-action = "proxy"
-domains = ["twitter.com", "*.twitter.com", "x.com", "*.x.com", "t.co", "twimg.com", "*.twimg.com"]
-[[rules]]
-action = "proxy"
-domains = ["telegram.org", "*.telegram.org", "t.me", "*.t.me", "telegram.me", "*.telegram.me", "telesco.pe"]
-ip_ranges = ["91.108.56.0/22", "91.108.4.0/22", "91.108.8.0/22", "91.108.16.0/22", "91.108.12.0/22", "91.108.20.0/22", "149.154.160.0/20", "91.105.192.0/23", "185.76.151.0/24"]
-[[rules]]
-action = "proxy"
-domains = ["linkedin.com", "*.linkedin.com", "licdn.com", "*.licdn.com"]
-[[rules]]
-action = "proxy"
-domains = ["snapchat.com", "*.snapchat.com", "snap.com", "*.snap.com", "*.sc-cdn.net"]
-[[rules]]
-action = "proxy"
-domains = ["google.com", "*.google.com", "*.googleapis.com", "*.gstatic.com", "*.googleusercontent.com", "gmail.com", "*.gmail.com", "*.gvt1.com", "*.gvt2.com"]
-[[rules]]
-action = "proxy"
-domains = ["discord.com", "*.discord.com", "discord.gg", "discord.media", "*.discord.media", "discordapp.com", "*.discordapp.com", "discordapp.net", "*.discordapp.net"]
-[[rules]]
-action = "proxy"
-domains = ["twitch.tv", "*.twitch.tv", "spotify.com", "*.spotify.com", "scdn.co", "*.scdn.co", "soundcloud.com", "*.soundcloud.com", "medium.com", "*.medium.com", "patreon.com", "*.patreon.com"]
-[[rules]]
-action = "proxy"
-domains = ["openai.com", "*.openai.com", "chatgpt.com", "*.chatgpt.com", "claude.ai", "*.claude.ai", "anthropic.com", "*.anthropic.com"]
-[[rules]]
-action = "proxy"
-domains = ["github.com", "*.github.com", "github.io", "*.github.io", "githubusercontent.com", "*.githubusercontent.com", "docker.io", "*.docker.io", "docker.com", "*.docker.com", "npmjs.com", "*.npmjs.com", "stackoverflow.com", "*.stackoverflow.com"]
-[[rules]]
-action = "proxy"
-domains = ["protonvpn.com", "*.protonvpn.com", "proton.me", "*.proton.me", "signal.org", "*.signal.org"]
-[[rules]]
-action = "proxy"
-domains = ["bbc.com", "*.bbc.com", "bbc.co.uk", "*.bbc.co.uk", "*.bbci.co.uk", "dw.com", "*.dw.com", "svoboda.org", "*.svoboda.org"]
-[[rules]]
-action = "proxy"
-domains = ["notion.so", "*.notion.so", "notion.com", "*.notion.com", "figma.com", "*.figma.com", "cloudflare.com", "*.cloudflare.com"]
-        """.trimIndent()
-
-        fun parseTomlDomains(toml: String): Pair<List<String>, List<String>> {
-            val domains = mutableListOf<String>()
-            val ipRanges = mutableListOf<String>()
-            var inDomains = false
-            var inIpRanges = false
-            for (line in toml.lines()) {
-                val t = line.trim()
-                if (t.startsWith("domains")) inDomains = true
-                if (t.startsWith("ip_ranges")) { inDomains = false; inIpRanges = true }
-                if (t.startsWith("action") || t.startsWith("[[") || t.startsWith("[routing")) {
-                    inDomains = false; inIpRanges = false
-                }
-                val matches = Regex("\"([^\"]+)\"").findAll(t)
-                for (m in matches) {
-                    val v = m.groupValues[1]
-                    if (inDomains && (v.contains(".") || v.startsWith("*"))) domains.add(v)
-                    if (inIpRanges && v.contains("/")) ipRanges.add(v)
-                }
-            }
-            return domains to ipRanges
-        }
-    }
 }

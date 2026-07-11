@@ -61,6 +61,8 @@ import com.xrproxy.app.ui.servers.ServerSwitcherSheet
 import com.xrproxy.app.ui.logs.LogList
 import com.xrproxy.app.ui.logs.LogToolbar
 import com.xrproxy.app.ui.logs.filterLog
+import com.xrproxy.app.ui.rules.RulesEntryCard
+import com.xrproxy.app.ui.rules.RulesScreen
 import com.xrproxy.app.ui.servers.FailurePolicySection
 import com.xrproxy.app.ui.servers.JournalSection
 import com.xrproxy.app.ui.servers.ServersSection
@@ -213,6 +215,7 @@ fun MainScreen(
     var addServerDialogOpen by remember { mutableStateOf(false) }
     var switcherSheetOpen by remember { mutableStateOf(false) }
     var editMode by remember { mutableStateOf<EditMode?>(null) }
+    var rulesOpen by remember { mutableStateOf(false) }
     val activity = LocalContext.current as Activity
     val scope = rememberCoroutineScope()
 
@@ -257,6 +260,12 @@ fun MainScreen(
                 editMode = null
             },
         )
+        return
+    }
+
+    // ── Rules editor overlay (LLD-05, XR-047) ──────────────────────
+    if (rulesOpen) {
+        RulesScreen(viewModel = viewModel, onBack = { rulesOpen = false })
         return
     }
 
@@ -541,6 +550,12 @@ fun MainScreen(
                     onEdit = { editMode = EditMode.Edit(it) },
                     onDelete = { viewModel.deleteServer(it) },
                     onAddServer = { addServerDialogOpen = true },
+                )
+                val userRules by viewModel.userRules.collectAsState()
+                RulesEntryCard(
+                    userRulesCount = userRules.size,
+                    presetName = activeServer?.hubPreset.orEmpty(),
+                    onClick = { rulesOpen = true },
                 )
                 TrustedNetworksSection(
                     networks = trustedNetworks,

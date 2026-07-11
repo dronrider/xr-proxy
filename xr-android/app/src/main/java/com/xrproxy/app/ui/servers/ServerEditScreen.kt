@@ -19,7 +19,6 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -42,7 +41,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -50,7 +48,6 @@ import androidx.compose.ui.unit.dp
 import com.xrproxy.app.data.ProfileEndpoint
 import com.xrproxy.app.data.ServerProfile
 import com.xrproxy.app.data.ServerSource
-import com.xrproxy.app.ui.VpnViewModel
 import java.time.OffsetDateTime
 import java.util.UUID
 
@@ -84,9 +81,6 @@ fun ServerEditScreen(
     var showKey by remember { mutableStateOf(false) }
     var modifier by remember { mutableStateOf(base.modifier) }
     var salt by remember { mutableStateOf(base.salt.toString()) }
-    var preset by remember { mutableStateOf(base.routingPreset) }
-    var customDomains by remember { mutableStateOf(base.customDomains) }
-    var customIpRanges by remember { mutableStateOf(base.customIpRanges) }
     var hubUrl by remember { mutableStateOf(base.hubUrl) }
     // Once the user edits the hub field (or it was inherited from an invite),
     // stop auto-deriving it from the server address.
@@ -96,8 +90,6 @@ fun ServerEditScreen(
     var endpointsError by remember { mutableStateOf(false) }
     var keyError by remember { mutableStateOf(false) }
     var saltError by remember { mutableStateOf(false) }
-
-    val clipboardManager = LocalClipboardManager.current
 
     fun validate(): Boolean {
         nameError = name.isBlank()
@@ -265,63 +257,6 @@ fun ServerEditScreen(
             )
             Spacer(Modifier.height(16.dp))
 
-            Text("Маршрутизация", style = MaterialTheme.typography.titleSmall)
-            Spacer(Modifier.height(8.dp))
-
-            Row(modifier = Modifier.fillMaxWidth()) {
-                for ((value, label) in listOf(
-                    "russia" to "Russia",
-                    "proxy_all" to "Proxy all",
-                    "custom" to "Custom",
-                )) {
-                    FilterChip(
-                        selected = preset == value,
-                        onClick = { preset = value },
-                        label = { Text(label) },
-                        leadingIcon = if (preset == value) {
-                            { Icon(Icons.Default.Check, null, Modifier.size(16.dp)) }
-                        } else null,
-                        modifier = Modifier.padding(end = 8.dp),
-                    )
-                }
-            }
-
-            if (preset == "custom") {
-                Spacer(Modifier.height(8.dp))
-                OutlinedButton(
-                    onClick = {
-                        val text = clipboardManager.getText()?.text ?: ""
-                        if (text.isNotBlank()) {
-                            val (d, r) = VpnViewModel.parseTomlDomains(text)
-                            if (d.isNotEmpty() || r.isNotEmpty()) {
-                                customDomains = d.joinToString("\n")
-                                customIpRanges = r.joinToString("\n")
-                            }
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Icon(Icons.Default.ContentPaste, null, Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Text("Import TOML from clipboard")
-                }
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = customDomains, onValueChange = { customDomains = it },
-                    label = { Text("Domains to proxy") },
-                    placeholder = { Text("youtube.com\n*.google.com") },
-                    modifier = Modifier.fillMaxWidth().height(120.dp), maxLines = 8,
-                )
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = customIpRanges, onValueChange = { customIpRanges = it },
-                    label = { Text("IP ranges to proxy") },
-                    placeholder = { Text("91.108.56.0/22") },
-                    modifier = Modifier.fillMaxWidth().height(100.dp), maxLines = 6,
-                )
-            }
-
-            Spacer(Modifier.height(16.dp))
             Text("Хаб", style = MaterialTheme.typography.titleSmall)
             Spacer(Modifier.height(8.dp))
             OutlinedTextField(
@@ -342,14 +277,16 @@ fun ServerEditScreen(
             Spacer(Modifier.height(4.dp))
             if (base.hubPreset.isNotBlank()) {
                 Text(
-                    "Правила маршрутизации берутся из хаба (пресет: ${base.hubPreset}).",
+                    "Правила маршрутизации берутся из хаба (пресет: ${base.hubPreset}), " +
+                        "свои поверх — в разделе «Правила» на вкладке «Серверы».",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             } else {
                 Text(
-                    "У этого сервера правила берутся из пресета выше; адрес хаба " +
-                        "используется для проверки обновлений.",
+                    "Пресет с хаба у этого сервера не подключён; правила задаются " +
+                        "в разделе «Правила» на вкладке «Серверы», адрес хаба нужен " +
+                        "для проверки обновлений.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -377,9 +314,6 @@ fun ServerEditScreen(
                         obfuscationKey = key.trim(),
                         modifier = modifier,
                         salt = parseSalt(salt) ?: DEFAULT_SALT,
-                        routingPreset = preset,
-                        customDomains = if (preset == "custom") customDomains else "",
-                        customIpRanges = if (preset == "custom") customIpRanges else "",
                         // hubPreset intentionally left as-is: a manual server keeps
                         // it blank, so the hub URL drives only the update check
                         // (preset refresh needs both hubUrl AND hubPreset set).
