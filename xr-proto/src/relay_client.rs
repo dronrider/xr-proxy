@@ -32,6 +32,9 @@ use crate::share::{RelayGrant, RelayToken};
 pub const RELAY_CONNECT_TARGET: &str = "xr-relay:connect";
 /// Pseudo-target the agent uses to open its registration stream (LLD-23 §2.1).
 pub const RELAY_REGISTER_TARGET: &str = "xr-relay:register";
+/// Pseudo-target the relay opens **towards the agent** for each reverse-stream
+/// (LLD-23 §2.2). The agent serves its HTTP router over such a stream.
+pub const RELAY_REVERSE_TARGET: &str = "xr-relay:reverse";
 /// The relay's hello verdict on success: transit granted, splice begins. A
 /// failed hello is answered with a `Close` instead (agent offline / rejected).
 pub const RELAY_HELLO_OK: u8 = 0x01;
