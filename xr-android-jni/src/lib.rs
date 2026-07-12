@@ -18,7 +18,7 @@ use xr_core::update;
 use xr_proto::config::RoutingConfig;
 use xr_proto::invite_url;
 use xr_core::sync::LocalFile;
-use xr_proto::share::{ShareManifest, ShareManifestEntry, ShareToken};
+use xr_proto::share::{RelayGrant, ShareManifest, ShareManifestEntry, ShareToken};
 
 use base64::Engine as _;
 use std::collections::HashSet;
@@ -1088,6 +1088,17 @@ fn parse_token(json: &str) -> Result<ShareToken, String> {
     serde_json::from_str::<ShareToken>(json).map_err(|e| format!("bad token json: {e}"))
 }
 
+/// Parse the optional relay leg (a [`RelayGrant`] JSON, or empty for
+/// direct-only, LLD-23 §2.4). A malformed leg is treated as absent: a share must
+/// still work on its direct address if the relay descriptor is somehow broken.
+fn parse_relay(json: &str) -> Option<RelayGrant> {
+    let s = json.trim();
+    if s.is_empty() {
+        return None;
+    }
+    serde_json::from_str(s).ok()
+}
+
 /// GET the hub's public share index. Returns `{"shares":[{name,addr,port,
 /// agent_pubkey,share_id}...]}` or `{"error":".."}`.
 #[no_mangle]
@@ -1146,7 +1157,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeInviteShares(
                         .ok()
                         .and_then(|b| String::from_utf8(b).ok())
                         .unwrap_or_default();
-                    serde_json::json!({
+                    let mut o = serde_json::json!({
                         "share_id": g.share_id,
                         "name": g.name,
                         "addr": g.addr,
@@ -1154,7 +1165,16 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeInviteShares(
                         "agent_pubkey": g.agent_pubkey,
                         "token": token_json,
                         "exp": g.exp,
-                    })
+                    });
+                    // The relay leg (LLD-23 §2.4), passed through verbatim so the
+                    // consumer stores it and falls back to the relay when the
+                    // direct address is unreachable. Absent for a direct share.
+                    if let Some(relay) = &g.relay {
+                        if let Ok(v) = serde_json::to_value(relay) {
+                            o["relay"] = v;
+                        }
+                    }
+                    o
                 })
                 .collect();
             serde_json::json!({ "shares": shares }).to_string()
@@ -1177,6 +1197,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeFetchManifest
     agent_url: JString,
     token_json: JString,
     agent_pubkey: JString,
+    relay_json: JString,
     timeout_ms: jlong,
 ) -> jstring {
     let agent_url = match read_jstring(&mut env, &agent_url) {
@@ -1191,9 +1212,10 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeFetchManifest
         Ok(s) => s,
         Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
     };
+    let relay = read_jstring(&mut env, &relay_json).ok().and_then(|s| parse_relay(&s));
     let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
 
-    let json = match with_onboarding_runtime(sync::fetch_manifest(&agent_url, &token, &agent_pubkey, timeout)) {
+    let json = match with_onboarding_runtime(sync::fetch_manifest_relay(&agent_url, &token, &agent_pubkey, relay.as_ref(), timeout)) {
         Ok(Ok(manifest)) => serde_json::to_string(&manifest)
             .unwrap_or_else(|e| json_error(&format!("serialize: {e}"))),
         Ok(Err(e)) | Err(e) => {
@@ -1218,6 +1240,8 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeDownloadFile(
     token_json: JString,
     entry_json: JString,
     dest_dir: JString,
+    agent_pubkey: JString,
+    relay_json: JString,
     timeout_ms: jlong,
 ) -> jstring {
     let agent_url = match read_jstring(&mut env, &agent_url) {
@@ -1228,6 +1252,11 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeDownloadFile(
         Ok(t) => t,
         Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
     };
+    let agent_pubkey = match read_jstring(&mut env, &agent_pubkey) {
+        Ok(s) => s,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let relay = read_jstring(&mut env, &relay_json).ok().and_then(|s| parse_relay(&s));
     let entry = match read_jstring(&mut env, &entry_json) {
         Ok(s) => match serde_json::from_str::<ShareManifestEntry>(&s) {
             Ok(e) => e,
@@ -1249,8 +1278,9 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeDownloadFile(
         None => json_error("busy"),
         Some(_guard) => {
             sync::transfer_file(&entry.path, 0);
-            let result =
-                with_onboarding_runtime(sync::download_entry(&agent_url, &token, &entry, &dest, timeout));
+            let result = with_onboarding_runtime(sync::download_entry_relay(
+                &agent_url, &token, &entry, &dest, &agent_pubkey, relay.as_ref(), timeout,
+            ));
             match result {
                 Ok(Ok(())) => {
                     journal_log("INFO", "files", &format!(
@@ -1330,6 +1360,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
     dest_dir: JString,
     index_path: JString,
     selection_json: JString,
+    relay_json: JString,
     dry_run: jboolean,
     timeout_ms: jlong,
 ) -> jstring {
@@ -1345,6 +1376,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
         Ok(s) => s,
         Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
     };
+    let relay = read_jstring(&mut env, &relay_json).ok().and_then(|s| parse_relay(&s));
     let dest = match read_jstring(&mut env, &dest_dir) {
         Ok(s) => PathBuf::from(s),
         Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
@@ -1363,7 +1395,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
     let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
 
     let dry = dry_run != 0;
-    let json = match with_onboarding_runtime(sync::sync_share_selected(
+    let json = match with_onboarding_runtime(sync::sync_share_selected_relay(
         &agent_url,
         &token,
         &agent_pubkey,
@@ -1371,6 +1403,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
         selection.as_ref(),
         index_path.as_deref(),
         dry,
+        relay.as_ref(),
         timeout,
     )) {
         Ok(Ok(result)) => {
