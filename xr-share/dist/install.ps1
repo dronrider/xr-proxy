@@ -10,6 +10,12 @@
 # any path:  xr-share share C:\photos   (a folder OR a single file). Set XR_DIR to
 # also share one path right away. Without XR_TOKEN it just installs the binary;
 # set up later with `xr-share install --token <reg-token>`.
+#
+# One-command share (XR-127): a setup token packs the reg-token and an invite, so
+# one line installs, mandates, and shares a folder (relay on by default, invite
+# attached automatically):
+#   $env:XR_SETUP="<SETUP-TOKEN>"; $env:XR_DIR="C:\photos"
+#   irm https://xr-hub.zoobr.top/share/install.ps1 | iex
 # Optional: $env:XR_HUB, $env:XR_ADDR (advertised address), $env:XR_NAME.
 $ErrorActionPreference = 'Stop'
 
@@ -49,19 +55,25 @@ if ($userPath -notlike "*$dir*") {
 if ($env:Path -notlike "*$dir*") { $env:Path = "$env:Path;$dir" }
 Write-Host "Installed: $dest"
 
-# ── No-hands: install the service with a hub mandate ────────────────
-if ($env:XR_TOKEN) {
+# No-hands: install the service with a hub mandate.
+if ($env:XR_SETUP -or $env:XR_TOKEN) {
     Write-Host "Installing the service and exchanging the token for a hub mandate ..."
-    $installArgs = @('install', '--non-interactive', '--hub', $hub, '--token', $env:XR_TOKEN)
+    if ($env:XR_SETUP) {
+        # One setup token packs the reg-token and an invite (XR-127): the invite is
+        # pinned as default, so the share below needs no --invite and relay is on.
+        $installArgs = @('install', '--non-interactive', '--hub', $hub, '--setup', $env:XR_SETUP)
+    } else {
+        $installArgs = @('install', '--non-interactive', '--hub', $hub, '--token', $env:XR_TOKEN)
+    }
     & $dest @installArgs           # needs an elevated (Administrator) PowerShell
     if ($env:XR_DIR) {
         Write-Host "Sharing $($env:XR_DIR) ..."
         $shareArgs = @('share', $env:XR_DIR)
         if ($env:XR_ADDR)   { $shareArgs += @('--addr', $env:XR_ADDR) }
         if ($env:XR_NAME)   { $shareArgs += @('--name', $env:XR_NAME) }
-        # Reachable through the hub's relay for a share behind NAT (LLD-23): the
-        # binary must be a relay build; the relay descriptor came with the mandate
-        # above, so no config editing is needed.
+        # Relay is on by default once the mandate carries a relay descriptor
+        # (XR-127); --relay only forces it and --invite is only needed without a
+        # --setup invite.
         if ($env:XR_RELAY)  { $shareArgs += @('--relay') }
         if ($env:XR_INVITE) { $shareArgs += @('--invite', $env:XR_INVITE) }
         & $dest @shareArgs

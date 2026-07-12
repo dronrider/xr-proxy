@@ -11,21 +11,44 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use base64::Engine;
 use clap::Args;
 use ed25519_dalek::SigningKey;
 
 use crate::config::{AgentConfig, ShareEntry};
 use crate::setup;
 
+/// Split a `--setup` blob back into (reg_token, invite_token). Inverse of the
+/// hub's pack (XR-127): base64url of "<reg>.<invite>".
+fn unpack_setup_token(blob: &str) -> Result<(String, String)> {
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(blob.trim())
+        .context("setup-токен не base64url")?;
+    let joined = String::from_utf8(raw).context("setup-токен не utf8")?;
+    let (reg, inv) = joined
+        .split_once('.')
+        .context("setup-токен без разделителя reg.invite")?;
+    if reg.is_empty() || inv.is_empty() {
+        bail!("setup-токен: пустая часть reg или invite");
+    }
+    Ok((reg.to_string(), inv.to_string()))
+}
+
 #[derive(Args)]
 pub struct InstallArgs {
     /// Hub base URL, e.g. https://xr-hub.zoobr.top. Prompted if omitted.
     #[arg(long)]
     pub hub: Option<String>,
-    /// Registration token from the hub admin "install command" — exchanged for a
+    /// Registration token from the hub admin "install command", exchanged for a
     /// long-lived agent credential so later `share`s need no admin action.
     #[arg(long)]
     pub token: Option<String>,
+    /// One-token onboarding (XR-127): a setup blob from the hub admin that packs
+    /// the reg-token together with an invite. Redeems the reg half for a mandate
+    /// and pins the invite as the default for later `share`s, so the whole flow is
+    /// a single command. Takes the place of `--token`.
+    #[arg(long)]
+    pub setup: Option<String>,
     /// Listen address (default 0.0.0.0:8443).
     #[arg(long)]
     pub listen: Option<String>,
@@ -58,11 +81,16 @@ pub struct ShareArgs {
     /// reaches it (the access anchor, §9.5). Repeatable.
     #[arg(long = "invite")]
     pub invites: Vec<String>,
-    /// Mark the share reachable through the hub's relay (LLD-23 §2.4): for an
-    /// agent behind NAT, consumers fall back to the relay when the direct address
-    /// is unreachable. Needs a hub with a relay configured.
+    /// Force the share reachable through the hub's relay (LLD-23 п. 2.4) even if
+    /// the agent has no relay descriptor yet. Relay is on by default whenever the
+    /// mandate carried one (XR-127); this flag only matters to force it on.
     #[arg(long)]
     pub relay: bool,
+    /// Opt out of the relay leg for this share (XR-127): advertise direct-only
+    /// even though the agent has a relay descriptor. Use on a public-IP host where
+    /// the relay uplink would be dead weight.
+    #[arg(long)]
+    pub no_relay: bool,
 }
 
 /// `xr-share install` — set up the binary + service with **no** folder binding.
@@ -70,12 +98,31 @@ pub struct ShareArgs {
 pub fn install(config_path: &Path, args: InstallArgs) -> Result<()> {
     println!("xr-share install — установка агента (без привязки к папке)\n");
 
+    // A --setup blob carries the reg-token and an invite in one (XR-127): the reg
+    // half stands in for --token, the invite becomes the default attach target.
+    let (token, setup_invite) = match args.setup.as_deref() {
+        Some(blob) => {
+            let (reg, inv) = unpack_setup_token(blob).context("разбор setup-токена")?;
+            (Some(reg), Some(inv))
+        }
+        None => (args.token.clone(), None),
+    };
+
     // Re-running install must not orphan an existing agent's shares (XR-037):
     // generating a fresh identity and an empty share list would leave every
     // registered share unreachable on the hub. Keep the existing config and just
     // refresh the autostart service. A clean wipe is opt-in via --force.
     if !args.force {
-        if let Ok(existing) = read_config(config_path) {
+        if let Ok(mut existing) = read_config(config_path) {
+            // A fresh --setup can re-point where future shares attach; persist it.
+            if let Some(inv) = &setup_invite {
+                if existing.default_invite.as_deref() != Some(inv.as_str()) {
+                    existing.default_invite = Some(inv.clone());
+                    normalize_legacy(&mut existing);
+                    write_config(config_path, &existing)?;
+                    println!("  инвайт по умолчанию обновлён из setup-токена");
+                }
+            }
             println!("  ✓ найден конфиг: личность, шары ({}) и мандат сохранены", existing.shares.len());
             if !args.no_service {
                 setup::service_install(config_path)?;
@@ -97,7 +144,7 @@ pub fn install(config_path: &Path, args: InstallArgs) -> Result<()> {
     let identity = SigningKey::generate(&mut rand::thread_rng());
     let agent_pub = setup::b64(identity.verifying_key().as_bytes());
 
-    let (agent_credential, relay_cfg) = match args.token.as_deref() {
+    let (agent_credential, relay_cfg) = match token.as_deref() {
         Some(token) => {
             let (cred, relay) = exchange(&hub, token, &agent_pub).context("обмен reg-токена на мандат")?;
             println!("  ✓ мандат агента получен (можно шарить без админки)");
@@ -107,7 +154,7 @@ pub fn install(config_path: &Path, args: InstallArgs) -> Result<()> {
             (Some(cred), relay.map(|d| crate::config::RelayAgentConfig::from_descriptor(&d)))
         }
         None => {
-            println!("  ! без --token мандата нет: запросишь его позже через `install --token <reg-токен>`");
+            println!("  ! без --token/--setup мандата нет: запросишь его позже через `install --token <reg-токен>`");
             (None, None)
         }
     };
@@ -120,6 +167,7 @@ pub fn install(config_path: &Path, args: InstallArgs) -> Result<()> {
         identity_key: Some(setup::b64(&identity.to_bytes())),
         tls: None,
         relay: relay_cfg,
+        default_invite: setup_invite,
         shares: Vec::new(),
         dir: None,
         share_id: None,
@@ -149,7 +197,26 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     let hub = cfg
         .hub_url
         .clone()
-        .context("в конфиге нет hub_url — переустанови через `xr-share install`")?;
+        .context("в конфиге нет hub_url, переустанови через `xr-share install`")?;
+
+    // Attach targets: explicit --invite wins; otherwise the install-time default
+    // invite from a --setup token (XR-127), so onboarding needs no per-share flag.
+    let invites: Vec<String> = if args.invites.is_empty() {
+        cfg.default_invite.iter().cloned().collect()
+    } else {
+        args.invites.clone()
+    };
+
+    // Relay is on by default whenever the agent holds a relay descriptor (the
+    // mandate carried one). --relay forces it on even before the descriptor
+    // arrives; --no-relay opts a public-IP host out of the uplink (XR-127).
+    let via_relay = if args.no_relay {
+        false
+    } else if args.relay {
+        true
+    } else {
+        cfg.relay.is_some()
+    };
 
     let canon = Path::new(&args.path)
         .canonicalize()
@@ -176,7 +243,7 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     if let Some(addr) = args.addr.as_deref() {
         body["addr"] = serde_json::json!(addr);
     }
-    if args.relay {
+    if via_relay {
         body["via_relay"] = serde_json::json!(true);
     }
     let resp = hub_post(&format!("{}/api/v1/share/add", hub.trim_end_matches('/')), &body)
@@ -202,8 +269,8 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     });
     write_config(config_path, &cfg)?;
 
-    // Attach to invites so their holders get access (the access anchor, §9.5).
-    for invite in &args.invites {
+    // Attach to invites so their holders get access (the access anchor, п. 9.5).
+    for invite in &invites {
         let body = serde_json::json!({ "credential": cred, "share_id": share_id, "invite_token": invite });
         match hub_post(&format!("{}/api/v1/share/attach", hub.trim_end_matches('/')), &body) {
             Ok(_) => println!("  ✓ привязана к инвайту {}", short(invite)),
@@ -221,7 +288,7 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
         eprintln!("  Снаружи она недоступна. Регистрируй с хоста агента (хаб подставит белый IP сам),");
         eprintln!("  либо передай --addr <публичный IP или DDNS> и пробрось порт {port} на эту машину.");
     }
-    if args.invites.is_empty() {
+    if invites.is_empty() {
         // No invite: hand out a self-contained link (receiver pulls directly).
         println!("\n  Ссылка для получателя (отправь её в мессенджере):");
         println!("  xrshare://{addr}:{port}/{share_id}?token={token}");
@@ -370,5 +437,36 @@ fn normalize_legacy(cfg: &mut AgentConfig) {
         if !cfg.shares.iter().any(|s| s.share_id == id) {
             cfg.shares.push(ShareEntry { share_id: id, path: dir, name: None });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pack(reg: &str, inv: &str) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{reg}.{inv}").as_bytes())
+    }
+
+    // The setup blob the hub packs must split back into exactly its two tokens
+    // (the reg-token itself is base64url and holds no dot, so the first dot is the
+    // separator), XR-127.
+    #[test]
+    fn unpack_setup_token_roundtrips() {
+        let (reg, inv) = unpack_setup_token(&pack("regTok-9", "invTok_1")).unwrap();
+        assert_eq!(reg, "regTok-9");
+        assert_eq!(inv, "invTok_1");
+    }
+
+    #[test]
+    fn unpack_setup_token_rejects_malformed() {
+        // Not base64url at all.
+        assert!(unpack_setup_token("!!!nope!!!").is_err());
+        // Valid base64url but no separator.
+        let no_dot = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"regonly");
+        assert!(unpack_setup_token(&no_dot).is_err());
+        // Empty invite half.
+        let empty = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"reg.");
+        assert!(unpack_setup_token(&empty).is_err());
     }
 }

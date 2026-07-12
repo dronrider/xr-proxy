@@ -11,9 +11,15 @@
 # Pass --dir to also share one path right after install. Without --token it just
 # installs the binary; set up later with `xr-share install --token <reg-token>`.
 #
-# Flags (or env): --token/XR_TOKEN, --hub/XR_HUB, --dir/XR_DIR (share now),
-#                 --addr/XR_ADDR (advertised address; default = source IP),
-#                 --name/XR_NAME (share name; default = path's file name).
+# One-command share (XR-127): a --setup token packs the reg-token and an invite,
+# so a single line installs, mandates, and shares a folder on any OS, relay on by
+# default and the invite attached with no extra flags:
+#   curl -fsSL https://xr-hub.zoobr.top/share/install.sh | sudo sh -s -- \
+#     --setup <SETUP-TOKEN> --dir /srv/photos
+#
+# Flags (or env): --token/XR_TOKEN, --setup/XR_SETUP, --hub/XR_HUB,
+#                 --dir/XR_DIR (share now), --addr/XR_ADDR (advertised address;
+#                 default = source IP), --name/XR_NAME (share name).
 set -eu
 
 BASE="${XR_SHARE_BASE:-https://xr-hub.zoobr.top/share}"
@@ -24,10 +30,12 @@ ADDR="${XR_ADDR:-}"
 NAME="${XR_NAME:-}"
 RELAY="${XR_RELAY:-}"
 INVITE="${XR_INVITE:-}"
+SETUP="${XR_SETUP:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --dir)    DIR="$2";    shift 2 ;;
     --token)  TOKEN="$2";  shift 2 ;;
+    --setup)  SETUP="$2";  shift 2 ;;
     --hub)    HUB="$2";    shift 2 ;;
     --addr)   ADDR="$2";   shift 2 ;;
     --name)   NAME="$2";   shift 2 ;;
@@ -79,23 +87,33 @@ if [ -w /usr/local/bin ]; then dir=/usr/local/bin; else dir="$HOME/.local/bin"; 
 mv "$tmp/$bin" "$dir/xr-share"
 say "Installed: $dir/xr-share"
 
-# ── No-hands: install the service with a hub mandate ────────────────
-if [ -n "$TOKEN" ]; then
+# No-hands: install the service with a hub mandate.
+if [ -n "$SETUP" ] || [ -n "$TOKEN" ]; then
   if [ "$(id -u)" != 0 ]; then
     say ""
     say "Installing the service needs root, re-run as:"
-    say "  curl -fsSL $BASE/install.sh | sudo sh -s -- --token <token>"
+    if [ -n "$SETUP" ]; then
+      say "  curl -fsSL $BASE/install.sh | sudo sh -s -- --setup <setup-token> --dir <path>"
+    else
+      say "  curl -fsSL $BASE/install.sh | sudo sh -s -- --token <token>"
+    fi
     exit 0
   fi
   say "Installing the service and exchanging the token for a hub mandate ..."
-  "$dir/xr-share" install --non-interactive --hub "$HUB" --token "$TOKEN"
+  if [ -n "$SETUP" ]; then
+    # One setup token packs the reg-token and an invite (XR-127): the invite is
+    # pinned as the default, so the share below needs no --invite and relay is on.
+    "$dir/xr-share" install --non-interactive --hub "$HUB" --setup "$SETUP"
+  else
+    "$dir/xr-share" install --non-interactive --hub "$HUB" --token "$TOKEN"
+  fi
   if [ -n "$DIR" ]; then
     say "Sharing $DIR ..."
     set -- share "$DIR"
     [ -n "$ADDR" ] && set -- "$@" --addr "$ADDR"
     [ -n "$NAME" ] && set -- "$@" --name "$NAME"
-    # Reachable through the hub's relay for a share behind NAT (LLD-23): needs a
-    # relay build; the relay descriptor came with the mandate, no config editing.
+    # Relay is on by default once the mandate carries a relay descriptor (XR-127);
+    # --relay only forces it and --invite is only needed without a --setup invite.
     [ -n "$RELAY" ]  && set -- "$@" --relay
     [ -n "$INVITE" ] && set -- "$@" --invite "$INVITE"
     "$dir/xr-share" "$@"

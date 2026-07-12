@@ -46,6 +46,12 @@ pub struct AgentConfig {
     /// default build parses it but logs that it's ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<RelayAgentConfig>,
+    /// Invite this agent attaches new shares to when `share` gets no explicit
+    /// `--invite` (XR-127). Set from a `--setup` token at install, so onboarding
+    /// is one command: install once, and every later `share` lands on the invite
+    /// its holders already carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_invite: Option<String>,
     /// The shares this agent serves. Each `[[share]]` is a `share_id` + path.
     #[serde(default, rename = "share")]
     pub shares: Vec<ShareEntry>,
@@ -243,6 +249,7 @@ mod tests {
             identity_key: Some("priv".into()),
             tls: None,
             relay: None,
+            default_invite: Some("inv123".into()),
             shares: vec![ShareEntry { share_id: "a".into(), path: "/srv/x".into(), name: Some("X".into()) }],
             dir: None,
             share_id: None,
@@ -251,6 +258,7 @@ mod tests {
         let back: AgentConfig = toml::from_str(&text).unwrap();
         assert_eq!(back.resolved_shares().len(), 1);
         assert_eq!(back.hub_url.as_deref(), Some("https://hub"));
+        assert_eq!(back.default_invite.as_deref(), Some("inv123"));
         assert!(back.dir.is_none());
     }
 }
