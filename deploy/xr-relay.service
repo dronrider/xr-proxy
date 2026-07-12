@@ -1,0 +1,18 @@
+[Unit]
+Description=XR Share Relay (blind transit for NAT'd shares, LLD-23)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xr-relay --config /etc/xr-proxy/relay.toml
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+# Security hardening
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
