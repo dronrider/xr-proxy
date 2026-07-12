@@ -71,8 +71,19 @@ if ($env:XR_TOKEN) {
     Write-Host "  xr-share share C:\photos"
     Write-Host "  xr-share list"
 } else {
-    Write-Host ""
-    Write-Host "Next: install the service, then share paths"
-    Write-Host "  xr-share install --hub $hub --token <reg-token-from-hub>"
-    Write-Host "  xr-share share C:\path\to\share"
+    # Binary-only run (no token). If a service is already installed, this was an
+    # update, so restart it: the new binary (and its relay auto-config on start,
+    # XR-123) takes effect now, not at next logon. Fresh installs have no task and
+    # fall through to the hint below.
+    schtasks /Query /TN xr-share 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        schtasks /Run /TN xr-share | Out-Null
+        Write-Host ""
+        Write-Host "Updated and restarted the xr-share service with the new binary."
+    } else {
+        Write-Host ""
+        Write-Host "Next: install the service, then share paths"
+        Write-Host "  xr-share install --hub $hub --token <reg-token-from-hub>"
+        Write-Host "  xr-share share C:\path\to\share"
+    }
 }

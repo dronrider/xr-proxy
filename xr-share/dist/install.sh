@@ -105,8 +105,18 @@ if [ -n "$TOKEN" ]; then
   say "  sudo xr-share share /srv/photos"
   say "  sudo xr-share list"
 else
-  say ""
-  say "Next: install the service, then share paths"
-  say "  sudo xr-share install --hub $HUB --token <reg-token-from-hub>"
-  say "  sudo xr-share share /path/to/share"
+  # Binary-only run (no token). If the service is already installed, this was an
+  # update, so restart it: the new binary (and its relay auto-config on start,
+  # XR-123) takes effect now. Fresh installs fall through to the hint.
+  if [ "$(id -u)" = 0 ] && systemctl list-unit-files xr-share.service >/dev/null 2>&1 \
+     && systemctl cat xr-share.service >/dev/null 2>&1; then
+    systemctl restart xr-share
+    say ""
+    say "Updated and restarted xr-share with the new binary."
+  else
+    say ""
+    say "Next: install the service, then share paths"
+    say "  sudo xr-share install --hub $HUB --token <reg-token-from-hub>"
+    say "  sudo xr-share share /path/to/share"
+  fi
 fi
