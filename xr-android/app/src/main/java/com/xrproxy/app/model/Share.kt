@@ -58,6 +58,10 @@ data class ShareGrant(
     val port: Int,
     val agentPubkey: String,
     val tokenJson: String,
+    /** The grant's relay leg as raw JSON (`{addr,port,obf,relay_token}`), or null
+     *  for a direct share. Passed to the native calls so the consumer falls back
+     *  to the relay when the direct address is unreachable (LLD-23 §2.4). */
+    val relayJson: String? = null,
 ) {
     companion object {
         fun listFrom(json: String): Result<List<ShareGrant>> = runCatching {
@@ -75,6 +79,7 @@ data class ShareGrant(
                     port = o.getInt("port"),
                     agentPubkey = o.getString("agent_pubkey"),
                     tokenJson = o.getString("token"),
+                    relayJson = o.optJSONObject("relay")?.toString(),
                 )
             }
         }
@@ -168,9 +173,15 @@ data class ShareConfig(
     /** Whether the user has made the first-sync storage choice. We prompt once,
      *  then stop asking, even if the choice was the default app directory. */
     val storageChosen: Boolean = false,
+    /** The relay leg (raw JSON) for a share reachable through the hub's relay
+     *  (LLD-23 §2.4), or null for a direct share. Persisted so the background
+     *  mirror can fall back to the relay without re-fetching the grant. */
+    val relayJson: String? = null,
 ) {
     val agentBaseUrl: String get() = "http://$addr:$port"
     val hasToken: Boolean get() = !tokenJson.isNullOrBlank()
+    /** Relay leg for the native calls; empty string means direct-only. */
+    val relayArg: String get() = relayJson ?: ""
 
     /** Selection as the JSON array the native sync/plan calls expect. */
     fun selectionJson(): String = JSONArray().apply { selection.forEach { put(it) } }.toString()
@@ -186,6 +197,7 @@ data class ShareConfig(
         .put("selection", JSONArray().apply { selection.forEach { put(it) } })
         .put("storage_path", storagePath ?: JSONObject.NULL)
         .put("storage_chosen", storageChosen)
+        .put("relay_json", relayJson ?: JSONObject.NULL)
 
     companion object {
         /** Build a configured share from an invite grant — the token comes with it. */
@@ -196,6 +208,7 @@ data class ShareConfig(
             port = g.port,
             agentPubkey = g.agentPubkey,
             tokenJson = g.tokenJson,
+            relayJson = g.relayJson,
         )
 
         fun fromJson(o: JSONObject) = ShareConfig(
@@ -211,6 +224,7 @@ data class ShareConfig(
             },
             storagePath = o.optString("storage_path").takeIf { it.isNotBlank() && it != "null" },
             storageChosen = o.optBoolean("storage_chosen", false),
+            relayJson = o.optString("relay_json").takeIf { it.isNotBlank() && it != "null" },
         )
     }
 }

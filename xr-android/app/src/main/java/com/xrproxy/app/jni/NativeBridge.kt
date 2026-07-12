@@ -217,6 +217,7 @@ object NativeBridge {
         agentUrl: String,
         tokenJson: String,
         agentPubkey: String,
+        relayJson: String,
         timeoutMs: Long,
     ): String
 
@@ -230,12 +231,17 @@ object NativeBridge {
     external fun nativePlanSync(manifestJson: String, localJson: String, selectionJson: String): String
 
     /** Download one manifest entry ([entryJson]) to [destDir], SHA-256-verified
-     *  before it is published. Returns `{"ok":true}` or `{"error":".."}`. */
+     *  before it is published. Returns `{"ok":true}` or `{"error":".."}`.
+     *  [agentPubkey] pins the relay's end-to-end TLS; [relayJson] is the grant's
+     *  relay leg (or empty) used only when the direct address is unreachable
+     *  (LLD-23 §2.4). */
     external fun nativeDownloadFile(
         agentUrl: String,
         tokenJson: String,
         entryJson: String,
         destDir: String,
+        agentPubkey: String,
+        relayJson: String,
         timeoutMs: Long,
     ): String
 
@@ -255,6 +261,7 @@ object NativeBridge {
         destDir: String,
         indexPath: String,
         selectionJson: String,
+        relayJson: String,
         dryRun: Boolean,
         timeoutMs: Long,
     ): String

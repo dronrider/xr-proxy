@@ -122,7 +122,7 @@ class ShareRepository(private val context: Context) {
         val token = config.tokenJson ?: return Result.failure(IllegalStateException("no token"))
         return parseManifest(
             NativeBridge.nativeFetchManifest(
-                config.agentBaseUrl, token, config.agentPubkey, MANIFEST_TIMEOUT_MS,
+                config.agentBaseUrl, token, config.agentPubkey, config.relayArg, MANIFEST_TIMEOUT_MS,
             ),
         )
     }
@@ -133,7 +133,8 @@ class ShareRepository(private val context: Context) {
     fun downloadOne(config: ShareConfig, entry: ManifestEntry): String? {
         val token = config.tokenJson ?: return "no token"
         val res = NativeBridge.nativeDownloadFile(
-            config.agentBaseUrl, token, entry.toJson(), destDir(config).absolutePath, XFER_TIMEOUT_MS,
+            config.agentBaseUrl, token, entry.toJson(), destDir(config).absolutePath,
+            config.agentPubkey, config.relayArg, XFER_TIMEOUT_MS,
         )
         return runCatching {
             val o = JSONObject(res)
@@ -156,7 +157,7 @@ class ShareRepository(private val context: Context) {
         val token = config.tokenJson ?: return SyncOutcome(0, 0, 0, "no token")
         val res = NativeBridge.nativeSyncShare(
             config.agentBaseUrl, token, config.agentPubkey, destDir(config).absolutePath,
-            hashIndexPath(config), config.selectionJson(), false, XFER_TIMEOUT_MS,
+            hashIndexPath(config), config.selectionJson(), config.relayArg, false, XFER_TIMEOUT_MS,
         )
         return runCatching {
             val o = JSONObject(res)
