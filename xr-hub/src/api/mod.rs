@@ -76,6 +76,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/shares/{id}", delete(shares::delete_share))
         .route("/shares/{id}/token", post(shares::mint_token))
         .route("/shares/reg-token", post(register::create_reg_token))
+        .route("/shares/setup-token", post(register::create_setup_token))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_admin,

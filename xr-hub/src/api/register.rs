@@ -91,16 +91,13 @@ pub struct CreateRegTokenResp {
     pub exp: u64,
 }
 
-/// `POST /api/v1/admin/shares/reg-token` — sign a short-lived registration token.
-pub async fn create_reg_token(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<CreateRegTokenReq>,
-) -> Result<Json<CreateRegTokenResp>, (StatusCode, String)> {
-    let signing = state.signing.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "hub signing key not configured".into(),
-    ))?;
-    let ttl = req.ttl_seconds.unwrap_or(DEFAULT_REG_TTL);
+/// Sign a fresh registration token with the given TTL, returning the blob and its
+/// expiry. Shared by the admin reg-token endpoint and the combined setup-token
+/// (XR-127), so both go through one signing path.
+pub(crate) fn sign_reg_token(
+    signing: &SigningContext,
+    ttl: u64,
+) -> Result<(String, u64), (StatusCode, String)> {
     if ttl == 0 || ttl > MAX_REG_TTL {
         return Err((StatusCode::BAD_REQUEST, format!("ttl_seconds must be 1..={MAX_REG_TTL}")));
     }
@@ -112,7 +109,87 @@ pub async fn create_reg_token(
     };
     let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(serde_json::to_vec(&rt).expect("serialize reg token"));
+    Ok((token, exp))
+}
+
+/// `POST /api/v1/admin/shares/reg-token` signs a short-lived registration token.
+pub async fn create_reg_token(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateRegTokenReq>,
+) -> Result<Json<CreateRegTokenResp>, (StatusCode, String)> {
+    let signing = state.signing.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "hub signing key not configured".into(),
+    ))?;
+    let ttl = req.ttl_seconds.unwrap_or(DEFAULT_REG_TTL);
+    let (token, exp) = sign_reg_token(signing, ttl)?;
     Ok(Json(CreateRegTokenResp { token, exp }))
+}
+
+// Admin: mint a combined setup token (reg-token + invite), XR-127.
+
+#[derive(Debug, Deserialize)]
+pub struct CreateSetupTokenReq {
+    /// Reg-token lifetime: how long the operator has to run the installer.
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+    /// Invite lifetime; defaults to the hub's invite default TTL.
+    #[serde(default)]
+    pub invite_ttl_seconds: Option<u64>,
+    /// One-time invite. Default false: a setup token you hand to a colleague is
+    /// meant to be reusable while it lives.
+    #[serde(default)]
+    pub one_time: bool,
+    #[serde(default)]
+    pub comment: String,
+    #[serde(default)]
+    pub preset: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct CreateSetupTokenResp {
+    /// The single blob for `xr-share install --setup`: base64url("<reg>.<invite>").
+    pub setup_token: String,
+    pub reg_token: String,
+    pub invite_token: String,
+    pub reg_exp: u64,
+}
+
+/// Pack a reg-token and an invite token into one opaque setup token. The client
+/// splits it back with [`unpack_setup_token`].
+pub(crate) fn pack_setup_token(reg_token: &str, invite_token: &str) -> String {
+    let joined = format!("{reg_token}.{invite_token}");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(joined.as_bytes())
+}
+
+/// `POST /api/v1/admin/shares/setup-token` mints a reg-token AND an invite and
+/// bundles them into one blob (XR-127), so onboarding needs a single secret. The
+/// agent redeems the reg-token for a mandate and auto-attaches its shares to the
+/// invite.
+pub async fn create_setup_token(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateSetupTokenReq>,
+) -> Result<Json<CreateSetupTokenResp>, (StatusCode, String)> {
+    let signing = state.signing.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "hub signing key not configured".into(),
+    ))?;
+    let ttl = req.ttl_seconds.unwrap_or(DEFAULT_REG_TTL);
+    let (reg_token, reg_exp) = sign_reg_token(signing, ttl)?;
+
+    let invite = crate::api::invites::build_invite(
+        &state,
+        req.invite_ttl_seconds,
+        req.one_time,
+        req.comment.clone(),
+        req.preset.clone(),
+        None,
+    )
+    .await?;
+    let invite_token = invite.token;
+
+    let setup_token = pack_setup_token(&reg_token, &invite_token);
+    Ok(Json(CreateSetupTokenResp { setup_token, reg_token, invite_token, reg_exp }))
 }
 
 // ── Public: agent self-registers ────────────────────────────────────
@@ -220,4 +297,68 @@ pub(crate) fn validate_ed25519_pubkey(b64: &str) -> Result<(), (StatusCode, Stri
         return Err((StatusCode::BAD_REQUEST, format!("agent_pubkey must be 32 bytes, got {}", bytes.len())));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use ed25519_dalek::SigningKey;
+    use tokio::sync::RwLock;
+
+    use super::*;
+    use crate::config::HubConfig;
+
+    fn state_with_signing() -> Arc<AppState> {
+        let dir = std::env::temp_dir().join(format!("xr-hub-setup-{}", std::process::id()));
+        let toml = format!("[server]\ndata_dir = \"{}\"\n[admin]\nusers = []\n", dir.display());
+        let config: HubConfig = toml::from_str(&toml).unwrap();
+        Arc::new(AppState {
+            presets: RwLock::new(HashMap::new()),
+            invites: RwLock::new(HashMap::new()),
+            shares: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashMap::new()),
+            config,
+            signing: Some(crate::signing::SigningContext {
+                signing_key: SigningKey::from_bytes(&[42u8; 32]),
+            }),
+        })
+    }
+
+    /// The setup token packs a reg-token and an invite into one blob; splitting it
+    /// back yields exactly the two tokens the response reports, the reg half
+    /// verifies against the hub key, and the invite half is stored (XR-127).
+    #[tokio::test]
+    async fn setup_token_bundles_reg_and_invite() {
+        let state = state_with_signing();
+        let resp = create_setup_token(
+            State(state.clone()),
+            Json(CreateSetupTokenReq {
+                ttl_seconds: Some(3600),
+                invite_ttl_seconds: Some(3600),
+                one_time: false,
+                comment: "colleague".into(),
+                preset: None,
+            }),
+        )
+        .await
+        .expect("mint setup token")
+        .0;
+
+        // The opaque blob splits back into the same two tokens.
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&resp.setup_token)
+            .expect("setup token is base64url");
+        let joined = String::from_utf8(raw).unwrap();
+        let (reg, inv) = joined.split_once('.').expect("reg.invite");
+        assert_eq!(reg, resp.reg_token);
+        assert_eq!(inv, resp.invite_token);
+
+        // The reg half is a valid registration token against the hub key.
+        let signing = state.signing.as_ref().unwrap();
+        verify_reg_token(signing, reg, now_unix()).expect("reg half verifies");
+
+        // The invite half is registered and reachable by its token.
+        assert!(state.invites.read().await.contains_key(inv));
+    }
 }

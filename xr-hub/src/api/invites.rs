@@ -236,7 +236,30 @@ pub async fn create_invite(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateInviteRequest>,
 ) -> Result<(StatusCode, Json<Invite>), (StatusCode, String)> {
-    let ttl = req.ttl_seconds.unwrap_or(state.config.invites.default_ttl_seconds);
+    let invite = build_invite(
+        &state,
+        req.ttl_seconds,
+        req.one_time,
+        req.comment,
+        req.preset,
+        req.payload,
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(invite)))
+}
+
+/// Build, persist and register an invite. Shared by the admin endpoint and the
+/// combined setup-token (XR-127). With `payload` given it is used verbatim;
+/// otherwise the payload is filled from the hub's invite defaults.
+pub(crate) async fn build_invite(
+    state: &AppState,
+    ttl_seconds: Option<u64>,
+    one_time: bool,
+    comment: String,
+    preset: Option<String>,
+    payload: Option<InvitePayload>,
+) -> Result<Invite, (StatusCode, String)> {
+    let ttl = ttl_seconds.unwrap_or(state.config.invites.default_ttl_seconds);
     if ttl > state.config.invites.max_ttl_seconds {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -246,11 +269,11 @@ pub async fn create_invite(
 
     // Build payload from explicit values or defaults.
     let defaults = &state.config.invites.defaults;
-    let payload = if let Some(p) = req.payload {
+    let payload = if let Some(p) = payload {
         p
     } else {
-        let preset_name = req.preset.unwrap_or_default();
-        // Пул серверов из конфига хаба (LLD-10 §2.8); legacy-поля всегда
+        let preset_name = preset.unwrap_or_default();
+        // Пул серверов из конфига хаба (LLD-10 п. 2.8); legacy-поля всегда
         // несут primary, чтобы старое приложение работало по ним как раньше.
         let servers = defaults.sorted_servers();
         let (server_address, server_port) = servers
@@ -283,8 +306,8 @@ pub async fn create_invite(
         expires_at: expires.to_rfc3339(),
         consumed_at: None,
         claimed_by_ip: None,
-        one_time: req.one_time,
-        comment: req.comment,
+        one_time,
+        comment,
         payload,
         share_ids: Vec::new(),
     };
@@ -293,10 +316,9 @@ pub async fn create_invite(
     storage::save_invite(data_dir, &invite)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let mut invites = state.invites.write().await;
-    invites.insert(invite.token.clone(), invite.clone());
+    state.invites.write().await.insert(invite.token.clone(), invite.clone());
 
-    Ok((StatusCode::CREATED, Json(invite)))
+    Ok(invite)
 }
 
 pub async fn revoke_invite(
