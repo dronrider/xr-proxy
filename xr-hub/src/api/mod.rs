@@ -48,6 +48,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/shares", get(shares::list_shares))
         .route("/share/register", post(register::register))
         // v2 self-service multishare (agent-authenticated by reg-token/credential).
+        .route("/relay", get(share_v2::get_relay))
         .route("/share/exchange", post(share_v2::exchange))
         .route("/share/add", post(share_v2::add))
         .route("/share/mint", post(share_v2::mint))

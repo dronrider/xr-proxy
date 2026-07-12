@@ -130,6 +130,15 @@ pub async fn exchange(
     Ok(Json(ExchangeResp { credential: encode_blob(&cred), exp, relay }))
 }
 
+/// `GET /api/v1/relay`: the hub's relay descriptor (LLD-23), or `null`.
+/// Public, the descriptor (addr/port/obfuscation) is not secret since consumers
+/// already get it in every grant. The agent fetches it at startup to bring up
+/// its reverse tunnel without re-exchanging a token or hand-editing the config
+/// (XR-123), so a plain binary update is enough to switch an agent onto relay.
+pub async fn get_relay(State(state): State<Arc<AppState>>) -> Json<Option<RelayDescriptor>> {
+    Json(state.config.relay.as_ref().map(|r| r.descriptor()))
+}
+
 // ── add: credential → new share + access token ──────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -564,6 +573,22 @@ mod tests {
             .await
             .unwrap();
         assert!(grants[0].relay.is_none(), "no hub relay => no relay leg");
+    }
+
+    #[tokio::test]
+    async fn get_relay_returns_descriptor_or_null() {
+        // XR-123: the agent fetches this at startup. With a relay configured it
+        // returns the descriptor; without, null (agent falls back to direct).
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let state = state_with(&config_with_relay(), hub.clone(), vec![]);
+        let Json(d) = get_relay(State(state)).await;
+        let d = d.expect("relay configured");
+        assert_eq!(d.addr, "relay.example.com");
+        assert_eq!(d.port, 8444);
+
+        let state = state_with("[server]\n[admin]\nusers = []\n", hub, vec![]);
+        let Json(d) = get_relay(State(state)).await;
+        assert!(d.is_none(), "no relay configured => null");
     }
 
     #[test]
