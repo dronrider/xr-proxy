@@ -22,13 +22,17 @@ TOKEN="${XR_TOKEN:-}"
 HUB="${XR_HUB:-https://xr-hub.zoobr.top}"
 ADDR="${XR_ADDR:-}"
 NAME="${XR_NAME:-}"
+RELAY="${XR_RELAY:-}"
+INVITE="${XR_INVITE:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dir)   DIR="$2";   shift 2 ;;
-    --token) TOKEN="$2"; shift 2 ;;
-    --hub)   HUB="$2";   shift 2 ;;
-    --addr)  ADDR="$2";  shift 2 ;;
-    --name)  NAME="$2";  shift 2 ;;
+    --dir)    DIR="$2";    shift 2 ;;
+    --token)  TOKEN="$2";  shift 2 ;;
+    --hub)    HUB="$2";    shift 2 ;;
+    --addr)   ADDR="$2";   shift 2 ;;
+    --name)   NAME="$2";   shift 2 ;;
+    --relay)  RELAY=1;     shift ;;
+    --invite) INVITE="$2"; shift 2 ;;
     *) printf 'warning: ignoring unknown arg %s\n' "$1" >&2; shift ;;
   esac
 done
@@ -90,6 +94,10 @@ if [ -n "$TOKEN" ]; then
     set -- share "$DIR"
     [ -n "$ADDR" ] && set -- "$@" --addr "$ADDR"
     [ -n "$NAME" ] && set -- "$@" --name "$NAME"
+    # Reachable through the hub's relay for a share behind NAT (LLD-23): needs a
+    # relay build; the relay descriptor came with the mandate, no config editing.
+    [ -n "$RELAY" ]  && set -- "$@" --relay
+    [ -n "$INVITE" ] && set -- "$@" --invite "$INVITE"
     "$dir/xr-share" "$@"
   fi
   say ""

@@ -57,8 +57,13 @@ if ($env:XR_TOKEN) {
     if ($env:XR_DIR) {
         Write-Host "Sharing $($env:XR_DIR) ..."
         $shareArgs = @('share', $env:XR_DIR)
-        if ($env:XR_ADDR) { $shareArgs += @('--addr', $env:XR_ADDR) }
-        if ($env:XR_NAME) { $shareArgs += @('--name', $env:XR_NAME) }
+        if ($env:XR_ADDR)   { $shareArgs += @('--addr', $env:XR_ADDR) }
+        if ($env:XR_NAME)   { $shareArgs += @('--name', $env:XR_NAME) }
+        # Reachable through the hub's relay for a share behind NAT (LLD-23): the
+        # binary must be a relay build; the relay descriptor came with the mandate
+        # above, so no config editing is needed.
+        if ($env:XR_RELAY)  { $shareArgs += @('--relay') }
+        if ($env:XR_INVITE) { $shareArgs += @('--invite', $env:XR_INVITE) }
         & $dest @shareArgs
     }
     Write-Host ""
