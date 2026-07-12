@@ -4,8 +4,8 @@
 //! `init` walks the operator through a config: which directory to share, the
 //! hub URL (whose public key it fetches automatically), and the `share_id` the
 //! hub hands back after registering this agent's identity. `service` wires it
-//! into the OS — systemd on Linux, a Scheduled Task on Windows (a proper
-//! Windows service needs SCM integration — a follow-up).
+//! into the OS: systemd on Linux, a Scheduled Task on Windows, a LaunchDaemon on
+//! macOS (a proper Windows service needs SCM integration, a follow-up).
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -207,10 +207,14 @@ pub fn service_install(config_path: &Path) -> Result<()> {
     {
         schtasks_install(&exe, config_path)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        launchd_install(&exe, config_path)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         let _ = (exe, config_path);
-        bail!("`service install` поддержан только на Linux/Windows; запускай xr-share вручную")
+        bail!("`service install` поддержан только на Linux/Windows/macOS; запускай xr-share вручную")
     }
 }
 
@@ -230,7 +234,14 @@ pub fn service_uninstall() -> Result<()> {
         println!("✓ задача автозапуска xr-share удалена");
         Ok(())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = run("launchctl", &["unload", LAUNCHD_PLIST]);
+        let _ = std::fs::remove_file(LAUNCHD_PLIST);
+        println!("launchd-служба xr-share удалена");
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         bail!("не поддержано на этой ОС")
     }
@@ -244,6 +255,10 @@ pub fn service_status() -> Result<()> {
     #[cfg(target_os = "windows")]
     let _ = std::process::Command::new("schtasks")
         .args(["/query", "/tn", "xr-share", "/v", "/fo", "LIST"])
+        .status();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("launchctl")
+        .args(["list", LAUNCHD_LABEL])
         .status();
     Ok(())
 }
@@ -289,6 +304,49 @@ fn schtasks_install(exe: &Path, config_path: &Path) -> Result<()> {
     let _ = run("schtasks", &["/run", "/tn", "xr-share"]);
     println!("✓ задача автозапуска xr-share создана (запуск при старте системы)");
     println!("  состояние: schtasks /query /tn xr-share");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+const LAUNCHD_LABEL: &str = "top.zoobr.xr-share";
+#[cfg(target_os = "macos")]
+const LAUNCHD_PLIST: &str = "/Library/LaunchDaemons/top.zoobr.xr-share.plist";
+
+/// Install a LaunchDaemon so the agent starts at boot and stays up (KeepAlive).
+/// A system daemon runs as root, which matches the default config under /etc.
+/// `load -w` works across macOS versions (bootstrap/bootout are newer-only).
+#[cfg(target_os = "macos")]
+fn launchd_install(exe: &Path, config_path: &Path) -> Result<()> {
+    let plist = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n\
+         \x20 <key>Label</key><string>{label}</string>\n\
+         \x20 <key>ProgramArguments</key>\n\
+         \x20 <array>\n\
+         \x20   <string>{exe}</string>\n\
+         \x20   <string>-c</string>\n\
+         \x20   <string>{cfg}</string>\n\
+         \x20 </array>\n\
+         \x20 <key>RunAtLoad</key><true/>\n\
+         \x20 <key>KeepAlive</key><true/>\n\
+         \x20 <key>StandardOutPath</key><string>/var/log/xr-share.log</string>\n\
+         \x20 <key>StandardErrorPath</key><string>/var/log/xr-share.log</string>\n\
+         </dict>\n\
+         </plist>\n",
+        label = LAUNCHD_LABEL,
+        exe = exe.display(),
+        cfg = config_path.display(),
+    );
+    std::fs::write(LAUNCHD_PLIST, plist)
+        .with_context(|| format!("запись {LAUNCHD_PLIST} (нужны права root, sudo?)"))?;
+    // Reload cleanly: drop any previous instance, then load it enabled.
+    let _ = run("launchctl", &["unload", LAUNCHD_PLIST]);
+    run("launchctl", &["load", "-w", LAUNCHD_PLIST])?;
+    println!("launchd-служба xr-share установлена и запущена");
+    println!("  состояние: sudo launchctl list | grep {LAUNCHD_LABEL}");
+    println!("  логи:      /var/log/xr-share.log");
     Ok(())
 }
 
