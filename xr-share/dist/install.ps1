@@ -72,10 +72,11 @@ if ($env:XR_SETUP -or $env:XR_TOKEN) {
         if ($env:XR_ADDR)   { $shareArgs += @('--addr', $env:XR_ADDR) }
         if ($env:XR_NAME)   { $shareArgs += @('--name', $env:XR_NAME) }
         # Relay is on by default once the mandate carries a relay descriptor
-        # (XR-127); --relay only forces it and --invite is only needed without a
-        # --setup invite.
-        if ($env:XR_RELAY)  { $shareArgs += @('--relay') }
-        if ($env:XR_INVITE) { $shareArgs += @('--invite', $env:XR_INVITE) }
+        # (XR-127); --relay only forces it, --no-relay opts a public-IP host out,
+        # and --invite is only needed without a --setup invite.
+        if ($env:XR_RELAY)    { $shareArgs += @('--relay') }
+        if ($env:XR_NO_RELAY) { $shareArgs += @('--no-relay') }
+        if ($env:XR_INVITE)   { $shareArgs += @('--invite', $env:XR_INVITE) }
         & $dest @shareArgs
     }
     Write-Host ""

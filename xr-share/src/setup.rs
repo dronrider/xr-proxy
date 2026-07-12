@@ -312,6 +312,14 @@ const LAUNCHD_LABEL: &str = "top.zoobr.xr-share";
 #[cfg(target_os = "macos")]
 const LAUNCHD_PLIST: &str = "/Library/LaunchDaemons/top.zoobr.xr-share.plist";
 
+/// Escape a path for embedding as XML character data in the plist. A path with
+/// `&` or `<` (legal on macOS) would otherwise produce a malformed plist that
+/// `launchctl load` rejects.
+#[cfg(target_os = "macos")]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 /// Install a LaunchDaemon so the agent starts at boot and stays up (KeepAlive).
 /// A system daemon runs as root, which matches the default config under /etc.
 /// `load -w` works across macOS versions (bootstrap/bootout are newer-only).
@@ -336,8 +344,8 @@ fn launchd_install(exe: &Path, config_path: &Path) -> Result<()> {
          </dict>\n\
          </plist>\n",
         label = LAUNCHD_LABEL,
-        exe = exe.display(),
-        cfg = config_path.display(),
+        exe = xml_escape(&exe.display().to_string()),
+        cfg = xml_escape(&config_path.display().to_string()),
     );
     std::fs::write(LAUNCHD_PLIST, plist)
         .with_context(|| format!("запись {LAUNCHD_PLIST} (нужны права root, sudo?)"))?;
@@ -421,4 +429,17 @@ pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<()> {
 /// Best-effort port extraction from a `host:port` listen string (for the hint).
 pub(crate) fn port_of(listen: &str) -> &str {
     listen.rsplit(':').next().unwrap_or("8443")
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    // A config path with '&'/'<'/'>' must not break the launchd plist XML.
+    #[test]
+    fn xml_escape_neutralizes_markup() {
+        assert_eq!(xml_escape("/opt/a&b/x.toml"), "/opt/a&amp;b/x.toml");
+        assert_eq!(xml_escape("/o/<x>/c"), "/o/&lt;x&gt;/c");
+        assert_eq!(xml_escape("/usr/local/bin/xr-share"), "/usr/local/bin/xr-share");
+    }
 }

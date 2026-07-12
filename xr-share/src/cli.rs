@@ -34,6 +34,28 @@ fn unpack_setup_token(blob: &str) -> Result<(String, String)> {
     Ok((reg.to_string(), inv.to_string()))
 }
 
+/// Attach targets for a `share`: an explicit `--invite` wins; otherwise the
+/// install-time default invite from a `--setup` token, if any (XR-127).
+fn resolve_invites(explicit: &[String], default_invite: Option<&str>) -> Vec<String> {
+    if explicit.is_empty() {
+        default_invite.map(str::to_string).into_iter().collect()
+    } else {
+        explicit.to_vec()
+    }
+}
+
+/// Whether to advertise a share through the hub relay. On by default once the
+/// agent holds a relay descriptor; `--relay` forces it, `--no-relay` opts out.
+fn resolve_via_relay(force_relay: bool, no_relay: bool, has_descriptor: bool) -> bool {
+    if no_relay {
+        false
+    } else if force_relay {
+        true
+    } else {
+        has_descriptor
+    }
+}
+
 #[derive(Args)]
 pub struct InstallArgs {
     /// Hub base URL, e.g. https://xr-hub.zoobr.top. Prompted if omitted.
@@ -114,15 +136,42 @@ pub fn install(config_path: &Path, args: InstallArgs) -> Result<()> {
     // refresh the autostart service. A clean wipe is opt-in via --force.
     if !args.force {
         if let Ok(mut existing) = read_config(config_path) {
-            // A fresh --setup can re-point where future shares attach; persist it.
+            let mut changed = false;
+
+            // Self-heal a half-installed agent: a config without a mandate (a prior
+            // tokenless install) plus a token now means we can redeem it, reusing
+            // the existing identity, so the one command completes whatever the
+            // prior state (XR-127).
+            if existing.agent_credential.is_none() {
+                if let (Some(tok), Some(hub)) = (token.as_deref(), existing.hub_url.clone()) {
+                    if let Some(id) = existing.identity_signing_key(config_path)? {
+                        let agent_pub = setup::b64(id.verifying_key().as_bytes());
+                        let (cred, relay) =
+                            exchange(&hub, tok, &agent_pub).context("обмен reg-токена на мандат")?;
+                        existing.agent_credential = Some(cred);
+                        if let Some(d) = relay {
+                            existing.relay = Some(crate::config::RelayAgentConfig::from_descriptor(&d));
+                        }
+                        changed = true;
+                        println!("  мандат получен для существующего конфига");
+                    }
+                }
+            }
+
+            // A fresh --setup can re-point where future shares attach.
             if let Some(inv) = &setup_invite {
                 if existing.default_invite.as_deref() != Some(inv.as_str()) {
                     existing.default_invite = Some(inv.clone());
-                    normalize_legacy(&mut existing);
-                    write_config(config_path, &existing)?;
+                    changed = true;
                     println!("  инвайт по умолчанию обновлён из setup-токена");
                 }
             }
+
+            if changed {
+                normalize_legacy(&mut existing);
+                write_config(config_path, &existing)?;
+            }
+
             println!("  ✓ найден конфиг: личность, шары ({}) и мандат сохранены", existing.shares.len());
             if !args.no_service {
                 setup::service_install(config_path)?;
@@ -201,22 +250,12 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
 
     // Attach targets: explicit --invite wins; otherwise the install-time default
     // invite from a --setup token (XR-127), so onboarding needs no per-share flag.
-    let invites: Vec<String> = if args.invites.is_empty() {
-        cfg.default_invite.iter().cloned().collect()
-    } else {
-        args.invites.clone()
-    };
+    let invites = resolve_invites(&args.invites, cfg.default_invite.as_deref());
 
     // Relay is on by default whenever the agent holds a relay descriptor (the
     // mandate carried one). --relay forces it on even before the descriptor
     // arrives; --no-relay opts a public-IP host out of the uplink (XR-127).
-    let via_relay = if args.no_relay {
-        false
-    } else if args.relay {
-        true
-    } else {
-        cfg.relay.is_some()
-    };
+    let via_relay = resolve_via_relay(args.relay, args.no_relay, cfg.relay.is_some());
 
     let canon = Path::new(&args.path)
         .canonicalize()
@@ -468,5 +507,30 @@ mod tests {
         // Empty invite half.
         let empty = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"reg.");
         assert!(unpack_setup_token(&empty).is_err());
+    }
+
+    #[test]
+    fn via_relay_defaults_to_having_a_descriptor() {
+        // Default: follows whether the agent holds a relay descriptor.
+        assert!(resolve_via_relay(false, false, true));
+        assert!(!resolve_via_relay(false, false, false));
+        // --relay forces on even without a descriptor yet.
+        assert!(resolve_via_relay(true, false, false));
+        // --no-relay wins over everything, including --relay.
+        assert!(!resolve_via_relay(false, true, true));
+        assert!(!resolve_via_relay(true, true, true));
+    }
+
+    #[test]
+    fn invites_prefer_explicit_then_default() {
+        // Explicit --invite wins and the default is ignored.
+        assert_eq!(
+            resolve_invites(&["a".into(), "b".into()], Some("def")),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // No explicit invite: fall back to the default from a setup token.
+        assert_eq!(resolve_invites(&[], Some("def")), vec!["def".to_string()]);
+        // Neither: no attach.
+        assert!(resolve_invites(&[], None).is_empty());
     }
 }

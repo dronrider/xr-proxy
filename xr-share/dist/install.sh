@@ -29,18 +29,20 @@ HUB="${XR_HUB:-https://xr-hub.zoobr.top}"
 ADDR="${XR_ADDR:-}"
 NAME="${XR_NAME:-}"
 RELAY="${XR_RELAY:-}"
+NORELAY="${XR_NO_RELAY:-}"
 INVITE="${XR_INVITE:-}"
 SETUP="${XR_SETUP:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dir)    DIR="$2";    shift 2 ;;
-    --token)  TOKEN="$2";  shift 2 ;;
-    --setup)  SETUP="$2";  shift 2 ;;
-    --hub)    HUB="$2";    shift 2 ;;
-    --addr)   ADDR="$2";   shift 2 ;;
-    --name)   NAME="$2";   shift 2 ;;
-    --relay)  RELAY=1;     shift ;;
-    --invite) INVITE="$2"; shift 2 ;;
+    --dir)      DIR="$2";    shift 2 ;;
+    --token)    TOKEN="$2";  shift 2 ;;
+    --setup)    SETUP="$2";  shift 2 ;;
+    --hub)      HUB="$2";    shift 2 ;;
+    --addr)     ADDR="$2";   shift 2 ;;
+    --name)     NAME="$2";   shift 2 ;;
+    --relay)    RELAY=1;     shift ;;
+    --no-relay) NORELAY=1;   shift ;;
+    --invite)   INVITE="$2"; shift 2 ;;
     *) printf 'warning: ignoring unknown arg %s\n' "$1" >&2; shift ;;
   esac
 done
@@ -113,9 +115,11 @@ if [ -n "$SETUP" ] || [ -n "$TOKEN" ]; then
     [ -n "$ADDR" ] && set -- "$@" --addr "$ADDR"
     [ -n "$NAME" ] && set -- "$@" --name "$NAME"
     # Relay is on by default once the mandate carries a relay descriptor (XR-127);
-    # --relay only forces it and --invite is only needed without a --setup invite.
-    [ -n "$RELAY" ]  && set -- "$@" --relay
-    [ -n "$INVITE" ] && set -- "$@" --invite "$INVITE"
+    # --relay only forces it, --no-relay opts a public-IP host out, and --invite is
+    # only needed without a --setup invite.
+    [ -n "$RELAY" ]   && set -- "$@" --relay
+    [ -n "$NORELAY" ] && set -- "$@" --no-relay
+    [ -n "$INVITE" ]  && set -- "$@" --invite "$INVITE"
     "$dir/xr-share" "$@"
   fi
   say ""
