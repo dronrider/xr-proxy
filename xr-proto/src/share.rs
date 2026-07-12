@@ -113,6 +113,12 @@ pub struct ShareRecord {
     /// Optional note.
     #[serde(default)]
     pub comment: String,
+    /// Reachable through the hub's relay (LLD-23 §2.4). When set, the hub mints a
+    /// [`RelayToken`] and puts a [`RelayGrant`] in the consumer's grant so it can
+    /// fall back to the relay if the direct address is unreachable. `#[serde(default)]`
+    /// keeps records written before this field loadable (they default to direct).
+    #[serde(default)]
+    pub via_relay: bool,
 }
 
 /// The public view of a share handed to a consumer by the hub: enough to reach
@@ -130,6 +136,12 @@ pub struct ShareInfo {
 /// the agent is, the key to pin, and a hub-minted access token the agent verifies
 /// offline. Returned by `GET /api/v1/invite/{token}/shares`. The `token` here is
 /// the URL-safe base64 blob the agent expects as a bearer.
+///
+/// `relay` (LLD-23 §2.4) is present only for a share the owner marked as
+/// reachable through a relay: it carries the relay's address, its mux obfuscation
+/// params and a separate [`RelayToken`] gating transit. The consumer tries the
+/// direct `addr:port` first and falls back to the relay last (XR-050 order); an
+/// older consumer that doesn't know the field ignores it (`#[serde(default)]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareGrant {
     pub share_id: String,
@@ -139,6 +151,128 @@ pub struct ShareGrant {
     pub agent_pubkey: String,
     pub token: String,
     pub exp: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayGrant>,
+}
+
+/// Obfuscation params for a relay's mux, mirrored from the deployment's
+/// `[obfuscation]` block. The consumer and the agent build the same [`Codec`]
+/// from these, so the relay's mux is indistinguishable on the wire from the
+/// proxy's on the same VPS (LLD-23 §3.5).
+///
+/// [`Codec`]: crate::protocol::Codec
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayObf {
+    /// Base64 (standard) obfuscation key.
+    pub key: String,
+    #[serde(default)]
+    pub salt: u64,
+    #[serde(default = "default_relay_modifier")]
+    pub modifier: String,
+    #[serde(default)]
+    pub padding_min: u8,
+    #[serde(default)]
+    pub padding_max: u8,
+}
+
+fn default_relay_modifier() -> String {
+    "positional_xor_rotate".to_string()
+}
+
+impl RelayObf {
+    /// Build the obfuscation [`Codec`](crate::protocol::Codec) for a relay mux.
+    /// Fails if the key isn't valid base64/empty or the modifier is unknown.
+    pub fn codec(&self) -> Result<crate::protocol::Codec, String> {
+        use crate::obfuscation::{ModifierStrategy, Obfuscator};
+        use base64::Engine as _;
+        let key = base64::engine::general_purpose::STANDARD
+            .decode(self.key.trim())
+            .map_err(|e| format!("relay obf key not base64: {e}"))?;
+        if key.is_empty() {
+            return Err("relay obf key is empty".into());
+        }
+        let strategy = ModifierStrategy::from_str(&self.modifier)
+            .ok_or_else(|| format!("relay obf modifier unknown: {}", self.modifier))?;
+        let obf = Obfuscator::new(key, self.salt as u32, strategy);
+        Ok(crate::protocol::Codec::new(obf, self.padding_min, self.padding_max))
+    }
+}
+
+/// Where a relay lives and how to obfuscate the mux to it, as handed to the
+/// **agent** in `exchange`/`add` responses (LLD-23 §2.4). No token: the agent
+/// authenticates to the relay with its [`AgentCredential`], not a relay-token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayDescriptor {
+    pub addr: String,
+    pub port: u16,
+    pub obf: RelayObf,
+}
+
+impl RelayDescriptor {
+    /// `host:port` string for dialing the relay.
+    pub fn dial(&self) -> String {
+        format!("{}:{}", self.addr, self.port)
+    }
+}
+
+/// The relay leg of a [`ShareGrant`] handed to the **consumer**: the relay
+/// descriptor plus a hub-minted [`RelayToken`] gating transit to the agent
+/// (LLD-23 §2.4, §3.7). Flat on the wire (`{addr, port, obf, relay_token}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayGrant {
+    pub addr: String,
+    pub port: u16,
+    pub obf: RelayObf,
+    pub relay_token: RelayToken,
+}
+
+impl RelayGrant {
+    /// Project to the address/obfuscation view (drops the token).
+    pub fn descriptor(&self) -> RelayDescriptor {
+        RelayDescriptor {
+            addr: self.addr.clone(),
+            port: self.port,
+            obf: self.obf.clone(),
+        }
+    }
+
+    /// `host:port` string for dialing the relay.
+    pub fn dial(&self) -> String {
+        format!("{}:{}", self.addr, self.port)
+    }
+}
+
+/// A capability the hub mints and the **relay** checks to admit transit to an
+/// agent (LLD-23 §3.7). Bound to a `share_id` **and** the target `agent_pubkey`,
+/// expires at `exp`, carries a detached ed25519 signature over
+/// [`relay_token_signing_bytes`]. The relay verifies it offline with the hub's
+/// pinned key. It is a distinct, coarser gate than the [`ShareToken`] the agent still
+/// checks end-to-end. A distinct domain prefix keeps it from ever being replayed
+/// as a share token or agent credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayToken {
+    pub share_id: String,
+    /// Base64 (standard) ed25519 key of the agent this transit is bound to.
+    pub agent_pubkey: String,
+    /// Expiry, unix seconds.
+    pub exp: u64,
+    /// Base64 (standard) of the 64-byte ed25519 signature.
+    pub signature: String,
+}
+
+/// The agent's answer to the relay's registration challenge (LLD-23 §2.1): its
+/// hub-signed [`AgentCredential`] plus an ed25519 signature over the relay's
+/// nonce made with the **identity key**. Together they prove both "the hub
+/// vouches for this pubkey" (credential) and "I hold the matching private key"
+/// (nonce signature), so the relay admits the mux into the registry under
+/// `credential.agent_pubkey`. The nonce is single-use and unpredictable, so this
+/// is replay-safe without any clock (LLD-23 §5.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayRegister {
+    pub credential: AgentCredential,
+    /// Base64 (standard) of the 64-byte ed25519 signature over
+    /// [`relay_register_signing_bytes`].
+    pub nonce_sig: String,
 }
 
 impl ShareRecord {
@@ -172,6 +306,26 @@ pub fn token_signing_bytes(share_id: &str, exp: u64) -> Vec<u8> {
 /// signatures over a `(string, exp)` pair.
 pub fn agent_credential_signing_bytes(agent_pubkey: &str, exp: u64) -> Vec<u8> {
     format!("xr-share-agent-cred\nv1\n{agent_pubkey}\n{exp}").into_bytes()
+}
+
+/// The exact bytes a [`RelayToken`] signature covers (LLD-23 §3.7). Same
+/// newline-delimited, versioned form as [`token_signing_bytes`], with a distinct
+/// domain prefix (`xr-relay-token`) and the target `agent_pubkey` folded in, so
+/// a relay token is bound to *both* the share and the agent and can never be
+/// replayed as a share token or agent credential.
+pub fn relay_token_signing_bytes(share_id: &str, agent_pubkey: &str, exp: u64) -> Vec<u8> {
+    format!("xr-relay-token\nv1\n{share_id}\n{agent_pubkey}\n{exp}").into_bytes()
+}
+
+/// The exact bytes an agent signs to answer the relay's registration challenge
+/// (LLD-23 §2.1): a domain prefix followed by the relay's raw nonce. The prefix
+/// keeps a captured registration signature from being replayable as any other
+/// ed25519 signature in the system; the nonce being single-use keeps it from
+/// being replayed as another registration.
+pub fn relay_register_signing_bytes(nonce: &[u8]) -> Vec<u8> {
+    let mut bytes = b"xr-relay-register\nv1\n".to_vec();
+    bytes.extend_from_slice(nonce);
+    bytes
 }
 
 /// Response header carrying the agent's detached manifest signature (base64 of
@@ -280,11 +434,74 @@ impl core::fmt::Display for ManifestSigError {
 
 impl std::error::Error for ManifestSigError {}
 
+/// Why a [`verify_relay_token`] check failed. Mirrors [`ShareTokenError`] with an
+/// extra `WrongAgent` variant: a relay token is bound to both a share and an
+/// agent, so the relay rejects one that names a different agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayTokenError {
+    /// `signature` was not valid base64 or not 64 bytes.
+    MalformedSignature,
+    /// Signature did not verify against the pinned hub key.
+    BadSignature,
+    /// `exp` is at or before `now`.
+    Expired,
+    /// The token is for a different `share_id`.
+    WrongShare,
+    /// The token is bound to a different `agent_pubkey`.
+    WrongAgent,
+}
+
+impl core::fmt::Display for RelayTokenError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = match self {
+            Self::MalformedSignature => "malformed relay-token signature",
+            Self::BadSignature => "relay-token signature does not verify",
+            Self::Expired => "relay-token has expired",
+            Self::WrongShare => "relay-token is for a different share",
+            Self::WrongAgent => "relay-token is for a different agent",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::error::Error for RelayTokenError {}
+
+/// Why a [`verify_relay_register`] check failed (LLD-23 §2.1). The relay logs the
+/// variant and drops the connection; every variant means "do not admit".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayRegisterError {
+    /// The embedded [`AgentCredential`] didn't verify against the hub key.
+    BadCredential,
+    /// `credential.agent_pubkey` was not a valid ed25519 key.
+    MalformedKey,
+    /// `nonce_sig` was not valid base64 or not 64 bytes.
+    MalformedSignature,
+    /// The nonce signature didn't verify against the credential's key (the
+    /// registrant does not hold the private key it claims).
+    BadSignature,
+}
+
+impl core::fmt::Display for RelayRegisterError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = match self {
+            Self::BadCredential => "agent credential does not verify",
+            Self::MalformedKey => "malformed agent public key",
+            Self::MalformedSignature => "malformed registration signature",
+            Self::BadSignature => "registration nonce signature does not verify",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::error::Error for RelayRegisterError {}
+
 #[cfg(any(feature = "share", test))]
 mod crypto {
     use super::{
-        agent_credential_signing_bytes, manifest_signing_bytes, token_signing_bytes,
-        AgentCredential, AgentCredentialError, ManifestSigError, ShareToken, ShareTokenError,
+        agent_credential_signing_bytes, manifest_signing_bytes, relay_register_signing_bytes,
+        relay_token_signing_bytes, token_signing_bytes, AgentCredential, AgentCredentialError,
+        ManifestSigError, RelayRegister, RelayRegisterError, RelayToken, RelayTokenError,
+        ShareToken, ShareTokenError,
     };
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
@@ -369,6 +586,101 @@ mod crypto {
             .map_err(|_| AgentCredentialError::BadSignature)
     }
 
+    /// Mint a relay token (LLD-23 §3.7): sign `(share_id, agent_pubkey, exp)`
+    /// with the hub's key. The hub calls this in `/invite/{token}/shares` for a
+    /// relay-reachable share, next to the `ShareToken`.
+    pub fn sign_relay_token(
+        key: &SigningKey,
+        share_id: &str,
+        agent_pubkey: &str,
+        exp: u64,
+    ) -> RelayToken {
+        let sig = key.sign(&relay_token_signing_bytes(share_id, agent_pubkey, exp));
+        RelayToken {
+            share_id: share_id.to_string(),
+            agent_pubkey: agent_pubkey.to_string(),
+            exp,
+            signature: base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()),
+        }
+    }
+
+    /// Verify a relay token offline against the pinned hub key, for transit to
+    /// `expected_agent_pubkey` on `expected_share_id` at `now_unix`. Cheap
+    /// binding/expiry checks first, then the signature; every path fails closed.
+    pub fn verify_relay_token(
+        token: &RelayToken,
+        hub_key: &VerifyingKey,
+        expected_share_id: &str,
+        expected_agent_pubkey: &str,
+        now_unix: u64,
+    ) -> Result<(), RelayTokenError> {
+        if token.share_id != expected_share_id {
+            return Err(RelayTokenError::WrongShare);
+        }
+        if token.agent_pubkey != expected_agent_pubkey {
+            return Err(RelayTokenError::WrongAgent);
+        }
+        if token.exp <= now_unix {
+            return Err(RelayTokenError::Expired);
+        }
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(token.signature.trim())
+            .map_err(|_| RelayTokenError::MalformedSignature)?;
+        let sig_arr: [u8; 64] = sig_bytes
+            .try_into()
+            .map_err(|_| RelayTokenError::MalformedSignature)?;
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        hub_key
+            .verify(
+                &relay_token_signing_bytes(&token.share_id, &token.agent_pubkey, token.exp),
+                &signature,
+            )
+            .map_err(|_| RelayTokenError::BadSignature)
+    }
+
+    /// Answer a relay registration challenge (LLD-23 §2.1): sign the relay's
+    /// `nonce` with the **identity key** and bundle it with the hub-issued
+    /// `credential`. The agent calls this on the register stream.
+    pub fn sign_relay_register(
+        identity: &SigningKey,
+        credential: &AgentCredential,
+        nonce: &[u8],
+    ) -> RelayRegister {
+        let sig = identity.sign(&relay_register_signing_bytes(nonce));
+        RelayRegister {
+            credential: credential.clone(),
+            nonce_sig: base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()),
+        }
+    }
+
+    /// Verify a registration answer (LLD-23 §2.1) at wall-clock `now_unix` against
+    /// the `nonce` the relay just sent. On success returns the proven
+    /// `agent_pubkey` (base64) the mux registers under. Fails closed: a bad hub
+    /// mandate, a malformed key/signature, or a nonce signature that doesn't
+    /// match the credential's key all reject.
+    pub fn verify_relay_register(
+        reg: &RelayRegister,
+        hub_key: &VerifyingKey,
+        nonce: &[u8],
+        now_unix: u64,
+    ) -> Result<String, RelayRegisterError> {
+        verify_agent_credential(&reg.credential, hub_key, now_unix)
+            .map_err(|_| RelayRegisterError::BadCredential)?;
+        let agent_key = parse_agent_pubkey(&reg.credential.agent_pubkey)
+            .map_err(|_| RelayRegisterError::MalformedKey)?;
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(reg.nonce_sig.trim())
+            .map_err(|_| RelayRegisterError::MalformedSignature)?;
+        let sig_arr: [u8; 64] = sig_bytes
+            .try_into()
+            .map_err(|_| RelayRegisterError::MalformedSignature)?;
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        agent_key
+            .verify(&relay_register_signing_bytes(nonce), &signature)
+            .map_err(|_| RelayRegisterError::BadSignature)?;
+        Ok(reg.credential.agent_pubkey.clone())
+    }
+
     /// Sign a manifest as served (XR-046): the **agent's identity key** over
     /// [`manifest_signing_bytes`]. Returns the base64 signature for the
     /// [`MANIFEST_SIG_HEADER`](super::MANIFEST_SIG_HEADER) response header;
@@ -419,8 +731,9 @@ mod crypto {
 
 #[cfg(any(feature = "share", test))]
 pub use crypto::{
-    parse_agent_pubkey, sign_agent_credential, sign_share_manifest, sign_share_token,
-    verify_agent_credential, verify_share_manifest, verify_share_token,
+    parse_agent_pubkey, sign_agent_credential, sign_relay_register, sign_relay_token,
+    sign_share_manifest, sign_share_token, verify_agent_credential, verify_relay_register,
+    verify_relay_token, verify_share_manifest, verify_share_token,
 };
 
 #[cfg(test)]
@@ -632,6 +945,168 @@ mod tests {
     }
 
     #[test]
+    fn test_relay_token_sign_verify() {
+        let key = hub_key();
+        let vk = key.verifying_key();
+        let agent = "agent-key-b64";
+        let token = sign_relay_token(&key, "share-1", agent, 5000);
+
+        // Valid: right key, right share, right agent, not yet expired.
+        assert!(verify_relay_token(&token, &vk, "share-1", agent, 4999).is_ok());
+
+        // Wrong signer -> BadSignature.
+        let other = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+        assert_eq!(
+            verify_relay_token(&token, &other, "share-1", agent, 4999),
+            Err(RelayTokenError::BadSignature)
+        );
+
+        // Expired (now == exp, now > exp) -> Expired.
+        assert_eq!(
+            verify_relay_token(&token, &vk, "share-1", agent, 5000),
+            Err(RelayTokenError::Expired)
+        );
+        assert_eq!(
+            verify_relay_token(&token, &vk, "share-1", agent, 6000),
+            Err(RelayTokenError::Expired)
+        );
+
+        // Different share -> WrongShare (checked before agent).
+        assert_eq!(
+            verify_relay_token(&token, &vk, "share-2", agent, 4999),
+            Err(RelayTokenError::WrongShare)
+        );
+
+        // Different agent on the right share -> WrongAgent.
+        assert_eq!(
+            verify_relay_token(&token, &vk, "share-1", "other-agent", 4999),
+            Err(RelayTokenError::WrongAgent)
+        );
+
+        // Tampered agent binding without re-signing -> BadSignature (agent is in
+        // the signed bytes, so the relay verifies against the real target).
+        let mut forged = token.clone();
+        forged.agent_pubkey = "other-agent".into();
+        assert_eq!(
+            verify_relay_token(&forged, &vk, "share-1", "other-agent", 4999),
+            Err(RelayTokenError::BadSignature)
+        );
+
+        // Malformed signature -> MalformedSignature, not a panic.
+        let mut bad = token.clone();
+        bad.signature = "@@@".into();
+        assert_eq!(
+            verify_relay_token(&bad, &vk, "share-1", agent, 4999),
+            Err(RelayTokenError::MalformedSignature)
+        );
+    }
+
+    #[test]
+    fn test_relay_register_challenge_response() {
+        // The hub issues the agent's credential; the agent answers the relay's
+        // nonce challenge with its identity key. A valid answer proves the pubkey.
+        let hub = hub_key();
+        let hub_vk = hub.verifying_key();
+        let identity = SigningKey::from_bytes(&[13u8; 32]);
+        let agent_pk = base64::engine::general_purpose::STANDARD
+            .encode(identity.verifying_key().as_bytes());
+        let cred = sign_agent_credential(&hub, &agent_pk, 5000);
+        let nonce = [7u8; 32];
+
+        let reg = sign_relay_register(&identity, &cred, &nonce);
+        assert_eq!(
+            verify_relay_register(&reg, &hub_vk, &nonce, 4999),
+            Ok(agent_pk.clone())
+        );
+
+        // Replay against a different nonce -> BadSignature (nonce is single-use).
+        assert_eq!(
+            verify_relay_register(&reg, &hub_vk, &[9u8; 32], 4999),
+            Err(RelayRegisterError::BadSignature)
+        );
+
+        // A credential the hub never signed -> BadCredential.
+        let forged_hub = SigningKey::from_bytes(&[99u8; 32]);
+        let forged_cred = sign_agent_credential(&forged_hub, &agent_pk, 5000);
+        let forged_reg = sign_relay_register(&identity, &forged_cred, &nonce);
+        assert_eq!(
+            verify_relay_register(&forged_reg, &hub_vk, &nonce, 4999),
+            Err(RelayRegisterError::BadCredential)
+        );
+
+        // Right credential but the nonce signed by a key that isn't the
+        // credential's identity -> BadSignature (does not hold the private key).
+        let impostor = SigningKey::from_bytes(&[14u8; 32]);
+        let impostor_reg = sign_relay_register(&impostor, &cred, &nonce);
+        assert_eq!(
+            verify_relay_register(&impostor_reg, &hub_vk, &nonce, 4999),
+            Err(RelayRegisterError::BadSignature)
+        );
+
+        // Expired credential -> BadCredential.
+        assert_eq!(
+            verify_relay_register(&reg, &hub_vk, &nonce, 5001),
+            Err(RelayRegisterError::BadCredential)
+        );
+    }
+
+    #[test]
+    fn relay_register_domain_separated() {
+        // The registration signing bytes must not collide with any token form.
+        let r = relay_register_signing_bytes(b"nonce");
+        assert_ne!(r, token_signing_bytes("nonce", 0));
+        assert_ne!(r, relay_token_signing_bytes("nonce", "a", 0));
+        assert_ne!(r, manifest_signing_bytes("nonce", 0, b""));
+    }
+
+    #[test]
+    fn relay_token_domain_separated() {
+        // A relay token, a share token and an agent credential are all hub
+        // signatures over newline-joined fields; the distinct prefixes must keep
+        // their signed byte spaces disjoint so one is never replayable as another.
+        let r = relay_token_signing_bytes("x", "a", 1);
+        assert_ne!(r, token_signing_bytes("x", 1));
+        assert_ne!(r, agent_credential_signing_bytes("x", 1));
+        assert_ne!(r, manifest_signing_bytes("x", 1, b""));
+    }
+
+    #[test]
+    fn relay_obf_codec_roundtrips_and_rejects_junk() {
+        // A well-formed descriptor builds a codec that round-trips a frame.
+        let key_b64 = base64::engine::general_purpose::STANDARD.encode(b"relay-obf-key-32-bytes-long!!!!!");
+        let obf = RelayObf {
+            key: key_b64,
+            salt: 0xDEAD,
+            modifier: "positional_xor_rotate".into(),
+            padding_min: 0,
+            padding_max: 0,
+        };
+        let codec = obf.codec().expect("codec builds");
+        let wire = codec
+            .encode_frame(crate::protocol::Command::Data, b"hi relay")
+            .unwrap();
+        let (frame, _) = codec.decode_frame(&wire).unwrap().unwrap();
+        assert_eq!(frame.payload, b"hi relay");
+
+        // Bad key / unknown modifier -> Err, not panic.
+        let bad_key = RelayObf { key: "@@@".into(), ..obf.clone() };
+        assert!(bad_key.codec().is_err());
+        let bad_mod = RelayObf { modifier: "nope".into(), ..obf.clone() };
+        assert!(bad_mod.codec().is_err());
+    }
+
+    #[test]
+    fn share_grant_relay_is_optional_on_wire() {
+        // An older grant without `relay` still deserializes (default None), and a
+        // grant without a relay serializes without the field (skip_serializing).
+        let json = r#"{"share_id":"s","name":"n","addr":"1.2.3.4","port":8443,"agent_pubkey":"QQ==","token":"t","exp":9}"#;
+        let g: ShareGrant = serde_json::from_str(json).unwrap();
+        assert!(g.relay.is_none());
+        let back = serde_json::to_string(&g).unwrap();
+        assert!(!back.contains("relay"), "no relay leg must not emit the field: {back}");
+    }
+
+    #[test]
     fn test_share_record_has_no_content() {
         // The hub record is an index entry: address + identity metadata only.
         // Serialize and assert no field carries file bytes or a listing — this
@@ -645,6 +1120,7 @@ mod tests {
             agent_pubkey: "QQ==".into(),
             created_at: "2026-06-24T00:00:00Z".into(),
             comment: "vacation".into(),
+            via_relay: false,
         };
         let json = serde_json::to_string(&rec).unwrap();
         for forbidden in ["entries", "files", "content", "data", "manifest", "sha256", "bytes"] {
@@ -666,6 +1142,7 @@ mod tests {
             agent_pubkey: "QQ==".into(),
             created_at: "2026-06-24T00:00:00Z".into(),
             comment: "secret note".into(),
+            via_relay: true,
         };
         let json = serde_json::to_string(&rec.info()).unwrap();
         assert!(!json.contains("owner"));

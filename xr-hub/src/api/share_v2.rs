@@ -26,8 +26,8 @@ use axum::Json;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use xr_proto::share::{
-    sign_agent_credential, sign_share_token, verify_agent_credential, AgentCredential, ShareGrant,
-    ShareRecord,
+    sign_agent_credential, sign_relay_token, sign_share_token, verify_agent_credential,
+    AgentCredential, RelayDescriptor, RelayGrant, ShareGrant, ShareRecord,
 };
 
 use crate::api::register::{client_ip, now_unix, validate_ed25519_pubkey, verify_reg_token};
@@ -108,6 +108,10 @@ pub struct ExchangeResp {
     /// base64url blob of the [`AgentCredential`]; the agent stores it `0600`.
     pub credential: String,
     pub exp: u64,
+    /// The relay this hub advertises (LLD-23 §2.4), so the agent can bring up its
+    /// reverse tunnel at install. `None` if the hub has no relay configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayDescriptor>,
 }
 
 /// `POST /api/v1/share/exchange` — one-time trade of a reg-token for a long-lived
@@ -122,7 +126,8 @@ pub async fn exchange(
 
     let exp = now_unix().saturating_add(AGENT_CREDENTIAL_TTL);
     let cred = sign_agent_credential(&signing.signing_key, req.agent_pubkey.trim(), exp);
-    Ok(Json(ExchangeResp { credential: encode_blob(&cred), exp }))
+    let relay = state.config.relay.as_ref().map(|r| r.descriptor());
+    Ok(Json(ExchangeResp { credential: encode_blob(&cred), exp, relay }))
 }
 
 // ── add: credential → new share + access token ──────────────────────
@@ -137,6 +142,10 @@ pub struct AddShareReq {
     pub port: u16,
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
+    /// Mark the share reachable through the hub's relay (LLD-23 §2.4). Set by
+    /// `xr-share share --relay` for an agent behind NAT.
+    #[serde(default)]
+    pub via_relay: bool,
 }
 
 #[derive(Serialize)]
@@ -147,6 +156,10 @@ pub struct AddShareResp {
     /// Ready-to-hand-out access token blob (base64url of the [`ShareToken`]).
     pub token: String,
     pub exp: u64,
+    /// The relay descriptor, echoed when the share is `via_relay` and the hub has
+    /// a relay, so the agent knows where to open its reverse tunnel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayDescriptor>,
 }
 
 /// `POST /api/v1/share/add` — register a share under the credential's pubkey and
@@ -189,6 +202,7 @@ pub async fn add(
         agent_pubkey: cred.agent_pubkey.clone(),
         created_at: chrono::Utc::now().to_rfc3339(),
         comment: "self-shared (v2)".into(),
+        via_relay: req.via_relay,
     };
     storage::save_share(Path::new(&state.config.server.data_dir), &share)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -196,7 +210,20 @@ pub async fn add(
 
     let exp = now.saturating_add(ttl);
     let token = sign_share_token(&signing.signing_key, &share_id, exp);
-    Ok(Json(AddShareResp { share_id, addr, port: req.port, token: encode_blob(&token), exp }))
+    // Give the agent the relay descriptor for a relay-reachable share, so it can
+    // bring up the reverse tunnel it just promised the consumer will use.
+    let relay = req
+        .via_relay
+        .then(|| state.config.relay.as_ref().map(|r| r.descriptor()))
+        .flatten();
+    Ok(Json(AddShareResp {
+        share_id,
+        addr,
+        port: req.port,
+        token: encode_blob(&token),
+        exp,
+        relay,
+    }))
 }
 
 // ── mint: credential → token for an existing owned share ────────────
@@ -381,6 +408,19 @@ pub async fn invite_shares(
         // Skip shares that were unregistered after being attached.
         if let Some(rec) = shares.get(sid) {
             let token = sign_share_token(&signing.signing_key, sid, exp);
+            // A relay-reachable share gets a relay leg next to the direct address
+            // (LLD-23 §2.4): its own transit token, bound to this agent+share, and
+            // the relay descriptor. The consumer tries direct first, relay last.
+            let relay = rec.via_relay.then(|| state.config.relay.as_ref()).flatten().map(|r| {
+                let relay_token =
+                    sign_relay_token(&signing.signing_key, sid, &rec.agent_pubkey, exp);
+                RelayGrant {
+                    addr: r.addr.clone(),
+                    port: r.port,
+                    obf: r.obf.clone(),
+                    relay_token,
+                }
+            });
             out.push(ShareGrant {
                 share_id: rec.share_id.clone(),
                 name: rec.name.clone(),
@@ -389,8 +429,150 @@ pub async fn invite_shares(
                 agent_pubkey: rec.agent_pubkey.clone(),
                 token: encode_blob(&token),
                 exp,
+                relay,
             });
         }
     }
     Ok(Json(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use ed25519_dalek::SigningKey;
+    use tokio::sync::RwLock;
+    use xr_proto::preset::{Invite, InvitePayload};
+    use xr_proto::share::verify_relay_token;
+
+    use super::*;
+    use crate::config::HubConfig;
+    use crate::signing::SigningContext;
+
+    const TOKEN: &str = "abcdefghij0123456789AB";
+
+    fn share(id: &str, agent_pk: &str, via_relay: bool) -> ShareRecord {
+        ShareRecord {
+            share_id: id.into(),
+            name: id.into(),
+            owner: String::new(),
+            addr: "203.0.113.9".into(),
+            port: 8443,
+            agent_pubkey: agent_pk.into(),
+            created_at: String::new(),
+            comment: String::new(),
+            via_relay,
+        }
+    }
+
+    fn state_with(config_toml: &str, hub: SigningKey, shares: Vec<ShareRecord>) -> Arc<AppState> {
+        let config: HubConfig = toml::from_str(config_toml).unwrap();
+        let ids: Vec<String> = shares.iter().map(|s| s.share_id.clone()).collect();
+        let invite = Invite {
+            token: TOKEN.into(),
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            expires_at: "2099-01-01T00:00:00+00:00".into(),
+            consumed_at: None,
+            claimed_by_ip: None,
+            one_time: false,
+            comment: String::new(),
+            payload: InvitePayload {
+                server_address: "203.0.113.10".into(),
+                server_port: 8443,
+                obfuscation_key: String::new(),
+                modifier: "positional_xor_rotate".into(),
+                salt: 0,
+                preset: "russia".into(),
+                hub_url: String::new(),
+                servers: Vec::new(),
+            },
+            share_ids: ids,
+        };
+        let mut invites = HashMap::new();
+        invites.insert(TOKEN.to_string(), invite);
+        let mut share_map = HashMap::new();
+        for s in shares {
+            share_map.insert(s.share_id.clone(), s);
+        }
+        Arc::new(AppState {
+            presets: RwLock::new(HashMap::new()),
+            invites: RwLock::new(invites),
+            shares: RwLock::new(share_map),
+            sessions: RwLock::new(HashMap::new()),
+            config,
+            signing: Some(SigningContext { signing_key: hub }),
+        })
+    }
+
+    fn config_with_relay() -> String {
+        let key = base64::engine::general_purpose::STANDARD.encode(b"relay-obf-key-32-bytes-long!!!!!");
+        format!(
+            "[server]\n[admin]\nusers = []\n[relay]\naddr = \"relay.example.com\"\nport = 8444\n[relay.obfuscation]\nkey = \"{key}\"\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn invite_shares_attaches_relay_leg_only_for_via_relay() {
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let agent_pk = base64::engine::general_purpose::STANDARD
+            .encode(SigningKey::from_bytes(&[7u8; 32]).verifying_key().as_bytes());
+        let state = state_with(
+            &config_with_relay(),
+            hub.clone(),
+            vec![
+                share("relayed", &agent_pk, true),
+                share("direct", &agent_pk, false),
+            ],
+        );
+
+        let Json(grants) = invite_shares(State(state), AxPath(TOKEN.to_string()))
+            .await
+            .unwrap();
+        let relayed = grants.iter().find(|g| g.share_id == "relayed").unwrap();
+        let direct = grants.iter().find(|g| g.share_id == "direct").unwrap();
+
+        // Direct share: no relay leg.
+        assert!(direct.relay.is_none(), "a direct share must not get a relay leg");
+
+        // Relayed share: descriptor + a valid, correctly-bound relay token.
+        let relay = relayed.relay.as_ref().expect("via_relay share gets a relay leg");
+        assert_eq!(relay.addr, "relay.example.com");
+        assert_eq!(relay.port, 8444);
+        assert!(
+            verify_relay_token(
+                &relay.relay_token,
+                &hub.verifying_key(),
+                "relayed",
+                &agent_pk,
+                now_unix(),
+            )
+            .is_ok(),
+            "relay token must verify against the hub key, bound to this share+agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn invite_shares_no_relay_leg_without_hub_relay() {
+        // A via_relay share, but the hub has no [relay]: no leg, share stays direct.
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let state = state_with(
+            "[server]\n[admin]\nusers = []\n",
+            hub,
+            vec![share("relayed", "QQ==", true)],
+        );
+        let Json(grants) = invite_shares(State(state), AxPath(TOKEN.to_string()))
+            .await
+            .unwrap();
+        assert!(grants[0].relay.is_none(), "no hub relay => no relay leg");
+    }
+
+    #[test]
+    fn relay_obf_config_parses() {
+        // The [relay] block round-trips into the descriptor the hub hands out.
+        let cfg: HubConfig = toml::from_str(&config_with_relay()).unwrap();
+        let r = cfg.relay.expect("relay parsed");
+        let desc = r.descriptor();
+        assert_eq!(desc.addr, "relay.example.com");
+        assert_eq!(desc.obf, r.obf);
+    }
 }

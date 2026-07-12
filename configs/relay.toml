@@ -1,0 +1,29 @@
+# XR share relay: configuration (LLD-23)
+# Place this file at /etc/xr-proxy/relay.toml on the VPS, next to xr-server.
+# The relay carries only ciphertext: it splices a consumer and a NAT'd agent
+# without ever seeing plaintext (E2E TLS is pinned to the agent's key).
+
+[relay]
+listen = "0.0.0.0"
+port = 8444                               # own port, alongside xr-server's 8443
+
+# Hub public key (base64, standard). The relay verifies agent credentials and
+# relay tokens against it offline; it never holds the hub's private key.
+hub_pubkey = "PASTE_HUB_PUBLIC_KEY"
+
+# Backpressure / anti-abuse (LLD-23 §5.2). Defaults shown.
+max_connections = 512                     # concurrent TCP connections
+max_streams = 4096                        # concurrent consumer transit streams
+max_registrations_per_ip = 8             # live agent registrations per source IP
+splice_lifetime_secs = 3600               # hard cap on one transfer
+counter_log_secs = 300                    # per-share byte totals logging interval
+log_level = "info"
+
+# Mux obfuscation. Must match the params the hub hands out to agents and
+# consumers in the relay descriptor, so the relay's mux looks like the proxy's.
+[relay.obfuscation]
+key = "GENERATE_WITH_generate-key.sh"
+modifier = "positional_xor_rotate"
+salt = 0xDEADBEEF
+padding_min = 16
+padding_max = 128

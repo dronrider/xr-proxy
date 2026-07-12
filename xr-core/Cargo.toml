@@ -11,8 +11,10 @@ uniffi = ["dep:uniffi"]
 [dependencies]
 # `share` включает ed25519-верификацию манифеста шары (XR-046); сам
 # ed25519-dalek и так уже в зависимостях (проверка APK-манифеста в update.rs),
-# так что xr-client от этого не тяжелеет.
-xr-proto = { path = "../xr-proto", features = ["share"] }
+# так что xr-client от этого не тяжелеет. `relay-tls` даёт пиннинг-verifier и
+# билдер rustls-конфига потребителя для relay-пути (LLD-23): rustls уже в дереве
+# через reqwest, x509-cert чистый Rust, кросс-сборка не страдает.
+xr-proto = { path = "../xr-proto", features = ["share", "relay-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "fs"] }
 tracing = "0.1"
 smoltcp = { version = "0.12", default-features = false, features = [

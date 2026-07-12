@@ -110,6 +110,7 @@ pub async fn create_share(
         agent_pubkey: req.agent_pubkey.trim().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
         comment: req.comment.trim().to_string(),
+        via_relay: false,
     };
 
     let data_dir = Path::new(&state.config.server.data_dir);
