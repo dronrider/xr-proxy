@@ -245,6 +245,18 @@ pub fn relay_obf_ok(obf: &RelayObf) -> bool {
     obf.codec().is_ok()
 }
 
+/// Fetch the hub's current relay descriptor (XR-123). A plain binary update then
+/// switches an agent onto relay without re-exchanging a token or hand-editing the
+/// config. Returns `None` if the hub advertises no relay or is unreachable, so the
+/// caller falls back to the config `[relay]`. The descriptor is not secret (every
+/// consumer grant carries it), so the fetch is unauthenticated.
+pub fn fetch_relay_descriptor(hub_url: &str) -> Option<xr_proto::share::RelayDescriptor> {
+    let url = format!("{}/api/v1/relay", hub_url.trim_end_matches('/'));
+    let resp = ureq::get(&url).timeout(std::time::Duration::from_secs(10)).call().ok()?;
+    let body = resp.into_string().ok()?;
+    serde_json::from_str::<Option<xr_proto::share::RelayDescriptor>>(&body).ok().flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

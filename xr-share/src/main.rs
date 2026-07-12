@@ -221,7 +221,16 @@ async fn run(path: &Path) -> Result<()> {
 /// not fatal: the agent still serves its direct listener.
 #[cfg(feature = "relay")]
 fn spawn_relay_uplink(cfg: &AgentConfig, path: &Path, state: Arc<AgentState>) {
-    let Some(relay) = cfg.relay.clone() else { return };
+    // Prefer the hub's live relay descriptor (XR-123), fall back to the config
+    // `[relay]`. Lets an updated agent pick up relay without a re-exchange or any
+    // hand-editing of the config.
+    let relay = cfg
+        .hub_url
+        .as_deref()
+        .and_then(relay::fetch_relay_descriptor)
+        .map(|d| config::RelayAgentConfig::from_descriptor(&d))
+        .or_else(|| cfg.relay.clone());
+    let Some(relay) = relay else { return };
     if !relay::relay_obf_ok(&relay.obf) {
         tracing::warn!("relay configured but obfuscation params are invalid; reverse tunnel disabled");
         return;
