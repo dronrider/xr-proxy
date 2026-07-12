@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use xr_proto::share::{ShareGrant, ShareInfo, ShareManifest, ShareManifestEntry, ShareToken};
+use xr_proto::share::{
+    RelayGrant, ShareGrant, ShareInfo, ShareManifest, ShareManifestEntry, ShareToken,
+};
 
 // ── Transfer control (progress + cancel) ─────────────────────────────
 //
@@ -810,8 +812,31 @@ pub async fn sync_share_selected(
     dry_run: bool,
     timeout: Duration,
 ) -> Result<SyncResult, String> {
-    let client = http_client(timeout)?;
-    run_sync(&client, agent_url, token, agent_pubkey, dest_root, selection, index_path, dry_run).await
+    sync_share_selected_relay(
+        agent_url, token, agent_pubkey, dest_root, selection, index_path, dry_run, None, timeout,
+    )
+    .await
+}
+
+/// [`sync_share_selected`] that tries the direct address first and falls back to
+/// the `relay` leg when the direct address is unreachable (LLD-23 §2.4). `None`
+/// relay is exactly the old direct-only behaviour.
+#[allow(clippy::too_many_arguments)]
+pub async fn sync_share_selected_relay(
+    agent_url: &str,
+    token: &ShareToken,
+    agent_pubkey: &str,
+    dest_root: &Path,
+    selection: Option<&HashSet<String>>,
+    index_path: Option<&Path>,
+    dry_run: bool,
+    relay: Option<&RelayGrant>,
+    timeout: Duration,
+) -> Result<SyncResult, String> {
+    direct_then_relay(agent_url, agent_pubkey, relay, &token.share_id, timeout, |client, base| async move {
+        run_sync(&client, &base, token, agent_pubkey, dest_root, selection, index_path, dry_run).await
+    })
+    .await
 }
 
 /// Mirror a share from its [`ShareGrant`], trying the **direct** address first
@@ -830,28 +855,58 @@ pub async fn sync_share_grant(
 ) -> Result<SyncResult, String> {
     let token = decode_share_token(&grant.token)?;
     let direct_base = format!("http://{}:{}/{}", grant.addr, grant.port, grant.share_id);
-    let plain = http_client(timeout)?;
-    match run_sync(&plain, &direct_base, &token, &grant.agent_pubkey, dest_root, selection, index_path, dry_run).await {
-        Ok(r) => Ok(r),
-        // Only an unreachable direct address is worth the (double-egress) relay;
-        // an auth/signature/HTTP error is a real answer, not a reason to retry.
-        Err(e) if is_unreachable(&e) => {
-            let Some(relay) = &grant.relay else { return Err(e) };
-            let leg = RelayLeg::open(relay).await?;
-            let client = pinned_client(&grant.agent_pubkey, timeout)?;
-            let base = format!("https://{}/{}", leg.local_addr(), grant.share_id);
-            let out = run_sync(&client, &base, &token, &grant.agent_pubkey, dest_root, selection, index_path, dry_run).await;
-            drop(leg); // stop the loopback forwarder once the transfer is done
-            out
-        }
-        Err(e) => Err(e),
-    }
+    sync_share_selected_relay(
+        &direct_base,
+        &token,
+        &grant.agent_pubkey,
+        dest_root,
+        selection,
+        index_path,
+        dry_run,
+        grant.relay.as_ref(),
+        timeout,
+    )
+    .await
 }
 
 /// A connect/timeout failure (as opposed to an authoritative HTTP/signature
 /// answer): only this warrants falling back to the relay.
 fn is_unreachable(err: &str) -> bool {
     err.starts_with("network:")
+}
+
+/// Run `op` over the direct transport first (plain HTTP at `agent_url`); if that
+/// fails *unreachable* and a `relay` leg is present, bring up the relay (pinned
+/// TLS over a loopback forwarder, base `https://<loopback>/<share_id>`) and run
+/// `op` there instead (LLD-23 §2.4). The relay leg is held for the whole `op`
+/// and dropped after. `op` gets an owned client and base URL; it must be safe to
+/// invoke twice (a failed direct manifest fetch writes nothing before the retry).
+async fn direct_then_relay<T, F, Fut>(
+    agent_url: &str,
+    agent_pubkey: &str,
+    relay: Option<&RelayGrant>,
+    share_id: &str,
+    timeout: Duration,
+    op: F,
+) -> Result<T, String>
+where
+    F: Fn(reqwest::Client, String) -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let plain = http_client(timeout)?;
+    match op(plain, agent_url.to_string()).await {
+        Ok(v) => Ok(v),
+        Err(e) if is_unreachable(&e) => {
+            let Some(relay) = relay else { return Err(e) };
+            let leg = RelayLeg::open(relay).await?;
+            let client = pinned_client(agent_pubkey, timeout)?;
+            let base = format!("https://{}/{}", leg.local_addr(), share_id);
+            let out = op(client, base).await;
+            drop(leg); // stop the loopback forwarder once the op is done
+            out
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The core mirror over an already-chosen transport (`client` + `base_url`):
@@ -941,8 +996,22 @@ pub async fn fetch_manifest(
     agent_pubkey: &str,
     timeout: Duration,
 ) -> Result<ShareManifest, String> {
-    let client = http_client(timeout)?;
-    fetch_manifest_with(&client, agent_url, token, agent_pubkey).await
+    fetch_manifest_relay(agent_url, token, agent_pubkey, None, timeout).await
+}
+
+/// [`fetch_manifest`] that falls back to the `relay` leg when the direct address
+/// is unreachable (LLD-23 §2.4). `None` relay is the old direct-only behaviour.
+pub async fn fetch_manifest_relay(
+    agent_url: &str,
+    token: &ShareToken,
+    agent_pubkey: &str,
+    relay: Option<&RelayGrant>,
+    timeout: Duration,
+) -> Result<ShareManifest, String> {
+    direct_then_relay(agent_url, agent_pubkey, relay, &token.share_id, timeout, |client, base| async move {
+        fetch_manifest_with(&client, &base, token, agent_pubkey).await
+    })
+    .await
 }
 
 /// [`fetch_manifest`] over an already-built client and base URL, so the caller
@@ -1002,8 +1071,28 @@ pub async fn download_entry(
     dest_root: &Path,
     timeout: Duration,
 ) -> Result<(), String> {
-    let client = http_client(timeout)?;
-    download_entry_with(&client, agent_url, token, entry, dest_root).await
+    // Direct-only path: no relay leg, so the agent key (only needed to pin the
+    // relay's TLS) is unused here.
+    download_entry_relay(agent_url, token, entry, dest_root, "", None, timeout).await
+}
+
+/// [`download_entry`] that falls back to the `relay` leg when the direct address
+/// is unreachable (LLD-23 §2.4). `agent_pubkey` pins the relay's end-to-end TLS
+/// (ignored on the direct path). `None` relay is the old direct-only behaviour.
+#[allow(clippy::too_many_arguments)]
+pub async fn download_entry_relay(
+    agent_url: &str,
+    token: &ShareToken,
+    entry: &ShareManifestEntry,
+    dest_root: &Path,
+    agent_pubkey: &str,
+    relay: Option<&RelayGrant>,
+    timeout: Duration,
+) -> Result<(), String> {
+    direct_then_relay(agent_url, agent_pubkey, relay, &token.share_id, timeout, |client, base| async move {
+        download_entry_with(&client, &base, token, entry, dest_root).await
+    })
+    .await
 }
 
 /// [`download_entry`] over an already-built client and base URL (transport
@@ -1401,6 +1490,45 @@ mod tests {
             .await
             .unwrap_err();
         assert!(is_unreachable(&err), "expected a direct network error, got {err}");
+    }
+
+    /// When the direct address is unreachable and a relay leg IS present, the
+    /// fallback branch runs. A malformed relay obf makes that branch fail
+    /// distinctly (`relay grant: ...`), proving direct-first then relay-last
+    /// executed rather than stopping at the direct error (LLD-23 §2.4).
+    #[tokio::test]
+    async fn fetch_manifest_falls_back_to_relay_when_direct_unreachable() {
+        use xr_proto::share::{RelayObf, RelayToken};
+        let token = ShareToken { share_id: "S".into(), exp: 9_999_999_999, signature: "s".into() };
+        let relay = RelayGrant {
+            addr: "127.0.0.1".into(),
+            port: 2,
+            // Malformed key: RelayEndpoint::from_grant fails, so the relay branch
+            // returns "relay grant: ..." rather than a network error.
+            obf: RelayObf {
+                key: "@@@".into(),
+                salt: 0,
+                modifier: "positional_xor_rotate".into(),
+                padding_min: 0,
+                padding_max: 0,
+            },
+            relay_token: RelayToken {
+                share_id: "S".into(),
+                agent_pubkey: "QQ==".into(),
+                exp: 9_999_999_999,
+                signature: "s".into(),
+            },
+        };
+        let err = fetch_manifest_relay(
+            "http://127.0.0.1:1/S", // refuses fast
+            &token,
+            "",
+            Some(&relay),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("relay grant"), "fallback must reach the relay leg, got {err}");
     }
 
     fn entry(path: &str, sha: &str) -> ShareManifestEntry {
