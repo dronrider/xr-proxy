@@ -31,7 +31,8 @@ use tokio::time::Duration;
 
 use crate::protocol::{
     decode_mux_payload, encode_mux_payload, Codec, Command, Frame, TargetAddr,
-    CLOSE_REASON_CONNECT_FAIL, CLOSE_REASON_RESOLVE_FAIL,
+    CLOSE_REASON_CONNECT_FAIL, CLOSE_REASON_RESOLVE_FAIL, HEADER_LEN, MAX_PADDING_LEN,
+    MAX_PAYLOAD_LEN, NONCE_LEN,
 };
 
 // ── Constants ───────────────────────────────────────────────────────
@@ -314,7 +315,7 @@ impl SendWindow {
     fn try_acquire(&self, want: usize) -> io::Result<usize> {
         loop {
             if self.closed.load(Ordering::Acquire) {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "mux stream closed"));
+                return Err(mux_broken());
             }
             let cur = self.credit.load(Ordering::Acquire);
             if cur <= 0 {
@@ -332,7 +333,24 @@ impl SendWindow {
     }
 
     fn add(&self, n: u32) {
-        self.credit.fetch_add(n as i64, Ordering::AcqRel);
+        // Saturating, не fetch_add: на mux без окна кредит стартует с i64::MAX,
+        // и одиночный WindowUpdate (повторный/от нонконформного пира) иначе
+        // завернул бы его в отрицательное значение, после чего try_acquire
+        // навсегда возвращает 0 и любой send на стриме виснет. Насыщение держит
+        // «бесконечный» кредит бесконечным, а честному пиру потолка i64 хватает.
+        let mut cur = self.credit.load(Ordering::Acquire);
+        loop {
+            let next = cur.saturating_add(n as i64);
+            match self.credit.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
         self.notify.notify_waiters();
     }
 
@@ -353,31 +371,46 @@ impl SendWindow {
 struct RecvCredit {
     stream_id: u32,
     ctrl_tx: mpsc::Sender<OutFrame>,
+    /// Балк-план как запасной путь возврата кредита (см. consumed).
+    bulk_tx: mpsc::Sender<OutFrame>,
     pending: u32,
 }
 
 impl RecvCredit {
+    fn frame(&self) -> OutFrame {
+        OutFrame {
+            stream_id: self.stream_id,
+            command: Command::WindowUpdate,
+            payload: self.pending.to_be_bytes().to_vec(),
+        }
+    }
+
     fn consumed(&mut self, n: usize) {
         self.pending = self.pending.saturating_add(n as u32);
         if self.pending < WINDOW_UPDATE_THRESHOLD {
             return;
         }
-        let frame = OutFrame {
-            stream_id: self.stream_id,
-            command: Command::WindowUpdate,
-            payload: self.pending.to_be_bytes().to_vec(),
-        };
-        if self.ctrl_tx.try_send(frame).is_ok() {
+        // Приоритетно ctrl (кредит не встаёт за балком Data). Но если ctrl полон,
+        // кредит НЕЛЬЗЯ просто копить до следующего consumed(): при исчерпании
+        // окна пир заснёт в acquire и данных больше не пришлёт, а раз данных нет,
+        // нового consumed() не будет - кредит завис, стрим встал (ловится только
+        // dead-link/лайфтаймом). Поэтому фолбэк в балк-план: там кредит может
+        // встать за Data, но это лучше вечного удержания. Оба канала полны это
+        // тотальный затык writer'а (TCP не принимает ничего), его ловит dead-link
+        // (XR-083); тогда пусть pending едет со следующим вычитыванием.
+        if self.ctrl_tx.try_send(self.frame()).is_ok()
+            || self.bulk_tx.try_send(self.frame()).is_ok()
+        {
             self.pending = 0;
         }
     }
 }
 
-/// Потолок Data-кадра в send_data: лимит payload кодека (u16) минус префикс
-/// stream_id. Раньше кусок больше лимита молча ронял writer на encode_frame
-/// (контракт держался на том, что все вызывающие читают сокет мелкими буферами);
-/// с нарезкой по окну потолок закреплён здесь.
-const SEND_CHUNK_MAX: usize = u16::MAX as usize - 4;
+/// Потолок Data-кадра в send_data: лимит payload кодека минус 4-байтовый префикс
+/// stream_id (его добавляет encode_mux_payload). Раньше кусок больше лимита молча
+/// ронял writer на encode_frame (контракт держался на том, что все вызывающие
+/// читают сокет мелкими буферами); с нарезкой по окну потолок закреплён здесь.
+const SEND_CHUNK_MAX: usize = MAX_PAYLOAD_LEN - 4;
 
 /// Общий путь отправки Data с оконным кредитом: кадр режется по доступному окну
 /// и уходит частями, когда пир вернул меньше, чем просили. Err = mux мёртв или
@@ -1026,6 +1059,7 @@ impl Multiplexer {
         self.caps.window.then(|| RecvCredit {
             stream_id,
             ctrl_tx: self.ctrl_tx.clone(),
+            bulk_tx: self.writer_tx.clone(),
             pending: 0,
         })
     }
@@ -1118,7 +1152,14 @@ async fn reader_task<R: AsyncReadExt + Unpin>(
     new_stream_tx: mpsc::Sender<NewStream>,
     relay_health: Option<Arc<RelayHealth>>,
 ) -> io::Result<()> {
-    let mut buf = vec![0u8; 65536 + 256];
+    // Буфер обязан вмещать максимальный легальный кадр целиком, иначе на нём
+    // decode вечно возвращает None, а следующий read идёт в пустой хвост
+    // (`buf[filled..]` длины 0), получает Ok(0) и трактуется как EOF -> весь mux
+    // рвётся. Максимум: nonce(4) + header(4) + padding(<=255) + payload(<=65535).
+    // С нарезкой send_data по SEND_CHUNK_MAX (LLD-27) наша сторона большие кадры
+    // теперь реально шлёт, так что запаса 256 (было) не хватало под большое
+    // padding; берём с запасом.
+    let mut buf = vec![0u8; NONCE_LEN + HEADER_LEN + MAX_PADDING_LEN + MAX_PAYLOAD_LEN];
     let mut filled = 0;
     // tokio-часы (не std::Instant): в проде эквивалентно, но так MUX_MAX_LIFETIME
     // и детект мёртвого линка тестируются под `tokio::time::pause`.
@@ -2076,80 +2117,171 @@ mod tests {
     const FLOW_TOTAL: usize = 4 * 1024 * 1024;
     const FLOW_CHUNK: usize = 3000;
 
-    /// Быстрый отправитель льёт в стрим, потребитель начинает вычитывать с
-    /// опозданием. Отправка идёт `send` серверного хэндла, вычитывание recv
-    /// клиента; байты проверяются по позиционному паттерну.
-    async fn run_slow_consumer(caps: MuxCaps) -> usize {
+    /// Залить в стрим `total` байт позиционным паттерном (байт = (offset%199)).
+    async fn send_pattern(stream: &MuxStream, total: usize) -> io::Result<()> {
+        let mut sent = 0usize;
+        let mut chunk = vec![0u8; FLOW_CHUNK];
+        while sent < total {
+            let n = FLOW_CHUNK.min(total - sent);
+            for (i, b) in chunk[..n].iter_mut().enumerate() {
+                *b = ((sent + i) % 199) as u8;
+            }
+            stream.send(&chunk[..n]).await?;
+            sent += n;
+        }
+        Ok(())
+    }
+
+    /// Регрессия XR-115: с оконным flow control медленный потребитель получает
+    /// тело целиком, отправитель упирается в окно вместо убийства стрима.
+    /// Детерминизм без sleep: отправитель блокируется на окне, потребитель
+    /// читает в такт, все байты обязаны дойти, а send-петля отправителя
+    /// завершается без ошибки (стрим не убит).
+    #[tokio::test]
+    async fn test_window_slow_consumer_gets_all_bytes() {
         let (client_io, server_io) = duplex(65536);
         let codec = test_codec();
+        let caps = MuxCaps { window: true };
         let client_mux = Multiplexer::new_client(client_io, codec.clone(), caps);
         let server_mux = Multiplexer::new_server(server_io, codec.clone(), caps);
 
+        let s = server_mux.clone();
+        let sender = tokio::spawn(async move {
+            let mut rx = s.take_new_stream_rx().await.unwrap();
+            let ns = rx.recv().await.unwrap();
+            let stream = s.register_stream(ns.stream_id).await;
+            s.send_frame(ns.stream_id, Command::ConnectAck, vec![0]).await.unwrap();
+            send_pattern(&stream, FLOW_TOTAL).await
+        });
+
+        let target = TargetAddr::Domain("bulk.example".to_string(), 443);
+        let mut stream = mux_open_stream(&client_mux, &target).await.unwrap();
+        let mut received = 0usize;
+        while received < FLOW_TOTAL {
+            let data = stream.recv().await.expect("стрим не должен закрыться до конца тела");
+            for (i, b) in data.iter().enumerate() {
+                assert_eq!(*b, ((received + i) % 199) as u8, "байты не по порядку");
+            }
+            received += data.len();
+        }
+        assert_eq!(received, FLOW_TOTAL);
+        sender
+            .await
+            .unwrap()
+            .expect("отправитель обязан долить всё через backpressure, без обрыва стрима");
+    }
+
+    /// Легаси-пара (окно не согласовано) сохраняет старое поведение: reader
+    /// убивает переполнившийся стрим, тело обрезается. Демонстрирует, что
+    /// test_window_slow_consumer_gets_all_bytes падал бы на старом коде.
+    /// Детерминизм без sleep: отправитель с бесконечным окном заливает всё и
+    /// сигналит oneshot'ом; потребитель начинает читать только после сигнала,
+    /// а факт убийства ловится по снятию записи стрима из карты (не по времени).
+    #[tokio::test]
+    async fn test_no_window_slow_consumer_stream_killed() {
+        let (client_io, server_io) = duplex(65536);
+        let codec = test_codec();
+        let caps = MuxCaps { window: false };
+        let client_mux = Multiplexer::new_client(client_io, codec.clone(), caps);
+        let server_mux = Multiplexer::new_server(server_io, codec.clone(), caps);
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let s = server_mux.clone();
         tokio::spawn(async move {
             let mut rx = s.take_new_stream_rx().await.unwrap();
             let ns = rx.recv().await.unwrap();
             let stream = s.register_stream(ns.stream_id).await;
             s.send_frame(ns.stream_id, Command::ConnectAck, vec![0]).await.unwrap();
-            let mut sent = 0usize;
-            let mut chunk = vec![0u8; FLOW_CHUNK];
-            while sent < FLOW_TOTAL {
-                let n = FLOW_CHUNK.min(FLOW_TOTAL - sent);
-                for (i, b) in chunk[..n].iter_mut().enumerate() {
-                    *b = ((sent + i) % 199) as u8;
-                }
-                // С окном отправитель здесь засыпает, пока потребитель не
-                // вернёт кредит; без окна флудит весь тотал сразу.
-                if stream.send(&chunk[..n]).await.is_err() {
-                    break;
-                }
-                sent += n;
-            }
+            let _ = send_pattern(&stream, FLOW_TOTAL).await;
+            let _ = done_tx.send(());
+            // Держим серверный хэндл живым, чтобы стрим снялся именно kill'ом
+            // reader'а на переполнении, а не Close при дропе хэндла.
+            std::future::pending::<()>().await;
         });
 
-        let target = TargetAddr::Domain("bulk.example".to_string(), 443);
-        let mut stream = mux_open_stream(&client_mux, &target).await.unwrap();
-
-        // Потребитель отстаёт: к этому моменту отправитель без окна уже
-        // переполнил per-stream канал (1398 кадров > 1024), а с окном спит,
-        // отправив ровно окно.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut stream = mux_open_stream(&client_mux, &target_bulk()).await.unwrap();
+        // Не читаем, пока отправитель не зальёт весь тотал в провод.
+        done_rx.await.unwrap();
+        // Ждём, пока reader продиспатчит хвост и убьёт переполненный стрим:
+        // детерминированный сигнал это снятие записи из client_mux.streams.
+        let sid = stream.stream_id();
+        let mut killed = false;
+        for _ in 0..100_000 {
+            if !client_mux.streams.lock().await.contains_key(&sid) {
+                killed = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(killed, "переполнивший канал стрим обязан быть снят reader'ом");
 
         let mut received = 0usize;
         while let Some(data) = stream.recv().await {
-            for (i, b) in data.iter().enumerate() {
-                assert_eq!(*b, ((received + i) % 199) as u8, "байты не по порядку");
-            }
             received += data.len();
-            if received >= FLOW_TOTAL {
-                break;
-            }
         }
-        received
-    }
-
-    /// Регрессия XR-115: с оконным flow control медленный потребитель получает
-    /// тело целиком, отправитель упирается в окно вместо переполнения канала.
-    #[tokio::test]
-    async fn test_window_slow_consumer_gets_all_bytes() {
-        let received = run_slow_consumer(MuxCaps { window: true }).await;
-        assert_eq!(
-            received, FLOW_TOTAL,
-            "с окном не должно теряться ни байта (стрим убит вместо backpressure?)"
-        );
-    }
-
-    /// Легаси-пара (окно не согласовано) сохраняет старое поведение: reader
-    /// убивает переполнившийся стрим, тело обрезается. Это же демонстрирует,
-    /// что test_window_slow_consumer_gets_all_bytes падал бы на старом коде.
-    #[tokio::test]
-    async fn test_no_window_slow_consumer_stream_killed() {
-        let received = run_slow_consumer(MuxCaps { window: false }).await;
         assert!(
             received < FLOW_TOTAL,
             "без окна медленный потребитель обязан потерять хвост (канал 1024 кадра), получено {}",
             received
         );
+    }
+
+    fn target_bulk() -> TargetAddr {
+        TargetAddr::Domain("bulk.example".to_string(), 443)
+    }
+
+    /// Регрессия (ревью LLD-27): WindowUpdate на стриме без согласованного окна
+    /// (кредит стартует с i64::MAX) не должен завернуть кредит в отрицательный.
+    /// Раньше fetch_add переполнял i64, try_acquire навсегда возвращал 0 и любой
+    /// send на стриме вис. Насыщающий add держит «бесконечный» кредит.
+    #[test]
+    fn test_window_update_does_not_wrap_disabled_window() {
+        let w = SendWindow::new(i64::MAX);
+        w.add(4096); // как от WindowUpdate пира на легаси-mux
+        assert!(
+            w.try_acquire(1024).unwrap() > 0,
+            "кредит не должен стать <= 0 после add у верхней границы"
+        );
+    }
+
+    /// Регрессия (ревью LLD-27): кадр у верхней границы payload с максимальным
+    /// padding обязан целиком влезать в приёмный буфер reader'а. Иначе decode
+    /// зацикливается на None, следующий read идёт в пустой хвост, получает Ok(0)
+    /// и трактуется как EOF, рвущий весь mux. Своя сторона такие кадры теперь
+    /// реально шлёт (send_data режет по SEND_CHUNK_MAX).
+    #[tokio::test]
+    async fn test_max_frame_survives_reader_buffer() {
+        let key = b"test-key-32-bytes-long-enough!!!".to_vec();
+        let obfs = Obfuscator::new(key, 0xDEADBEEF, ModifierStrategy::PositionalXorRotate);
+        let codec = Codec::new(obfs, 255, 255); // padding ровно 255, максимум
+        let caps = MuxCaps { window: true };
+        let (client_io, server_io) = duplex(1 << 20);
+        let client_mux = Multiplexer::new_client(client_io, codec.clone(), caps);
+        let server_mux = Multiplexer::new_server(server_io, codec.clone(), caps);
+
+        let s = server_mux.clone();
+        let sender = tokio::spawn(async move {
+            let mut rx = s.take_new_stream_rx().await.unwrap();
+            let ns = rx.recv().await.unwrap();
+            let stream = s.register_stream(ns.stream_id).await;
+            s.send_frame(ns.stream_id, Command::ConnectAck, vec![0]).await.unwrap();
+            // Кусок ровно в потолок: payload кадра дойдёт до MAX_PAYLOAD_LEN.
+            let big = vec![7u8; SEND_CHUNK_MAX];
+            stream.send(&big).await
+        });
+
+        let mut stream = mux_open_stream(&client_mux, &target_bulk()).await.unwrap();
+        let mut got = 0usize;
+        while got < SEND_CHUNK_MAX {
+            let d = stream
+                .recv()
+                .await
+                .expect("mux не должен порваться на максимальном кадре");
+            assert!(d.iter().all(|&b| b == 7));
+            got += d.len();
+        }
+        assert_eq!(got, SEND_CHUNK_MAX);
+        sender.await.unwrap().unwrap();
     }
 
     /// LLD-27: Close пира будит отправителя, заснувшего на исчерпанном окне,
