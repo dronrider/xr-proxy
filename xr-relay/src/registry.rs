@@ -161,7 +161,7 @@ mod tests {
             0,
         );
         let (a, _b) = tokio::io::duplex(64);
-        Multiplexer::new_server(a, codec)
+        Multiplexer::new_server(a, codec, xr_proto::mux::MuxCaps::LOCAL)
     }
 
     #[tokio::test]

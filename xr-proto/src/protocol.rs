@@ -44,6 +44,9 @@ pub enum Command {
     Ping = 7,
     /// Bidirectional: keepalive pong.
     Pong = 8,
+    /// Bidirectional: return receive-window credit for a stream (LLD-27).
+    /// Payload after the stream_id prefix: u32 BE, bytes of credit returned.
+    WindowUpdate = 9,
 }
 
 /// Причина закрытия стрима в payload Close (байт после stream_id), сервер ->
@@ -78,6 +81,7 @@ impl Command {
             6 => Some(Self::MuxInitAck),
             7 => Some(Self::Ping),
             8 => Some(Self::Pong),
+            9 => Some(Self::WindowUpdate),
             _ => None,
         }
     }
@@ -399,6 +403,13 @@ mod tests {
         let (frame, _) = codec.decode_frame(&wire).unwrap().unwrap();
         assert_eq!(frame.command, Command::Ping);
         assert_eq!(frame.payload, ts);
+
+        // WindowUpdate (LLD-27): stream_id + кредит u32 BE
+        let payload = encode_mux_payload(7, &4096u32.to_be_bytes());
+        let wire = codec.encode_frame(Command::WindowUpdate, &payload).unwrap();
+        let (frame, _) = codec.decode_frame(&wire).unwrap().unwrap();
+        assert_eq!(frame.command, Command::WindowUpdate);
+        assert_eq!(frame.payload, payload);
     }
 
     #[test]

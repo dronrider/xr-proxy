@@ -352,10 +352,13 @@ async fn run_mux_test_server(listener: TcpListener, codec: Codec) {
     };
 
     assert_eq!(init_frame.command, Command::MuxInit);
-    mux_handshake_server(&mut client, &codec, &init_frame).await.unwrap();
+    let caps = mux_handshake_server(&mut client, &codec, &init_frame)
+        .await
+        .unwrap()
+        .expect("mux handshake accepted");
 
     // Create server-side multiplexer.
-    let mux = Multiplexer::new_server(client, codec.clone());
+    let mux = Multiplexer::new_server(client, codec.clone(), caps);
     let mut new_stream_rx = mux.take_new_stream_rx().await.unwrap();
 
     // Handle incoming streams — connect to targets and relay.
@@ -440,9 +443,12 @@ async fn test_mux_two_concurrent_streams() {
     let mut conn = timeout(TIMEOUT, TcpStream::connect(server_addr))
         .await.unwrap().unwrap();
 
-    assert!(mux_handshake_client(&mut conn, &codec).await.unwrap());
+    let caps = mux_handshake_client(&mut conn, &codec)
+        .await
+        .unwrap()
+        .expect("server must accept mux");
 
-    let client_mux = Multiplexer::new_client(conn, codec.clone());
+    let client_mux = Multiplexer::new_client(conn, codec.clone(), caps);
 
     // Open stream 1 → echo1
     let mut stream1 = timeout(

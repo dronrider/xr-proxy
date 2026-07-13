@@ -44,13 +44,10 @@ pub const RELAY_HELLO_OK: u8 = 0x01;
 pub async fn connect_relay_mux(dial: &str, codec: Codec) -> io::Result<Arc<Multiplexer>> {
     let mut tcp = TcpStream::connect(dial).await?;
     tcp.set_nodelay(true).ok();
-    if !mux_handshake_client(&mut tcp, &codec).await? {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "relay rejected mux init",
-        ));
-    }
-    Ok(Multiplexer::new_client(tcp, codec))
+    let caps = mux_handshake_client(&mut tcp, &codec).await?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "relay rejected mux init")
+    })?;
+    Ok(Multiplexer::new_client(tcp, codec, caps))
 }
 
 /// Open one relay stream to the agent: `Connect` on the connect pseudo-target,
@@ -221,10 +218,10 @@ mod tests {
                 break frame;
             }
         };
-        if !mux_handshake_server(&mut tcp, &codec, &init).await.unwrap() {
+        let Some(caps) = mux_handshake_server(&mut tcp, &codec, &init).await.unwrap() else {
             return;
-        }
-        let mux = Multiplexer::new_server(tcp, codec);
+        };
+        let mux = Multiplexer::new_server(tcp, codec, caps);
         let mut rx = mux.take_new_stream_rx().await.unwrap();
         while let Some(ns) = rx.recv().await {
             let mux = mux.clone();
@@ -254,14 +251,14 @@ mod tests {
         }
     }
 
-    use crate::mux::mux_handshake_server;
+    use crate::mux::{mux_handshake_server, MuxCaps};
 
     #[tokio::test]
     async fn test_open_relay_stream_hello_ok() {
         let (client_io, server_io) = tokio::io::duplex(65536);
         let codec = test_codec();
-        let client_mux = Multiplexer::new_client(client_io, codec.clone());
-        let server_mux = Multiplexer::new_server(server_io, codec.clone());
+        let client_mux = Multiplexer::new_client(client_io, codec.clone(), MuxCaps::LOCAL);
+        let server_mux = Multiplexer::new_server(server_io, codec.clone(), MuxCaps::LOCAL);
 
         // Server plays the relay: accept the connect stream, ack, read hello,
         // reply OK, then echo.
@@ -286,8 +283,8 @@ mod tests {
     async fn test_open_relay_stream_rejected_maps_to_refused() {
         let (client_io, server_io) = tokio::io::duplex(65536);
         let codec = test_codec();
-        let client_mux = Multiplexer::new_client(client_io, codec.clone());
-        let server_mux = Multiplexer::new_server(server_io, codec.clone());
+        let client_mux = Multiplexer::new_client(client_io, codec.clone(), MuxCaps::LOCAL);
+        let server_mux = Multiplexer::new_server(server_io, codec.clone(), MuxCaps::LOCAL);
 
         // Relay closes the stream without OK (agent offline / token rejected).
         let s = server_mux.clone();

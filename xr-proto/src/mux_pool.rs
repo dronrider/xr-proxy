@@ -412,17 +412,18 @@ impl MuxPool {
 
         let mut stream = (self.connect_fn)().await?;
         match mux_handshake_client(&mut stream, &self.codec).await {
-            Ok(true) => {
+            Ok(Some(caps)) => {
                 let mux = Multiplexer::new_client_tracked(
                     stream,
                     self.codec.clone(),
                     self.relay_health.clone(),
+                    caps,
                 );
                 *guard = Some(mux.clone());
                 tracing::info!("mux slot {} connection established", idx);
                 Ok(mux)
             }
-            Ok(false) => Err(io::Error::new(
+            Ok(None) => Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "server rejected mux handshake",
             )),
@@ -446,11 +447,11 @@ impl MuxPool {
     pub async fn probe_fresh(&self) -> io::Result<()> {
         let mut stream = (self.connect_fn)().await?;
         match mux_handshake_client(&mut stream, &self.codec).await {
-            Ok(true) => {
+            Ok(Some(_)) => {
                 self.clear_breaker();
                 Ok(())
             }
-            Ok(false) => Err(io::Error::new(
+            Ok(None) => Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "probe: server rejected mux handshake",
             )),

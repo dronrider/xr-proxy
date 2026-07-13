@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -79,6 +79,47 @@ const DEAD_LINK_TIMEOUT: Duration = Duration::from_secs(75);
 /// поимённо и превратился в failover, а не в немой таймаут пула (XR-086).
 const OPEN_STEP_TIMEOUT: Duration = Duration::from_secs(4);
 const MUX_PROTOCOL_VERSION: u8 = 1;
+/// Бит capability в байте флагов MuxInit/MuxInitAck: пир умеет оконный flow
+/// control стримов (WindowUpdate, LLD-27).
+const MUX_FLAG_WINDOW: u8 = 0x01;
+/// Начальное окно приёма стрима (LLD-27): столько байт Data пир шлёт без
+/// возврата кредита. Покрывает BDP наших линков (~640 КБ при 50 Мбит/с и RTT
+/// 100мс) и режет память на медленный стрим до 1 МиБ вместо полного канала
+/// (1024 кадра, до 16 МБ). Обе стороны держат одну константу, обмена размером
+/// в хендшейке нет (yamux-подход); менять размер - новым флагом.
+const STREAM_RECV_WINDOW: u32 = 1024 * 1024;
+/// Порог возврата кредита: вычитанное копится и уезжает одним WindowUpdate раз
+/// в полокна, а не на каждый recv.
+const WINDOW_UPDATE_THRESHOLD: u32 = STREAM_RECV_WINDOW / 2;
+
+/// Возможности mux, согласованные хендшейком (LLD-27). Живут байтом флагов:
+/// второй байт MuxInit, третий байт MuxInitAck (пересечение сторон). Старый пир
+/// байта не шлёт и не читает, отсутствие = пустые флаги, поэтому смешанные
+/// версии совместимы в обе стороны и выкат не требует лок-степа.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MuxCaps {
+    /// Оконный flow control стримов: слать WindowUpdate и уважать окно пира.
+    pub window: bool,
+}
+
+impl MuxCaps {
+    /// Что умеет эта сборка; уходит в хендшейк, пересекается с флагами пира.
+    pub const LOCAL: MuxCaps = MuxCaps { window: true };
+
+    fn to_flags(self) -> u8 {
+        if self.window {
+            MUX_FLAG_WINDOW
+        } else {
+            0
+        }
+    }
+
+    fn from_flags(flags: u8) -> Self {
+        MuxCaps {
+            window: flags & MUX_FLAG_WINDOW != 0,
+        }
+    }
+}
 
 // ── Relay health (XR-094) ───────────────────────────────────────────
 
@@ -226,6 +267,155 @@ struct OutFrame {
     payload: Vec<u8>,
 }
 
+// -- Flow control (LLD-27) -------------------------------------------
+
+/// Окно отправки одного стрима: сколько байт Data ещё можно поставить в writer,
+/// не дожидаясь возврата кредита пиром. Живёт в `StreamEntry` (reader пополняет
+/// его по WindowUpdate) и шарится с хэндлами стрима. При выключенном окне (пир
+/// без capability) кредит стартует с i64::MAX и на практике не кончается,
+/// поэтому путь отправки один и ветвления на легаси нет.
+#[derive(Debug)]
+struct SendWindow {
+    credit: AtomicI64,
+    notify: Notify,
+    /// Стрим снят (Close пира, kill при переполнении, смерть mux): ждущие
+    /// кредита просыпаются ошибкой, а не висят на мёртвом стриме.
+    closed: AtomicBool,
+}
+
+impl SendWindow {
+    fn new(initial: i64) -> Arc<Self> {
+        Arc::new(Self {
+            credit: AtomicI64::new(initial),
+            notify: Notify::new(),
+            closed: AtomicBool::new(false),
+        })
+    }
+
+    /// Отдать до `want` (> 0) байт кредита, дождавшись WindowUpdate при пустом
+    /// окне. Возврат меньше want значит кадр надо порезать.
+    async fn acquire(&self, want: usize) -> io::Result<usize> {
+        loop {
+            match self.try_acquire(want)? {
+                0 => {}
+                n => return Ok(n),
+            }
+            let notified = self.notify.notified();
+            // Перепроверка после подписки: WindowUpdate или закрытие, пришедшие
+            // между try_acquire и notified(), иначе потерялись бы навсегда.
+            if self.credit.load(Ordering::Acquire) > 0 || self.closed.load(Ordering::Acquire) {
+                continue;
+            }
+            notified.await;
+        }
+    }
+
+    /// Неблокирующая половина acquire: 0 = кредита сейчас нет.
+    fn try_acquire(&self, want: usize) -> io::Result<usize> {
+        loop {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "mux stream closed"));
+            }
+            let cur = self.credit.load(Ordering::Acquire);
+            if cur <= 0 {
+                return Ok(0);
+            }
+            let take = cur.min(want as i64);
+            if self
+                .credit
+                .compare_exchange(cur, cur - take, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(take as usize);
+            }
+        }
+    }
+
+    fn add(&self, n: u32) {
+        self.credit.fetch_add(n as i64, Ordering::AcqRel);
+        self.notify.notify_waiters();
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+}
+
+/// Возврат кредита пиру по мере вычитывания. Копит вычитанные байты и раз в
+/// полокна шлёт WindowUpdate КОНТРОЛЬНЫМ планом: кредит не должен стоять в
+/// очереди за чужим балком Data, иначе при насыщении обеих сторон окно не
+/// пополняется вовремя. Отправка через try_send без блокировки и без потери:
+/// не влезло в канал - счётчик копится и уедет со следующим вычитыванием;
+/// заодно кредит не привязан к await-точке и переживает отмену recv-future
+/// потребителя (recv внутри tokio::select!).
+#[derive(Debug)]
+struct RecvCredit {
+    stream_id: u32,
+    ctrl_tx: mpsc::Sender<OutFrame>,
+    pending: u32,
+}
+
+impl RecvCredit {
+    fn consumed(&mut self, n: usize) {
+        self.pending = self.pending.saturating_add(n as u32);
+        if self.pending < WINDOW_UPDATE_THRESHOLD {
+            return;
+        }
+        let frame = OutFrame {
+            stream_id: self.stream_id,
+            command: Command::WindowUpdate,
+            payload: self.pending.to_be_bytes().to_vec(),
+        };
+        if self.ctrl_tx.try_send(frame).is_ok() {
+            self.pending = 0;
+        }
+    }
+}
+
+/// Потолок Data-кадра в send_data: лимит payload кодека (u16) минус префикс
+/// stream_id. Раньше кусок больше лимита молча ронял writer на encode_frame
+/// (контракт держался на том, что все вызывающие читают сокет мелкими буферами);
+/// с нарезкой по окну потолок закреплён здесь.
+const SEND_CHUNK_MAX: usize = u16::MAX as usize - 4;
+
+/// Общий путь отправки Data с оконным кредитом: кадр режется по доступному окну
+/// и уходит частями, когда пир вернул меньше, чем просили. Err = mux мёртв или
+/// стрим снят пиром (аналог EPIPE после чужого Close).
+async fn send_data(
+    writer_tx: &mpsc::Sender<OutFrame>,
+    alive: &AtomicBool,
+    window: &SendWindow,
+    stream_id: u32,
+    data: &[u8],
+) -> io::Result<()> {
+    if !alive.load(Ordering::Relaxed) {
+        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "mux connection dead"));
+    }
+    let broken = || io::Error::new(io::ErrorKind::BrokenPipe, "mux writer closed");
+    if data.is_empty() {
+        // Пустой Data-кадр окна не стоит: приёмнику нечего вычитывать.
+        return writer_tx
+            .send(OutFrame { stream_id, command: Command::Data, payload: Vec::new() })
+            .await
+            .map_err(|_| broken());
+    }
+    let mut off = 0;
+    while off < data.len() {
+        let n = window.acquire((data.len() - off).min(SEND_CHUNK_MAX)).await?;
+        writer_tx
+            .send(OutFrame {
+                stream_id,
+                command: Command::Data,
+                payload: data[off..off + n].to_vec(),
+            })
+            .await
+            .map_err(|_| broken())?;
+        off += n;
+    }
+    Ok(())
+}
+
 // ── MuxStream ───────────────────────────────────────────────────────
 
 /// A single logical stream within a multiplexed connection.
@@ -240,34 +430,29 @@ pub struct MuxStream {
     writer_tx: mpsc::Sender<OutFrame>,
     alive: Arc<AtomicBool>,
     closed: bool,
-    /// Set by `split()` so Drop on the husk skips Close — the WriteHalf now
+    /// Set by `split()` so Drop on the husk skips Close - the WriteHalf now
     /// owns that contract.
     detached: bool,
+    /// Окно отправки (LLD-27); reader пополняет его по WindowUpdate пира.
+    window: Arc<SendWindow>,
+    /// Возврат кредита пиру по мере вычитывания; None = окно не согласовано.
+    recv_credit: Option<RecvCredit>,
 }
 
 impl MuxStream {
     /// Receive data from this stream. Returns None if the stream or
     /// mux connection is closed.
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        match self.rx.as_mut() {
-            Some(rx) => rx.recv().await,
-            None => None,
+        let data = self.rx.as_mut()?.recv().await?;
+        if let Some(credit) = self.recv_credit.as_mut() {
+            credit.consumed(data.len());
         }
+        Some(data)
     }
 
     /// Send data on this stream.
     pub async fn send(&self, data: &[u8]) -> io::Result<()> {
-        if !self.alive.load(Ordering::Relaxed) {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "mux connection dead"));
-        }
-        self.writer_tx
-            .send(OutFrame {
-                stream_id: self.stream_id,
-                command: Command::Data,
-                payload: data.to_vec(),
-            })
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "mux writer closed"))
+        send_data(&self.writer_tx, &self.alive, &self.window, self.stream_id, data).await
     }
 
     /// Close this stream gracefully.
@@ -301,15 +486,17 @@ impl MuxStream {
     /// triggering "channel full, closing".
     pub fn split(mut self) -> (MuxReadHalf, MuxWriteHalf) {
         let rx = self.rx.take().expect("MuxStream already split");
+        let recv_credit = self.recv_credit.take();
         self.detached = true;
         let write = MuxWriteHalf {
             stream_id: self.stream_id,
             writer_tx: self.writer_tx.clone(),
             alive: self.alive.clone(),
             closed: self.closed,
+            window: self.window.clone(),
         };
         // self drops here; Drop honors `detached` and skips Close.
-        (MuxReadHalf { rx }, write)
+        (MuxReadHalf { rx, recv_credit }, write)
     }
 }
 
@@ -321,16 +508,18 @@ impl MuxStream {
     /// exactly as [`MuxStream`] does. Panics if the stream was already `split()`.
     pub fn into_io(mut self) -> MuxStreamIo {
         let rx = self.rx.take().expect("MuxStream already split");
+        let recv_credit = self.recv_credit.take();
         self.detached = true; // husk drop must not also send Close
         MuxStreamIo {
             stream_id: self.stream_id,
             rx,
             writer_tx: self.writer_tx.clone(),
             alive: self.alive.clone(),
+            window: self.window.clone(),
+            recv_credit,
             read_buf: Vec::new(),
             read_pos: 0,
             write_fut: None,
-            write_len: 0,
             close_fut: None,
             closed: self.closed,
         }
@@ -372,16 +561,40 @@ pub struct MuxStreamIo {
     rx: mpsc::Receiver<Vec<u8>>,
     writer_tx: mpsc::Sender<OutFrame>,
     alive: Arc<AtomicBool>,
+    /// Окно отправки (LLD-27): без кредита poll_write уходит в медленный путь
+    /// и ждёт WindowUpdate пира.
+    window: Arc<SendWindow>,
+    /// Возврат кредита пиру по мере вычитывания; None = окно не согласовано.
+    recv_credit: Option<RecvCredit>,
     /// Tail of the last received payload that didn't fit the caller's buffer.
     read_buf: Vec<u8>,
     read_pos: usize,
-    /// In-flight Data send, present only after the writer channel was full.
-    write_fut: Option<Pin<Box<dyn Future<Output = Result<(), ()>> + Send>>>,
-    /// Length promised to the caller for the in-flight `write_fut`.
-    write_len: usize,
+    /// In-flight Data send (writer channel was full or the window was empty);
+    /// resolves to the byte count promised to the caller.
+    write_fut: Option<Pin<Box<dyn Future<Output = Result<usize, ()>> + Send>>>,
     /// In-flight Close send during shutdown.
     close_fut: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     closed: bool,
+}
+
+/// Прокрутить отложенную отправку Data; по готовности вернуть принятые байты
+/// и очистить слот.
+fn poll_stored_write(
+    write_fut: &mut Option<Pin<Box<dyn Future<Output = Result<usize, ()>> + Send>>>,
+    cx: &mut Context<'_>,
+) -> Poll<io::Result<usize>> {
+    let fut = write_fut.as_mut().expect("write_fut present");
+    match fut.as_mut().poll(cx) {
+        Poll::Ready(Ok(n)) => {
+            *write_fut = None;
+            Poll::Ready(Ok(n))
+        }
+        Poll::Ready(Err(())) => {
+            *write_fut = None;
+            Poll::Ready(Err(mux_broken()))
+        }
+        Poll::Pending => Poll::Pending,
+    }
 }
 
 impl MuxStreamIo {
@@ -414,6 +627,12 @@ impl AsyncRead for MuxStreamIo {
         loop {
             match this.rx.poll_recv(cx) {
                 Poll::Ready(Some(data)) => {
+                    // Кредит возвращается при снятии кадра с канала (слот
+                    // освободился), не при доедании хвоста caller'ом: переучёт
+                    // ограничен одним кадром, как в h2.
+                    if let Some(credit) = this.recv_credit.as_mut() {
+                        credit.consumed(data.len());
+                    }
                     // Empty payloads (e.g. a bare ConnectAck routed here) carry no
                     // bytes, so skip rather than signal EOF.
                     if data.is_empty() {
@@ -443,18 +662,8 @@ impl AsyncWrite for MuxStreamIo {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         // Finish a send that returned Pending last time.
-        if let Some(fut) = this.write_fut.as_mut() {
-            return match fut.as_mut().poll(cx) {
-                Poll::Ready(Ok(())) => {
-                    this.write_fut = None;
-                    Poll::Ready(Ok(this.write_len))
-                }
-                Poll::Ready(Err(())) => {
-                    this.write_fut = None;
-                    Poll::Ready(Err(mux_broken()))
-                }
-                Poll::Pending => Poll::Pending,
-            };
+        if this.write_fut.is_some() {
+            return poll_stored_write(&mut this.write_fut, cx);
         }
         if !this.alive.load(Ordering::Relaxed) {
             return Poll::Ready(Err(mux_broken()));
@@ -462,7 +671,28 @@ impl AsyncWrite for MuxStreamIo {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let n = buf.len().min(IO_WRITE_CHUNK);
+        let want = buf.len().min(IO_WRITE_CHUNK);
+        // Окно (LLD-27): кадр режется по доступному кредиту. Пустое окно уводит
+        // в медленный путь: future ждёт WindowUpdate пира, потом шлёт.
+        let n = match this.window.try_acquire(want) {
+            Err(_) => return Poll::Ready(Err(mux_broken())),
+            Ok(0) => {
+                let window = this.window.clone();
+                let tx = this.writer_tx.clone();
+                let sid = this.stream_id;
+                let mut payload = buf[..want].to_vec();
+                this.write_fut = Some(Box::pin(async move {
+                    let granted = window.acquire(payload.len()).await.map_err(|_| ())?;
+                    payload.truncate(granted);
+                    tx.send(OutFrame { stream_id: sid, command: Command::Data, payload })
+                        .await
+                        .map_err(|_| ())?;
+                    Ok(granted)
+                }));
+                return poll_stored_write(&mut this.write_fut, cx);
+            }
+            Ok(n) => n,
+        };
         let frame = OutFrame {
             stream_id: this.stream_id,
             command: Command::Data,
@@ -472,20 +702,11 @@ impl AsyncWrite for MuxStreamIo {
             Ok(()) => Poll::Ready(Ok(n)),
             Err(mpsc::error::TrySendError::Full(frame)) => {
                 let tx = this.writer_tx.clone();
-                this.write_len = n;
-                this.write_fut =
-                    Some(Box::pin(async move { tx.send(frame).await.map_err(|_| ()) }));
-                match this.write_fut.as_mut().unwrap().as_mut().poll(cx) {
-                    Poll::Ready(Ok(())) => {
-                        this.write_fut = None;
-                        Poll::Ready(Ok(n))
-                    }
-                    Poll::Ready(Err(())) => {
-                        this.write_fut = None;
-                        Poll::Ready(Err(mux_broken()))
-                    }
-                    Poll::Pending => Poll::Pending,
-                }
+                this.write_fut = Some(Box::pin(async move {
+                    tx.send(frame).await.map_err(|_| ())?;
+                    Ok(n)
+                }));
+                poll_stored_write(&mut this.write_fut, cx)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(mux_broken())),
         }
@@ -495,18 +716,8 @@ impl AsyncWrite for MuxStreamIo {
         let this = self.get_mut();
         // Data is flushed by the writer task once it leaves the channel; the only
         // buffered state here is an in-flight send, so drive it to completion.
-        if let Some(fut) = this.write_fut.as_mut() {
-            match fut.as_mut().poll(cx) {
-                Poll::Ready(Ok(())) => {
-                    this.write_fut = None;
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Err(())) => {
-                    this.write_fut = None;
-                    Poll::Ready(Err(mux_broken()))
-                }
-                Poll::Pending => Poll::Pending,
-            }
+        if this.write_fut.is_some() {
+            poll_stored_write(&mut this.write_fut, cx).map_ok(|_| ())
         } else {
             Poll::Ready(Ok(()))
         }
@@ -516,13 +727,10 @@ impl AsyncWrite for MuxStreamIo {
         let this = self.get_mut();
         // Let a pending Data send finish before Close, or it would overtake still
         // unwritten Data of this stream (same ordering rule as MuxStream::close).
-        if let Some(fut) = this.write_fut.as_mut() {
-            match fut.as_mut().poll(cx) {
-                Poll::Ready(Ok(())) => this.write_fut = None,
-                Poll::Ready(Err(())) => {
-                    this.write_fut = None;
-                    return Poll::Ready(Err(mux_broken()));
-                }
+        if this.write_fut.is_some() {
+            match poll_stored_write(&mut this.write_fut, cx) {
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -582,11 +790,17 @@ fn close_on_drop(writer_tx: &mpsc::Sender<OutFrame>, stream_id: u32) {
 #[derive(Debug)]
 pub struct MuxReadHalf {
     rx: mpsc::Receiver<Vec<u8>>,
+    /// Возврат кредита пиру (LLD-27); None = окно не согласовано.
+    recv_credit: Option<RecvCredit>,
 }
 
 impl MuxReadHalf {
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        self.rx.recv().await
+        let data = self.rx.recv().await?;
+        if let Some(credit) = self.recv_credit.as_mut() {
+            credit.consumed(data.len());
+        }
+        Some(data)
     }
 }
 
@@ -600,21 +814,13 @@ pub struct MuxWriteHalf {
     writer_tx: mpsc::Sender<OutFrame>,
     alive: Arc<AtomicBool>,
     closed: bool,
+    /// Окно отправки (LLD-27), общее с остальными хэндлами стрима.
+    window: Arc<SendWindow>,
 }
 
 impl MuxWriteHalf {
     pub async fn send(&self, data: &[u8]) -> io::Result<()> {
-        if !self.alive.load(Ordering::Relaxed) {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "mux connection dead"));
-        }
-        self.writer_tx
-            .send(OutFrame {
-                stream_id: self.stream_id,
-                command: Command::Data,
-                payload: data.to_vec(),
-            })
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "mux writer closed"))
+        send_data(&self.writer_tx, &self.alive, &self.window, self.stream_id, data).await
     }
 
     pub async fn close(&mut self) -> io::Result<()> {
@@ -663,6 +869,17 @@ struct StreamEntry {
     got_data: bool,
     /// Таргет стрима это домен: успех идёт и в доменный счётчик здоровья.
     domain: bool,
+    /// Окно отправки нашей стороны (LLD-27); reader пополняет его по
+    /// WindowUpdate пира.
+    window: Arc<SendWindow>,
+}
+
+impl Drop for StreamEntry {
+    fn drop(&mut self) {
+        // Любое снятие записи (Close пира, kill при переполнении, очистка карты
+        // при смерти reader) будит отправителей, заснувших на пустом окне.
+        self.window.close();
+    }
 }
 
 /// Manages a multiplexed TCP connection with multiple logical streams.
@@ -681,38 +898,46 @@ pub struct Multiplexer {
     /// Externally-triggered shutdown signal. When the pool decides a slot
     /// is zombie (alive=true but server-state lost), calling shutdown()
     /// drops the write half, which propagates FIN → server closes → our
-    /// reader gets EOF → TCP fully closes. Without this the orphaned
+    /// reader gets EOF -> TCP fully closes. Without this the orphaned
     /// reader/writer tasks keep the socket ESTABLISHED for up to
     /// MUX_MAX_LIFETIME (4h), accumulating ghost connections on the server.
     shutdown_notify: Arc<Notify>,
+    /// Возможности, согласованные хендшейком (LLD-27).
+    caps: MuxCaps,
 }
 
 impl Multiplexer {
     /// Create a client-side multiplexer over an established TCP connection.
-    /// The TCP connection must already have completed MuxInit/MuxInitAck.
-    pub fn new_client<S>(stream: S, codec: Codec) -> Arc<Self>
+    /// The TCP connection must already have completed MuxInit/MuxInitAck;
+    /// `caps` это результат хендшейка (LLD-27).
+    pub fn new_client<S>(stream: S, codec: Codec, caps: MuxCaps) -> Arc<Self>
     where
         S: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
     {
-        Self::new_inner(stream, codec, 1, None) // client uses odd stream IDs
+        Self::new_inner(stream, codec, 1, None, caps) // client uses odd stream IDs
     }
 
     /// Клиентский мультиплексор с учётом исходов relay в общем здоровье пула
     /// (XR-094): причины из Close и первые Data-кадры стримов записываются в
     /// `health`, по нему `ServerPool` ловит «туннель жив, работа не идёт».
-    pub fn new_client_tracked<S>(stream: S, codec: Codec, health: Arc<RelayHealth>) -> Arc<Self>
+    pub fn new_client_tracked<S>(
+        stream: S,
+        codec: Codec,
+        health: Arc<RelayHealth>,
+        caps: MuxCaps,
+    ) -> Arc<Self>
     where
         S: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
     {
-        Self::new_inner(stream, codec, 1, Some(health))
+        Self::new_inner(stream, codec, 1, Some(health), caps)
     }
 
     /// Create a server-side multiplexer over an established TCP connection.
-    pub fn new_server<S>(stream: S, codec: Codec) -> Arc<Self>
+    pub fn new_server<S>(stream: S, codec: Codec, caps: MuxCaps) -> Arc<Self>
     where
         S: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
     {
-        Self::new_inner(stream, codec, 2, None) // server uses even stream IDs
+        Self::new_inner(stream, codec, 2, None, caps) // server uses even stream IDs
     }
 
     fn new_inner<S>(
@@ -720,6 +945,7 @@ impl Multiplexer {
         codec: Codec,
         first_stream_id: u32,
         relay_health: Option<Arc<RelayHealth>>,
+        caps: MuxCaps,
     ) -> Arc<Self>
     where
         S: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
@@ -779,6 +1005,28 @@ impl Multiplexer {
             _close_notify: close_notify,
             new_stream_rx: Mutex::new(Some(new_stream_rx)),
             shutdown_notify,
+            caps,
+        })
+    }
+
+    /// Окно отправки нового стрима: при выключенном flow control кредит
+    /// бесконечен, путь отправки не ветвится (LLD-27).
+    fn new_send_window(&self) -> Arc<SendWindow> {
+        let initial = if self.caps.window {
+            STREAM_RECV_WINDOW as i64
+        } else {
+            i64::MAX
+        };
+        SendWindow::new(initial)
+    }
+
+    /// Возврат кредита пиру: только при согласованном окне, иначе старый пир
+    /// умрёт на неизвестной команде WindowUpdate.
+    fn new_recv_credit(&self, stream_id: u32) -> Option<RecvCredit> {
+        self.caps.window.then(|| RecvCredit {
+            stream_id,
+            ctrl_tx: self.ctrl_tx.clone(),
+            pending: 0,
         })
     }
 
@@ -788,9 +1036,10 @@ impl Multiplexer {
         stream_id: u32,
     ) -> MuxStream {
         let (data_tx, data_rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
+        let window = self.new_send_window();
         self.streams.lock().await.insert(
             stream_id,
-            StreamEntry { tx: data_tx, got_data: false, domain: false },
+            StreamEntry { tx: data_tx, got_data: false, domain: false, window: window.clone() },
         );
 
         MuxStream {
@@ -800,6 +1049,8 @@ impl Multiplexer {
             alive: self.alive.clone(),
             closed: false,
             detached: false,
+            window,
+            recv_credit: self.new_recv_credit(stream_id),
         }
     }
 
@@ -961,6 +1212,19 @@ async fn dispatch_frame(
             });
         }
         Command::Pong => {}
+        Command::WindowUpdate => {
+            // Пир вернул кредит окна (LLD-27): пополнить окно отправки стрима
+            // и разбудить заснувших. Не блокируется (атомик + notify), для
+            // снятого стрима кредит молча выбрасывается.
+            if let Ok((stream_id, inc)) = decode_mux_payload(&frame.payload) {
+                if inc.len() >= 4 {
+                    let add = u32::from_be_bytes([inc[0], inc[1], inc[2], inc[3]]);
+                    if let Some(entry) = streams.lock().await.get(&stream_id) {
+                        entry.window.add(add);
+                    }
+                }
+            }
+        }
         Command::Data | Command::ConnectAck => {
             if let Ok((stream_id, data)) = decode_mux_payload(&frame.payload) {
                 let mut remove = false;
@@ -1112,14 +1376,15 @@ async fn writer_task<W: AsyncWriteExt + Unpin>(
 // ── Handshake helpers ───────────────────────────────────────────────
 
 /// Client: send MuxInit, wait for MuxInitAck.
-/// Returns Ok(true) if mux is supported, Ok(false) if server rejected,
-/// Err on I/O error.
+/// Returns Ok(Some(caps)) с согласованными возможностями, Ok(None) if the
+/// server rejected, Err on I/O error.
 pub async fn mux_handshake_client<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
     codec: &Codec,
-) -> io::Result<bool> {
-    // Send MuxInit.
-    let init_payload = vec![MUX_PROTOCOL_VERSION];
+) -> io::Result<Option<MuxCaps>> {
+    // Send MuxInit: версия + байт флагов (LLD-27). Старый сервер читает только
+    // первый байт и лишний игнорирует.
+    let init_payload = vec![MUX_PROTOCOL_VERSION, MuxCaps::LOCAL.to_flags()];
     let wire = codec.encode_frame(Command::MuxInit, &init_payload)?;
     stream.write_all(&wire).await?;
 
@@ -1143,40 +1408,51 @@ pub async fn mux_handshake_client<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         match codec.decode_frame(&buf[..filled])? {
             Some((frame, _)) => {
                 if frame.command != Command::MuxInitAck {
-                    return Ok(false); // server doesn't support mux
+                    return Ok(None); // server doesn't support mux
                 }
                 if frame.payload.len() >= 2 && frame.payload[1] == 0 {
-                    return Ok(true); // success
+                    // Третий байт это флаги сервера; старый сервер его не шлёт,
+                    // отсутствие читается как пустые флаги (окно выключено).
+                    let flags = frame.payload.get(2).copied().unwrap_or(0);
+                    return Ok(Some(MuxCaps::from_flags(flags & MuxCaps::LOCAL.to_flags())));
                 }
-                return Ok(false); // rejected
+                return Ok(None); // rejected
             }
             None => continue,
         }
     }
 }
 
-/// Server: check if frame is MuxInit, send MuxInitAck.
+/// Server: check if frame is MuxInit, send MuxInitAck. Возвращает
+/// согласованные возможности, None = не mux / версия не наша.
 pub async fn mux_handshake_server<S: AsyncWriteExt + Unpin>(
     stream: &mut S,
     codec: &Codec,
     init_frame: &Frame,
-) -> io::Result<bool> {
+) -> io::Result<Option<MuxCaps>> {
     if init_frame.command != Command::MuxInit {
-        return Ok(false);
+        return Ok(None);
     }
 
     let version = init_frame.payload.first().copied().unwrap_or(0);
     if version != MUX_PROTOCOL_VERSION {
-        // Unsupported version — reject.
+        // Unsupported version - reject.
         let ack = codec.encode_frame(Command::MuxInitAck, &[version, 1])?;
         stream.write_all(&ack).await?;
-        return Ok(false);
+        return Ok(None);
     }
 
+    // Второй байт MuxInit это флаги клиента (LLD-27); старый клиент шлёт один
+    // байт, отсутствие = пустые флаги. В ack уходит пересечение с нашими,
+    // старый клиент лишний третий байт игнорирует.
+    let peer_flags = init_frame.payload.get(1).copied().unwrap_or(0);
+    let caps = MuxCaps::from_flags(peer_flags & MuxCaps::LOCAL.to_flags());
+
     // Accept.
-    let ack = codec.encode_frame(Command::MuxInitAck, &[MUX_PROTOCOL_VERSION, 0])?;
+    let ack =
+        codec.encode_frame(Command::MuxInitAck, &[MUX_PROTOCOL_VERSION, 0, caps.to_flags()])?;
     stream.write_all(&ack).await?;
-    Ok(true)
+    Ok(Some(caps))
 }
 
 // ── Client open_stream (standalone function) ────────────────────────
@@ -1192,6 +1468,7 @@ pub async fn mux_open_stream(
 
     let stream_id = mux.next_stream_id.fetch_add(2, Ordering::Relaxed);
     let (data_tx, mut data_rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
+    let window = mux.new_send_window();
 
     // Register before sending Connect so we don't miss ConnectAck.
     // Таймаут+WARN на взятие async-Mutex `streams`: если открытие вешается ЗДЕСЬ
@@ -1205,6 +1482,7 @@ pub async fn mux_open_stream(
                     tx: data_tx,
                     got_data: false,
                     domain: matches!(target, TargetAddr::Domain(..)),
+                    window: window.clone(),
                 },
             );
         }
@@ -1261,6 +1539,8 @@ pub async fn mux_open_stream(
             alive: mux.alive.clone(),
             closed: false,
             detached: false,
+            window,
+            recv_credit: mux.new_recv_credit(stream_id),
         }),
         Ok(None) => Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
@@ -1345,8 +1625,9 @@ mod tests {
         });
 
         let (client_result, server_result) = tokio::join!(client_task, server_task);
-        assert!(client_result.unwrap().unwrap()); // client got MuxInitAck OK
-        assert!(server_result.unwrap().unwrap()); // server accepted MuxInit
+        // Обе стороны новые: хендшейк проходит и согласовывает окно (LLD-27).
+        assert_eq!(client_result.unwrap().unwrap(), Some(MuxCaps { window: true }));
+        assert_eq!(server_result.unwrap().unwrap(), Some(MuxCaps { window: true }));
     }
 
     #[tokio::test]
@@ -1355,8 +1636,8 @@ mod tests {
         let codec = test_codec();
 
         // Create multiplexers (skip handshake for unit test).
-        let client_mux = Multiplexer::new_client(client_io, codec.clone());
-        let server_mux = Multiplexer::new_server(server_io, codec.clone());
+        let client_mux = Multiplexer::new_client(client_io, codec.clone(), MuxCaps::LOCAL);
+        let server_mux = Multiplexer::new_server(server_io, codec.clone(), MuxCaps::LOCAL);
 
         // Server: listen for incoming Connect on a background task.
         let server_mux_clone = server_mux.clone();
@@ -1409,8 +1690,8 @@ mod tests {
     async fn test_mux_stream_id_parity() {
         let (client_io, server_io) = duplex(65536);
         let codec = test_codec();
-        let client_mux = Multiplexer::new_client(client_io, codec.clone());
-        let server_mux = Multiplexer::new_server(server_io, codec.clone());
+        let client_mux = Multiplexer::new_client(client_io, codec.clone(), MuxCaps::LOCAL);
+        let server_mux = Multiplexer::new_server(server_io, codec.clone(), MuxCaps::LOCAL);
 
         let s = server_mux.clone();
         let server_accept = tokio::spawn(async move {
@@ -1449,8 +1730,8 @@ mod tests {
     async fn test_mux_stream_io_roundtrip() {
         let (client_io, server_io) = duplex(65536);
         let codec = test_codec();
-        let client_mux = Multiplexer::new_client(client_io, codec.clone());
-        let server_mux = Multiplexer::new_server(server_io, codec.clone());
+        let client_mux = Multiplexer::new_client(client_io, codec.clone(), MuxCaps::LOCAL);
+        let server_mux = Multiplexer::new_server(server_io, codec.clone(), MuxCaps::LOCAL);
 
         let s = server_mux.clone();
         let server_task = tokio::spawn(async move {
@@ -1487,7 +1768,7 @@ mod tests {
         // и mux станет !alive (open вернётся рано, минуя путь отмены).
         let (client_io, _server_io) = duplex(65536);
         let codec = test_codec();
-        let mux = Multiplexer::new_client(client_io, codec);
+        let mux = Multiplexer::new_client(client_io, codec, MuxCaps::LOCAL);
 
         let target = TargetAddr::Domain("silent.test".to_string(), 443);
         // Внешний таймаут короче внутренних 10с ConnectAck: он отменяет
@@ -1522,7 +1803,7 @@ mod tests {
     async fn test_reader_detects_dead_link() {
         let (client_io, _server_io) = duplex(65536);
         let codec = test_codec();
-        let mux = Multiplexer::new_client(client_io, codec);
+        let mux = Multiplexer::new_client(client_io, codec, MuxCaps::LOCAL);
         assert!(mux.is_alive(), "fresh mux must be alive");
 
         // Дать reader-таску запуститься и встать на select (skip-тик + await).
@@ -1557,7 +1838,7 @@ mod tests {
         let codec = test_codec();
         // Маленький буфер, чтобы writer клиента упёрся быстро.
         let (client_io, mut server_io) = duplex(512);
-        let _client = Multiplexer::new_client(client_io, codec.clone());
+        let _client = Multiplexer::new_client(client_io, codec.clone(), MuxCaps::LOCAL);
 
         let ping = codec.encode_frame(Command::Ping, &0u64.to_be_bytes()).unwrap();
         let flood = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1581,8 +1862,8 @@ mod tests {
         let codec = test_codec();
         let health = Arc::new(RelayHealth::new());
         let client_mux =
-            Multiplexer::new_client_tracked(client_io, codec.clone(), health.clone());
-        let server_mux = Multiplexer::new_server(server_io, codec.clone());
+            Multiplexer::new_client_tracked(client_io, codec.clone(), health.clone(), MuxCaps::LOCAL);
+        let server_mux = Multiplexer::new_server(server_io, codec.clone(), MuxCaps::LOCAL);
 
         // Сервер: принять Connect, ответить ConnectAck, затем Close с причиной
         // resolve-сбоя (ровно как mux_handler при мёртвом DNS), и Close-дубль.
@@ -1639,8 +1920,8 @@ mod tests {
         let codec = test_codec();
         let health = Arc::new(RelayHealth::new());
         let client_mux =
-            Multiplexer::new_client_tracked(client_io, codec.clone(), health.clone());
-        let server_mux = Multiplexer::new_server(server_io, codec.clone());
+            Multiplexer::new_client_tracked(client_io, codec.clone(), health.clone(), MuxCaps::LOCAL);
+        let server_mux = Multiplexer::new_server(server_io, codec.clone(), MuxCaps::LOCAL);
 
         let server_task = tokio::spawn(async move {
             let mut rx = server_mux.take_new_stream_rx().await.unwrap();
@@ -1723,6 +2004,229 @@ mod tests {
         assert!(health.degraded());
         tokio::time::advance(RELAY_WINDOW * 2 + Duration::from_secs(1)).await;
         assert!(!health.degraded(), "сбои старше окна не считаются");
+    }
+
+    /// Эмуляция СТАРОГО сервера (LLD-27): на MuxInit с байтом флагов он
+    /// отвечает двухбайтовым ack [версия, 0]. Новый клиент обязан пройти
+    /// хендшейк и выключить окно, а не счесть сервер несовместимым.
+    #[tokio::test]
+    async fn test_handshake_old_server_disables_window() {
+        let (mut client_io, mut server_io) = duplex(1024);
+        let codec = test_codec();
+
+        let server_codec = codec.clone();
+        let old_server = tokio::spawn(async move {
+            let mut buf = vec![0u8; 256];
+            let mut filled = 0;
+            let init = loop {
+                let n = server_io.read(&mut buf[filled..]).await.unwrap();
+                filled += n;
+                if let Some((f, _)) = server_codec.decode_frame(&buf[..filled]).unwrap() {
+                    break f;
+                }
+            };
+            assert_eq!(init.command, Command::MuxInit);
+            // Старый сервер читает только версию, флаги игнорирует.
+            assert_eq!(init.payload.first(), Some(&MUX_PROTOCOL_VERSION));
+            let ack = server_codec
+                .encode_frame(Command::MuxInitAck, &[MUX_PROTOCOL_VERSION, 0])
+                .unwrap();
+            server_io.write_all(&ack).await.unwrap();
+        });
+
+        let caps = mux_handshake_client(&mut client_io, &codec).await.unwrap();
+        assert_eq!(
+            caps,
+            Some(MuxCaps { window: false }),
+            "старый сервер без байта флагов = mux есть, окна нет"
+        );
+        old_server.await.unwrap();
+    }
+
+    /// Эмуляция СТАРОГО клиента (LLD-27): MuxInit из одного байта версии.
+    /// Новый сервер принимает, окно выключено, ack совместим со старой
+    /// проверкой `payload[1] == 0`.
+    #[tokio::test]
+    async fn test_handshake_old_client_disables_window() {
+        let (mut server_io, mut client_io) = duplex(1024);
+        let codec = test_codec();
+
+        let init = Frame { command: Command::MuxInit, payload: vec![MUX_PROTOCOL_VERSION] };
+        let caps = mux_handshake_server(&mut server_io, &codec, &init).await.unwrap();
+        assert_eq!(caps, Some(MuxCaps { window: false }));
+
+        // Ack глазами старого клиента: он смотрит только payload[0..2].
+        let mut buf = vec![0u8; 256];
+        let mut filled = 0;
+        let ack = loop {
+            let n = client_io.read(&mut buf[filled..]).await.unwrap();
+            filled += n;
+            if let Some((f, _)) = codec.decode_frame(&buf[..filled]).unwrap() {
+                break f;
+            }
+        };
+        assert_eq!(ack.command, Command::MuxInitAck);
+        assert!(ack.payload.len() >= 2 && ack.payload[1] == 0);
+    }
+
+    /// Тотал и размер кадра для тестов окна: кадров больше ёмкости per-stream
+    /// канала (1024), чтобы легаси-режим гарантированно переполнялся, а размер
+    /// не делит окно нацело, чтобы отправка с окном прошла и путь частичного
+    /// кредита (кадр режется по остатку окна).
+    const FLOW_TOTAL: usize = 4 * 1024 * 1024;
+    const FLOW_CHUNK: usize = 3000;
+
+    /// Быстрый отправитель льёт в стрим, потребитель начинает вычитывать с
+    /// опозданием. Отправка идёт `send` серверного хэндла, вычитывание recv
+    /// клиента; байты проверяются по позиционному паттерну.
+    async fn run_slow_consumer(caps: MuxCaps) -> usize {
+        let (client_io, server_io) = duplex(65536);
+        let codec = test_codec();
+        let client_mux = Multiplexer::new_client(client_io, codec.clone(), caps);
+        let server_mux = Multiplexer::new_server(server_io, codec.clone(), caps);
+
+        let s = server_mux.clone();
+        tokio::spawn(async move {
+            let mut rx = s.take_new_stream_rx().await.unwrap();
+            let ns = rx.recv().await.unwrap();
+            let stream = s.register_stream(ns.stream_id).await;
+            s.send_frame(ns.stream_id, Command::ConnectAck, vec![0]).await.unwrap();
+            let mut sent = 0usize;
+            let mut chunk = vec![0u8; FLOW_CHUNK];
+            while sent < FLOW_TOTAL {
+                let n = FLOW_CHUNK.min(FLOW_TOTAL - sent);
+                for (i, b) in chunk[..n].iter_mut().enumerate() {
+                    *b = ((sent + i) % 199) as u8;
+                }
+                // С окном отправитель здесь засыпает, пока потребитель не
+                // вернёт кредит; без окна флудит весь тотал сразу.
+                if stream.send(&chunk[..n]).await.is_err() {
+                    break;
+                }
+                sent += n;
+            }
+        });
+
+        let target = TargetAddr::Domain("bulk.example".to_string(), 443);
+        let mut stream = mux_open_stream(&client_mux, &target).await.unwrap();
+
+        // Потребитель отстаёт: к этому моменту отправитель без окна уже
+        // переполнил per-stream канал (1398 кадров > 1024), а с окном спит,
+        // отправив ровно окно.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut received = 0usize;
+        while let Some(data) = stream.recv().await {
+            for (i, b) in data.iter().enumerate() {
+                assert_eq!(*b, ((received + i) % 199) as u8, "байты не по порядку");
+            }
+            received += data.len();
+            if received >= FLOW_TOTAL {
+                break;
+            }
+        }
+        received
+    }
+
+    /// Регрессия XR-115: с оконным flow control медленный потребитель получает
+    /// тело целиком, отправитель упирается в окно вместо переполнения канала.
+    #[tokio::test]
+    async fn test_window_slow_consumer_gets_all_bytes() {
+        let received = run_slow_consumer(MuxCaps { window: true }).await;
+        assert_eq!(
+            received, FLOW_TOTAL,
+            "с окном не должно теряться ни байта (стрим убит вместо backpressure?)"
+        );
+    }
+
+    /// Легаси-пара (окно не согласовано) сохраняет старое поведение: reader
+    /// убивает переполнившийся стрим, тело обрезается. Это же демонстрирует,
+    /// что test_window_slow_consumer_gets_all_bytes падал бы на старом коде.
+    #[tokio::test]
+    async fn test_no_window_slow_consumer_stream_killed() {
+        let received = run_slow_consumer(MuxCaps { window: false }).await;
+        assert!(
+            received < FLOW_TOTAL,
+            "без окна медленный потребитель обязан потерять хвост (канал 1024 кадра), получено {}",
+            received
+        );
+    }
+
+    /// LLD-27: Close пира будит отправителя, заснувшего на исчерпанном окне,
+    /// ошибкой, а не вечным зависанием.
+    #[tokio::test]
+    async fn test_close_wakes_sender_blocked_on_window() {
+        let (client_io, server_io) = duplex(65536);
+        let codec = test_codec();
+        let caps = MuxCaps { window: true };
+        let client_mux = Multiplexer::new_client(client_io, codec.clone(), caps);
+        let server_mux = Multiplexer::new_server(server_io, codec.clone(), caps);
+
+        let s = server_mux.clone();
+        let sender = tokio::spawn(async move {
+            let mut rx = s.take_new_stream_rx().await.unwrap();
+            let ns = rx.recv().await.unwrap();
+            let stream = s.register_stream(ns.stream_id).await;
+            s.send_frame(ns.stream_id, Command::ConnectAck, vec![0]).await.unwrap();
+            // Выесть окно целиком, следующий send засыпает на кредите.
+            let fill = vec![0u8; STREAM_RECV_WINDOW as usize];
+            stream.send(&fill).await.unwrap();
+            stream.send(b"blocked").await
+        });
+
+        let target = TargetAddr::Domain("x".into(), 1);
+        let stream = mux_open_stream(&client_mux, &target).await.unwrap();
+        // Потребитель не читает и закрывает стрим: Close уезжает на сервер,
+        // запись стрима снимается, окно закрывается.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(stream);
+
+        let r = tokio::time::timeout(Duration::from_secs(5), sender)
+            .await
+            .expect("заснувший на окне отправитель обязан проснуться по Close")
+            .unwrap();
+        assert!(r.is_err(), "send после Close пира должен вернуть ошибку");
+    }
+
+    /// LLD-27: io-адаптер гоняет объём больше окна через poll_write/poll_read
+    /// (медленный путь с ожиданием кредита в write_fut), байты целы.
+    #[tokio::test]
+    async fn test_mux_stream_io_bulk_over_window() {
+        let (client_io, server_io) = duplex(65536);
+        let codec = test_codec();
+        let caps = MuxCaps { window: true };
+        let client_mux = Multiplexer::new_client(client_io, codec.clone(), caps);
+        let server_mux = Multiplexer::new_server(server_io, codec.clone(), caps);
+
+        const TOTAL: usize = 3 * 1024 * 1024;
+
+        let s = server_mux.clone();
+        let reader = tokio::spawn(async move {
+            let mut rx = s.take_new_stream_rx().await.unwrap();
+            let ns = rx.recv().await.unwrap();
+            let stream = s.register_stream(ns.stream_id).await;
+            s.send_frame(ns.stream_id, Command::ConnectAck, vec![0]).await.unwrap();
+            let mut io = stream.into_io();
+            // Дать писателю упереться в окно, прежде чем начать читать.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut got = Vec::with_capacity(TOTAL);
+            io.read_to_end(&mut got).await.unwrap();
+            got
+        });
+
+        let target = TargetAddr::Domain("io-bulk".into(), 1);
+        let stream = mux_open_stream(&client_mux, &target).await.unwrap();
+        let mut io = stream.into_io();
+        let data: Vec<u8> = (0..TOTAL).map(|i| (i % 199) as u8).collect();
+        io.write_all(&data).await.unwrap();
+        io.shutdown().await.unwrap();
+
+        let got = tokio::time::timeout(Duration::from_secs(10), reader)
+            .await
+            .expect("объём больше окна должен пройти через io-адаптер")
+            .unwrap();
+        assert_eq!(got.len(), TOTAL);
+        assert_eq!(got, data, "байты через io-адаптер обязаны прийти целыми");
     }
 
     /// Регрессия XR-086 (head-of-line контрольных кадров): контрольный кадр
