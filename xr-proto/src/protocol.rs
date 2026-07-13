@@ -16,9 +16,12 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 // ── Constants ────────────────────────────────────────────────────────
 
-const NONCE_LEN: usize = 4;
-const HEADER_LEN: usize = 4;
-const MAX_PAYLOAD_LEN: usize = u16::MAX as usize;
+pub(crate) const NONCE_LEN: usize = 4;
+pub(crate) const HEADER_LEN: usize = 4;
+pub(crate) const MAX_PAYLOAD_LEN: usize = u16::MAX as usize;
+/// Верхняя граница padding кадра (padding_len это u8). Нужна вне модуля, чтобы
+/// приёмный буфер mux вмещал максимальный легальный кадр целиком.
+pub const MAX_PADDING_LEN: usize = u8::MAX as usize;
 /// Fixed magic embedded in header for basic validation (bits 5-7 of command byte).
 const HEADER_MAGIC_MASK: u8 = 0xE0;
 const HEADER_MAGIC: u8 = 0xA0;
