@@ -119,10 +119,10 @@ async fn connect_and_serve(
         .await
         .with_context(|| format!("dial relay {}", relay.dial()))?;
     tcp.set_nodelay(true).ok();
-    if !mux_handshake_client(&mut tcp, &codec).await? {
+    let Some(caps) = mux_handshake_client(&mut tcp, &codec).await? else {
         return Err(anyhow!("relay rejected mux init"));
-    }
-    let mux = Multiplexer::new_client(tcp, codec);
+    };
+    let mux = Multiplexer::new_client(tcp, codec, caps);
 
     // Registration is inline on the first stream: relay acks, sends a nonce, we
     // answer with the credential + a signature over the nonce, and hold the

@@ -615,13 +615,11 @@ mod tests {
                             Err(_) => return,
                         }
                     };
-                    if !mux_handshake_server(&mut sock, &codec, &init)
-                        .await
-                        .unwrap_or(false)
-                    {
+                    let Ok(Some(caps)) = mux_handshake_server(&mut sock, &codec, &init).await
+                    else {
                         return;
-                    }
-                    let mux = Multiplexer::new_server(sock, codec.clone());
+                    };
+                    let mux = Multiplexer::new_server(sock, codec.clone(), caps);
                     let Some(mut rx) = mux.take_new_stream_rx().await else { return };
                     while let Some(ns) = rx.recv().await {
                         let _ = mux
@@ -660,13 +658,11 @@ mod tests {
                             Err(_) => return,
                         }
                     };
-                    if !mux_handshake_server(&mut sock, &codec, &init)
-                        .await
-                        .unwrap_or(false)
-                    {
+                    let Ok(Some(caps)) = mux_handshake_server(&mut sock, &codec, &init).await
+                    else {
                         return;
-                    }
-                    let mux = Multiplexer::new_server(sock, codec.clone());
+                    };
+                    let mux = Multiplexer::new_server(sock, codec.clone(), caps);
                     let Some(mut rx) = mux.take_new_stream_rx().await else { return };
                     while let Some(ns) = rx.recv().await {
                         let _ = mux

@@ -43,14 +43,14 @@ async fn handle_mux_client_lt(
     init_frame: &Frame,
     lifetime: Duration,
 ) -> io::Result<()> {
-    if !mux_handshake_server(&mut client, &codec, init_frame).await? {
+    let Some(caps) = mux_handshake_server(&mut client, &codec, init_frame).await? else {
         tracing::warn!("{} mux handshake rejected", client_addr);
         return Ok(());
-    }
+    };
 
     tracing::info!("{} mux session started", client_addr);
 
-    let mux = Multiplexer::new_server(client, codec.clone());
+    let mux = Multiplexer::new_server(client, codec.clone(), caps);
 
     let mut new_stream_rx = mux.take_new_stream_rx().await
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "new_stream_rx already taken"))?;
@@ -301,7 +301,7 @@ mod tests {
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
         assert!(
-            mux_handshake_client(&mut client, &codec).await.unwrap(),
+            mux_handshake_client(&mut client, &codec).await.unwrap().is_some(),
             "handshake ok"
         );
         client
@@ -417,7 +417,7 @@ mod tests {
         });
 
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        assert!(mux_handshake_client(&mut client, &codec).await.unwrap(), "handshake ok");
+        assert!(mux_handshake_client(&mut client, &codec).await.unwrap().is_some(), "handshake ok");
 
         // Клиент НЕ шлёт keepalive и просто ждёт. Кап (300мс) < dead-link (75с),
         // поэтому reader жив в момент капа. С фиксом сервер сделает shutdown ->

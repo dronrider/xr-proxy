@@ -165,11 +165,11 @@ pub async fn handle_connection(
     state: Arc<RelayState>,
 ) -> io::Result<()> {
     let init = read_first_frame(&mut tcp, &codec).await?;
-    if !mux_handshake_server(&mut tcp, &codec, &init).await? {
+    let Some(caps) = mux_handshake_server(&mut tcp, &codec, &init).await? else {
         tracing::debug!("{peer} mux handshake rejected");
         return Ok(());
-    }
-    let mux = Multiplexer::new_server(tcp, codec);
+    };
+    let mux = Multiplexer::new_server(tcp, codec, caps);
     let mut new_stream_rx = mux
         .take_new_stream_rx()
         .await
