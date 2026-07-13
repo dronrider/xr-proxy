@@ -875,12 +875,35 @@ fn is_unreachable(err: &str) -> bool {
     err.starts_with("network:")
 }
 
+/// How long a direct-path liveness probe may take before we give up on it and
+/// fall back to the relay. Kept well under the op timeout: a NAT that accepts the
+/// TCP connection but never answers (CGNAT, stale port-forward) must not cost the
+/// full manifest timeout (60s) or transfer timeout (up to an hour) before the
+/// relay takes over.
+const DIRECT_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// A quick liveness check of the direct agent address. Any HTTP answer (even an
+/// error status like 401) proves the agent is up and answering; only a transport
+/// error or the short deadline counts as unreachable. Unauthenticated on purpose:
+/// we only need the response line, not the body, and the probe carries no token.
+async fn direct_reachable(agent_url: &str, probe_timeout: Duration) -> bool {
+    let Ok(client) = http_client(probe_timeout) else { return false };
+    let url = format!("{}/manifest", agent_url.trim_end_matches('/'));
+    client.get(&url).send().await.is_ok()
+}
+
 /// Run `op` over the direct transport first (plain HTTP at `agent_url`); if that
 /// fails *unreachable* and a `relay` leg is present, bring up the relay (pinned
 /// TLS over a loopback forwarder, base `https://<loopback>/<share_id>`) and run
-/// `op` there instead (LLD-23 §2.4). The relay leg is held for the whole `op`
+/// `op` there instead (LLD-23 п. 2.4). The relay leg is held for the whole `op`
 /// and dropped after. `op` gets an owned client and base URL; it must be safe to
 /// invoke twice (a failed direct manifest fetch writes nothing before the retry).
+///
+/// When a relay is available, the direct path is first probed with a short
+/// deadline ([`direct_reachable`]): a dead-but-TCP-accepting address is skipped in
+/// seconds instead of stalling the whole op timeout before the relay takes over.
+/// With no relay to fall back to, the probe is pointless, so `op` runs directly
+/// under its own timeout as before.
 async fn direct_then_relay<T, F, Fut>(
     agent_url: &str,
     agent_pubkey: &str,
@@ -893,20 +916,27 @@ where
     F: Fn(reqwest::Client, String) -> Fut,
     Fut: std::future::Future<Output = Result<T, String>>,
 {
-    let plain = http_client(timeout)?;
-    match op(plain, agent_url.to_string()).await {
-        Ok(v) => Ok(v),
-        Err(e) if is_unreachable(&e) => {
-            let Some(relay) = relay else { return Err(e) };
-            let leg = RelayLeg::open(relay).await?;
-            let client = pinned_client(agent_pubkey, timeout)?;
-            let base = format!("https://{}/{}", leg.local_addr(), share_id);
-            let out = op(client, base).await;
-            drop(leg); // stop the loopback forwarder once the op is done
-            out
+    // The probe must never cost more than the op itself would (a caller may pass a
+    // timeout below the probe budget).
+    let probe = DIRECT_PROBE_TIMEOUT.min(timeout);
+    let try_direct = relay.is_none() || direct_reachable(agent_url, probe).await;
+    if try_direct {
+        match op(http_client(timeout)?, agent_url.to_string()).await {
+            Ok(v) => return Ok(v),
+            // Only an unreachable failure with a relay to fall back to is retried;
+            // an authoritative HTTP/signature error is the answer, direct or not.
+            Err(e) if !(is_unreachable(&e) && relay.is_some()) => return Err(e),
+            Err(_) => {}
         }
-        Err(e) => Err(e),
     }
+
+    let relay = relay.ok_or_else(|| "network: прямой путь недоступен, relay не задан".to_string())?;
+    let leg = RelayLeg::open(relay).await?;
+    let client = pinned_client(agent_pubkey, timeout)?;
+    let base = format!("https://{}/{}", leg.local_addr(), share_id);
+    let out = op(client, base).await;
+    drop(leg); // stop the loopback forwarder once the op is done
+    out
 }
 
 /// The core mirror over an already-chosen transport (`client` + `base_url`):
@@ -2080,6 +2110,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(m.entries.len(), 1);
+    }
+
+    // direct reachability probe: fast relay fallback (XR-128)
+
+    #[tokio::test]
+    async fn direct_reachable_true_on_any_http_answer() {
+        // Any HTTP response, even an unauthenticated 401, proves the agent is up.
+        let url = serve_once(
+            "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".into(),
+        )
+        .await;
+        assert!(direct_reachable(&url, Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn direct_reachable_false_and_fast_when_accepted_but_silent() {
+        use tokio::io::AsyncReadExt;
+        // A NAT that accepts the TCP connection but never answers: the probe must
+        // honour its own short deadline (the input here) rather than the caller's
+        // op timeout, which for a real download can be up to an hour. This checks
+        // direct_reachable in isolation; the caller passes DIRECT_PROBE_TIMEOUT.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 64];
+                let _ = sock.read(&mut buf).await;
+                std::future::pending::<()>().await; // hold open, never reply
+            }
+        });
+        let start = std::time::Instant::now();
+        let ok = direct_reachable(&format!("http://{addr}"), Duration::from_millis(400)).await;
+        let elapsed = start.elapsed();
+        assert!(!ok);
+        assert!(elapsed < Duration::from_secs(5), "probe stalled {elapsed:?}");
     }
 
     // ── sync_share_selected with a persistent index (XR-098) ─────────
