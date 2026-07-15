@@ -34,9 +34,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       # zig as the cross-linker gives musl for any arch with the current rustc.
+      # The runner has no zig of its own, without this step cargo-zigbuild dies
+      # in seconds (XR-105); 0.13 is the version proven on the fleet builds.
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild
+      - name: Install zig
+        run: pip3 install 'ziglang==0.13.0.post1'
       - name: Build
         run: cargo zigbuild --release -p xr-share --features relay --target ${{ matrix.target }}
       - name: Name artifact
