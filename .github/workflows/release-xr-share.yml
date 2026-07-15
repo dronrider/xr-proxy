@@ -1,18 +1,21 @@
 name: release-xr-share
 
-# Builds the xr-share agent for Linux (static musl, x86_64 + aarch64) and
-# Windows on a current Rust toolchain (avoids the old-Rust musl-cross friction),
-# then publishes the binaries + install scripts + SHA256SUMS to the hub's
-# share-dist over SSH. The one-liner installer pulls from there (XR-028).
+# Builds the xr-share agent for Linux (static musl, x86_64 + aarch64), Windows
+# and macOS (aarch64 + x86_64) on a current Rust toolchain (avoids the old-Rust
+# musl-cross friction), then publishes the binaries + install scripts +
+# SHA256SUMS to the hub's share-dist over SSH. The one-liner installer pulls
+# from there (XR-028). Every binary is built with the relay feature: the hub
+# hands out relay by default (XR-127), so a relay-less agent silently loses
+# shares behind NAT; the publish job refuses binaries without it.
 #
 # Trigger: push a tag `xr-share-v*` (e.g. `xr-share-v0.1.0`), or run manually.
 #
 # Required repo secrets:
-#   HUB_SSH_KEY  — private SSH key authorized as root on the hub
-#   HUB_HOST     — hub host/IP (e.g. 201.51.16.159)
-#   HUB_PORT     — SSH port (e.g. 8822)
+#   HUB_SSH_KEY  - private SSH key authorized as root on the hub
+#   HUB_HOST     - hub host/IP (e.g. 201.51.16.159)
+#   HUB_PORT     - SSH port (e.g. 8822)
 # Optional repo variable:
-#   HUB_DIR      — target dir (default /var/lib/xr-hub/share-dist)
+#   HUB_DIR      - target dir (default /var/lib/xr-hub/share-dist)
 
 on:
   push:
@@ -30,12 +33,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      # zig as the cross-linker → musl for any arch with the current rustc.
+      # zig as the cross-linker gives musl for any arch with the current rustc.
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild
       - name: Build
-        run: cargo zigbuild --release -p xr-share --target ${{ matrix.target }}
+        run: cargo zigbuild --release -p xr-share --features relay --target ${{ matrix.target }}
       - name: Name artifact
         run: |
           arch="${{ matrix.target }}"; arch="${arch%%-*}"
@@ -51,7 +54,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
-        run: cargo build --release -p xr-share
+        run: cargo build --release -p xr-share --features relay
       - name: Name artifact
         run: copy target\release\xr-share.exe xr-share-windows-x86_64.exe
       - uses: actions/upload-artifact@v4
@@ -59,8 +62,29 @@ jobs:
           name: bin-windows
           path: xr-share-windows-x86_64.exe
 
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release -p xr-share --features relay --target ${{ matrix.target }}
+      - name: Name artifact
+        run: |
+          arch="${{ matrix.target }}"; arch="${arch%%-*}"
+          cp "target/${{ matrix.target }}/release/xr-share" "xr-share-macos-${arch}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-macos-${{ matrix.target }}
+          path: xr-share-macos-*
+
   publish:
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -68,6 +92,14 @@ jobs:
         with:
           path: dl
           merge-multiple: true
+      # The relay uplink leaves this literal in .rodata; a binary without it was
+      # built with the default feature set and must not reach the hub (XR-133).
+      - name: Relay guard
+        run: |
+          for b in dl/xr-share-*; do
+            grep -qa "relay reverse tunnel" "$b" \
+              || { echo "::error::$b is built without the relay feature"; exit 1; }
+          done
       - name: Stage dist (binaries + scripts + checksums)
         run: |
           mkdir -p dist
