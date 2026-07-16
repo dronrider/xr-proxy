@@ -58,10 +58,12 @@ flowchart LR
     style CON fill:#efe,stroke:#8a8
 ```
 
-Установка одной командой и саморегистрация в хабе:
-`curl -fsSL https://<хаб>/share/install.sh | sudo sh -s -- --dir /srv/share --token <reg-токен>`.
-Подробности и sequence-диаграммы в [docs/lld/19-file-sharing-agent.md](docs/lld/19-file-sharing-agent.md),
-README агента в [xr-share/README.md](xr-share/README.md).
+Установка одной командой на любой ОС (setup-токен выпускается в админке хаба):
+`curl -fsSL https://<хаб>/share/install.sh | sudo sh -s -- --setup <setup-токен> --dir /srv/share`,
+на Windows `$env:XR_SETUP="<setup-токен>"; $env:XR_DIR="C:\share"; irm https://<хаб>/share/install.ps1 | iex`
+в PowerShell от администратора. Команды всех вариантов (reg-токен, обновление
+бинаря) в [xr-share/README.md](xr-share/README.md), подробности и
+sequence-диаграммы в [docs/lld/19-file-sharing-agent.md](docs/lld/19-file-sharing-agent.md).
 
 ## Структура проекта
 

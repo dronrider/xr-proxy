@@ -42,29 +42,36 @@ Full design + sequence diagrams: [docs/lld/19-file-sharing-agent.md](../docs/lld
 
 ## Install
 
-One command downloads the binary from the hub, verifies its SHA-256, and
-puts `xr-share` on your PATH:
+One command on any OS: downloads the binary from the hub, verifies its SHA-256,
+installs the autostart service (systemd / Scheduled Task / launchd) with a
+long-lived hub mandate, and shares a folder right away. Take a **setup token**
+in the hub admin (**Shares** tab) and run as root/Administrator:
 
 ```sh
 # Linux / macOS
-curl -fsSL https://xr-hub.zoobr.top/share/install.sh | sh
+curl -fsSL https://xr-hub.zoobr.top/share/install.sh | sudo sh -s -- \
+  --setup <SETUP-TOKEN> --dir /srv/share
 ```
 ```powershell
-# Windows (PowerShell)
+# Windows (elevated PowerShell)
+$env:XR_SETUP="<SETUP-TOKEN>"; $env:XR_DIR="C:\share"
 irm https://xr-hub.zoobr.top/share/install.ps1 | iex
 ```
 
-Then configure and enable autostart:
+The setup token packs a registration token and an invite (XR-127): the share
+gets attached to the invite, and the relay leg turns on by itself when the
+mandate carries a relay descriptor, so a share behind NAT just works
+(`--no-relay` opts a public-IP host out). With a plain **reg token**
+(`--token <REG-TOKEN>` / `$env:XR_TOKEN`) the same line installs the mandated
+service only; share any path anytime after:
 
 ```sh
-xr-share init                  # asks: folder to share, hub URL (fetches its key), share_id
-sudo xr-share service install  # systemd (Linux) / Scheduled Task (Windows)
+sudo xr-share share /srv/photos   # a folder OR a single file
+sudo xr-share list
 ```
 
-`init` generates this agent's identity and prints its **public key**. Register
-a share in the hub admin (**Shares** tab) with your `addr:port` and that key, and
-the hub returns the `share_id` you paste back. Consumers then pin the agent by that
-key (TOFU) and pull files straight from you.
+Run the installer with no token at all to just fetch or update the binary; an
+already-installed service is restarted with the new one.
 
 > Self-hosting the hub? Point the installer elsewhere with
 > `XR_SHARE_BASE=https://your-hub/share`.
@@ -95,7 +102,7 @@ against the `agent_pubkey` pinned from the grant. Without the identity key
 (config `identity_key` or `identity.key` next to the config) the agent serves
 unsigned and pinning consumers refuse the listing.
 
-## Setup
+## Manual setup (no installer)
 
 ```sh
 # 1. Generate the agent identity (once). Register the printed PUBLIC key in the
@@ -111,8 +118,9 @@ xr-share keygen
 xr-share -c /etc/xr-share/config.toml
 ```
 
-Reachability is direct-access only in the MVP: public IP, forwarded port, or an
-already-public machine. CGNAT/relay is out of scope.
+Direct access needs a public IP or a forwarded port. Behind NAT the relay leg
+(LLD-23) carries the share instead: token installs pick the relay descriptor up
+from the hub automatically, hand-rolled setups add a `[relay]` block.
 
 ## Build
 
@@ -127,17 +135,15 @@ cargo build --release -p xr-share --target x86_64-unknown-linux-musl
 cargo build --release -p xr-share --target x86_64-pc-windows-gnu
 ```
 
+Release binaries in the hub's share-dist are built with `--features relay`
+(the CI relay guard refuses a binary without it, XR-133); add the flag to a
+source build if the share must work behind NAT.
+
 ## Autostart
 
-**Linux (systemd):** install [`deploy/xr-share.service`](../deploy/xr-share.service)
-to `/etc/systemd/system/`, then `systemctl enable --now xr-share`.
-
-**Windows:** run at boot via Task Scheduler:
-
-```powershell
-schtasks /create /tn xr-share /sc onstart /ru SYSTEM ^
-  /tr "C:\xr-share\xr-share.exe -c C:\xr-share\config.toml"
-```
-
-(or wrap it as a proper service with [nssm](https://nssm.cc/)). A native
-Windows-service integration is a follow-up.
+`sudo xr-share service install` covers every OS: a systemd unit on Linux, a
+SYSTEM Scheduled Task on Windows, a LaunchDaemon on macOS (XR-127);
+`service status` / `service uninstall` to inspect and remove. The install
+one-liner already did this for you. For a hand-rolled Linux setup there is
+also [`deploy/xr-share.service`](../deploy/xr-share.service) to drop into
+`/etc/systemd/system/` and `systemctl enable --now xr-share`.
