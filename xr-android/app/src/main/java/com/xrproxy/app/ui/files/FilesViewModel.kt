@@ -141,6 +141,17 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
      *  (no route, DNS, connect timeout); everything else came from the hub. */
     private fun Throwable.isOffline(): Boolean = message?.startsWith("network") == true
 
+    /** The relay reported the share's agent gone from its registry (XR-134):
+     *  the share is dead until its owner brings the agent back. An
+     *  authoritative verdict, unlike the transport-level "network: ...". */
+    private fun Throwable.isAgentOffline(): Boolean = message?.startsWith("agent_offline") == true
+
+    /** Native error strings are category-prefixed and (for agent_offline) carry
+     *  the human wording after the prefix; show that instead of the machine
+     *  category, keeping the text's single source in Rust (XR-134). */
+    private fun humanError(e: String): String =
+        if (e.startsWith("agent_offline")) e.substringAfter(": ", "агент шары не на связи") else e
+
     /**
      * Refresh of the invite carries the agent's current address/port/token. If a
      * share was added earlier and the agent has since moved (e.g. a private LAN
@@ -218,6 +229,15 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     },
                     onFailure = { e ->
                         when {
+                            // The agent is gone from the relay: mark the share
+                            // offline and say so, instead of the raw network
+                            // error against the loopback address (XR-134).
+                            e.isAgentOffline() ->
+                                st.copy(
+                                    manifestLoading = false, offlineLocal = true,
+                                    message = humanError(e.message.orEmpty())
+                                        .replaceFirstChar { c -> c.uppercaseChar() },
+                                )
                             // The agent answered (expired token, http_4xx): a real
                             // error the user should see, unlike a mere no-network.
                             !e.isOffline() ->
@@ -293,6 +313,10 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     message = when {
                         err == null -> null
                         err == "busy" -> "Идёт синхронизация, попробуй ещё раз"
+                        // A dead share deserves its verdict here too, not the
+                        // catch-all text (XR-134).
+                        err.startsWith("agent_offline") ->
+                            humanError(err).replaceFirstChar { c -> c.uppercaseChar() }
                         else -> "Не удалось скачать"
                     },
                 )
@@ -352,7 +376,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                             "Синк «${config.name}»: +${outcome.fetched} −${outcome.deleted}" +
                                 if (outcome.failed > 0) " (ошибок ${outcome.failed})" else ""
                         outcome.error == "busy" -> "Идёт синхронизация, подождите"
-                        else -> "Синк «${config.name}»: ${outcome.error}"
+                        else -> "Синк «${config.name}»: ${humanError(outcome.error ?: "ошибка")}"
                     },
                 )
             }
