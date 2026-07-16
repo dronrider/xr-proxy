@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -470,6 +470,9 @@ pub struct MuxStream {
     window: Arc<SendWindow>,
     /// Возврат кредита пиру по мере вычитывания; None = окно не согласовано.
     recv_credit: Option<RecvCredit>,
+    /// Причина Close пира (CLOSE_REASON_*), общая со StreamEntry: reader пишет
+    /// её при снятии стрима, потребитель читает после recv() == None (XR-134).
+    close_reason: Arc<AtomicU8>,
 }
 
 impl MuxStream {
@@ -510,6 +513,17 @@ impl MuxStream {
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Причина, с которой пир закрыл стрим (байт из Close, см. CLOSE_REASON_*),
+    /// или None, если Close без причины либо стрим ещё жив. Осмысленно после
+    /// того, как recv() вернул None: так relay-клиент отличает «агент шары не
+    /// на связи» от прочих отказов (XR-134).
+    pub fn close_reason(&self) -> Option<u8> {
+        match self.close_reason.load(Ordering::Relaxed) {
+            0 => None,
+            code => Some(code),
+        }
     }
 
     /// Split into independent read and write halves, so a download (recv→LAN)
@@ -905,6 +919,8 @@ struct StreamEntry {
     /// Окно отправки нашей стороны (LLD-27); reader пополняет его по
     /// WindowUpdate пира.
     window: Arc<SendWindow>,
+    /// Причина Close пира, разделяется с MuxStream (см. одноимённое поле там).
+    close_reason: Arc<AtomicU8>,
 }
 
 impl Drop for StreamEntry {
@@ -1071,9 +1087,16 @@ impl Multiplexer {
     ) -> MuxStream {
         let (data_tx, data_rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
         let window = self.new_send_window();
+        let close_reason = Arc::new(AtomicU8::new(0));
         self.streams.lock().await.insert(
             stream_id,
-            StreamEntry { tx: data_tx, got_data: false, domain: false, window: window.clone() },
+            StreamEntry {
+                tx: data_tx,
+                got_data: false,
+                domain: false,
+                window: window.clone(),
+                close_reason: close_reason.clone(),
+            },
         );
 
         MuxStream {
@@ -1085,6 +1108,7 @@ impl Multiplexer {
             detached: false,
             window,
             recv_credit: self.new_recv_credit(stream_id),
+            close_reason,
         }
     }
 
@@ -1309,12 +1333,17 @@ async fn dispatch_frame(
                 // (см. CLOSE_REASON_*). Считаем сбой в здоровье сервера, но
                 // только для ещё зарегистрированного стрима, чтобы дубль
                 // Close не удвоил счёт (XR-094).
-                if removed.is_some() {
-                    if let (Some(h), Some(&code)) = (relay_health, reason.first()) {
-                        match code {
-                            CLOSE_REASON_RESOLVE_FAIL => h.record_resolve_fail(),
-                            CLOSE_REASON_CONNECT_FAIL => h.record_connect_fail(),
-                            _ => {}
+                if let Some(entry) = &removed {
+                    if let Some(&code) = reason.first() {
+                        // Причина публикуется до дропа entry (и его tx): когда
+                        // recv() стрима вернёт None, close_reason уже на месте.
+                        entry.close_reason.store(code, Ordering::Relaxed);
+                        if let Some(h) = relay_health {
+                            match code {
+                                CLOSE_REASON_RESOLVE_FAIL => h.record_resolve_fail(),
+                                CLOSE_REASON_CONNECT_FAIL => h.record_connect_fail(),
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -1510,6 +1539,7 @@ pub async fn mux_open_stream(
     let stream_id = mux.next_stream_id.fetch_add(2, Ordering::Relaxed);
     let (data_tx, mut data_rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
     let window = mux.new_send_window();
+    let close_reason = Arc::new(AtomicU8::new(0));
 
     // Register before sending Connect so we don't miss ConnectAck.
     // Таймаут+WARN на взятие async-Mutex `streams`: если открытие вешается ЗДЕСЬ
@@ -1524,6 +1554,7 @@ pub async fn mux_open_stream(
                     got_data: false,
                     domain: matches!(target, TargetAddr::Domain(..)),
                     window: window.clone(),
+                    close_reason: close_reason.clone(),
                 },
             );
         }
@@ -1582,6 +1613,7 @@ pub async fn mux_open_stream(
             detached: false,
             window,
             recv_credit: mux.new_recv_credit(stream_id),
+            close_reason,
         }),
         Ok(None) => Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
@@ -1892,6 +1924,43 @@ mod tests {
             flood.is_ok(),
             "reader must keep draining the socket under a full writer channel (no deadlock)"
         );
+    }
+
+    /// XR-134: причина Close пира должна быть доступна потребителю стрима
+    /// после того, как recv() вернул None: relay-клиент по ней отличает
+    /// «агент шары не на связи» от прочих отказов.
+    #[tokio::test]
+    async fn test_close_reason_reaches_stream_consumer() {
+        let (client_io, server_io) = duplex(65536);
+        let codec = test_codec();
+        let client_mux = Multiplexer::new_client(client_io, codec.clone(), MuxCaps::LOCAL);
+        let server_mux = Multiplexer::new_server(server_io, codec.clone(), MuxCaps::LOCAL);
+
+        let server_task = tokio::spawn(async move {
+            let mut rx = server_mux.take_new_stream_rx().await.unwrap();
+            let ns = rx.recv().await.unwrap();
+            server_mux
+                .send_frame(ns.stream_id, Command::ConnectAck, vec![0])
+                .await
+                .unwrap();
+            server_mux
+                .send_frame(
+                    ns.stream_id,
+                    Command::Close,
+                    vec![crate::protocol::CLOSE_REASON_AGENT_OFFLINE],
+                )
+                .await
+                .unwrap();
+        });
+
+        let target = TargetAddr::Domain("xr-relay:connect".to_string(), 0);
+        let mut stream = mux_open_stream(&client_mux, &target).await.unwrap();
+        assert!(stream.recv().await.is_none());
+        assert_eq!(
+            stream.close_reason(),
+            Some(crate::protocol::CLOSE_REASON_AGENT_OFFLINE)
+        );
+        server_task.await.unwrap();
     }
 
     /// XR-094: Close с причиной от сервера (relay упал на resolve/connect)

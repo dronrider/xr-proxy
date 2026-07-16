@@ -24,7 +24,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 use crate::mux::{mux_handshake_client, mux_open_stream, MuxStream, Multiplexer};
-use crate::protocol::{Codec, TargetAddr};
+use crate::protocol::{Codec, TargetAddr, CLOSE_REASON_AGENT_OFFLINE};
 use crate::share::{RelayGrant, RelayToken};
 
 /// Pseudo-target the consumer leg opens against the relay (LLD-23 §3.5). The
@@ -38,6 +38,11 @@ pub const RELAY_REVERSE_TARGET: &str = "xr-relay:reverse";
 /// The relay's hello verdict on success: transit granted, splice begins. A
 /// failed hello is answered with a `Close` instead (agent offline / rejected).
 pub const RELAY_HELLO_OK: u8 = 0x01;
+/// Error text for a hello refused because the share's agent isn't registered on
+/// the relay (`Close` with [`CLOSE_REASON_AGENT_OFFLINE`]): the share is dead
+/// until its agent comes back, which callers surface to the user instead of a
+/// raw transport error (XR-134).
+pub const RELAY_ERR_AGENT_OFFLINE: &str = "relay: agent offline";
 
 /// Dial the relay and complete the mux handshake, yielding a client-side
 /// multiplexer (odd stream ids). The obfuscation `codec` must match the relay's.
@@ -69,6 +74,13 @@ pub async fn open_relay_stream(
         // into the OK frame, so anything longer is a protocol violation, not
         // payload to silently drop.
         Some(reply) if reply == [RELAY_HELLO_OK] => Ok(stream),
+        // The close reason distinguishes a dead share (agent gone from the
+        // relay registry) from transient refusals, so the caller can say
+        // "agent offline" instead of a generic failure (XR-134).
+        _ if stream.close_reason() == Some(CLOSE_REASON_AGENT_OFFLINE) => Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            RELAY_ERR_AGENT_OFFLINE,
+        )),
         _ => Err(io::Error::new(
             io::ErrorKind::ConnectionRefused,
             "relay: source unavailable",
@@ -123,14 +135,23 @@ impl RelayEndpoint {
 pub struct LoopbackForwarder {
     local_addr: SocketAddr,
     handle: tokio::task::JoinHandle<()>,
+    /// The latest stream open was refused because the share's agent is off the
+    /// relay. The forwarder can only close the loopback socket on failure, which
+    /// the HTTP client above reports as a bare send error; this flag lets the
+    /// caller tell a dead share from that noise (XR-134). Leg-scoped and
+    /// last-writer-wins: meaningful for sequential requests over one leg.
+    agent_offline: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LoopbackForwarder {
     /// Bind the loopback listener and spawn the accept loop. Returns once bound,
     /// so `local_addr()` is immediately usable.
     pub async fn spawn(endpoint: Arc<RelayEndpoint>) -> io::Result<Self> {
+        use std::sync::atomic::{AtomicBool, Ordering};
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let local_addr = listener.local_addr()?;
+        let agent_offline = Arc::new(AtomicBool::new(false));
+        let flag = agent_offline.clone();
         let handle = tokio::spawn(async move {
             loop {
                 let (sock, _) = match listener.accept().await {
@@ -138,26 +159,39 @@ impl LoopbackForwarder {
                     Err(_) => break,
                 };
                 let ep = endpoint.clone();
+                let flag = flag.clone();
                 tokio::spawn(async move {
                     match ep.stream().await {
                         Ok(stream) => {
+                            flag.store(false, Ordering::Relaxed);
                             if let Err(e) = splice(sock, stream).await {
                                 tracing::debug!("relay splice ended: {e}");
                             }
                         }
-                        // Dropping `sock` closes the loopback connection, so the
-                        // consumer's client sees the failure and retries.
-                        Err(e) => tracing::debug!("relay stream open failed: {e}"),
+                        // The verdict lands before `sock` drops: when the closed
+                        // loopback connection fails the consumer's request, the
+                        // flag is already readable.
+                        Err(e) => {
+                            flag.store(e.to_string() == RELAY_ERR_AGENT_OFFLINE, Ordering::Relaxed);
+                            tracing::debug!("relay stream open failed: {e}");
+                        }
                     }
                 });
             }
         });
-        Ok(Self { local_addr, handle })
+        Ok(Self { local_addr, handle, agent_offline })
     }
 
     /// The `127.0.0.1:port` the consumer's HTTP client should target.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Whether the latest stream open was refused with "agent offline" (the
+    /// share's agent is gone from the relay registry); cleared by a later
+    /// successful open.
+    pub fn agent_offline(&self) -> bool {
+        self.agent_offline.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -203,8 +237,10 @@ mod tests {
     /// A minimal in-process relay for one connection: mux handshake, then for
     /// every consumer stream verify it targets the connect pseudo-target, ack,
     /// read the hello, reply `OK`, and echo everything after (stands in for the
-    /// blind splice to the agent). `reject` flips it to close instead of `OK`.
-    async fn run_test_relay(tcp: TcpStream, codec: Codec, reject: bool) {
+    /// blind splice to the agent). `reject_first` refuses the first stream with
+    /// the agent-offline close reason (as the real relay does for an
+    /// unregistered agent) and serves the rest.
+    async fn run_test_relay(tcp: TcpStream, codec: Codec, reject_first: bool) {
         let mut tcp = tcp;
         let mut buf = vec![0u8; 512];
         let mut filled = 0;
@@ -223,8 +259,10 @@ mod tests {
         };
         let mux = Multiplexer::new_server(tcp, codec, caps);
         let mut rx = mux.take_new_stream_rx().await.unwrap();
+        let mut first = true;
         while let Some(ns) = rx.recv().await {
             let mux = mux.clone();
+            let reject = reject_first && std::mem::take(&mut first);
             tokio::spawn(async move {
                 let (target, _) = TargetAddr::decode(&ns.payload).unwrap();
                 match target {
@@ -238,7 +276,9 @@ mod tests {
                 // The hello (relay token bytes).
                 let _hello = stream.recv().await;
                 if reject {
-                    let _ = stream.close().await;
+                    let _ = mux
+                        .send_frame(ns.stream_id, Command::Close, vec![CLOSE_REASON_AGENT_OFFLINE])
+                        .await;
                     return;
                 }
                 stream.send(&[RELAY_HELLO_OK]).await.unwrap();
@@ -249,6 +289,35 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// A forwarder wired to an in-process relay (see `run_test_relay`).
+    async fn spawn_test_forwarder(reject_first: bool) -> LoopbackForwarder {
+        let codec = test_codec();
+        let relay_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let relay_codec = codec.clone();
+        tokio::spawn(async move {
+            let (tcp, _) = relay_listener.accept().await.unwrap();
+            run_test_relay(tcp, relay_codec, reject_first).await;
+        });
+
+        let key_b64 = base64::engine::general_purpose::STANDARD
+            .encode(b"test-key-32-bytes-long-enough!!!");
+        let grant = RelayGrant {
+            addr: relay_addr.ip().to_string(),
+            port: relay_addr.port(),
+            obf: RelayObf {
+                key: key_b64,
+                salt: 0xDEADBEEF,
+                modifier: "positional_xor_rotate".into(),
+                padding_min: 0,
+                padding_max: 0,
+            },
+            relay_token: dummy_token(),
+        };
+        let endpoint = Arc::new(RelayEndpoint::from_grant(&grant).unwrap());
+        LoopbackForwarder::spawn(endpoint).await.unwrap()
     }
 
     use crate::mux::{mux_handshake_server, MuxCaps};
@@ -301,37 +370,42 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
     }
 
+    /// A hello refused with the agent-offline close reason (the share's agent is
+    /// gone from the relay registry) must surface as the named error, so the
+    /// consumer can say "agent offline" instead of a generic failure (XR-134).
+    #[tokio::test]
+    async fn test_open_relay_stream_agent_offline_is_named() {
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let codec = test_codec();
+        let client_mux = Multiplexer::new_client(client_io, codec.clone(), MuxCaps::LOCAL);
+        let server_mux = Multiplexer::new_server(server_io, codec.clone(), MuxCaps::LOCAL);
+
+        // Relay answers the hello exactly as `handle_connect` does for an
+        // unregistered agent: read it, then Close with CLOSE_REASON_AGENT_OFFLINE.
+        let s = server_mux.clone();
+        tokio::spawn(async move {
+            let mut rx = s.take_new_stream_rx().await.unwrap();
+            let ns = rx.recv().await.unwrap();
+            let mut stream = s.register_stream(ns.stream_id).await;
+            s.send_frame(ns.stream_id, Command::ConnectAck, vec![0]).await.unwrap();
+            let _hello = stream.recv().await;
+            s.send_frame(ns.stream_id, Command::Close, vec![CLOSE_REASON_AGENT_OFFLINE])
+                .await
+                .unwrap();
+        });
+
+        let err = open_relay_stream(&client_mux, &dummy_token()).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(err.to_string(), RELAY_ERR_AGENT_OFFLINE);
+    }
+
     /// Full consumer path over a real loopback TCP relay: `RelayEndpoint` dials
     /// the relay, `LoopbackForwarder` turns a local TCP connection into a relay
     /// stream, and bytes round-trip through the blind splice. Exercises
     /// `connect_relay_mux` + `open_relay_stream` + the forwarder + the io splice.
     #[tokio::test]
     async fn test_loopback_forwarder_round_trips() {
-        let codec = test_codec();
-        let relay_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let relay_addr = relay_listener.local_addr().unwrap();
-        let relay_codec = codec.clone();
-        tokio::spawn(async move {
-            let (tcp, _) = relay_listener.accept().await.unwrap();
-            run_test_relay(tcp, relay_codec, false).await;
-        });
-
-        let key_b64 = base64::engine::general_purpose::STANDARD
-            .encode(b"test-key-32-bytes-long-enough!!!");
-        let grant = RelayGrant {
-            addr: relay_addr.ip().to_string(),
-            port: relay_addr.port(),
-            obf: RelayObf {
-                key: key_b64,
-                salt: 0xDEADBEEF,
-                modifier: "positional_xor_rotate".into(),
-                padding_min: 0,
-                padding_max: 0,
-            },
-            relay_token: dummy_token(),
-        };
-        let endpoint = Arc::new(RelayEndpoint::from_grant(&grant).unwrap());
-        let fwd = LoopbackForwarder::spawn(endpoint).await.unwrap();
+        let fwd = spawn_test_forwarder(false).await;
 
         // A "consumer HTTP client" connecting to the loopback address sees the
         // agent through the splice: write bytes, read the echo.
@@ -340,5 +414,36 @@ mod tests {
         let mut got = vec![0u8; 16];
         client.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"tls-record-bytes");
+        assert!(!fwd.agent_offline());
+    }
+
+    /// The forwarder records the agent-offline refusal (so the caller can tell a
+    /// dead share from transport noise) and clears it once a later open
+    /// succeeds (XR-134).
+    #[tokio::test]
+    async fn test_forwarder_flags_agent_offline() {
+        let fwd = spawn_test_forwarder(true).await;
+
+        // First loopback connection: the relay refuses with agent-offline, the
+        // forwarder drops the socket and raises the flag.
+        let mut client = TcpStream::connect(fwd.local_addr()).await.unwrap();
+        client.write_all(b"x").await.unwrap();
+        let mut buf = [0u8; 8];
+        let _ = client.read(&mut buf).await; // EOF once the open fails
+        for _ in 0..200 {
+            if fwd.agent_offline() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(fwd.agent_offline(), "отказ agent-offline должен подниматься флагом");
+
+        // Second connection is served: the verdict clears.
+        let mut client = TcpStream::connect(fwd.local_addr()).await.unwrap();
+        client.write_all(b"ok").await.unwrap();
+        let mut got = vec![0u8; 2];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"ok");
+        assert!(!fwd.agent_offline());
     }
 }
