@@ -934,9 +934,26 @@ where
     let leg = RelayLeg::open(relay).await?;
     let client = pinned_client(agent_pubkey, timeout)?;
     let base = format!("https://{}/{}", leg.local_addr(), share_id);
-    let out = op(client, base).await;
+    let out = map_relay_outcome(op(client, base).await, leg.agent_offline());
     drop(leg); // stop the loopback forwarder once the op is done
     out
+}
+
+/// Error category of a share whose agent is gone from the relay: the relay leg
+/// is up, but there is no one behind it. Distinct from `network:` (this is an
+/// authoritative verdict, not the phone being offline) and worded for the user,
+/// who otherwise saw the raw reqwest error against the loopback address (XR-134).
+pub const ERR_AGENT_OFFLINE: &str = "agent_offline: агент шары не на связи";
+
+/// The relay leg fails a request by closing the loopback socket, so `op` itself
+/// reports a bare transport error; when the forwarder recorded that the agent is
+/// off the relay, that recorded verdict replaces the noise. Authoritative
+/// answers (HTTP status, signature) pass through untouched.
+fn map_relay_outcome<T>(out: Result<T, String>, agent_offline: bool) -> Result<T, String> {
+    match out {
+        Err(e) if is_unreachable(&e) && agent_offline => Err(ERR_AGENT_OFFLINE.to_string()),
+        other => other,
+    }
 }
 
 /// The core mirror over an already-chosen transport (`client` + `base_url`):
@@ -1388,7 +1405,7 @@ fn pinned_client(agent_pubkey: &str, timeout: Duration) -> Result<reqwest::Clien
 /// TCP connections into relay streams to the agent (LLD-23 §2.2). Held for the
 /// duration of a transfer; dropping it stops the forwarder.
 struct RelayLeg {
-    _fwd: xr_proto::relay_client::LoopbackForwarder,
+    fwd: xr_proto::relay_client::LoopbackForwarder,
     local_addr: std::net::SocketAddr,
 }
 
@@ -1401,11 +1418,17 @@ impl RelayLeg {
             .await
             .map_err(|e| format!("relay forwarder: {e}"))?;
         let local_addr = fwd.local_addr();
-        Ok(Self { _fwd: fwd, local_addr })
+        Ok(Self { fwd, local_addr })
     }
 
     fn local_addr(&self) -> std::net::SocketAddr {
         self.local_addr
+    }
+
+    /// The relay refused the latest stream because the share's agent isn't
+    /// registered there: the share is dead, not merely unreachable (XR-134).
+    fn agent_offline(&self) -> bool {
+        self.fwd.agent_offline()
     }
 }
 
@@ -1497,6 +1520,25 @@ mod tests {
         assert!(!is_unreachable("http_403"));
         assert!(!is_unreachable("manifest_unsigned"));
         assert!(!is_unreachable("manifest_signature: bad"));
+    }
+
+    /// The relay leg fails requests by closing the loopback socket, so `op`
+    /// reports a bare transport error; the forwarder's "agent offline" verdict
+    /// must replace that noise with the named category, while authoritative
+    /// answers pass through untouched (XR-134).
+    #[test]
+    fn relay_outcome_maps_agent_offline() {
+        let dead: Result<(), String> =
+            Err("network: error sending request for url (https://127.0.0.1:9/s/manifest)".into());
+        assert_eq!(map_relay_outcome(dead, true).unwrap_err(), ERR_AGENT_OFFLINE);
+        // No verdict from the forwarder: the network error stays as is.
+        let plain: Result<(), String> = Err("network: x".into());
+        assert_eq!(map_relay_outcome(plain, false).unwrap_err(), "network: x");
+        // An authoritative agent answer wins over a stale offline verdict.
+        let http: Result<(), String> = Err("http_403".into());
+        assert_eq!(map_relay_outcome(http, true).unwrap_err(), "http_403");
+        let ok: Result<i32, String> = Ok(7);
+        assert_eq!(map_relay_outcome(ok, true).unwrap(), 7);
     }
 
     /// A grant with no relay leg and an unreachable direct address surfaces the
