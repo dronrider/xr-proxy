@@ -73,6 +73,15 @@ sudo xr-share list
 Run the installer with no token at all to just fetch or update the binary; an
 already-installed service is restarted with the new one.
 
+Re-running the installer keeps the existing agent: `install` looks for the
+config at the requested path, then at the path recorded in the autostart
+service, then at the OS default location, and reuses its identity, shares and
+mandate (a fresh `--setup` only re-points the default invite). A fresh identity
+would orphan every share registered under the old one on the hub (XR-134), so
+it is minted only when no config is found anywhere (with a warning if service
+traces remain) or on `xr-share install --force`, which also takes the previous
+shares off the hub index.
+
 > Self-hosting the hub? Point the installer elsewhere with
 > `XR_SHARE_BASE=https://your-hub/share`.
 
