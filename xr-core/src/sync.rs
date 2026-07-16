@@ -1730,6 +1730,26 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_empty_selection_is_delete_only() {
+        // XR-135: an empty (but present) selection is not "the whole share".
+        // Nothing is desired, so every local file is deleted and nothing is
+        // fetched. This is the plan a manual "sync with no ticks" drives to wipe
+        // the download, and it must differ from None (the whole share).
+        let m = manifest(vec![entry("a.txt", "a"), entry("b.txt", "b")]);
+        let have = vec![local("a.txt", "a"), local("b.txt", "b")];
+        let empty: HashSet<String> = HashSet::new();
+
+        let plan = plan_with_selection(&m, &have, Some(&empty));
+        assert!(plan.fetch.is_empty());
+        assert_eq!(plan.delete, vec!["a.txt".to_string(), "b.txt".to_string()]);
+
+        // None keeps both (they match the manifest), Some(empty) drops both.
+        let whole = plan_with_selection(&m, &have, None);
+        assert!(whole.fetch.is_empty() && whole.delete.is_empty());
+        assert_ne!(plan, whole);
+    }
+
+    #[test]
     fn test_plan_folder_prefix_selection() {
         let m = manifest(vec![
             entry("docs/a.txt", "a"),
