@@ -7,7 +7,7 @@
 //! action is needed per share. The config is the single source of truth: `share`
 //! and `unshare` rewrite it, and the running agent hot-reloads it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -80,8 +80,10 @@ pub struct InstallArgs {
     /// Don't prompt — take every value from flags.
     #[arg(long)]
     pub non_interactive: bool,
-    /// Clean reinstall: new identity, drop existing shares. Without it an existing
-    /// agent's identity, shares and mandate are kept (re-running install is safe).
+    /// Clean reinstall: new identity, drop existing shares (best-effort removing
+    /// them from the hub index too, so they don't linger dead). Without it an
+    /// existing agent's identity, shares and mandate are kept (re-running install
+    /// is safe), even when the config lives off the requested path (XR-134).
     #[arg(long)]
     pub force: bool,
 }
@@ -133,54 +135,42 @@ pub fn install(config_path: &Path, args: InstallArgs) -> Result<()> {
     // Re-running install must not orphan an existing agent's shares (XR-037):
     // generating a fresh identity and an empty share list would leave every
     // registered share unreachable on the hub. Keep the existing config and just
-    // refresh the autostart service. A clean wipe is opt-in via --force.
-    if !args.force {
-        if let Ok(mut existing) = read_config(config_path) {
-            let mut changed = false;
-
-            // Self-heal a half-installed agent: a config without a mandate (a prior
-            // tokenless install) plus a token now means we can redeem it, reusing
-            // the existing identity, so the one command completes whatever the
-            // prior state (XR-127).
-            if existing.agent_credential.is_none() {
-                if let (Some(tok), Some(hub)) = (token.as_deref(), existing.hub_url.clone()) {
-                    if let Some(id) = existing.identity_signing_key(config_path)? {
-                        let agent_pub = setup::b64(id.verifying_key().as_bytes());
-                        let (cred, relay) =
-                            exchange(&hub, tok, &agent_pub).context("обмен reg-токена на мандат")?;
-                        existing.agent_credential = Some(cred);
-                        if let Some(d) = relay {
-                            existing.relay = Some(crate::config::RelayAgentConfig::from_descriptor(&d));
-                        }
-                        changed = true;
-                        println!("  мандат получен для существующего конфига");
-                    }
-                }
-            }
-
-            // A fresh --setup can re-point where future shares attach.
-            if let Some(inv) = &setup_invite {
-                if existing.default_invite.as_deref() != Some(inv.as_str()) {
-                    existing.default_invite = Some(inv.clone());
-                    changed = true;
-                    println!("  инвайт по умолчанию обновлён из setup-токена");
-                }
-            }
-
-            if changed {
-                normalize_legacy(&mut existing);
-                write_config(config_path, &existing)?;
-            }
-
-            println!("  ✓ найден конфиг: личность, шары ({}) и мандат сохранены", existing.shares.len());
-            if !args.no_service {
-                setup::service_install(config_path)?;
-            }
-            println!("\n✓ Агент обновлён, существующие шары на месте.");
-            println!("  Перезапусти службу, чтобы поднять новый бинарь.");
-            println!("  Полная переустановка с нуля: xr-share install --force ...");
-            return Ok(());
+    // refresh the autostart service. The config is looked up beyond the requested
+    // path (service definition, OS default) so a re-onboarding finds the identity
+    // even after a prior `-c <elsewhere>` install (XR-134). A clean wipe is
+    // opt-in via --force.
+    let mut previous: Option<(PathBuf, AgentConfig)> = None;
+    let mut skipped_keyless = false;
+    if args.force {
+        // Capture the previous agent now, but touch the hub only at the very end,
+        // once the fresh install actually succeeded: an aborted --force run
+        // (bad token, Ctrl-C at a prompt) must leave the hub index intact.
+        previous = locate_config(config_path);
+        if previous.is_none() && setup::service_definition_exists() {
+            println!("  ! прежний конфиг не найден или не читается: его шары останутся на хабе, сними их в админке");
         }
+    } else if let Some((source, existing)) = locate_config(config_path) {
+        // Adopting a config from another path is only worth it together with its
+        // identity: without the key it would relocate a broken agent whose
+        // shares stay dead anyway.
+        let adoptable = source.as_path() == config_path
+            || matches!(existing.identity_signing_key(&source), Ok(Some(_)));
+        if adoptable {
+            return refresh_existing(
+                config_path,
+                &source,
+                existing,
+                args.hub.as_deref(),
+                token.as_deref(),
+                setup_invite,
+                args.no_service,
+            );
+        }
+        println!(
+            "  ! найден конфиг {} без читаемой личности: не переношу, его шары останутся без агента",
+            source.display()
+        );
+        skipped_keyless = true;
     }
 
     let hub = setup::resolve(args.hub, args.non_interactive, "URL хаба (напр. https://xr-hub.zoobr.top)", None)?;
@@ -188,6 +178,14 @@ pub fn install(config_path: &Path, args: InstallArgs) -> Result<()> {
 
     let hub_pubkey = setup::fetch_hub_pubkey(&hub).context("не удалось получить публичный ключ хаба")?;
     println!("  ✓ публичный ключ хаба получен");
+
+    // A service definition without a readable config means an agent lived here
+    // before: the fresh identity below won't match what the hub has on record.
+    // The key-less-config case printed its own warning above.
+    if !args.force && !skipped_keyless && setup::service_definition_exists() {
+        println!("  ! на этой машине уже ставился агент, но его конфиг не найден:");
+        println!("    прежние шары останутся без агента, сними их в админке хаба");
+    }
 
     // This agent's identity. The hub binds the credential to its public key.
     let identity = SigningKey::generate(&mut rand::thread_rng());
@@ -230,6 +228,13 @@ pub fn install(config_path: &Path, args: InstallArgs) -> Result<()> {
         println!("\nУстанавливаю службу автозапуска…");
         setup::service_install(config_path)?;
     }
+
+    // The wiped identity leaves the previous agent's shares dead on consumers'
+    // invites; now that the fresh agent is in place, take them off the hub index.
+    if let Some((path, old)) = &previous {
+        drop_previous_shares(path, old);
+    }
+
     println!("\nТеперь шарь сколько угодно путей:");
     println!("  xr-share share /srv/photos");
     println!("  xr-share share /srv/report.pdf");
@@ -386,10 +391,9 @@ pub fn unshare(config_path: &Path, target: &str) -> Result<()> {
 
     // Best-effort hub removal so the index entry disappears. Keep going on
     // failure (hub down): the local removal still stops serving the bytes.
-    if let (Some(cred), Some(hub)) = (cfg.agent_credential.clone(), cfg.hub_url.clone()) {
-        let body = serde_json::json!({ "credential": cred, "share_id": share_id });
-        match hub_post(&format!("{}/api/v1/share/unshare", hub.trim_end_matches('/')), &body) {
-            Ok(_) => println!("  ✓ запись удалена из индекса хаба"),
+    if let Some((hub, cred)) = unshare_target(&cfg) {
+        match hub_unshare(&hub, &cred, &share_id) {
+            Ok(()) => println!("  запись удалена из индекса хаба"),
             Err(e) => println!("  ! хаб не подтвердил удаление ({e}); запись в индексе может остаться, повтори позже"),
         }
     }
@@ -398,6 +402,195 @@ pub fn unshare(config_path: &Path, target: &str) -> Result<()> {
     write_config(config_path, &cfg)?;
     println!("✓ Шара {share_id} убрана из раздачи");
     Ok(())
+}
+
+/// Refresh an already-installed agent in place: keep its identity, shares and
+/// mandate, redeem a token if the mandate is missing, re-point the default
+/// invite from a fresh `--setup`. When the config was found off the requested
+/// path (a prior `-c <elsewhere>` install, XR-134) it moves to `config_path`
+/// and the source file is parked, so exactly one mandated config remains and
+/// the service and future commands agree on one location.
+fn refresh_existing(
+    config_path: &Path,
+    source: &Path,
+    mut existing: AgentConfig,
+    hub_arg: Option<&str>,
+    token: Option<&str>,
+    setup_invite: Option<String>,
+    no_service: bool,
+) -> Result<()> {
+    // Re-onboarding to a different hub is not an in-place refresh: keeping the
+    // old hub's mandate with the new hub's invite breaks every later `share`
+    // quietly, so this asks for an explicit clean reinstall instead.
+    if let (Some(new_hub), Some(old_hub)) = (hub_arg, existing.hub_url.as_deref()) {
+        if new_hub.trim_end_matches('/') != old_hub.trim_end_matches('/') {
+            bail!(
+                "агент уже привязан к хабу {old_hub}; перепривязка к {new_hub} это новая установка: \
+                 xr-share install --force (шары на прежнем хабе останутся без агента)"
+            );
+        }
+    }
+
+    let migrating = source != config_path;
+    let mut changed = migrating;
+
+    // A legacy config (the init flow) carries no hub_url: take it from --hub so
+    // the token below can still be redeemed and later commands know the hub.
+    if existing.hub_url.is_none() {
+        if let Some(h) = hub_arg {
+            existing.hub_url = Some(h.trim_end_matches('/').to_string());
+            changed = true;
+        }
+    }
+
+    if migrating {
+        println!("  найден конфиг существующего агента: {}", source.display());
+        // Inline the identity stored next to the source (the init flow's
+        // identity.key file), so the moved config is self-contained.
+        if existing.identity_key.is_none() {
+            if let Some(id) = existing.identity_signing_key(source)? {
+                existing.identity_key = Some(setup::b64(&id.to_bytes()));
+            }
+        }
+    }
+
+    // Self-heal a half-installed agent: a config without a mandate (a prior
+    // tokenless install) plus a token now means we can redeem it, reusing
+    // the existing identity, so the one command completes whatever the
+    // prior state (XR-127).
+    if existing.agent_credential.is_none() {
+        if let (Some(tok), Some(hub)) = (token, existing.hub_url.clone()) {
+            if let Some(id) = existing.identity_signing_key(source)? {
+                let agent_pub = setup::b64(id.verifying_key().as_bytes());
+                let (cred, relay) =
+                    exchange(&hub, tok, &agent_pub).context("обмен reg-токена на мандат")?;
+                existing.agent_credential = Some(cred);
+                if let Some(d) = relay {
+                    existing.relay = Some(crate::config::RelayAgentConfig::from_descriptor(&d));
+                }
+                changed = true;
+                println!("  мандат получен для существующего конфига");
+            }
+        }
+    } else if token.is_some() {
+        println!("  мандат уже есть, токен не использован (сбросить мандат: install --force)");
+    }
+
+    // A fresh --setup can re-point where future shares attach.
+    if let Some(inv) = &setup_invite {
+        if existing.default_invite.as_deref() != Some(inv.as_str()) {
+            existing.default_invite = Some(inv.clone());
+            changed = true;
+            println!("  инвайт по умолчанию обновлён из setup-токена");
+        }
+    }
+
+    if changed {
+        normalize_legacy(&mut existing);
+        write_config(config_path, &existing)?;
+    }
+    if migrating {
+        // Park the source so exactly one mandated config remains: a later `share`
+        // without -c must not register shares into a file no service serves.
+        let parked = source.with_extension("toml.imported");
+        match std::fs::rename(source, &parked) {
+            Ok(()) => println!(
+                "  конфиг перенесён в {}, старый убран в {}",
+                config_path.display(),
+                parked.display()
+            ),
+            Err(e) => println!(
+                "  ! конфиг перенесён в {}, но старый файл не убрался ({e}): удали {} сам",
+                config_path.display(),
+                source.display()
+            ),
+        }
+        if no_service {
+            println!(
+                "  ! служба не переустановлена (--no-service): перезапусти агента с -c {}",
+                config_path.display()
+            );
+        }
+    }
+
+    if existing.agent_credential.is_some() {
+        println!("  личность, шары ({}) и мандат сохранены", existing.shares.len());
+    } else {
+        println!(
+            "  личность и шары ({}) сохранены; мандата нет, запроси его: install --token <reg-токен>",
+            existing.shares.len()
+        );
+    }
+    if !no_service {
+        setup::service_install(config_path)?;
+    }
+    println!("\nАгент обновлён, существующие шары на месте.");
+    println!("  Перезапусти службу, чтобы поднять новый бинарь.");
+    println!("  Полная переустановка с нуля: xr-share install --force ...");
+    Ok(())
+}
+
+/// The existing agent's config: the requested path first, then the `-c`
+/// recorded in the autostart service, then the OS default (XR-134).
+fn locate_config(requested: &Path) -> Option<(PathBuf, AgentConfig)> {
+    let mut candidates = vec![requested.to_path_buf()];
+    candidates.extend(setup::service_config_path());
+    candidates.push(setup::default_config_path());
+    first_readable(&candidates)
+}
+
+/// First candidate that parses as a config.
+fn first_readable(candidates: &[PathBuf]) -> Option<(PathBuf, AgentConfig)> {
+    candidates
+        .iter()
+        .find_map(|c| read_config(c).ok().map(|cfg| (c.clone(), cfg)))
+}
+
+/// Hub coordinates for de-indexing a config's shares: needs both the mandate
+/// and the hub URL.
+fn unshare_target(cfg: &AgentConfig) -> Option<(String, String)> {
+    Some((cfg.hub_url.clone()?, cfg.agent_credential.clone()?))
+}
+
+/// Remove one share from the hub index (shared by `unshare` and the `--force`
+/// cleanup, so the wire contract lives in one place).
+fn hub_unshare(hub: &str, cred: &str, share_id: &str) -> Result<()> {
+    let body = serde_json::json!({ "credential": cred, "share_id": share_id });
+    hub_post(&format!("{}/api/v1/share/unshare", hub.trim_end_matches('/')), &body).map(|_| ())
+}
+
+/// Take the previous agent's shares off the hub index after a `--force`
+/// reinstall (XR-134): the wiped identity leaves them dead on consumers'
+/// invites otherwise. Best-effort: a hub error leaves the entry for the admin.
+fn drop_previous_shares(path: &Path, old: &AgentConfig) {
+    let shares = old.resolved_shares();
+    if shares.is_empty() {
+        return;
+    }
+    let Some((hub, cred)) = unshare_target(old) else {
+        println!(
+            "  ! прежний конфиг ({}) держит шары ({}), но без мандата снять их с хаба нельзя, удали их в админке",
+            path.display(),
+            shares.len()
+        );
+        return;
+    };
+    for s in &shares {
+        match hub_unshare(&hub, &cred, &s.share_id) {
+            Ok(()) => println!("  прежняя шара {} снята с хаба", s.share_id),
+            Err(e) => {
+                println!("  ! прежняя шара {} осталась на хабе ({e}), сними её в админке", s.share_id);
+                // A transport error repeats for every entry: stop instead of
+                // burning a 15s timeout per share against a dead hub.
+                if e.to_string().starts_with("сеть при запросе") {
+                    if shares.len() > 1 {
+                        println!("  ! хаб недоступен, остальные шары тоже остались в его индексе");
+                    }
+                    break;
+                }
+            }
+        }
+    }
 }
 
 // ── hub client ──────────────────────────────────────────────────────
@@ -519,6 +712,150 @@ mod tests {
         // --no-relay wins over everything, including --relay.
         assert!(!resolve_via_relay(false, true, true));
         assert!(!resolve_via_relay(true, true, true));
+    }
+
+    fn minimal_cfg() -> AgentConfig {
+        AgentConfig {
+            listen: "0.0.0.0:8443".into(),
+            hub_pubkey: "QQ==".into(),
+            hub_url: Some("https://hub".into()),
+            agent_credential: Some("mandate".into()),
+            identity_key: None,
+            tls: None,
+            relay: None,
+            default_invite: None,
+            shares: vec![ShareEntry { share_id: "s1".into(), path: "/srv/x".into(), name: None }],
+            dir: None,
+            share_id: None,
+        }
+    }
+
+    fn write_cfg(path: &Path, cfg: &AgentConfig) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, toml::to_string(cfg).unwrap()).unwrap();
+    }
+
+    // Re-onboarding must find the existing agent's config wherever it lives
+    // (XR-134): the requested path wins when readable, unreadable candidates are
+    // skipped, the first parseable one wins.
+    #[test]
+    fn first_readable_prefers_earlier_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let requested = dir.path().join("new/config.toml");
+        let old = dir.path().join("old/config.toml");
+        write_cfg(&old, &minimal_cfg());
+        let broken = dir.path().join("broken/config.toml");
+        std::fs::create_dir_all(broken.parent().unwrap()).unwrap();
+        std::fs::write(&broken, "not toml [").unwrap();
+
+        // The requested path is missing: the first readable candidate after it wins.
+        let found = first_readable(&[requested.clone(), broken.clone(), old.clone()]);
+        let (path, cfg) = found.expect("должен найти конфиг по соседнему пути");
+        assert_eq!(path, old);
+        assert_eq!(cfg.shares.len(), 1);
+
+        // A readable requested path wins over the rest.
+        write_cfg(&requested, &minimal_cfg());
+        let (path, _) = first_readable(&[requested.clone(), old]).unwrap();
+        assert_eq!(path, requested);
+
+        assert!(first_readable(&[broken, dir.path().join("нет/config.toml")]).is_none());
+    }
+
+    // The incident of XR-134: reinstall at another path used to mint a fresh
+    // identity and orphan the hub-registered shares. Adopting the old config must
+    // carry the identity (inlined from the identity.key file next to it), the
+    // shares and the mandate over to the requested path, and park the source so
+    // exactly one mandated config remains.
+    #[test]
+    fn refresh_existing_migrates_identity_to_requested_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("old/config.toml");
+        let requested = dir.path().join("etc/config.toml");
+        let cfg = minimal_cfg();
+        write_cfg(&source, &cfg);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let key_b64 = setup::b64(&key.to_bytes());
+        std::fs::write(source.parent().unwrap().join("identity.key"), format!("{key_b64}\n")).unwrap();
+
+        refresh_existing(&requested, &source, cfg, None, None, None, true).unwrap();
+
+        let moved = read_config(&requested).unwrap();
+        assert_eq!(moved.identity_key.as_deref(), Some(key_b64.as_str()));
+        assert_eq!(moved.shares.len(), 1);
+        assert_eq!(moved.shares[0].share_id, "s1");
+        assert_eq!(moved.agent_credential.as_deref(), Some("mandate"));
+        // The source is parked, not left as a second mandated config.
+        assert!(!source.exists());
+        assert!(dir.path().join("old/config.toml.imported").exists());
+    }
+
+    // A fresh --setup on a re-run re-points where future shares attach, without
+    // touching identity or shares; the same hub (modulo trailing slash) is not a
+    // mismatch.
+    #[test]
+    fn refresh_existing_repoints_default_invite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = minimal_cfg();
+        cfg.identity_key = Some("inline".into());
+        cfg.default_invite = Some("oldInv".into());
+        write_cfg(&path, &cfg);
+
+        refresh_existing(&path, &path, cfg, Some("https://hub/"), None, Some("newInv".into()), true).unwrap();
+
+        let updated = read_config(&path).unwrap();
+        assert_eq!(updated.default_invite.as_deref(), Some("newInv"));
+        assert_eq!(updated.identity_key.as_deref(), Some("inline"));
+        assert_eq!(updated.shares.len(), 1);
+    }
+
+    // A legacy init-flow config has no hub_url: the --hub argument must fill it
+    // in (and persist), or a supplied token would be dropped silently.
+    #[test]
+    fn refresh_existing_fills_hub_url_from_arg() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = minimal_cfg();
+        cfg.hub_url = None;
+        cfg.identity_key = Some("inline".into());
+        write_cfg(&path, &cfg);
+
+        refresh_existing(&path, &path, cfg, Some("https://hub2/"), None, None, true).unwrap();
+
+        assert_eq!(read_config(&path).unwrap().hub_url.as_deref(), Some("https://hub2"));
+    }
+
+    // Re-onboarding an agent onto a DIFFERENT hub must not mix the old hub's
+    // mandate with the new hub's invite: that is an explicit --force reinstall.
+    #[test]
+    fn refresh_existing_bails_on_hub_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = minimal_cfg();
+        write_cfg(&path, &cfg);
+
+        let err = refresh_existing(&path, &path, cfg, Some("https://other-hub"), None, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--force"), "ошибка должна вести к --force: {err}");
+        // The config is untouched.
+        assert_eq!(read_config(&path).unwrap().hub_url.as_deref(), Some("https://hub"));
+    }
+
+    // The --force cleanup needs both the mandate and the hub URL to de-index.
+    #[test]
+    fn unshare_target_requires_mandate_and_hub() {
+        let mut cfg = minimal_cfg();
+        assert_eq!(
+            unshare_target(&cfg),
+            Some(("https://hub".into(), "mandate".into()))
+        );
+        cfg.agent_credential = None;
+        assert!(unshare_target(&cfg).is_none());
+        cfg.agent_credential = Some("mandate".into());
+        cfg.hub_url = None;
+        assert!(unshare_target(&cfg).is_none());
     }
 
     #[test]

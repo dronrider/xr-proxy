@@ -185,6 +185,113 @@ fn self_register(
         .context("хаб не вернул share_id")
 }
 
+#[cfg(target_os = "linux")]
+const SYSTEMD_UNIT: &str = "/etc/systemd/system/xr-share.service";
+/// Registered task XML on Windows: UTF-16 file, no codepage guesswork (the
+/// `schtasks /query` console output comes in the OEM codepage and mangles
+/// non-ASCII paths).
+#[cfg(target_os = "windows")]
+fn windows_task_file() -> PathBuf {
+    let root = std::env::var("SYSTEMROOT").unwrap_or_else(|_| "C:\\Windows".into());
+    PathBuf::from(root).join("System32").join("Tasks").join("xr-share")
+}
+
+/// Config path recorded in the installed autostart service (`-c <path>`), if an
+/// agent was already set up on this machine. This is how a re-run of `install`
+/// finds the existing identity even when the config lives off the default path
+/// (a prior `-c <elsewhere>` install): a fresh key would orphan every share
+/// registered under the old one (XR-134).
+pub(crate) fn service_config_path() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        config_arg_from_unit(&std::fs::read_to_string(SYSTEMD_UNIT).ok()?)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        config_arg_from_plist(&std::fs::read_to_string(LAUNCHD_PLIST).ok()?)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let bytes = std::fs::read(windows_task_file()).ok()?;
+        config_arg_from_schtasks(&xml_unescape(&utf16_or_utf8(&bytes)))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+/// Whether this machine carries traces of a previously installed agent (an
+/// autostart definition), even if its config is gone or unreadable.
+pub(crate) fn service_definition_exists() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        Path::new(SYSTEMD_UNIT).exists()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Path::new(LAUNCHD_PLIST).exists()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows_task_file().exists()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        false
+    }
+}
+
+/// Decode a Windows task/config file that may be UTF-16 (schtasks XML) or plain
+/// UTF-8, by BOM.
+#[allow(dead_code)]
+fn utf16_or_utf8(bytes: &[u8]) -> String {
+    let decode16 = |bytes: &[u8], le: bool| -> String {
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|p| if le { u16::from_le_bytes([p[0], p[1]]) } else { u16::from_be_bytes([p[0], p[1]]) })
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => decode16(rest, true),
+        [0xFE, 0xFF, rest @ ..] => decode16(rest, false),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// Extract the `-c <path>` argument from a systemd unit's ExecStart line. The
+/// path is the single token after `-c` (the unit is written unquoted, so a path
+/// with spaces would not survive systemd's own splitting either); tokenizing
+/// keeps the parse correct if flags are ever appended after the path.
+#[allow(dead_code)]
+fn config_arg_from_unit(unit: &str) -> Option<PathBuf> {
+    let line = unit.lines().find_map(|l| l.trim().strip_prefix("ExecStart="))?;
+    let (_, rest) = line.split_once(" -c ")?;
+    let path = rest.trim_start().split_whitespace().next()?;
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// Extract the `-c <path>` argument from a launchd plist's ProgramArguments.
+/// Inverse of the escaping done at install time (see `xml_escape`).
+#[allow(dead_code)]
+fn config_arg_from_plist(plist: &str) -> Option<PathBuf> {
+    let after = plist.split("<string>-c</string>").nth(1)?;
+    let raw = after.split("<string>").nth(1)?.split("</string>").next()?;
+    let path = xml_unescape(raw);
+    (!path.trim().is_empty()).then(|| PathBuf::from(path.trim()))
+}
+
+/// Extract the `-c "<path>"` argument from Windows task text: either the
+/// registered task XML (`<Arguments>-c "..."</Arguments>`) or `schtasks /query
+/// /v /fo LIST` output; both carry the quoted path `schtasks_install` wrote.
+#[allow(dead_code)]
+fn config_arg_from_schtasks(listing: &str) -> Option<PathBuf> {
+    let (_, rest) = listing.split_once("-c \"")?;
+    let path = rest.split('"').next()?;
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
 /// Best-effort machine hostname for the default share name.
 pub(crate) fn hostname() -> String {
     std::env::var("COMPUTERNAME")
@@ -222,7 +329,7 @@ pub fn service_uninstall() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let _ = run("systemctl", &["disable", "--now", "xr-share"]);
-        let _ = std::fs::remove_file("/etc/systemd/system/xr-share.service");
+        let _ = std::fs::remove_file(SYSTEMD_UNIT);
         let _ = run("systemctl", &["daemon-reload"]);
         println!("✓ systemd-служба xr-share удалена");
         Ok(())
@@ -283,7 +390,7 @@ fn systemd_install(exe: &Path, config_path: &Path) -> Result<()> {
         exe.display(),
         config_path.display(),
     );
-    let unit_path = Path::new("/etc/systemd/system/xr-share.service");
+    let unit_path = Path::new(SYSTEMD_UNIT);
     std::fs::write(unit_path, unit)
         .with_context(|| format!("запись {} (нужны права root — sudo?)", unit_path.display()))?;
     run("systemctl", &["daemon-reload"])?;
@@ -315,9 +422,17 @@ const LAUNCHD_PLIST: &str = "/Library/LaunchDaemons/top.zoobr.xr-share.plist";
 /// Escape a path for embedding as XML character data in the plist. A path with
 /// `&` or `<` (legal on macOS) would otherwise produce a malformed plist that
 /// `launchctl load` rejects.
-#[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Inverse of [`xml_escape`], for reading paths back out of service XML (the
+/// launchd plist, the Windows task file). `&amp;` goes last so escaped ampersands
+/// don't double-decode.
+#[allow(dead_code)]
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&amp;", "&")
 }
 
 /// Install a LaunchDaemon so the agent starts at boot and stays up (KeepAlive).
@@ -429,6 +544,77 @@ pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<()> {
 /// Best-effort port extraction from a `host:port` listen string (for the hint).
 pub(crate) fn port_of(listen: &str) -> &str {
     listen.rsplit(':').next().unwrap_or("8443")
+}
+
+#[cfg(test)]
+mod service_config_path_tests {
+    use super::*;
+
+    // The `-c` argument recorded by the OS autostart definitions is how a re-run
+    // of `install` finds an existing agent's config off the default path (XR-134);
+    // each parser must match exactly what the matching install writes.
+    #[test]
+    fn unit_exec_start_yields_config_path() {
+        let unit = "[Service]\nType=simple\nExecStart=/usr/local/bin/xr-share -c /home/u/xr/config.toml\nRestart=always\n";
+        assert_eq!(config_arg_from_unit(unit), Some(PathBuf::from("/home/u/xr/config.toml")));
+        // Flags appended after the path must not glue onto it.
+        let with_flags = "ExecStart=/usr/bin/xr-share -c /srv/xr/config.toml --log-level info\n";
+        assert_eq!(config_arg_from_unit(with_flags), Some(PathBuf::from("/srv/xr/config.toml")));
+        assert_eq!(config_arg_from_unit("[Service]\nExecStart=/usr/bin/xr-share\n"), None);
+        assert_eq!(config_arg_from_unit(""), None);
+    }
+
+    #[test]
+    fn plist_program_arguments_yield_config_path() {
+        let plist = "<array>\n  <string>/usr/local/bin/xr-share</string>\n  <string>-c</string>\n  <string>/Users/u/a&amp;b/config.toml</string>\n</array>";
+        assert_eq!(config_arg_from_plist(plist), Some(PathBuf::from("/Users/u/a&b/config.toml")));
+        assert_eq!(config_arg_from_plist("<plist><dict></dict></plist>"), None);
+    }
+
+    #[test]
+    fn schtasks_text_yields_config_path() {
+        // `schtasks /query /v /fo LIST` output form.
+        let listing = "TaskName: \\xr-share\nTask To Run: \"C:\\Program Files\\xr-share.exe\" -c \"C:\\ProgramData\\xr-share\\config.toml\"\nStatus: Ready\n";
+        assert_eq!(
+            config_arg_from_schtasks(listing),
+            Some(PathBuf::from("C:\\ProgramData\\xr-share\\config.toml"))
+        );
+        // Registered task XML form (the file under System32\Tasks).
+        let xml = "<Exec><Command>\"C:\\Program Files\\xr-share.exe\"</Command><Arguments>-c \"C:\\Users\\Андрей\\xr\\config.toml\"</Arguments></Exec>";
+        assert_eq!(
+            config_arg_from_schtasks(xml),
+            Some(PathBuf::from("C:\\Users\\Андрей\\xr\\config.toml"))
+        );
+        assert_eq!(config_arg_from_schtasks("Task To Run: \"C:\\x.exe\"\n"), None);
+    }
+
+    // The Windows task file is UTF-16 with a BOM; a Cyrillic path must survive
+    // the decode (the schtasks console output would mangle it, XR-134).
+    #[test]
+    fn utf16_task_file_decodes_by_bom() {
+        let text = "-c \"C:\\Users\\Андрей\\config.toml\"";
+        let mut le = vec![0xFF, 0xFE];
+        for u in text.encode_utf16() {
+            le.extend_from_slice(&u.to_le_bytes());
+        }
+        assert_eq!(utf16_or_utf8(&le), text);
+        let mut be = vec![0xFE, 0xFF];
+        for u in text.encode_utf16() {
+            be.extend_from_slice(&u.to_be_bytes());
+        }
+        assert_eq!(utf16_or_utf8(&be), text);
+        assert_eq!(utf16_or_utf8(text.as_bytes()), text);
+    }
+
+    // The unescape used for reading paths back must invert the escape used when
+    // writing them into service XML.
+    #[test]
+    fn xml_escape_roundtrips_through_unescape() {
+        for path in ["/opt/a&b/x.toml", "/o/<x>/c", "C:\\plain\\config.toml"] {
+            assert_eq!(xml_unescape(&xml_escape(path)), path);
+        }
+        assert_eq!(xml_unescape("&quot;x&quot; &amp;lt;"), "\"x\" &lt;");
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
