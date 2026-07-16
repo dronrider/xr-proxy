@@ -29,7 +29,8 @@ use tokio::sync::Semaphore;
 
 use xr_proto::mux::{mux_handshake_server, mux_open_stream, Multiplexer};
 use xr_proto::protocol::{
-    Codec, Command, Frame, TargetAddr, CLOSE_REASON_AGENT_OFFLINE, CLOSE_REASON_RELAY_BUSY,
+    Codec, Command, Frame, TargetAddr, CLOSE_REASON_AGENT_OFFLINE, CLOSE_REASON_CONNECT_FAIL,
+    CLOSE_REASON_RELAY_BUSY,
 };
 use xr_proto::relay_client::{
     RELAY_CONNECT_TARGET, RELAY_HELLO_OK, RELAY_REGISTER_TARGET, RELAY_REVERSE_TARGET,
@@ -379,8 +380,12 @@ async fn handle_connect(stream_id: u32, mux: Arc<Multiplexer>, state: Arc<RelayS
     {
         Ok(s) => s,
         Err(_) => {
+            // Агент зарегистрирован и жив, но реверс-стрим не открылся (затык
+            // mux, потолок стримов): это транзиент, а не «агента нет», поэтому
+            // причина connect-fail; вердикт agent-offline у потребителя (XR-134)
+            // поднимается только по отсутствию агента в реестре.
             let _ = mux
-                .send_frame(stream_id, Command::Close, vec![CLOSE_REASON_AGENT_OFFLINE])
+                .send_frame(stream_id, Command::Close, vec![CLOSE_REASON_CONNECT_FAIL])
                 .await;
             return;
         }
@@ -527,7 +532,9 @@ mod tests {
     }
 
     /// A token for an agent that isn't registered is refused with agent-offline
-    /// semantics (LLD-23 §2.5): the consumer's open maps it to ConnectionRefused.
+    /// semantics (LLD-23 §2.5): the consumer's open maps it to ConnectionRefused
+    /// and carries the named reason, so a dead share (agent gone after a
+    /// re-onboarding, XR-134) surfaces as "agent offline", not a generic failure.
     #[tokio::test]
     async fn test_relay_agent_offline() {
         let hub = SigningKey::from_bytes(&[42u8; 32]);
@@ -537,6 +544,9 @@ mod tests {
         let mux = connect_relay_mux(&relay_addr.to_string(), test_codec()).await.unwrap();
         let err = open_relay_stream(&mux, &token).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        // The literal pins the wire contract (RELAY_ERR_AGENT_OFFLINE): consumers
+        // match on this text to tell a dead share from transient refusals.
+        assert_eq!(err.to_string(), "relay: agent offline");
     }
 
     /// A token the hub never signed (or for the wrong agent) is rejected before
