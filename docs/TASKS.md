@@ -30,8 +30,6 @@ R >= 75, P1 при 50-74, P2 при 25-49, P3 при 0-24 (смысл: P0 чин
 
 | ID | Задача | Тип | P | R | Ссылка |
 |--------|--------|-----|---|---|--------|
-| XR-123 | Relay-онбординг агента одной командой: хаб раздаёт relay-сборку xr-share (Windows/Linux) в share-dist, install-скрипты (install.ps1/install.sh) поддерживают XR_RELAY/--relay и XR_INVITE/--invite, чтобы один one-liner ставил relay-агента, брал мандат и метил шару via_relay без ручной правки конфига. Хвост: авто-подтягивание relay-дескриптора агентом (GET /api/v1/relay) для обновления без повторного токена | task | P3 | 11 (0+5+2+0+4) | [tasks/XR-123.md](tasks/XR-123.md) |
-| XR-124 | Инцидент 2026-07-12: TLS-сертификат xr-hub.zoobr.top истёк, авто-продление месяц молча падало (certbot standalone не мог занять :80 под nginx). Устранено: перевыпуск + pre/post-hook стоп/старт nginx на Timeweb, cert скопирован на Aeza. Осталось: Aeza сам продлить не может (DNS на Timeweb) -> нужен deploy-hook копирования cert Timeweb->Aeza + мониторинг срока/алерт | bug | P2 | 35 (25+0+2+5+3) | [tasks/XR-124.md](tasks/XR-124.md) |
 
 ## Backlog
 
