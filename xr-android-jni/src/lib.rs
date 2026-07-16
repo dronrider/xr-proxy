@@ -1099,6 +1099,28 @@ fn parse_relay(json: &str) -> Option<RelayGrant> {
     serde_json::from_str(s).ok()
 }
 
+/// Parse the sync selection into the three cases the mirror engine tells apart
+/// (XR-135). The consumer sends a JSON array of chosen manifest paths / folder
+/// prefixes:
+///   - missing, empty, or the literal `null` -> `None`: no selection at all,
+///     which for the engine means "the whole share" (`plan_sync`);
+///   - `"[]"` -> `Some(empty)`: the selection is present but empty. Nothing is
+///     desired, so the plan is pure deletes, a delete-only pass that wipes the
+///     local copy. Folding this into `None` was the XR-135 bug: unticking the
+///     last file left the download undeletable through sync;
+///   - a non-empty array -> `Some(set)`: mirror exactly that subset.
+/// A malformed array is an error, not a silent whole-share or delete-all: both
+/// defaults would surprise, and delete-all is destructive.
+fn parse_selection(json: &str) -> Result<Option<HashSet<String>>, String> {
+    let s = json.trim();
+    if s.is_empty() || s == "null" {
+        return Ok(None);
+    }
+    serde_json::from_str::<Vec<String>>(s)
+        .map(|v| Some(v.into_iter().collect()))
+        .map_err(|e| format!("bad selection json: {e}"))
+}
+
 /// GET the hub's public share index. Returns `{"shares":[{name,addr,port,
 /// agent_pubkey,share_id}...]}` or `{"error":".."}`.
 #[no_mangle]
@@ -1350,6 +1372,9 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePlanSync(
 /// `agent_pubkey` pins the agent identity for the manifest fetch (XR-046), as
 /// in `nativeFetchManifest`. `index_path` names the persistent hash-index file
 /// (XR-098) so a warm rescan skips re-hashing; empty = scan without an index.
+/// `selection_json` picks the subset to mirror: absent / empty / `null` = the
+/// whole share, `"[]"` = an empty selection (delete-only), else the chosen
+/// paths (XR-135, see `parse_selection`).
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
     mut env: JNIEnv,
@@ -1385,13 +1410,13 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
         Ok(s) if !s.trim().is_empty() => Some(PathBuf::from(s)),
         _ => None,
     };
-    // Selection: JSON array of chosen paths / folder prefixes; empty = whole share.
-    let selection: Option<HashSet<String>> = match read_jstring(&mut env, &selection_json) {
-        Ok(s) if !s.trim().is_empty() && s.trim() != "[]" => {
-            serde_json::from_str::<Vec<String>>(&s).ok().map(|v| v.into_iter().collect())
-        }
-        _ => None,
-    };
+    // Selection tells "the whole share" (None) apart from an empty-but-present
+    // selection ("[]" -> delete-only), see parse_selection (XR-135).
+    let selection: Option<HashSet<String>> =
+        match read_jstring(&mut env, &selection_json).and_then(|s| parse_selection(&s)) {
+            Ok(sel) => sel,
+            Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+        };
     let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
 
     let dry = dry_run != 0;
@@ -1572,6 +1597,39 @@ domains = ["youtube.com", "*.youtube.com"]"#;
     fn get_str_unterminated() {
         let json = r#"{"foo":"bar"#;
         assert!(json_get_str(json, "foo").is_err());
+    }
+
+    #[test]
+    fn selection_absent_is_whole_share() {
+        // No selection at all mirrors everything (plan_sync). The three ways the
+        // Kotlin side can spell "no selection": empty string, whitespace, null.
+        assert_eq!(parse_selection("").unwrap(), None);
+        assert_eq!(parse_selection("  ").unwrap(), None);
+        assert_eq!(parse_selection("null").unwrap(), None);
+    }
+
+    #[test]
+    fn selection_empty_array_is_delete_only() {
+        // XR-135 regression: "[]" is a present-but-empty selection, not the whole
+        // share. The old plumbing mapped it to None (whole share) and locked
+        // deletion of the last unticked file; it must now be Some(empty), which
+        // the engine turns into a pure delete plan.
+        assert_eq!(parse_selection("[]").unwrap(), Some(HashSet::new()));
+        assert_eq!(parse_selection(" [] ").unwrap(), Some(HashSet::new()));
+    }
+
+    #[test]
+    fn selection_subset_round_trips() {
+        let sel = parse_selection(r#"["a.txt","docs"]"#).unwrap().unwrap();
+        assert_eq!(sel, HashSet::from(["a.txt".to_string(), "docs".to_string()]));
+    }
+
+    #[test]
+    fn selection_malformed_is_error() {
+        // A broken array is neither silently whole-share nor silently delete-all.
+        assert!(parse_selection("{").is_err());
+        assert!(parse_selection(r#"{"x":1}"#).is_err());
+        assert!(parse_selection("[1,2]").is_err());
     }
 
     #[test]
