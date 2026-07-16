@@ -155,6 +155,23 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
             onDismiss = { vm.dismissStorageDialog() },
         )
     }
+
+    val deleteAllCfg = configs.firstOrNull { it.shareId == ui.confirmDeleteAllFor }
+    if (deleteAllCfg != null) {
+        AlertDialog(
+            onDismissRequest = { vm.dismissDeleteAll() },
+            title = { Text("Удалить всё скачанное?") },
+            text = {
+                Text(
+                    "Галочек нет. Синк удалит все локальные копии шары «${deleteAllCfg.name}». " +
+                        "На сервере файлы останутся.",
+                    fontSize = 13.sp,
+                )
+            },
+            confirmButton = { TextButton(onClick = { vm.confirmDeleteAll() }) { Text("Удалить") } },
+            dismissButton = { TextButton(onClick = { vm.dismissDeleteAll() }) { Text("Отмена") } },
+        )
+    }
 }
 
 // ── Storage-directory dialog (XR-043) ───────────────────────────────
@@ -286,7 +303,7 @@ private fun ShareListView(
                         Text(cfg.name, style = MaterialTheme.typography.titleMedium, maxLines = 1,
                             modifier = Modifier.basicMarquee())
                         Text(
-                            if (cfg.selection.isEmpty()) "вся шара" else "выбрано: ${cfg.selection.size}",
+                            if (cfg.selection.isEmpty()) "ничего не выбрано" else "выбрано: ${cfg.selection.size}",
                             fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         Text(

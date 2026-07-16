@@ -145,15 +145,18 @@ class ShareRepository(private val context: Context) {
 
     /**
      * Mirror the selected subset of a share into its app directory. True mirror:
-     * files that were unticked or vanished on the server are removed locally. An
-     * empty selection mirrors the whole share.
+     * files that were unticked or vanished on the server are removed locally.
+     *
+     * An empty selection is "nothing ticked", not "mirror the whole share". By
+     * default ([deleteAll] false, the background worker) it is a no-op: auto-
+     * downloading the whole share would hold the transfer lock and block taps
+     * with a false "busy", and auto-deleting everything on a schedule would be
+     * worse. With [deleteAll] set (an explicit user action behind a confirmation,
+     * XR-135) an empty selection becomes a delete-only pass that removes every
+     * local copy of the share.
      */
-    fun syncOnce(config: ShareConfig): SyncOutcome {
-        // Empty selection means "nothing ticked", not "mirror the whole share":
-        // the background worker must not auto-download the entire share, which
-        // would hold the transfer lock and block taps with a false "busy". The
-        // UI mirrors only ticked files/folders.
-        if (config.selection.isEmpty()) return SyncOutcome(0, 0, 0)
+    fun syncOnce(config: ShareConfig, deleteAll: Boolean = false): SyncOutcome {
+        if (config.selection.isEmpty() && !deleteAll) return SyncOutcome(0, 0, 0)
         val token = config.tokenJson ?: return SyncOutcome(0, 0, 0, "no token")
         val res = NativeBridge.nativeSyncShare(
             config.agentBaseUrl, token, config.agentPubkey, destDir(config).absolutePath,

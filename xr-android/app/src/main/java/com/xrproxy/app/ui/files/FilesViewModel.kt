@@ -82,6 +82,10 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         /** True when the dialog is the first-sync prompt (auto-continues the
          *  deferred action on choice) vs. a later "change folder" from settings. */
         val storagePromptMode: Boolean = false,
+        /** Share whose "no ticks: delete everything downloaded?" confirmation is
+         *  open (XR-135), or null. A manual sync with an empty selection is a
+         *  destructive delete-only pass, so it asks before wiping the copy. */
+        val confirmDeleteAllFor: String? = null,
     )
 
     /** A sync action deferred until the user makes the first-sync storage choice. */
@@ -352,20 +356,34 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun syncNow(config: ShareConfig) {
-        if (config.selection.isEmpty()) {
-            _ui.update { it.copy(message = "Отметь галочками файлы или папки для синка") }
+    fun syncNow(config: ShareConfig, deleteAll: Boolean = false) {
+        if (config.selection.isEmpty() && !deleteAll) {
+            // No ticks: a manual sync means "remove every local copy of this
+            // share" (XR-135). Nothing downloaded, nothing to do; otherwise ask
+            // before the destructive delete-only pass.
+            viewModelScope.launch {
+                val hasLocal = withContext(Dispatchers.IO) { repo.localPaths(config).isNotEmpty() }
+                _ui.update {
+                    if (hasLocal) it.copy(confirmDeleteAllFor = config.shareId)
+                    else it.copy(message = "Отметь галочками файлы или папки для синка")
+                }
+            }
             return
         }
         if (!config.storageChosen) {
             promptStorage(config.shareId, Pending.Sync(config.shareId))
             return
         }
-        if (_ui.value.busyShareId != null) return
+        if (_ui.value.busyShareId != null) {
+            // Another transfer holds the lock. Say so instead of a silent return:
+            // for a confirmed delete-all the user expects something to happen.
+            _ui.update { it.copy(message = "Идёт синхронизация, подождите") }
+            return
+        }
         _ui.update { it.copy(busyShareId = config.shareId, progress = preparing()) }
         val poll = launchPolling()
         viewModelScope.launch {
-            val outcome = withContext(Dispatchers.IO) { repo.syncOnce(config) }
+            val outcome = withContext(Dispatchers.IO) { repo.syncOnce(config, deleteAll) }
             poll.cancel()
             val local = withContext(Dispatchers.IO) { repo.localPaths(config) }
             _ui.update {
@@ -382,6 +400,19 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
     }
+
+    /** User confirmed the "no ticks, delete everything" prompt (XR-135): run the
+     *  delete-only pass that wipes the share's local copy. The prompt only opens
+     *  when local files exist, which means storage was already settled, so
+     *  syncNow's first-sync storage detour is not reachable from here. */
+    fun confirmDeleteAll() {
+        val shareId = _ui.value.confirmDeleteAllFor ?: return
+        _ui.update { it.copy(confirmDeleteAllFor = null) }
+        val config = _configs.value.firstOrNull { it.shareId == shareId } ?: return
+        syncNow(config, deleteAll = true)
+    }
+
+    fun dismissDeleteAll() = _ui.update { it.copy(confirmDeleteAllFor = null) }
 
     fun cancelTransfer() {
         viewModelScope.launch { withContext(Dispatchers.IO) { NativeBridge.nativeCancelTransfer() } }
