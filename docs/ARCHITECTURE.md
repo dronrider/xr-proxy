@@ -97,6 +97,7 @@ Cargo-workspace + Android-модуль:
   `Codec` — верхнеуровневая оболочка поверх обфускатора.
 - [routing.rs](../xr-proto/src/routing.rs) — `Router`, `Action::{Proxy,Direct}`,
   скомпилированные правила (exact / wildcard / CIDR / GeoIP).
+- [sni.rs](../xr-proto/src/sni.rs) достаёт SNI из TLS ClientHello.
 - [udp_relay.rs](../xr-proto/src/udp_relay.rs) — wire-формат UDP relay:
   `[Nonce:4B][Obfuscated: type + dst + src_port + payload]`.
 - mux — поверх TCP создаётся мультиплексированный поток (см. `MuxPool`,
@@ -201,10 +202,10 @@ debug-метрика. Чтобы инвариант «бадж = число WARN
   TCP-прокси и UDP-relay, обработка сигналов.
 - [proxy.rs](../xr-client/src/proxy.rs) — прозрачный TCP-прокси: `accept →
   SO_ORIGINAL_DST → SNI extraction → route → relay/tunnel`.
-- [routing.rs](../xr-client/src/routing.rs) — тонкая обёртка над `xr_proto::routing`.
+  Извлечение SNI и маршрутизация берутся напрямую из `xr_proto` (`sni`,
+  `routing`), своих обёрток у клиента нет.
 - [redirect.rs](../xr-client/src/redirect.rs) — управление nftables/iptables
   (auto-setup, cleanup). Использует семейство `ip` (не `inet`, см. CLAUDE.md).
-- [sni.rs](../xr-client/src/sni.rs) — извлечение SNI из TLS ClientHello.
 - [udp_relay.rs](../xr-client/src/udp_relay.rs) — UDP TPROXY: `recvmsg` +
   `IP_ORIGDSTADDR`, relay на VPS, spoofed-responses через `IP_TRANSPARENT`.
 
@@ -630,7 +631,7 @@ follow-up) → **LLD-19** (файлообмен, поверх 17) → **LLD-07**
    изменение модели конфигурации).
 3. Не дублируй в `ARCHITECTURE.md` детали, которые легко извлечь из кода:
    имена приватных функций, сигнатуры, конкретные строки. Достаточно
-   карты и ссылок вида [file.rs:line](../path#L42).
+   карты и ссылок на файл с якорем строки вида `#L42`.
 4. Любое изменение, затрагивающее: состав крейтов, wire-протокол, формат
    конфига, топологию деплоя, модель состояния клиента, — обязано
    отражаться здесь **в том же коммите**.
