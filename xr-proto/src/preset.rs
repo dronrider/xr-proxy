@@ -55,6 +55,13 @@ pub struct Invite {
     /// `default` so invites stored before this field still load.
     #[serde(default)]
     pub share_ids: Vec<String>,
+    /// Subset of `share_ids` this invite may write to (LLD-28). The hub mints a
+    /// `share:write` scope only for a share listed here (and marked `writable` on
+    /// the record); a read binding keeps the share in `share_ids` but not here.
+    /// The invariant "subset of `share_ids`" is held by the hub's attach/detach.
+    /// `default` keeps invites stored before this field loadable (empty = no write).
+    #[serde(default)]
+    pub write_share_ids: Vec<String>,
 }
 
 /// Connection details delivered to a client via invite.

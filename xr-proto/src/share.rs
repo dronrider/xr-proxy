@@ -54,16 +54,38 @@ pub struct ShareManifest {
 }
 
 /// A capability the hub mints and the agent checks. Bound to a single
-/// `share_id`, expires at `exp`, and carries a detached ed25519 signature over
+/// `share_id`, carries an OAuth-style `scope` (which operations it authorizes),
+/// expires at `exp`, and holds a detached ed25519 signature over
 /// [`token_signing_bytes`]. The agent verifies it offline with the hub's pinned
-/// public key — the hub is never contacted at access time.
+/// public key (the hub is never contacted at access time).
+///
+/// `scope` is a space-separated list of scope names (OAuth, RFC 6749), each with
+/// a service prefix: today [`SCOPE_READ`] and [`SCOPE_WRITE`]. It sits **inside**
+/// the signed bytes (v2 format), so a holder cannot widen it. There is no v1
+/// compatibility: a token minted before scopes fails the signature check (LLD-28
+/// п. 3.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareToken {
     pub share_id: String,
+    /// OAuth scope string, e.g. `"share:read"` or `"share:read share:write"`.
+    pub scope: String,
     /// Expiry, unix seconds.
     pub exp: u64,
     /// Base64 (standard) of the 64-byte ed25519 signature.
     pub signature: String,
+}
+
+/// Scope name that authorizes reading a share (manifest + file bytes).
+pub const SCOPE_READ: &str = "share:read";
+/// Scope name that authorizes writing to a share (`PUT`/`DELETE`).
+pub const SCOPE_WRITE: &str = "share:write";
+
+/// True if the space-separated OAuth `scope` string grants `name`. Unknown names
+/// are ignored (resource-server semantics), so a scope minted by a newer hub with
+/// extra names still authorizes the operations this binary knows about (LLD-28
+/// п. 2.2).
+pub fn scope_contains(scope: &str, name: &str) -> bool {
+    scope.split(' ').any(|s| s == name)
 }
 
 /// A long-lived **bearer mandate** the hub issues to an agent once at install
@@ -119,6 +141,12 @@ pub struct ShareRecord {
     /// keeps records written before this field loadable (they default to direct).
     #[serde(default)]
     pub via_relay: bool,
+    /// The owner marked this share writable (LLD-28): a master switch on the hub
+    /// side. The hub only mints [`SCOPE_WRITE`] for a share that carries this flag
+    /// *and* a write-binding on the invite. Read-only shares default `false`;
+    /// `#[serde(default)]` keeps pre-LLD-28 records loadable.
+    #[serde(default)]
+    pub writable: bool,
 }
 
 /// The public view of a share handed to a consumer by the hub: enough to reach
@@ -294,9 +322,14 @@ impl ShareRecord {
 /// versioned, so the format can evolve without ambiguity.
 ///
 /// `share_id` cannot contain a newline in practice (it is an opaque id the hub
-/// generates); the version prefix and fixed field order keep this injective.
-pub fn token_signing_bytes(share_id: &str, exp: u64) -> Vec<u8> {
-    format!("xr-share-token\nv1\n{share_id}\n{exp}").into_bytes()
+/// generates), and `scope` is space-separated names with no newline; the version
+/// prefix and fixed field order keep this injective.
+///
+/// v2 folds `scope` into the signed bytes (LLD-28). The format is broken from v1
+/// on purpose: a token signed under the old `v1` form no longer verifies, so a
+/// mixed old-agent/new-token pair fails closed rather than dropping the scope.
+pub fn token_signing_bytes(share_id: &str, scope: &str, exp: u64) -> Vec<u8> {
+    format!("xr-share-token\nv2\n{share_id}\n{scope}\n{exp}").into_bytes()
 }
 
 /// The exact bytes an [`AgentCredential`] signature covers. As with
@@ -365,6 +398,10 @@ pub enum ShareTokenError {
     Expired,
     /// The token is for a different `share_id` than the one being accessed.
     WrongShare,
+    /// The signature is valid but the scope lacks the name the operation needs
+    /// (e.g. a read-only token on a `PUT`). Distinct from [`Self::BadSignature`]
+    /// so the agent can answer `403`, not `401`.
+    MissingScope,
 }
 
 impl core::fmt::Display for ShareTokenError {
@@ -374,6 +411,7 @@ impl core::fmt::Display for ShareTokenError {
             Self::BadSignature => "token signature does not verify",
             Self::Expired => "token has expired",
             Self::WrongShare => "token is for a different share",
+            Self::MissingScope => "token lacks the required scope",
         };
         f.write_str(s)
     }
@@ -506,28 +544,34 @@ mod crypto {
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 
-    /// Mint a share token: sign `(share_id, exp)` with the hub's key. The caller
-    /// (hub) owns the `SigningKey`; `exp` is an absolute unix-seconds deadline.
-    pub fn sign_share_token(key: &SigningKey, share_id: &str, exp: u64) -> ShareToken {
-        let sig = key.sign(&token_signing_bytes(share_id, exp));
+    /// Mint a share token: sign `(share_id, scope, exp)` with the hub's key. The
+    /// caller (hub) owns the `SigningKey`; `scope` is the OAuth scope string
+    /// (space-separated names); `exp` is an absolute unix-seconds deadline.
+    pub fn sign_share_token(key: &SigningKey, share_id: &str, scope: &str, exp: u64) -> ShareToken {
+        let sig = key.sign(&token_signing_bytes(share_id, scope, exp));
         ShareToken {
             share_id: share_id.to_string(),
+            scope: scope.to_string(),
             exp,
             signature: base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()),
         }
     }
 
     /// Verify a token offline against the pinned hub public key, for access to
-    /// `expected_share_id` at wall-clock `now_unix`. Fails closed: any decode
-    /// error, signature mismatch, share mismatch, or expiry returns `Err`.
+    /// `expected_share_id` needing `required_scope`, at wall-clock `now_unix`.
+    /// Fails closed: any decode error, signature mismatch, share mismatch,
+    /// expiry, or a scope that lacks `required_scope` returns `Err`.
     ///
-    /// Order matters for diagnostics: share binding and expiry are cheap and
-    /// checked first, then the signature. (All paths still fully reject — none
-    /// of the early returns grant access.)
+    /// Order for diagnostics: cheap binding and expiry first, then the signature
+    /// (which covers the scope, so it must verify before the scope is trusted),
+    /// then scope membership. Every path still fully rejects; no early return
+    /// grants access. `required_scope` is a single name, matched by
+    /// [`super::scope_contains`].
     pub fn verify_share_token(
         token: &ShareToken,
         hub_key: &VerifyingKey,
         expected_share_id: &str,
+        required_scope: &str,
         now_unix: u64,
     ) -> Result<(), ShareTokenError> {
         if token.share_id != expected_share_id {
@@ -544,8 +588,12 @@ mod crypto {
             .map_err(|_| ShareTokenError::MalformedSignature)?;
         let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
         hub_key
-            .verify(&token_signing_bytes(&token.share_id, token.exp), &signature)
-            .map_err(|_| ShareTokenError::BadSignature)
+            .verify(&token_signing_bytes(&token.share_id, &token.scope, token.exp), &signature)
+            .map_err(|_| ShareTokenError::BadSignature)?;
+        if !super::scope_contains(&token.scope, required_scope) {
+            return Err(ShareTokenError::MissingScope);
+        }
+        Ok(())
     }
 
     /// Issue an agent mandate: sign `(agent_pubkey, exp)` with the hub key. The
@@ -748,56 +796,123 @@ mod tests {
 
     #[test]
     fn token_signing_bytes_is_deterministic() {
-        let a = token_signing_bytes("share-1", 1000);
-        let b = token_signing_bytes("share-1", 1000);
+        let a = token_signing_bytes("share-1", "share:read", 1000);
+        let b = token_signing_bytes("share-1", "share:read", 1000);
         assert_eq!(a, b);
-        // Distinct inputs produce distinct bytes (no field collision).
-        assert_ne!(token_signing_bytes("share-1", 1000), token_signing_bytes("share-1", 1001));
-        assert_ne!(token_signing_bytes("share-1", 1000), token_signing_bytes("share-2", 1000));
+        // Distinct inputs produce distinct bytes (no field collision), scope
+        // included: a read-only and a read+write token over the same share/exp
+        // must sign different bytes.
+        assert_ne!(token_signing_bytes("share-1", "share:read", 1000), token_signing_bytes("share-1", "share:read", 1001));
+        assert_ne!(token_signing_bytes("share-1", "share:read", 1000), token_signing_bytes("share-2", "share:read", 1000));
+        assert_ne!(
+            token_signing_bytes("share-1", "share:read", 1000),
+            token_signing_bytes("share-1", "share:read share:write", 1000)
+        );
     }
 
     #[test]
     fn test_share_token_sign_verify() {
         let key = hub_key();
         let vk = key.verifying_key();
-        let token = sign_share_token(&key, "share-1", 5000);
+        let token = sign_share_token(&key, "share-1", "share:read", 5000);
 
-        // Valid: right key, right share, not yet expired.
-        assert!(verify_share_token(&token, &vk, "share-1", 4999).is_ok());
+        // Valid: right key, right share, right scope, not yet expired.
+        assert!(verify_share_token(&token, &vk, "share-1", "share:read", 4999).is_ok());
 
-        // Wrong signer key → BadSignature.
+        // Wrong signer key -> BadSignature.
         let other = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
         assert_eq!(
-            verify_share_token(&token, &other, "share-1", 4999),
+            verify_share_token(&token, &other, "share-1", "share:read", 4999),
             Err(ShareTokenError::BadSignature)
         );
 
-        // Expired exp (now == exp, and now > exp) → Expired.
+        // Expired exp (now == exp, and now > exp) -> Expired.
         assert_eq!(
-            verify_share_token(&token, &vk, "share-1", 5000),
+            verify_share_token(&token, &vk, "share-1", "share:read", 5000),
             Err(ShareTokenError::Expired)
         );
         assert_eq!(
-            verify_share_token(&token, &vk, "share-1", 5001),
+            verify_share_token(&token, &vk, "share-1", "share:read", 5001),
             Err(ShareTokenError::Expired)
         );
 
-        // Bound to a different share → WrongShare.
+        // Bound to a different share -> WrongShare.
         assert_eq!(
-            verify_share_token(&token, &vk, "share-2", 4999),
+            verify_share_token(&token, &vk, "share-2", "share:read", 4999),
             Err(ShareTokenError::WrongShare)
         );
+    }
+
+    #[test]
+    fn test_token_scope_sign_verify() {
+        // LLD-28: a read+write token authorizes both read and write; a read-only
+        // token authorizes read but not write; an unknown extra name is ignored;
+        // a tampered scope breaks the signature.
+        let key = hub_key();
+        let vk = key.verifying_key();
+
+        let rw = sign_share_token(&key, "s", "share:read share:write", 5000);
+        assert!(verify_share_token(&rw, &vk, "s", SCOPE_READ, 4999).is_ok());
+        assert!(verify_share_token(&rw, &vk, "s", SCOPE_WRITE, 4999).is_ok());
+
+        let ro = sign_share_token(&key, "s", SCOPE_READ, 5000);
+        assert!(verify_share_token(&ro, &vk, "s", SCOPE_READ, 4999).is_ok());
+        assert_eq!(
+            verify_share_token(&ro, &vk, "s", SCOPE_WRITE, 4999),
+            Err(ShareTokenError::MissingScope)
+        );
+
+        // An unknown name alongside the known one does not break the known check.
+        let extra = sign_share_token(&key, "s", "share:read share:import", 5000);
+        assert!(verify_share_token(&extra, &vk, "s", SCOPE_READ, 4999).is_ok());
+        assert_eq!(
+            verify_share_token(&extra, &vk, "s", SCOPE_WRITE, 4999),
+            Err(ShareTokenError::MissingScope)
+        );
+
+        // Forging write into the scope string without the key breaks the signature
+        // (scope is covered), so it never reaches the MissingScope check.
+        let mut forged = ro.clone();
+        forged.scope = "share:read share:write".into();
+        assert_eq!(
+            verify_share_token(&forged, &vk, "s", SCOPE_WRITE, 4999),
+            Err(ShareTokenError::BadSignature)
+        );
+
+        // A v1 blob (signed under the old scopeless format) no longer verifies:
+        // the v2 verifier recomputes different bytes. This is the deliberate
+        // format break (LLD-28 п. 3.1).
+        let v1_bytes = format!("xr-share-token\nv1\ns\n5000").into_bytes();
+        let v1_sig = {
+            use ed25519_dalek::Signer;
+            base64::engine::general_purpose::STANDARD.encode(key.sign(&v1_bytes).to_bytes())
+        };
+        let v1 = ShareToken { share_id: "s".into(), scope: SCOPE_READ.into(), exp: 5000, signature: v1_sig };
+        assert_eq!(
+            verify_share_token(&v1, &vk, "s", SCOPE_READ, 4999),
+            Err(ShareTokenError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn scope_contains_matches_whole_names() {
+        assert!(scope_contains("share:read share:write", "share:read"));
+        assert!(scope_contains("share:read share:write", "share:write"));
+        assert!(!scope_contains("share:read", "share:write"));
+        // A substring is not a member (prefix/suffix must not leak authority).
+        assert!(!scope_contains("share:readonly", "share:read"));
+        assert!(!scope_contains("", "share:read"));
     }
 
     #[test]
     fn verify_rejects_tampered_claims() {
         let key = hub_key();
         let vk = key.verifying_key();
-        let mut token = sign_share_token(&key, "share-1", 5000);
-        // Push out the expiry without re-signing → signature no longer matches.
+        let mut token = sign_share_token(&key, "share-1", "share:read", 5000);
+        // Push out the expiry without re-signing -> signature no longer matches.
         token.exp = 9999;
         assert_eq!(
-            verify_share_token(&token, &vk, "share-1", 4999),
+            verify_share_token(&token, &vk, "share-1", "share:read", 4999),
             Err(ShareTokenError::BadSignature)
         );
     }
@@ -806,16 +921,16 @@ mod tests {
     fn verify_rejects_malformed_signature() {
         let key = hub_key();
         let vk = key.verifying_key();
-        let mut token = sign_share_token(&key, "share-1", 5000);
+        let mut token = sign_share_token(&key, "share-1", "share:read", 5000);
         token.signature = "not-base64-@@@".into();
         assert_eq!(
-            verify_share_token(&token, &vk, "share-1", 4999),
+            verify_share_token(&token, &vk, "share-1", "share:read", 4999),
             Err(ShareTokenError::MalformedSignature)
         );
         // Valid base64 but wrong length is also malformed, not a panic.
         token.signature = base64::engine::general_purpose::STANDARD.encode([0u8; 10]);
         assert_eq!(
-            verify_share_token(&token, &vk, "share-1", 4999),
+            verify_share_token(&token, &vk, "share-1", "share:read", 4999),
             Err(ShareTokenError::MalformedSignature)
         );
     }
@@ -873,7 +988,7 @@ mod tests {
         // bytes disjoint so one can never be replayed as the other.
         assert_ne!(
             agent_credential_signing_bytes("x", 1),
-            token_signing_bytes("x", 1)
+            token_signing_bytes("x", "share:read", 1)
         );
     }
 
@@ -940,7 +1055,7 @@ mod tests {
         // All three are ed25519 signatures over newline-joined fields; the
         // distinct prefixes keep the signed byte spaces disjoint.
         let m = manifest_signing_bytes("x", 1, b"");
-        assert_ne!(m, token_signing_bytes("x", 1));
+        assert_ne!(m, token_signing_bytes("x", "share:read", 1));
         assert_ne!(m, agent_credential_signing_bytes("x", 1));
     }
 
@@ -1054,7 +1169,7 @@ mod tests {
     fn relay_register_domain_separated() {
         // The registration signing bytes must not collide with any token form.
         let r = relay_register_signing_bytes(b"nonce");
-        assert_ne!(r, token_signing_bytes("nonce", 0));
+        assert_ne!(r, token_signing_bytes("nonce", "share:read", 0));
         assert_ne!(r, relay_token_signing_bytes("nonce", "a", 0));
         assert_ne!(r, manifest_signing_bytes("nonce", 0, b""));
     }
@@ -1065,7 +1180,7 @@ mod tests {
         // signatures over newline-joined fields; the distinct prefixes must keep
         // their signed byte spaces disjoint so one is never replayable as another.
         let r = relay_token_signing_bytes("x", "a", 1);
-        assert_ne!(r, token_signing_bytes("x", 1));
+        assert_ne!(r, token_signing_bytes("x", "share:read", 1));
         assert_ne!(r, agent_credential_signing_bytes("x", 1));
         assert_ne!(r, manifest_signing_bytes("x", 1, b""));
     }
@@ -1121,6 +1236,7 @@ mod tests {
             created_at: "2026-06-24T00:00:00Z".into(),
             comment: "vacation".into(),
             via_relay: false,
+            writable: false,
         };
         let json = serde_json::to_string(&rec).unwrap();
         for forbidden in ["entries", "files", "content", "data", "manifest", "sha256", "bytes"] {
@@ -1143,6 +1259,7 @@ mod tests {
             created_at: "2026-06-24T00:00:00Z".into(),
             comment: "secret note".into(),
             via_relay: true,
+            writable: true,
         };
         let json = serde_json::to_string(&rec.info()).unwrap();
         assert!(!json.contains("owner"));

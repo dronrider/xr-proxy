@@ -51,6 +51,7 @@ fn main() {
         created_at: "2026-06-24T12:00:00Z".into(),
         comment: "фотки с поездки".into(),
         via_relay: false,
+        writable: false,
     };
     println!("=== ShareRecord (hub-stored — index entry, NO file bytes) ===");
     println!("{}\n", pretty(&record));
@@ -81,7 +82,7 @@ fn main() {
     // --- The capability: hub mints a token, agent verifies it offline. ---
     let now = now_unix();
     let exp = now + 3600; // valid for 1h
-    let token = sign_share_token(&hub_key, "vacation-2026", exp);
+    let token = sign_share_token(&hub_key, "vacation-2026", "share:read", exp);
     println!("=== ShareToken (hub-minted, 1h TTL) ===");
     println!("{}\n", pretty(&token));
 
@@ -92,7 +93,7 @@ fn main() {
 
     // Forged by a different key — the agent's pinned hub key rejects it.
     let attacker = SigningKey::from_bytes(&[7u8; 32]);
-    let forged = sign_share_token(&attacker, "vacation-2026", exp);
+    let forged = sign_share_token(&attacker, "vacation-2026", "share:read", exp);
     show("forged by attacker key", &forged, &hub_pub, "vacation-2026", now);
 
     // Tampered claims (push out exp without re-signing).
@@ -102,7 +103,7 @@ fn main() {
 }
 
 fn show(label: &str, token: &ShareToken, hub_pub: &ed25519_dalek::VerifyingKey, share: &str, now: u64) {
-    match verify_share_token(token, hub_pub, share, now) {
+    match verify_share_token(token, hub_pub, share, "share:read", now) {
         Ok(()) => println!("  [ACCEPT] {label}"),
         Err(e) => println!("  [REJECT] {label} -> {e}"),
     }
