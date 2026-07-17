@@ -24,7 +24,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use xr_proto::share::{
-    RelayGrant, ShareGrant, ShareInfo, ShareManifest, ShareManifestEntry, ShareToken,
+    scope_contains, RelayGrant, ShareGrant, ShareInfo, ShareManifest, ShareManifestEntry,
+    ShareToken, SCOPE_WRITE,
 };
 
 // ── Transfer control (progress + cancel) ─────────────────────────────
@@ -869,6 +870,120 @@ pub async fn sync_share_grant(
     .await
 }
 
+// -- write path (LLD-28) --------------------------------------------
+
+/// Returned by [`upload_file`]/[`delete_file`] when the grant's token has no
+/// `share:write` scope: the invite is read-only for this share, so we refuse
+/// before touching the network (LLD-28 п. 2.4). Worded for the user.
+pub const ERR_NO_WRITE_SCOPE: &str = "no_write_scope: нет права записи на эту шару";
+
+/// Upload `local_path` to `rel` inside the grant's share (LLD-28). Uses the same
+/// transport as sync: direct plain HTTP first, the relay's pinned TLS as a
+/// fallback (XR-050 order). Refuses before the network if the grant's token
+/// lacks `share:write`. `expected_hash` is optional optimistic concurrency: the
+/// hash of the version being replaced, sent as `If-Match` so a newer upload is
+/// not clobbered (`412` on mismatch); `None` is last-write-wins.
+pub async fn upload_file(
+    grant: &ShareGrant,
+    rel: &str,
+    local_path: &Path,
+    expected_hash: Option<&str>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let token = decode_share_token(&grant.token)?;
+    if !scope_contains(&token.scope, SCOPE_WRITE) {
+        return Err(ERR_NO_WRITE_SCOPE.to_string());
+    }
+    let direct_base = format!("http://{}:{}/{}", grant.addr, grant.port, grant.share_id);
+    let token = &token; // move the reference (Copy) into the op, not the token
+    direct_then_relay(
+        &direct_base,
+        &grant.agent_pubkey,
+        grant.relay.as_ref(),
+        &token.share_id,
+        timeout,
+        |client, base| async move { upload_with(&client, &base, token, rel, local_path, expected_hash).await },
+    )
+    .await
+}
+
+/// Delete `rel` from the grant's share (LLD-28). Same transport and scope check
+/// as [`upload_file`]; `expected_hash` maps to `If-Match` (delete only if the
+/// current content still matches).
+pub async fn delete_file(
+    grant: &ShareGrant,
+    rel: &str,
+    expected_hash: Option<&str>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let token = decode_share_token(&grant.token)?;
+    if !scope_contains(&token.scope, SCOPE_WRITE) {
+        return Err(ERR_NO_WRITE_SCOPE.to_string());
+    }
+    let direct_base = format!("http://{}:{}/{}", grant.addr, grant.port, grant.share_id);
+    let token = &token; // move the reference (Copy) into the op, not the token
+    direct_then_relay(
+        &direct_base,
+        &grant.agent_pubkey,
+        grant.relay.as_ref(),
+        &token.share_id,
+        timeout,
+        |client, base| async move { delete_with(&client, &base, token, rel, expected_hash).await },
+    )
+    .await
+}
+
+/// PUT a local file over an already-chosen transport (`client` + `base`),
+/// streaming it so a large file is not buffered in memory. `201`/`204` are
+/// success; anything else is `http_<code>`. A connect failure surfaces as
+/// `network:` so [`direct_then_relay`] can fall back. Re-opening the file each
+/// call keeps this safe to invoke twice (direct then relay).
+async fn upload_with(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &ShareToken,
+    rel: &str,
+    local_path: &Path,
+    if_match: Option<&str>,
+) -> Result<(), String> {
+    let file = tokio::fs::File::open(local_path)
+        .await
+        .map_err(|e| format!("open: {e}"))?;
+    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+    let url = format!("{}/file/{}", base_url.trim_end_matches('/'), encode_path(rel));
+    let mut req = client.put(&url).bearer_auth(token_blob(token)).body(body);
+    if let Some(m) = if_match {
+        req = req.header("If-Match", m);
+    }
+    let resp = req.send().await.map_err(|e| format!("network: {e}"))?;
+    match resp.status().as_u16() {
+        201 | 204 => Ok(()),
+        code => Err(format!("http_{code}")),
+    }
+}
+
+/// DELETE `rel` over an already-chosen transport. `204` is success, `404` maps to
+/// a named error, otherwise `http_<code>`; a connect failure is `network:`.
+async fn delete_with(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &ShareToken,
+    rel: &str,
+    if_match: Option<&str>,
+) -> Result<(), String> {
+    let url = format!("{}/file/{}", base_url.trim_end_matches('/'), encode_path(rel));
+    let mut req = client.delete(&url).bearer_auth(token_blob(token));
+    if let Some(m) = if_match {
+        req = req.header("If-Match", m);
+    }
+    let resp = req.send().await.map_err(|e| format!("network: {e}"))?;
+    match resp.status().as_u16() {
+        204 => Ok(()),
+        404 => Err("not_found".into()),
+        code => Err(format!("http_{code}")),
+    }
+}
+
 /// A connect/timeout failure (as opposed to an authoritative HTTP/signature
 /// answer): only this warrants falling back to the relay.
 fn is_unreachable(err: &str) -> bool {
@@ -1493,7 +1608,7 @@ mod tests {
 
     fn token_blob_of(share_id: &str) -> String {
         use base64::Engine as _;
-        let t = ShareToken { share_id: share_id.into(), exp: 9_999_999_999, signature: "sig".into() };
+        let t = ShareToken { share_id: share_id.into(), scope: "share:read".into(), exp: 9_999_999_999, signature: "sig".into() };
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&t).unwrap())
     }
 
@@ -1571,7 +1686,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_manifest_falls_back_to_relay_when_direct_unreachable() {
         use xr_proto::share::{RelayObf, RelayToken};
-        let token = ShareToken { share_id: "S".into(), exp: 9_999_999_999, signature: "s".into() };
+        let token = ShareToken { share_id: "S".into(), scope: "share:read".into(), exp: 9_999_999_999, signature: "s".into() };
         let relay = RelayGrant {
             addr: "127.0.0.1".into(),
             port: 2,
@@ -1601,6 +1716,105 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("relay grant"), "fallback must reach the relay leg, got {err}");
+    }
+
+    // -- write path: upload_file / delete_file (LLD-28) ------------------
+
+    /// A canned one-shot HTTP server that captures the request line + headers and
+    /// answers `status_line`. Returns its address and a channel with the request
+    /// text (enough to assert method/path/headers; the streamed body follows).
+    async fn serve_capture(
+        status_line: &'static str,
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let resp = format!("{status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+            let _ = tx.send(req);
+        });
+        (addr, rx)
+    }
+
+    /// A direct-only grant to `addr` whose token carries `scope`.
+    fn write_grant(addr: std::net::SocketAddr, scope: &str) -> ShareGrant {
+        use base64::Engine as _;
+        let token = ShareToken {
+            share_id: "S".into(),
+            scope: scope.into(),
+            exp: 9_999_999_999,
+            signature: "sig".into(),
+        };
+        let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&token).unwrap());
+        ShareGrant {
+            share_id: "S".into(),
+            name: "S".into(),
+            addr: addr.ip().to_string(),
+            port: addr.port(),
+            agent_pubkey: String::new(),
+            token: blob,
+            exp: 9_999_999_999,
+            relay: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upload_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, b"hello upload").unwrap();
+        let (addr, rx) = serve_capture("HTTP/1.1 201 Created").await;
+        let grant = write_grant(addr, "share:read share:write");
+
+        upload_file(&grant, "docs/a.txt", &f, Some("abc123"), Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let req = rx.await.unwrap();
+        assert!(req.starts_with("PUT /S/file/docs/a.txt "), "wrong request line: {req}");
+        // The expected hash rides along as If-Match (optimistic concurrency).
+        assert!(req.to_lowercase().contains("if-match: abc123"), "If-Match missing: {req}");
+        assert!(req.contains("authorization: Bearer") || req.contains("Authorization: Bearer"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_via_grant() {
+        let (addr, rx) = serve_capture("HTTP/1.1 204 No Content").await;
+        let grant = write_grant(addr, "share:read share:write");
+
+        delete_file(&grant, "old.txt", None, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let req = rx.await.unwrap();
+        assert!(req.starts_with("DELETE /S/file/old.txt "), "wrong request line: {req}");
+    }
+
+    #[tokio::test]
+    async fn write_refused_without_scope_before_network() {
+        // A read-only grant is refused locally, so an unreachable address is never
+        // dialed (the error is the scope error, not a network one).
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, b"x").unwrap();
+        let grant = write_grant("127.0.0.1:1".parse().unwrap(), "share:read");
+
+        let err = upload_file(&grant, "a.txt", &f, None, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert_eq!(err, ERR_NO_WRITE_SCOPE);
+        let err = delete_file(&grant, "a.txt", None, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert_eq!(err, ERR_NO_WRITE_SCOPE);
     }
 
     fn entry(path: &str, sha: &str) -> ShareManifestEntry {
@@ -2084,7 +2298,7 @@ mod tests {
     }
 
     fn test_token(share_id: &str) -> ShareToken {
-        ShareToken { share_id: share_id.into(), exp: u64::MAX, signature: "sig".into() }
+        ShareToken { share_id: share_id.into(), scope: "share:read".into(), exp: u64::MAX, signature: "sig".into() }
     }
 
     fn signed_headers(key: &ed25519_dalek::SigningKey, share_id: &str, signed_at: u64, body: &str) -> String {
