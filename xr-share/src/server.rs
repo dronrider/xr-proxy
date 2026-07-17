@@ -16,35 +16,41 @@
 //! (`main`) can swap in a new set without restarting the server.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{Path as AxPath, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use http_body_util::BodyExt;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use xr_proto::share::{
     sign_share_manifest, verify_share_token, ShareManifest, MANIFEST_SIGNED_AT_HEADER,
-    MANIFEST_SIG_HEADER,
+    MANIFEST_SIG_HEADER, SCOPE_READ, SCOPE_WRITE,
 };
 
 use crate::auth::extract_token;
 use crate::manifest::{
     build_listing, build_listing_for_file, build_manifest, build_manifest_for_file, HashCache,
+    UPLOAD_TEMP_PREFIX,
 };
 use crate::safepath::resolve_within;
 
 /// One served share: a canonical path that is either a directory tree or a
-/// single file.
+/// single file. A directory share may be `writable` (LLD-28): only then does the
+/// agent accept `PUT`/`DELETE`. A file share is never writable.
 pub struct ShareRoot {
     pub path: PathBuf,
     pub is_file: bool,
+    pub writable: bool,
 }
 
 impl ShareRoot {
@@ -99,7 +105,13 @@ pub fn build_shares(entries: &[crate::config::ShareEntry]) -> SharesMap {
                     tracing::warn!("share {}: path is neither file nor directory, skipping: {}", e.share_id, e.path);
                     continue;
                 }
-                map.insert(e.share_id.clone(), ShareRoot { path: canon, is_file });
+                // Only a directory can be writable (LLD-28); a `writable` file
+                // share in a hand-edited config is served read-only regardless.
+                let writable = e.writable && !is_file;
+                if e.writable && is_file {
+                    tracing::warn!("share {}: writable ignored, a file share is read-only", e.share_id);
+                }
+                map.insert(e.share_id.clone(), ShareRoot { path: canon, is_file, writable });
             }
             Err(err) => {
                 tracing::warn!("share {}: path unreadable ({err}), skipping: {}", e.share_id, e.path)
@@ -119,6 +131,9 @@ pub struct AgentState {
     pub hub_key: VerifyingKey,
     pub hash_cache: HashCache,
     pub identity: Option<SigningKey>,
+    /// Upload size cap in mebibytes (LLD-28), `None` for no limit. Applies to the
+    /// write path only; read routes are unaffected.
+    pub max_file_mb: Option<u64>,
 }
 
 impl AgentState {
@@ -141,9 +156,13 @@ impl AgentState {
 pub fn router(state: Arc<AgentState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
-        // v2: share selected by the URL.
+        // v2: share selected by the URL. The file route also accepts writes
+        // (LLD-28); PUT/DELETE are v2-only, no legacy alias.
         .route("/{share_id}/manifest", get(get_manifest))
-        .route("/{share_id}/file/{*path}", get(serve_file))
+        .route(
+            "/{share_id}/file/{*path}",
+            get(serve_file).put(put_file).delete(delete_file),
+        )
         // legacy: share selected by the token (single-share v1 consumers).
         .route("/manifest", get(get_manifest_legacy))
         .route("/file/{*path}", get(serve_file_legacy))
@@ -154,11 +173,19 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Verify the request's token is valid, unexpired, and bound to `share_id`.
-fn check_token(state: &AgentState, share_id: &str, req: &Request) -> Result<(), (StatusCode, &'static str)> {
+/// Verify the request's token is valid, unexpired, bound to `share_id`, and
+/// carries `required_scope`. A missing/malformed token is `401`; a token that is
+/// present but rejected (wrong share, expired, bad signature, or lacking the
+/// scope) is `403` (LLD-28 п. 2.3).
+fn check_token(
+    state: &AgentState,
+    share_id: &str,
+    required_scope: &str,
+    req: &Request,
+) -> Result<(), (StatusCode, &'static str)> {
     let token = extract_token(req.headers(), req.uri())
         .ok_or((StatusCode::UNAUTHORIZED, "missing or malformed token"))?;
-    verify_share_token(&token, &state.hub_key, share_id, now_unix())
+    verify_share_token(&token, &state.hub_key, share_id, required_scope, now_unix())
         .map_err(|_| (StatusCode::FORBIDDEN, "token rejected"))
 }
 
@@ -186,6 +213,28 @@ async fn serve_file(
     req: Request,
 ) -> Response {
     file_response(&state, &share_id, &rel, req).await
+}
+
+async fn put_file(
+    State(state): State<Arc<AgentState>>,
+    AxPath((share_id, rel)): AxPath<(String, String)>,
+    req: Request,
+) -> Response {
+    match handle_put(&state, &share_id, &rel, req).await {
+        Ok(resp) => resp,
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn delete_file(
+    State(state): State<Arc<AgentState>>,
+    AxPath((share_id, rel)): AxPath<(String, String)>,
+    req: Request,
+) -> Response {
+    match handle_delete(&state, &share_id, &rel, req).await {
+        Ok(resp) => resp,
+        Err(e) => e.into_response(),
+    }
 }
 
 // ── legacy: share id from the token ─────────────────────────────────
@@ -220,7 +269,7 @@ async fn manifest_response(
     if !state.snapshot().contains_key(&share_id) {
         return Err((StatusCode::NOT_FOUND, "no such share"));
     }
-    check_token(&state, &share_id, &req)?;
+    check_token(&state, &share_id, SCOPE_READ, &req)?;
     // Listing never hashes (XR-039): it returns metadata plus any hash already in
     // the cache, so it is instant even on a cold cache of a huge share. The
     // warmer fills hashes in the background. Still off the async runtime because
@@ -273,7 +322,7 @@ async fn file_response(state: &AgentState, share_id: &str, rel: &str, req: Reque
     let Some(share) = shares.get(share_id) else {
         return (StatusCode::NOT_FOUND, "no such share").into_response();
     };
-    if let Err(e) = check_token(state, share_id, &req) {
+    if let Err(e) = check_token(state, share_id, SCOPE_READ, &req) {
         return e.into_response();
     }
     let Some(safe) = share.resolve(rel) else {
@@ -285,6 +334,275 @@ async fn file_response(state: &AgentState, share_id: &str, rel: &str, req: Reque
         Ok(resp) => resp.map(Body::new),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "io error").into_response(),
     }
+}
+
+// -- write path (LLD-28) --------------------------------------------
+
+/// Accept an upload into a writable directory share. Order of gates (LLD-28
+/// п. 2.3): share exists (`404`), writable in config (`403`), token with
+/// `share:write` (`401`/`403`), safepath (`403`), then target-state and
+/// preconditions. The body streams into a reserved `.xr-part-<rand>` temp next
+/// to the target, is hashed on the fly, fsync'd and atomically renamed over the
+/// target on success; the temp is removed on any failure. `201` for a new file,
+/// `204` for an overwrite.
+async fn handle_put(
+    state: &AgentState,
+    share_id: &str,
+    rel: &str,
+    req: Request,
+) -> Result<Response, (StatusCode, &'static str)> {
+    let target = {
+        let shares = state.snapshot();
+        let share = shares
+            .get(share_id)
+            .ok_or((StatusCode::NOT_FOUND, "no such share"))?;
+        if !share.writable {
+            return Err((StatusCode::FORBIDDEN, "share is read-only"));
+        }
+        check_token(state, share_id, SCOPE_WRITE, &req)?;
+        resolve_within(&share.path, rel).map_err(|_| (StatusCode::FORBIDDEN, "path rejected"))?
+    };
+
+    if target.is_dir() {
+        return Err((StatusCode::CONFLICT, "target is a directory"));
+    }
+    let existed = target.is_file();
+
+    // All header-based checks before the body is consumed.
+    check_put_preconditions(req.headers(), state, &target, existed)?;
+    if let (Some(cap_mb), Some(len)) = (state.max_file_mb, content_length(req.headers())) {
+        if len > cap_mb.saturating_mul(1024 * 1024) {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, "file too large"));
+        }
+    }
+    let expected_sha = header_str(req.headers(), "x-xr-sha256").map(|s| s.trim().to_string());
+
+    let parent = target
+        .parent()
+        .ok_or((StatusCode::FORBIDDEN, "path rejected"))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "mkdir failed"))?;
+
+    let tmp = parent.join(format!("{UPLOAD_TEMP_PREFIX}{:016x}", rand::random::<u64>()));
+    let cap_bytes = state.max_file_mb.map(|m| m.saturating_mul(1024 * 1024));
+    let (sha, size) = stream_to_temp(req.into_body(), &tmp, cap_bytes).await?;
+
+    // Optional integrity check before the file is published.
+    if let Some(want) = &expected_sha {
+        if !sha.eq_ignore_ascii_case(want) {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, "sha256 mismatch"));
+        }
+    }
+
+    if rename_replace(&tmp, &target).await.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "rename failed"));
+    }
+
+    // Seed the cache so the manifest serves the fresh file already hashed.
+    if let Ok(meta) = std::fs::metadata(&target) {
+        state.hash_cache.seed(&target, meta.len(), mtime_secs(&meta), sha);
+    }
+
+    let status = if existed {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::CREATED
+    };
+    tracing::info!("PUT share={share_id} rel={rel} size={size} -> {}", status.as_u16());
+    Ok(status.into_response())
+}
+
+/// Delete a file from a writable directory share. Same gate order as
+/// [`handle_put`], then `409` for a directory, `404` for a missing file, and an
+/// optional `If-Match` precondition (`412`) before the removal (LLD-28 п. 2.3).
+async fn handle_delete(
+    state: &AgentState,
+    share_id: &str,
+    rel: &str,
+    req: Request,
+) -> Result<Response, (StatusCode, &'static str)> {
+    let target = {
+        let shares = state.snapshot();
+        let share = shares
+            .get(share_id)
+            .ok_or((StatusCode::NOT_FOUND, "no such share"))?;
+        if !share.writable {
+            return Err((StatusCode::FORBIDDEN, "share is read-only"));
+        }
+        check_token(state, share_id, SCOPE_WRITE, &req)?;
+        resolve_within(&share.path, rel).map_err(|_| (StatusCode::FORBIDDEN, "path rejected"))?
+    };
+
+    if target.is_dir() {
+        return Err((StatusCode::CONFLICT, "target is a directory"));
+    }
+    if !target.is_file() {
+        return Err((StatusCode::NOT_FOUND, "no such file"));
+    }
+    // If-Match against the current content, if the client asked (last-write-wins
+    // by default). The target is known to exist here.
+    if let Some(want) = if_match_hash(req.headers()) {
+        let current = state
+            .hash_cache
+            .hash_of(&target)
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "hash failed"))?;
+        if !current.eq_ignore_ascii_case(&want) {
+            return Err((StatusCode::PRECONDITION_FAILED, "version mismatch"));
+        }
+    }
+
+    tokio::fs::remove_file(&target)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "delete failed"))?;
+    tracing::info!("DELETE share={share_id} rel={rel}");
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Optimistic-concurrency preconditions for a `PUT` (LLD-28 п. 3.7):
+/// `If-None-Match: *` requires the target not to exist; `If-Match: <sha>`
+/// requires the target's current content hash to equal `<sha>`. A violated
+/// precondition is `412` and the target is left untouched.
+fn check_put_preconditions(
+    headers: &HeaderMap,
+    state: &AgentState,
+    target: &Path,
+    existed: bool,
+) -> Result<(), (StatusCode, &'static str)> {
+    if let Some(v) = header_str(headers, "if-none-match") {
+        if v.trim() == "*" && existed {
+            return Err((StatusCode::PRECONDITION_FAILED, "target already exists"));
+        }
+    }
+    if let Some(want) = if_match_hash(headers) {
+        if !existed {
+            return Err((StatusCode::PRECONDITION_FAILED, "no current version to match"));
+        }
+        let current = state
+            .hash_cache
+            .hash_of(target)
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "hash failed"))?;
+        if !current.eq_ignore_ascii_case(&want) {
+            return Err((StatusCode::PRECONDITION_FAILED, "version mismatch"));
+        }
+    }
+    Ok(())
+}
+
+/// The `If-Match` value as a bare sha256 hex (tolerating ETag-style quotes). The
+/// consumer sends the hash from the manifest, not a file-server ETag.
+fn if_match_hash(headers: &HeaderMap) -> Option<String> {
+    let v = header_str(headers, "if-match")?.trim().trim_matches('"');
+    (!v.is_empty() && v != "*").then(|| v.to_string())
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    header_str(headers, "content-length")?.parse().ok()
+}
+
+/// Stream a request body into `tmp`, hashing on the fly and enforcing `cap_bytes`
+/// (if any). Fsync before returning `(sha256_hex, size)`. On any error the temp
+/// is removed and a status is returned: `413` over cap, `507` on a full disk,
+/// `400` on a broken body, `500` otherwise.
+async fn stream_to_temp(
+    body: Body,
+    tmp: &Path,
+    cap_bytes: Option<u64>,
+) -> Result<(String, u64), (StatusCode, &'static str)> {
+    let mut file = match tokio::fs::File::create(tmp).await {
+        Ok(f) => f,
+        Err(e) => return Err(io_status(&e)),
+    };
+    let mut hasher = Sha256::new();
+    let mut total: u64 = 0;
+    let mut body = body;
+    let result = loop {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                let Ok(data) = frame.into_data() else { continue };
+                total += data.len() as u64;
+                if let Some(cap) = cap_bytes {
+                    if total > cap {
+                        break Err((StatusCode::PAYLOAD_TOO_LARGE, "file too large"));
+                    }
+                }
+                hasher.update(&data);
+                if let Err(e) = file.write_all(&data).await {
+                    break Err(io_status(&e));
+                }
+            }
+            Some(Err(_)) => break Err((StatusCode::BAD_REQUEST, "body read error")),
+            None => break Ok(()),
+        }
+    };
+    match result {
+        Ok(()) => {
+            if let Err(e) = file.sync_all().await {
+                drop(file);
+                let _ = tokio::fs::remove_file(tmp).await;
+                return Err(io_status(&e));
+            }
+            drop(file);
+            Ok((hex_lower(&hasher.finalize()), total))
+        }
+        Err(status) => {
+            drop(file);
+            let _ = tokio::fs::remove_file(tmp).await;
+            Err(status)
+        }
+    }
+}
+
+/// Map an IO error to a status: a full disk (`ENOSPC` on unix, `ERROR_DISK_FULL`
+/// on Windows) is `507`, everything else `500`.
+fn io_status(e: &std::io::Error) -> (StatusCode, &'static str) {
+    match e.raw_os_error() {
+        Some(28) | Some(112) => (StatusCode::INSUFFICIENT_STORAGE, "no space left"),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "io error"),
+    }
+}
+
+/// Rename `from` over `to`. Atomic on Unix; Windows cannot rename over an
+/// existing file, so there we remove the target first (a tiny non-atomic window,
+/// accepted for the Windows agent, LLD-28 risk 2).
+async fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    match tokio::fs::rename(from, to).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            #[cfg(windows)]
+            {
+                let _ = tokio::fs::remove_file(to).await;
+                return tokio::fs::rename(from, to).await;
+            }
+            #[cfg(not(windows))]
+            Err(e)
+        }
+    }
+}
+
+/// Modification time in whole unix seconds (0 if the filesystem cannot say),
+/// matching the manifest builder so a seeded hash keys on the same value.
+fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 fn now_unix() -> u64 {
@@ -309,12 +627,22 @@ mod tests {
     }
 
     fn state_with(shares: SharesMap, key: &SigningKey) -> Arc<AgentState> {
+        state_with_cap(shares, key, None)
+    }
+
+    fn state_with_cap(shares: SharesMap, key: &SigningKey, max_file_mb: Option<u64>) -> Arc<AgentState> {
         Arc::new(AgentState {
             shares: RwLock::new(Arc::new(shares)),
             hub_key: key.verifying_key(),
             hash_cache: HashCache::new(),
             identity: Some(SigningKey::from_bytes(&[77u8; 32])),
+            max_file_mb,
         })
+    }
+
+    /// A directory share; `writable` opts into the write path (LLD-28).
+    fn dir_share(path: PathBuf, writable: bool) -> ShareRoot {
+        ShareRoot { path, is_file: false, writable }
     }
 
     fn get_with_token(uri: &str, tok: Option<&ShareToken>) -> HttpRequest<Body> {
@@ -325,6 +653,43 @@ mod tests {
         b.body(Body::empty()).unwrap()
     }
 
+    /// A `PUT`/`DELETE` request with a bearer token and arbitrary extra headers.
+    fn write_req(
+        method: &str,
+        uri: &str,
+        tok: Option<&ShareToken>,
+        headers: &[(&str, String)],
+        body: &[u8],
+    ) -> HttpRequest<Body> {
+        let mut b = HttpRequest::builder().method(method).uri(uri);
+        if let Some(t) = tok {
+            b = b.header("authorization", format!("Bearer {}", blob(t)));
+        }
+        for (k, v) in headers {
+            b = b.header(*k, v.clone());
+        }
+        b.body(Body::from(body.to_vec())).unwrap()
+    }
+
+    /// SHA-256 hex of `data`, the value a client puts in `X-Xr-Sha256`/`If-Match`.
+    fn sha_hex(data: &[u8]) -> String {
+        hex_lower(&Sha256::digest(data))
+    }
+
+    /// The manifest paths a share currently lists (for asserting a PUT/DELETE
+    /// took effect).
+    async fn manifest_paths(app: &Router, share_id: &str, tok: &ShareToken) -> Vec<String> {
+        let r = app
+            .clone()
+            .oneshot(get_with_token(&format!("/{share_id}/manifest"), Some(tok)))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let m: ShareManifest = serde_json::from_slice(&body).unwrap();
+        m.entries.into_iter().map(|e| e.path).collect()
+    }
+
     #[tokio::test]
     async fn test_router_share_id() {
         // Two directory shares; a token for one must not open the other.
@@ -333,11 +698,11 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), b"hi").unwrap();
         let canon = dir.path().canonicalize().unwrap();
         let mut shares = SharesMap::new();
-        shares.insert("A".into(), ShareRoot { path: canon.clone(), is_file: false });
-        shares.insert("B".into(), ShareRoot { path: canon, is_file: false });
+        shares.insert("A".into(), dir_share(canon.clone(), false));
+        shares.insert("B".into(), dir_share(canon, false));
         let app = router(state_with(shares, &key));
 
-        let tok_a = sign_share_token(&key, "A", now_unix() + 1000);
+        let tok_a = sign_share_token(&key, "A", SCOPE_READ, now_unix() + 1000);
 
         // Right share → 200.
         let r = app.clone().oneshot(get_with_token("/A/manifest", Some(&tok_a))).await.unwrap();
@@ -348,7 +713,7 @@ mod tests {
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
 
         // Unknown share id → 404.
-        let tok_x = sign_share_token(&key, "X", now_unix() + 1000);
+        let tok_x = sign_share_token(&key, "X", SCOPE_READ, now_unix() + 1000);
         let r = app.clone().oneshot(get_with_token("/X/manifest", Some(&tok_x))).await.unwrap();
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
 
@@ -365,9 +730,9 @@ mod tests {
         let file = dir.path().join("report.pdf");
         std::fs::write(&file, b"hello").unwrap();
         let mut shares = SharesMap::new();
-        shares.insert("F".into(), ShareRoot { path: file.canonicalize().unwrap(), is_file: true });
+        shares.insert("F".into(), ShareRoot { path: file.canonicalize().unwrap(), is_file: true, writable: false });
         let app = router(state_with(shares, &key));
-        let tok = sign_share_token(&key, "F", now_unix() + 1000);
+        let tok = sign_share_token(&key, "F", SCOPE_READ, now_unix() + 1000);
 
         let r = app.clone().oneshot(get_with_token("/F/manifest", Some(&tok))).await.unwrap();
         assert_eq!(r.status(), StatusCode::OK);
@@ -397,12 +762,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), b"hi").unwrap();
         let mut shares = SharesMap::new();
-        shares.insert("A".into(), ShareRoot { path: dir.path().canonicalize().unwrap(), is_file: false });
+        shares.insert("A".into(), dir_share(dir.path().canonicalize().unwrap(), false));
         let state = state_with(shares, &key);
         let agent_vk = state.identity.as_ref().unwrap().verifying_key();
         let app = router(state);
 
-        let tok = sign_share_token(&key, "A", now_unix() + 1000);
+        let tok = sign_share_token(&key, "A", SCOPE_READ, now_unix() + 1000);
         let r = app.oneshot(get_with_token("/A/manifest", Some(&tok))).await.unwrap();
         assert_eq!(r.status(), StatusCode::OK);
 
@@ -430,16 +795,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), b"hi").unwrap();
         let mut shares = SharesMap::new();
-        shares.insert("A".into(), ShareRoot { path: dir.path().canonicalize().unwrap(), is_file: false });
+        shares.insert("A".into(), dir_share(dir.path().canonicalize().unwrap(), false));
         let state = Arc::new(AgentState {
             shares: RwLock::new(Arc::new(shares)),
             hub_key: key.verifying_key(),
             hash_cache: HashCache::new(),
             identity: None,
+            max_file_mb: None,
         });
         let app = router(state);
 
-        let tok = sign_share_token(&key, "A", now_unix() + 1000);
+        let tok = sign_share_token(&key, "A", SCOPE_READ, now_unix() + 1000);
         let r = app.oneshot(get_with_token("/A/manifest", Some(&tok))).await.unwrap();
         assert_eq!(r.status(), StatusCode::OK);
         assert!(r.headers().get(MANIFEST_SIG_HEADER).is_none());
@@ -453,16 +819,299 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), b"hi").unwrap();
         let mut shares = SharesMap::new();
-        shares.insert("only".into(), ShareRoot { path: dir.path().canonicalize().unwrap(), is_file: false });
+        shares.insert("only".into(), dir_share(dir.path().canonicalize().unwrap(), false));
         let app = router(state_with(shares, &key));
 
-        let tok = sign_share_token(&key, "only", now_unix() + 1000);
+        let tok = sign_share_token(&key, "only", SCOPE_READ, now_unix() + 1000);
         let r = app.clone().oneshot(get_with_token("/manifest", Some(&tok))).await.unwrap();
         assert_eq!(r.status(), StatusCode::OK);
 
         // A token for a share this agent doesn't hold → 404 via the legacy path.
-        let bad = sign_share_token(&key, "missing", now_unix() + 1000);
+        let bad = sign_share_token(&key, "missing", SCOPE_READ, now_unix() + 1000);
         let r = app.oneshot(get_with_token("/manifest", Some(&bad))).await.unwrap();
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -- write path (LLD-28) --------------------------------------------
+
+    /// A read+write scope string, as the hub mints for a write binding.
+    fn rw_scope() -> String {
+        format!("{SCOPE_READ} {SCOPE_WRITE}")
+    }
+
+    /// A one-share writable-directory app plus a read+write token for it.
+    fn writable_app(key: &SigningKey, dir: &Path, cap: Option<u64>) -> (Router, ShareToken) {
+        let mut shares = SharesMap::new();
+        shares.insert("W".into(), dir_share(dir.canonicalize().unwrap(), true));
+        let app = router(state_with_cap(shares, key, cap));
+        let tok = sign_share_token(key, "W", &rw_scope(), now_unix() + 1000);
+        (app, tok)
+    }
+
+    #[tokio::test]
+    async fn test_put_creates_and_overwrites() {
+        let key = SigningKey::from_bytes(&[20u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let (app, wtok) = writable_app(&key, dir.path(), None);
+
+        // New file (nested) -> 201, visible in the manifest.
+        let r = app
+            .clone()
+            .oneshot(write_req("PUT", "/W/file/docs/a.txt", Some(&wtok), &[], b"hello"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+        assert_eq!(std::fs::read(dir.path().join("docs/a.txt")).unwrap(), b"hello");
+        assert_eq!(manifest_paths(&app, "W", &wtok).await, vec!["docs/a.txt".to_string()]);
+
+        // Overwrite -> 204, content replaced whole.
+        let r = app
+            .clone()
+            .oneshot(write_req("PUT", "/W/file/docs/a.txt", Some(&wtok), &[], b"world!!"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        assert_eq!(std::fs::read(dir.path().join("docs/a.txt")).unwrap(), b"world!!");
+    }
+
+    #[tokio::test]
+    async fn test_put_requires_write_scope() {
+        let key = SigningKey::from_bytes(&[21u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let (app, _wtok) = writable_app(&key, dir.path(), None);
+
+        // No token -> 401.
+        let r = app
+            .clone()
+            .oneshot(write_req("PUT", "/W/file/a.txt", None, &[], b"x"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+        // Read-only token -> 403 (writable share, but scope lacks share:write).
+        let rtok = sign_share_token(&key, "W", SCOPE_READ, now_unix() + 1000);
+        let r = app
+            .oneshot(write_req("PUT", "/W/file/a.txt", Some(&rtok), &[], b"x"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert!(!dir.path().join("a.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_put_readonly_share_rejected() {
+        // A valid write token against a share the agent config marks read-only:
+        // the agent's own switch refuses it (LLD-28 п. 3.2).
+        let key = SigningKey::from_bytes(&[22u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut shares = SharesMap::new();
+        shares.insert("R".into(), dir_share(dir.path().canonicalize().unwrap(), false));
+        let app = router(state_with(shares, &key));
+        let wtok = sign_share_token(&key, "R", &rw_scope(), now_unix() + 1000);
+
+        let r = app
+            .oneshot(write_req("PUT", "/R/file/a.txt", Some(&wtok), &[], b"x"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert!(!dir.path().join("a.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_put_path_traversal_blocked() {
+        let key = SigningKey::from_bytes(&[23u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let (app, wtok) = writable_app(&key, dir.path(), None);
+
+        // Traversal and the reserved upload-temp prefix are refused (403).
+        for bad in [
+            "/W/file/../evil",
+            "/W/file/.xr-part-abc",
+            "/W/file/sub/.xr-part-x",
+        ] {
+            let r = app
+                .clone()
+                .oneshot(write_req("PUT", bad, Some(&wtok), &[], b"x"))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "must reject {bad}");
+        }
+        // Nothing escaped the share root.
+        assert!(!dir.path().parent().unwrap().join("evil").exists());
+    }
+
+    #[tokio::test]
+    async fn test_put_sha256_mismatch() {
+        let key = SigningKey::from_bytes(&[24u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let (app, wtok) = writable_app(&key, dir.path(), None);
+
+        // Wrong X-Xr-Sha256 -> 422, nothing written, no temp left behind.
+        let hdr = [("x-xr-sha256", "deadbeef".to_string())];
+        let r = app
+            .clone()
+            .oneshot(write_req("PUT", "/W/file/a.txt", Some(&wtok), &hdr, b"hello"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!dir.path().join("a.txt").exists());
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none(), "temp must be cleaned up");
+
+        // The correct hash goes through.
+        let hdr = [("x-xr-sha256", sha_hex(b"hello"))];
+        let r = app
+            .oneshot(write_req("PUT", "/W/file/a.txt", Some(&wtok), &hdr, b"hello"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_conditional_requests() {
+        let key = SigningKey::from_bytes(&[25u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let (app, wtok) = writable_app(&key, dir.path(), None);
+        let put = |uri: &'static str, hdrs: Vec<(&'static str, String)>, body: &'static [u8]| {
+            let app = app.clone();
+            let tok = wtok.clone();
+            async move { app.oneshot(write_req("PUT", uri, Some(&tok), &hdrs, body)).await.unwrap().status() }
+        };
+
+        // Seed v1.
+        assert_eq!(put("/W/file/a.txt", vec![], b"v1").await, StatusCode::CREATED);
+        let h1 = sha_hex(b"v1");
+
+        // If-Match on the current version replaces it (204).
+        assert_eq!(
+            put("/W/file/a.txt", vec![("if-match", h1.clone())], b"v2").await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"v2");
+
+        // A now-stale If-Match -> 412, content untouched.
+        assert_eq!(
+            put("/W/file/a.txt", vec![("if-match", h1.clone())], b"v3").await,
+            StatusCode::PRECONDITION_FAILED
+        );
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"v2");
+
+        // If-Match against an absent target -> 412.
+        assert_eq!(
+            put("/W/file/nope.txt", vec![("if-match", h1.clone())], b"x").await,
+            StatusCode::PRECONDITION_FAILED
+        );
+
+        // If-None-Match:* over an existing file -> 412; over a new path -> 201.
+        assert_eq!(
+            put("/W/file/a.txt", vec![("if-none-match", "*".into())], b"x").await,
+            StatusCode::PRECONDITION_FAILED
+        );
+        assert_eq!(
+            put("/W/file/fresh.txt", vec![("if-none-match", "*".into())], b"n").await,
+            StatusCode::CREATED
+        );
+
+        // DELETE with a mismatched If-Match -> 412, the file stays.
+        let r = app
+            .clone()
+            .oneshot(write_req("DELETE", "/W/file/a.txt", Some(&wtok), &[("if-match", h1)], b""))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::PRECONDITION_FAILED);
+        assert!(dir.path().join("a.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_put_cap_exceeded() {
+        let key = SigningKey::from_bytes(&[26u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        // 1 MiB cap.
+        let (app, wtok) = writable_app(&key, dir.path(), Some(1));
+
+        // Declared Content-Length over the cap is refused up front (413).
+        let hdr = [("content-length", "5000000".to_string())];
+        let r = app
+            .clone()
+            .oneshot(write_req("PUT", "/W/file/big.bin", Some(&wtok), &hdr, b"small body"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // An actual body over the cap (no declared length) is caught while
+        // streaming, and leaves no temp behind.
+        let big = vec![7u8; 1024 * 1024 + 1];
+        let r = app
+            .oneshot(write_req("PUT", "/W/file/big.bin", Some(&wtok), &[], &big))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!dir.path().join("big.bin").exists());
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none(), "no temp junk");
+    }
+
+    #[tokio::test]
+    async fn test_delete_file() {
+        let key = SigningKey::from_bytes(&[27u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let (app, wtok) = writable_app(&key, dir.path(), None);
+
+        // Put two files, one nested.
+        for (uri, body) in [("/W/file/a.txt", &b"a"[..]), ("/W/file/sub/b.txt", &b"b"[..])] {
+            let r = app.clone().oneshot(write_req("PUT", uri, Some(&wtok), &[], body)).await.unwrap();
+            assert_eq!(r.status(), StatusCode::CREATED);
+        }
+
+        // Delete a.txt -> 204, gone from disk and the manifest.
+        let r = app
+            .clone()
+            .oneshot(write_req("DELETE", "/W/file/a.txt", Some(&wtok), &[], b""))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        assert!(!dir.path().join("a.txt").exists());
+        assert_eq!(manifest_paths(&app, "W", &wtok).await, vec!["sub/b.txt".to_string()]);
+
+        // Deleting it again -> 404.
+        let r = app
+            .clone()
+            .oneshot(write_req("DELETE", "/W/file/a.txt", Some(&wtok), &[], b""))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+
+        // Deleting a directory -> 409.
+        let r = app
+            .oneshot(write_req("DELETE", "/W/file/sub", Some(&wtok), &[], b""))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        assert!(dir.path().join("sub/b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_file_share_not_writable() {
+        // A file share is never writable, even if the config asked (build_shares
+        // zeroes it), so a PUT is refused (LLD-28 п. 2.1).
+        let key = SigningKey::from_bytes(&[28u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("report.pdf");
+        std::fs::write(&file, b"hello").unwrap();
+        let entries = vec![crate::config::ShareEntry {
+            share_id: "F".into(),
+            path: file.display().to_string(),
+            name: None,
+            writable: true,
+        }];
+        let shares = build_shares(&entries);
+        assert!(!shares.get("F").unwrap().writable, "a file share must not be writable");
+        let app = router(state_with(shares, &key));
+        let wtok = sign_share_token(&key, "F", &rw_scope(), now_unix() + 1000);
+
+        let r = app
+            .oneshot(write_req("PUT", "/F/file/report.pdf", Some(&wtok), &[], b"x"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 }

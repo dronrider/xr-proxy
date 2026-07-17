@@ -59,6 +59,12 @@ pub fn resolve_within(root: &Path, requested: &str) -> Result<PathBuf, SafePathE
             // The one component that can escape — refuse outright.
             ".." => return Err(SafePathError::InvalidComponent),
             other => {
+                // The upload temp prefix is reserved (LLD-28): no request path may
+                // name a `.xr-part-*` component, so another upload's in-flight
+                // partial can never be read, overwritten, or deleted through a route.
+                if other.starts_with(crate::manifest::UPLOAD_TEMP_PREFIX) {
+                    return Err(SafePathError::InvalidComponent);
+                }
                 // A component that is itself absolute (e.g. "C:" or starts with
                 // a separator after our split shouldn't happen, but be strict).
                 let p = Path::new(other);
@@ -141,6 +147,13 @@ mod tests {
         // Absolute path component and backslash.
         assert_eq!(resolve_within(r, "\\windows\\system32"), Err(SafePathError::InvalidComponent));
         assert_eq!(resolve_within(r, "foo\0bar"), Err(SafePathError::InvalidComponent));
+
+        // The reserved upload-temp prefix is refused in any position (LLD-28), so
+        // no one can reach another upload's in-flight partial.
+        assert_eq!(resolve_within(r, ".xr-part-abc"), Err(SafePathError::InvalidComponent));
+        assert_eq!(resolve_within(r, "sub/.xr-part-abc"), Err(SafePathError::InvalidComponent));
+        // A benign name that merely resembles it is fine.
+        assert!(resolve_within(r, "xr-part.txt").is_ok());
     }
 
     #[cfg(unix)]

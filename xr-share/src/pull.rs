@@ -22,7 +22,7 @@ use xr_proto::share::{
     MANIFEST_SIG_HEADER,
 };
 
-const HUB_DEFAULT: &str = "https://xr-hub.zoobr.top";
+pub(crate) const HUB_DEFAULT: &str = "https://xr-hub.zoobr.top";
 
 #[derive(Args)]
 pub struct PullArgs {
@@ -51,18 +51,20 @@ pub struct PullArgs {
     pub share: Option<String>,
 }
 
+/// One share on an invite, as the hub returns it (`GET /invite/{t}/shares`).
+/// Shared by the `pull` receiver and the `push`/`rm` harness (LLD-28).
 #[derive(Deserialize)]
-struct InviteShareDto {
-    share_id: String,
-    name: String,
-    addr: String,
-    port: u16,
+pub(crate) struct InviteShareDto {
+    pub(crate) share_id: String,
+    pub(crate) name: String,
+    pub(crate) addr: String,
+    pub(crate) port: u16,
     /// Base64 identity key of the agent; the manifest signature is verified
     /// against it (XR-046). Tolerated absent for an older hub, then the
     /// manifest is accepted unverified.
     #[serde(default)]
-    agent_pubkey: String,
-    token: String,
+    pub(crate) agent_pubkey: String,
+    pub(crate) token: String,
 }
 
 pub fn pull(args: PullArgs) -> Result<()> {
@@ -185,7 +187,7 @@ fn select_paths(values: &[String], manifest: &ShareManifest) -> HashSet<String> 
 /// SHA-256 verification below would confirm the substitution. Fail-closed when
 /// a key is pinned: a missing signature (old agent or stripped headers) is a
 /// refusal with a pointer at updating the agent.
-fn fetch_manifest_verified(url: &str, share: &InviteShareDto) -> Result<ShareManifest> {
+pub(crate) fn fetch_manifest_verified(url: &str, share: &InviteShareDto) -> Result<ShareManifest> {
     let resp = match ureq::get(url)
         .set("Authorization", &format!("Bearer {}", share.token))
         .timeout(Duration::from_secs(30))
@@ -217,7 +219,7 @@ fn fetch_manifest_verified(url: &str, share: &InviteShareDto) -> Result<ShareMan
 
 /// GET a JSON body, optionally with a bearer token. Maps a 4xx/5xx to a clear
 /// error instead of a panic.
-fn get_json<T: DeserializeOwned>(url: &str, token: Option<&str>) -> Result<T> {
+pub(crate) fn get_json<T: DeserializeOwned>(url: &str, token: Option<&str>) -> Result<T> {
     let mut req = ureq::get(url).timeout(Duration::from_secs(30));
     if let Some(t) = token {
         req = req.set("Authorization", &format!("Bearer {t}"));
@@ -311,7 +313,7 @@ fn sanitize(name: &str) -> String {
 }
 
 /// Percent-encode a share path for the URL, preserving `/` separators.
-fn encode_path(p: &str) -> String {
+pub(crate) fn encode_path(p: &str) -> String {
     p.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {

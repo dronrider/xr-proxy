@@ -34,6 +34,10 @@ axum = { version = "0.8", features = ["json"] }
 axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs"] }
+# Stream a PUT request body frame by frame (LLD-28 upload path) without buffering
+# a multi-GB file in memory. Pure Rust, already in the tree via axum/hyper, so it
+# does not weigh down the Windows/musl cross-build.
+http-body-util = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

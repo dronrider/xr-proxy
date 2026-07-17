@@ -52,6 +52,11 @@ pub struct AgentConfig {
     /// its holders already carry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_invite: Option<String>,
+    /// Optional cap on an accepted upload's size, in mebibytes (LLD-28). `None`
+    /// means no limit (the trusted circle default). A body over the cap is
+    /// refused with `413` before it is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_file_mb: Option<u64>,
     /// The shares this agent serves. Each `[[share]]` is a `share_id` + path.
     #[serde(default, rename = "share")]
     pub shares: Vec<ShareEntry>,
@@ -74,6 +79,12 @@ pub struct ShareEntry {
     /// Optional human label (echoed back to the operator by `list`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The agent accepts `PUT`/`DELETE` into this share (LLD-28). Off by default:
+    /// the local switch is a second gate on top of the hub-minted `share:write`
+    /// scope, so a compromised hub still cannot write here. Only directories are
+    /// writable; a file share stays read-only. Set by `xr-share share --writable`.
+    #[serde(default)]
+    pub writable: bool,
 }
 
 /// The relay this agent tunnels through for NAT'd shares (LLD-23 §2.4). Mirror
@@ -163,6 +174,8 @@ impl AgentConfig {
                     share_id: id.clone(),
                     path: dir.clone(),
                     name: None,
+                    // Legacy single-share configs predate writable shares.
+                    writable: false,
                 });
             }
         }
@@ -250,13 +263,16 @@ mod tests {
             tls: None,
             relay: None,
             default_invite: Some("inv123".into()),
-            shares: vec![ShareEntry { share_id: "a".into(), path: "/srv/x".into(), name: Some("X".into()) }],
+            max_file_mb: Some(100),
+            shares: vec![ShareEntry { share_id: "a".into(), path: "/srv/x".into(), name: Some("X".into()), writable: true }],
             dir: None,
             share_id: None,
         };
         let text = toml::to_string(&cfg).unwrap();
         let back: AgentConfig = toml::from_str(&text).unwrap();
         assert_eq!(back.resolved_shares().len(), 1);
+        assert!(back.resolved_shares()[0].writable, "writable flag must survive the roundtrip");
+        assert_eq!(back.max_file_mb, Some(100));
         assert_eq!(back.hub_url.as_deref(), Some("https://hub"));
         assert_eq!(back.default_invite.as_deref(), Some("inv123"));
         assert!(back.dir.is_none());

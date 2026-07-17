@@ -115,6 +115,12 @@ pub struct ShareArgs {
     /// the relay uplink would be dead weight.
     #[arg(long)]
     pub no_relay: bool,
+    /// Allow writing to this share (LLD-28): the agent accepts `PUT`/`DELETE` and
+    /// a write-binding is added on the invite, so its holders can push and remove
+    /// files. Directories only. Re-running `share` without this flag turns write
+    /// back off. Off by default.
+    #[arg(long)]
+    pub writable: bool,
 }
 
 /// `xr-share install` — set up the binary + service with **no** folder binding.
@@ -215,6 +221,7 @@ pub fn install(config_path: &Path, args: InstallArgs) -> Result<()> {
         tls: None,
         relay: relay_cfg,
         default_invite: setup_invite,
+        max_file_mb: None,
         shares: Vec::new(),
         dir: None,
         share_id: None,
@@ -268,6 +275,11 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     if !canon.is_file() && !canon.is_dir() {
         bail!("путь не файл и не директория: {}", args.path);
     }
+    // Запись есть только у директории (LLD-28): у файла-шары «файл = весь корень»
+    // с PUT/DELETE не дружит, перезаписывать одиночный файл удалённо незачем.
+    if args.writable && canon.is_file() {
+        bail!("--writable недопустим для файла: писабельной может быть только папка");
+    }
     let name = args.name.clone().unwrap_or_else(|| {
         canon
             .file_name()
@@ -290,6 +302,9 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     if via_relay {
         body["via_relay"] = serde_json::json!(true);
     }
+    if args.writable {
+        body["writable"] = serde_json::json!(true);
+    }
     let resp = hub_post(&format!("{}/api/v1/share/add", hub.trim_end_matches('/')), &body)
         .context("регистрация шары в хабе")?;
     let share_id = str_field(&resp, "share_id")?;
@@ -310,12 +325,20 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
         share_id: share_id.clone(),
         path: canon.display().to_string(),
         name: Some(name.clone()),
+        writable: args.writable,
     });
     write_config(config_path, &cfg)?;
 
     // Attach to invites so their holders get access (the access anchor, п. 9.5).
+    // A writable share carries the write flag, so the hub mints share:write for
+    // these invites (LLD-28); without it the binding is read-only.
     for invite in &invites {
-        let body = serde_json::json!({ "credential": cred, "share_id": share_id, "invite_token": invite });
+        let body = serde_json::json!({
+            "credential": cred,
+            "share_id": share_id,
+            "invite_token": invite,
+            "write": args.writable,
+        });
         match hub_post(&format!("{}/api/v1/share/attach", hub.trim_end_matches('/')), &body) {
             Ok(_) => println!("  ✓ привязана к инвайту {}", short(invite)),
             Err(e) => println!("  ! не удалось привязать к инвайту {}: {e}", short(invite)),
@@ -327,6 +350,9 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     println!("  путь:     {}", canon.display());
     println!("  share_id: {share_id}");
     println!("  адрес:    {addr}:{port}");
+    if args.writable {
+        println!("  запись:   разрешена (держатели инвайта могут заливать и удалять файлы)");
+    }
     if addr_is_private(&addr) {
         eprintln!("\n  ВНИМАНИЕ: адрес {addr} приватный, шара видна только в локальной сети.");
         eprintln!("  Снаружи она недоступна. Регистрируй с хоста агента (хаб подставит белый IP сам),");
@@ -667,7 +693,7 @@ fn write_config(path: &Path, cfg: &AgentConfig) -> Result<()> {
 fn normalize_legacy(cfg: &mut AgentConfig) {
     if let (Some(dir), Some(id)) = (cfg.dir.take(), cfg.share_id.take()) {
         if !cfg.shares.iter().any(|s| s.share_id == id) {
-            cfg.shares.push(ShareEntry { share_id: id, path: dir, name: None });
+            cfg.shares.push(ShareEntry { share_id: id, path: dir, name: None, writable: false });
         }
     }
 }
@@ -724,7 +750,8 @@ mod tests {
             tls: None,
             relay: None,
             default_invite: None,
-            shares: vec![ShareEntry { share_id: "s1".into(), path: "/srv/x".into(), name: None }],
+            max_file_mb: None,
+            shares: vec![ShareEntry { share_id: "s1".into(), path: "/srv/x".into(), name: None, writable: false }],
             dir: None,
             share_id: None,
         }

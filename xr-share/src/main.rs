@@ -8,6 +8,7 @@ mod cli;
 mod config;
 mod manifest;
 mod pull;
+mod push;
 #[cfg(feature = "relay")]
 mod relay;
 mod safepath;
@@ -64,6 +65,10 @@ enum Commands {
     },
     /// Receive (desktop): list the shares on an invite, pick files, download them.
     Pull(pull::PullArgs),
+    /// Send (desktop): upload a local file into a writable share on an invite.
+    Push(push::PushArgs),
+    /// Remove a file from a writable share on an invite (desktop).
+    Rm(push::RmArgs),
     /// Manage OS autostart (systemd on Linux, Scheduled Task on Windows).
     Service {
         #[command(subcommand)]
@@ -101,6 +106,8 @@ fn main() -> Result<()> {
         Some(Commands::List) => return cli::list(&config_path),
         Some(Commands::Unshare { target }) => return cli::unshare(&config_path, &target),
         Some(Commands::Pull(args)) => return pull::pull(args),
+        Some(Commands::Push(args)) => return push::push(args),
+        Some(Commands::Rm(args)) => return push::rm(args),
         Some(Commands::Service { action }) => {
             return match action {
                 ServiceAction::Install => setup::service_install(&config_path),
@@ -174,6 +181,7 @@ async fn run(path: &Path) -> Result<()> {
         hub_key,
         hash_cache: manifest::HashCache::new(),
         identity,
+        max_file_mb: cfg.max_file_mb,
     });
 
     // Hot reload: pick up `share`/`unshare` edits to the config without restart.

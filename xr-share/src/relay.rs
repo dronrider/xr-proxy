@@ -355,13 +355,14 @@ mod tests {
         let mut shares = SharesMap::new();
         shares.insert(
             "S".into(),
-            ShareRoot { path: dir.path().canonicalize().unwrap(), is_file: false },
+            ShareRoot { path: dir.path().canonicalize().unwrap(), is_file: false, writable: false },
         );
         let state = Arc::new(AgentState {
             shares: RwLock::new(Arc::new(shares)),
             hub_key: hub.verifying_key(),
             hash_cache: HashCache::new(),
             identity: Some(identity.clone()),
+            max_file_mb: None,
         });
         let cred = sign_agent_credential(&hub, &agent_pk, now() + 3600);
         let cred_blob =
@@ -400,7 +401,7 @@ mod tests {
             .use_preconfigured_tls(pinned_client_config(&agent_pk).unwrap())
             .build()
             .unwrap();
-        let share_token = sign_share_token(&hub, "S", now() + 3600);
+        let share_token = sign_share_token(&hub, "S", "share:read", now() + 3600);
 
         // Manifest over the relay.
         let resp = client

@@ -61,7 +61,7 @@ mod tests {
     }
 
     fn sample() -> ShareToken {
-        ShareToken { share_id: "s1".into(), exp: 123, signature: "AAAA".into() }
+        ShareToken { share_id: "s1".into(), scope: "share:read".into(), exp: 123, signature: "AAAA".into() }
     }
 
     #[test]
