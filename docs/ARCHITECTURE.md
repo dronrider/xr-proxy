@@ -78,7 +78,7 @@ Cargo-workspace + Android-модуль:
 | [xr-android-jni/](../xr-android-jni/) | JNI-мост Kotlin ↔ xr-core. |
 | [xr-android/](../xr-android/) | Android-приложение (Compose + MVVM), использует `xr-core` через JNI. |
 | [xr-hub/](../xr-hub/) | Control-plane сервис (пресеты, инвайты, шары, Admin UI). |
-| [xr-share/](../xr-share/) | Агент файлообмена (LLD-19): раздаёт директорию read-only, подписывает манифест, проверяет токены офлайн. |
+| [xr-share/](../xr-share/) | Агент файлообмена (LLD-19, LLD-28): раздаёт директории и файлы (чтение по умолчанию, запись по write-привязке инвайта), подписывает манифест, проверяет токены офлайн. |
 | [xr-relay/](../xr-relay/) | Слепой транзит шар за NAT (LLD-23, XR-103): реестр агентов, регистрация, проверка relay-токенов, сплайс без чтения содержимого. |
 
 ## 4. Компоненты
@@ -129,6 +129,15 @@ Cargo-workspace + Android-модуль:
   `RelayGrant` (relay-плечо гранта), `RelayRegister` (challenge-response
   регистрации агента: мандат хаба + подпись nonce identity-ключом), признак
   `via_relay` в `ShareRecord`. Подпись/проверка за фичой `share`.
+- [share.rs](../xr-proto/src/share.rs) write-scope (LLD-28): у `ShareToken`
+  появилось поле `scope` (OAuth-строка имён через пробел, `SCOPE_READ` /
+  `SCOPE_WRITE`), подпись перешла на v2 со строкой скоупа внутри (формат ломаем,
+  v1 не проходит), `verify_share_token` принимает требуемое имя и проверяет
+  вхождение через `scope_contains`. Признак `writable` в `ShareRecord`
+  (мастер-рубильник у записи хаба) и `write_share_ids` в `Invite` (право записи у
+  пары шара-инвайт). Хаб минтит `share:write` единственным путём, в грантах
+  `invite_shares` при write-привязке и writable-записи; ссылка и `/share/mint`
+  дают только `share:read`.
 - [server_pool.rs](../xr-proto/src/server_pool.rs) вводит `ServerPool`
   (LLD-10): пул *серверов* поверх нескольких `MuxPool` (по одному на VPS), строгий
   primary/backup по приоритету (не балансировка). `open_stream` идёт в пул
@@ -374,6 +383,24 @@ identity-ключа, rcgen на ring), потребитель проверяет
   `agent_offline: агент шары не на связи`; приложение показывает «Агент шары
   не на связи» и помечает шару офлайн.
 
+**Запись в шару (LLD-28).** Карта эндпоинтов агента
+([server.rs](../xr-share/src/server.rs)): `GET /{id}/manifest`, `GET /{id}/file/{*rel}`
+(scope `share:read`), `PUT /{id}/file/{*rel}`, `DELETE /{id}/file/{*rel}` (scope
+`share:write`, только v2). Порядок гейтов у записи: шара существует (`404`),
+`writable` в конфиге агента (`403`), токен с `share:write` (`401`/`403`),
+safepath (`403`). Заливка стримится во временный `.xr-part-<rand>` рядом с целью
+(зарезервированный префикс: обход манифеста его пропускает, роуты отвергают),
+хеш на лету, `fsync` + атомарный rename поверх цели, посев `HashCache`; `201`
+на новый файл, `204` на перезапись. Оптимистический контроль против lost update:
+`If-Match: <sha>` (и у `PUT` `If-None-Match: *`) сверяется с текущим содержимым,
+нарушение это `412`; заголовок `X-Xr-Sha256` даёт `422` на расхождении, колпак
+`max_file_mb` это `413`, `ENOSPC` это `507`, временный файл убирается в любом
+исходе. Тот же relay/прямой путь несёт запись: в
+[sync.rs](../xr-core/src/sync.rs) `upload_file`/`delete_file` идут поверх
+`direct_then_relay`, до сети проверяют `share:write` в скоупе гранта и
+транслируют ожидаемый хеш в `If-Match`. Десктопный харнесс `xr-share push`/`rm`
+делает то же на `ureq`.
+
 **Осталось за пределами XR-103:** JNI/Kotlin проброс relay-плеча гранта в
 `sync_share_grant` на Android; identity-TLS на прямом листенере агента (сейчас
 прямой путь plain-HTTP, целостность закрыта подписью манифеста); relay-fallback в
@@ -608,7 +635,7 @@ GeoIP (за feature-flag).
 | 22 | [22-router-load-balancing.md](lld/22-router-load-balancing.md) | Балансировка устройств по VPS на роутере (XR-080): ключ это LAN source IP, правила «IP/CIDR -> сервер» плюс weighted rendezvous для устройств без правила, стабильный exit-IP на устройство. Слой выбора дома над механикой отказа LLD-10 (дом, если стабильно жив -> глобальный порядок), без per-device состояния. Роутер-only; Android получит тот же ключевой API после per-app туннеля XR-016 (ключ UID). | Шаг 10 (LLD-10) | Draft |
 | 23 | [23-share-relay-nat.md](lld/23-share-relay-nat.md) | Доступ к шаре без белого IP (XR-035): агент за NAT держит исходящий обфусцированный mux-туннель к отдельному сервису `xr-relay`, потребитель приходит туда с relay-токеном хаба, relay слепо сплайсит стримы; E2E это pinned TLS до агента (SPKI == agent_pubkey), хаб остаётся чистым сигналингом. Hole-punching отдельной фазой после XR-064, relay остаётся fallback'ом. | LLD-19, шаг 2 (LLD-01); стык с XR-046/XR-050 | XR-103: транзит (`xr-relay`), протокол (`xr-proto`) и сигналинг (`xr-hub`) готовы; оконечный identity-TLS у агента и pinned-verifier у потребителя осталось |
 | 24 | [24-share-hash-index.md](lld/24-share-hash-index.md) | Локальный индекс хэшей для синка шары (XR-098): персистентный `(отн. путь, size, mtime) -> sha256` в `xr-core/sync.rs` по образцу агентского `HashCache`, тёплый скан это stat-обход без пересчёта SHA-256; файл индекса в `filesDir/share-index/<shareId>.json`, битый/чужой файл даёт полный пересчёт; хэш скачанного кладётся в индекс сразу (верифицирован при скачивании). | LLD-19; стык с XR-043/XR-097 | Implemented |
-| 28 | [28-share-write-scope.md](lld/28-share-write-scope.md) | Доступ к шаре на запись (XR-051): OAuth-вида scope внутри `ShareToken` (строка имён через пробел, `share:read share:write`; подпись v2, формат ломаем: парк тестовый, токены эфемерны; при переезде на JWT XR-030 scope-клейм переносится дословно), право записи у привязки шара-инвайт (при LLD-25/XR-030 переезжает в scope мандата, капабилити-слой не меняется), двойной опт-ин владельца (writable в записи хаба и в конфиге агента), приём `PUT`/`DELETE` агентом строго в пределах шары (safepath, атомарная заливка temp + rename, хеш на лету, оптимистический `If-Match` против lost update), харнесс `push`/`rm`. Фундамент XR-052 (импорт по URL) и любых правок шары с устройства. | LLD-19, LLD-23; стык с LLD-27 и LLD-25 | Draft |
+| 28 | [28-share-write-scope.md](lld/28-share-write-scope.md) | Доступ к шаре на запись (XR-051): OAuth-вида scope внутри `ShareToken` (строка имён через пробел, `share:read share:write`; подпись v2, формат ломаем: парк тестовый, токены эфемерны; при переезде на JWT XR-030 scope-клейм переносится дословно), право записи у привязки шара-инвайт (при LLD-25/XR-030 переезжает в scope мандата, капабилити-слой не меняется), двойной опт-ин владельца (writable в записи хаба и в конфиге агента), приём `PUT`/`DELETE` агентом строго в пределах шары (safepath, атомарная заливка temp + rename, хеш на лету, оптимистический `If-Match` против lost update), харнесс `push`/`rm`. Фундамент XR-052 (импорт по URL) и любых правок шары с устройства. | LLD-19, LLD-23; стык с LLD-27 и LLD-25 | Implemented (XR-139) |
 | 27 | [27-mux-flow-control.md](lld/27-mux-flow-control.md) | Оконный flow control в mux (XR-115): окно отправки на стрим (1 МиБ), возврат кредита кадром `WindowUpdate`, согласование capability-байтом в `MuxInit`/`MuxInitAck` без бампа версии (смешанные пары живут по-старому). Чинит обрыв скачивания через relay (быстрый агент + медленный потребитель переполнял per-stream канал, reader убивал стрим) и тот же механизм на основном прокси (XR-071). | LLD-23 (relay-путь приёмки) | Implemented |
 
 **Предварительный порядок реализации второго пакета (C6+):** LLD-03 ✓ →

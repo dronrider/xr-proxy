@@ -1,29 +1,56 @@
-# xr-share — file-sharing agent configuration (LLD-19)
+# xr-share -- file-sharing agent configuration (LLD-19, LLD-28)
 # Place at /etc/xr-share/config.toml (Linux) or next to the binary (Windows).
 #
-# The agent serves ONE directory read-only and verifies hub-minted access
-# tokens offline. The hub only indexes the address — bytes flow straight from
-# this agent to the consumer.
+# The agent serves any number of shares and verifies hub-minted access tokens
+# offline. The hub only indexes the address -- bytes flow straight from this
+# agent to the consumer. `xr-share install` / `share` write this file for you;
+# the fields below are for a hand-rolled setup.
 
-# Address to listen on. Must be reachable by consumers: a public IP, a
-# forwarded port, or an already-public machine (MVP is direct-access only —
-# CGNAT/relay is out of scope).
+# Address to listen on. Must be reachable by consumers: a public IP, a forwarded
+# port, an already-public machine, or (behind NAT) the relay leg (LLD-23).
 listen = "0.0.0.0:8443"
-
-# Directory to share, read-only. Serving is strictly confined to this path
-# (anti-traversal: no "..", no symlinks escaping it).
-dir = "/srv/share"
-
-# The share id this agent serves — copy it from the hub after registering the
-# share (the `share_id` field of the created record). A token is only accepted
-# if it is bound to exactly this id.
-share_id = "REPLACE_WITH_SHARE_ID_FROM_HUB"
 
 # The hub's ed25519 PUBLIC key (base64), pinned here. Fetch it once from
 #   GET https://<hub>/api/v1/public-key
 # Tokens are verified against this offline; the hub is never contacted at
 # access time.
 hub_pubkey = "REPLACE_WITH_HUB_PUBLIC_KEY"
+
+# Hub base URL, used by the `share` / `list` / `unshare` subcommands to reach the
+# hub on your behalf. Written by `install`.
+# hub_url = "https://xr-hub.zoobr.top"
+
+# Long-lived agent mandate (base64url blob) obtained once at install, so `share`
+# needs no admin action. Written by `install --token` / `--setup`. Keep 0600.
+# agent_credential = "..."
+
+# This agent's own ed25519 private key (base64), the identity consumers pin (TOFU)
+# and the key that signs served manifests (XR-046). Written by `install`; a
+# hand-rolled setup may instead keep an `identity.key` file next to this config.
+# identity_key = "..."
+
+# Optional cap on an accepted upload's size, in mebibytes (LLD-28). Omit for no
+# limit (the trusted-circle default). A body over the cap is refused with 413
+# before it is written; applies only to writable shares.
+# max_file_mb = 2048
+
+# One share per [[share]] block: an opaque share_id (the token binding) and a
+# path that is EITHER a directory (its tree is served) OR a single file.
+[[share]]
+share_id = "REPLACE_WITH_SHARE_ID_FROM_HUB"
+path = "/srv/photos"
+name = "Photos"
+
+# A writable directory share (LLD-28): the agent accepts PUT/DELETE from invite
+# holders that carry a write-binding. Default false. Directories only -- a file
+# share is always read-only. This is the agent-side master switch: even a valid
+# share:write token is refused unless `writable` is true here, so a compromised
+# hub cannot write. Set by `xr-share share <dir> --writable`.
+[[share]]
+share_id = "REPLACE_WITH_ANOTHER_SHARE_ID"
+path = "/srv/dropbox"
+name = "Dropbox"
+writable = true
 
 # Optional TLS. Without it the agent serves plain HTTP (dev, or behind a TLS
 # terminator). The consumer pins the agent's identity (TOFU), so a self-signed
@@ -32,7 +59,18 @@ hub_pubkey = "REPLACE_WITH_HUB_PUBLIC_KEY"
 # cert = "/etc/xr-share/cert.pem"
 # key  = "/etc/xr-share/key.pem"
 
-# ── Generating the agent identity ────────────────────────────────────────
+# Relay for shares behind NAT (LLD-23): the agent keeps an outgoing tunnel to the
+# relay and serves reverse-streams over identity-TLS. Token installs pick this up
+# from the hub automatically; a hand-rolled setup fills it in. Needs a build with
+# `--features relay`.
+# [relay]
+# addr = "relay.example.com"
+# port = 8444
+# [relay.obfuscation]
+# key = "REPLACE_WITH_BASE64_OBFUSCATION_KEY"
+
+# -- Generating the agent identity (hand-rolled setup) ---------------------
 # Run once:   xr-share keygen
-# Register the printed PUBLIC key in the hub as the share's `agent_pubkey`
-# (the consumer pins it). Keep the private key safe.
+# Register the printed PUBLIC key in the hub as the share's agent_pubkey (the
+# consumer pins it). Keep the private key safe (identity_key above, or an
+# identity.key file next to this config).

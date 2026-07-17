@@ -1,10 +1,11 @@
 # xr-share: file-sharing agent (LLD-19)
 
-Shares **any number of paths** (folders *and* individual files) read-only over
-HTTP(S): it serves a signed-hash **manifest** and verifies hub-minted **access
-tokens offline**. The hub is only an index and a notary. It knows agent addresses
-and signs access tokens, but **file bytes never pass through it** (legal
-cleanliness).
+Shares **any number of paths** (folders *and* individual files) over HTTP(S):
+it serves a signed-hash **manifest** and verifies hub-minted **access tokens
+offline**. Shares are **read by default**; a folder marked writable also accepts
+uploads and deletes from invite holders who carry a write-binding (LLD-28). The
+hub is only an index and a notary. It knows agent addresses and signs access
+tokens, but **file bytes never pass through it** (legal cleanliness).
 
 ## How it works
 
@@ -66,9 +67,23 @@ mandate carries a relay descriptor, so a share behind NAT just works
 service only; share any path anytime after:
 
 ```sh
-sudo xr-share share /srv/photos   # a folder OR a single file
+sudo xr-share share /srv/photos              # a folder OR a single file
+sudo xr-share share /srv/dropbox --writable  # invite holders can upload/delete (folders only)
 sudo xr-share list
 ```
+
+`--writable` opts a folder into the write path and adds a write-binding on the
+attached invite; re-running `share` without the flag turns write back off. From a
+laptop the desktop harness mirrors `pull` for sending:
+
+```sh
+xr-share push --invite <TOKEN> --share <id|name> report.pdf   # upload (--to <rel> to rename)
+xr-share rm   --invite <TOKEN> --share <id|name> report.pdf   # delete
+```
+
+`push` refuses locally if the invite grants no write access, and on overwrite
+sends `If-Match` with the hash it just read, so it cannot silently clobber a
+newer version (`--force` drops that guard).
 
 Run the installer with no token at all to just fetch or update the binary; an
 already-installed service is restarted with the new one.
@@ -92,17 +107,62 @@ shares off the hub index.
 
 ## Endpoints
 
-| Method / path        | Auth  | Purpose                                            |
-|----------------------|-------|----------------------------------------------------|
-| `GET /healthz`       | none  | liveness                                           |
-| `GET /manifest`      | token | listing: `path`, `size`, `mtime`, `sha256`         |
-| `GET /file/{*path}`  | token | file bytes; supports `Range` (resume); 404/403/401 |
+The share id is in the URL (`GET /{share_id}/manifest`, `GET /{share_id}/file/...`);
+the bare `/manifest` and `/file/...` are legacy aliases that select the share from
+the token. The write routes are v2 only.
+
+| Method / path                  | Scope         | Purpose                                            |
+|--------------------------------|---------------|----------------------------------------------------|
+| `GET /healthz`                 | none          | liveness                                           |
+| `GET /{id}/manifest`           | `share:read`  | listing: `path`, `size`, `mtime`, `sha256`         |
+| `GET /{id}/file/{*path}`       | `share:read`  | file bytes; supports `Range` (resume)              |
+| `PUT /{id}/file/{*path}`       | `share:write` | upload a file; `201` new, `204` overwrite          |
+| `DELETE /{id}/file/{*path}`    | `share:write` | remove a file; `204`, `404` missing, `409` a dir   |
 
 Token is presented as a URL-safe base64 blob of the hub's `ShareToken` JSON, via
 `Authorization: Bearer <blob>`, `X-Share-Token: <blob>`, or `?token=<blob>`
 (best-effort for browsers). Verified offline against the pinned hub key (bound
-`share_id`, not expired, valid signature); otherwise `401`/`403`. Tokens are never
-logged.
+`share_id`, not expired, valid signature, and carrying the route's scope);
+otherwise `401` (no/garbled token) or `403` (wrong share, expired, bad signature,
+or missing scope). Tokens are never logged.
+
+### Scope model (LLD-28)
+
+The token carries an OAuth-style `scope` string inside its signed bytes: today
+`share:read` and `share:write`. Read routes need `share:read`, write routes
+`share:write`; a grant with write access gets both names. Write scope is minted
+by a single path only, `GET /api/v1/invite/{token}/shares` for an invite that has
+a **write-binding** to a **writable** share; the share link and `/share/mint`
+always hand out read-only tokens. A holder reads its own rights by decoding the
+grant's token blob and looking for `share:write` in `scope`.
+
+### Write path (PUT / DELETE)
+
+The order of gates: the share exists (`404`), the agent config marks it
+`writable` (`403`), the token carries `share:write` (`401`/`403`), and the path
+resolves inside the share (`403`). Both master switches are the owner's: the hub
+never mints `share:write` for a share the owner did not mark writable, and the
+agent refuses even a valid `share:write` token unless its own config allows the
+share, so a compromised hub still cannot write.
+
+An upload streams into a reserved `.xr-part-<rand>` temp next to the target,
+hashing on the fly, then `fsync` + atomic rename over the target, so a
+half-written file never appears in the manifest or under the target name. The
+`.xr-part-` prefix is reserved: no request path (including `GET`) may name a
+component with it, and the manifest walk skips such files.
+
+Optional headers:
+
+- `X-Xr-Sha256: <hex>` on `PUT` verifies the received bytes before the rename;
+  a mismatch is `422` and the target is untouched.
+- `If-Match: <sha256>` runs the operation only if the target's current content
+  hash equals that value (optimistic concurrency against a lost update); `PUT`
+  also honours `If-None-Match: *` to require the target not to exist. A violated
+  precondition is `412`, target untouched. Without these the default is
+  last-write-wins on atomic operations.
+- `max_file_mb` in the agent config caps an upload: over the cap is `413` (by
+  `Content-Length` up front, else while streaming). A full disk is `507`; the
+  temp is removed on any failure.
 
 The manifest response is signed with the agent's identity key (XR-046): the
 `x-xr-manifest-sig` / `x-xr-manifest-signed-at` headers carry an ed25519
