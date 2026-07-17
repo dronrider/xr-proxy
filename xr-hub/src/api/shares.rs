@@ -20,7 +20,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use base64::Engine;
 use serde::Deserialize;
-use xr_proto::share::{sign_share_token, ShareInfo, ShareRecord, ShareToken};
+use xr_proto::share::{sign_share_token, ShareInfo, ShareRecord, ShareToken, SCOPE_READ};
 
 use crate::state::AppState;
 use crate::storage;
@@ -111,6 +111,9 @@ pub async fn create_share(
         created_at: chrono::Utc::now().to_rfc3339(),
         comment: req.comment.trim().to_string(),
         via_relay: false,
+        // Admin-registered shares are read-only by default; write is opted into
+        // through the self-service `xr-share share --writable` path (LLD-28).
+        writable: false,
     };
 
     let data_dir = Path::new(&state.config.server.data_dir);
@@ -177,7 +180,9 @@ pub async fn mint_token(
     }
     let exp = now_unix().saturating_add(ttl);
 
-    let token = sign_share_token(&signing.signing_key, &share_id, exp);
+    // The admin hand-out token is read-only, like the self-service link: write
+    // scope only ever comes from a write-binding on an invite (LLD-28 п. 2.2).
+    let token = sign_share_token(&signing.signing_key, &share_id, SCOPE_READ, exp);
     Ok(Json(token))
 }
 

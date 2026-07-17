@@ -264,6 +264,7 @@ pub async fn register(
         created_at: chrono::Utc::now().to_rfc3339(),
         comment: "self-registered".into(),
         via_relay: false,
+        writable: false,
     };
     storage::save_share(Path::new(&state.config.server.data_dir), &share)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

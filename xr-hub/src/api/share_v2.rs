@@ -27,7 +27,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use xr_proto::share::{
     sign_agent_credential, sign_relay_token, sign_share_token, verify_agent_credential,
-    AgentCredential, RelayDescriptor, RelayGrant, ShareGrant, ShareRecord,
+    AgentCredential, RelayDescriptor, RelayGrant, ShareGrant, ShareRecord, SCOPE_READ, SCOPE_WRITE,
 };
 
 use crate::api::register::{client_ip, now_unix, validate_ed25519_pubkey, verify_reg_token};
@@ -155,6 +155,10 @@ pub struct AddShareReq {
     /// `xr-share share --relay` for an agent behind NAT.
     #[serde(default)]
     pub via_relay: bool,
+    /// Mark the share writable (LLD-28), the hub-side master switch. Set by
+    /// `xr-share share --writable`; a share never becomes writable by accident.
+    #[serde(default)]
+    pub writable: bool,
 }
 
 #[derive(Serialize)]
@@ -212,13 +216,16 @@ pub async fn add(
         created_at: chrono::Utc::now().to_rfc3339(),
         comment: "self-shared (v2)".into(),
         via_relay: req.via_relay,
+        writable: req.writable,
     };
     storage::save_share(Path::new(&state.config.server.data_dir), &share)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     state.shares.write().await.insert(share_id.clone(), share);
 
     let exp = now.saturating_add(ttl);
-    let token = sign_share_token(&signing.signing_key, &share_id, exp);
+    // The hand-out token is read-only: write scope is minted only through a
+    // write-binding on an invite (LLD-28 п. 2.2), never on the share link.
+    let token = sign_share_token(&signing.signing_key, &share_id, SCOPE_READ, exp);
     // Give the agent the relay descriptor for a relay-reachable share, so it can
     // bring up the reverse tunnel it just promised the consumer will use.
     let relay = req
@@ -274,7 +281,9 @@ pub async fn mint(
     }
 
     let exp = now.saturating_add(ttl);
-    let token = sign_share_token(&signing.signing_key, &req.share_id, exp);
+    // Read-only, like `add`: the owner needs no write link to their own machine,
+    // and a second write-scope channel would be extra surface (LLD-28 п. 2.2).
+    let token = sign_share_token(&signing.signing_key, &req.share_id, SCOPE_READ, exp);
     Ok(Json(MintResp { token: encode_blob(&token), exp }))
 }
 
@@ -315,6 +324,13 @@ pub struct AttachReq {
     pub credential: String,
     pub share_id: String,
     pub invite_token: String,
+    /// Grant write access on this binding (LLD-28): the share lands in the
+    /// invite's `write_share_ids` too, so the hub mints `share:write`. `false`
+    /// (the default, and a re-attach without it) is a read-only binding and
+    /// clears any prior write binding, keeping `write_share_ids` a subset of
+    /// `share_ids`.
+    #[serde(default)]
+    pub write: bool,
 }
 
 /// Confirm the presenting agent owns `share_id` (the share's pinned key matches
@@ -348,8 +364,22 @@ pub async fn attach(
     let invite = invites
         .get_mut(&req.invite_token)
         .ok_or((StatusCode::NOT_FOUND, "invite not found".into()))?;
+    let mut changed = false;
     if !invite.share_ids.contains(&req.share_id) {
         invite.share_ids.push(req.share_id.clone());
+        changed = true;
+    }
+    // Keep write_share_ids a subset of share_ids and match the requested access:
+    // --writable adds the write binding, a plain re-attach clears it.
+    let has_write = invite.write_share_ids.contains(&req.share_id);
+    if req.write && !has_write {
+        invite.write_share_ids.push(req.share_id.clone());
+        changed = true;
+    } else if !req.write && has_write {
+        invite.write_share_ids.retain(|s| s != &req.share_id);
+        changed = true;
+    }
+    if changed {
         storage::save_invite(Path::new(&state.config.server.data_dir), invite)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
@@ -370,8 +400,12 @@ pub async fn detach(
         .get_mut(&req.invite_token)
         .ok_or((StatusCode::NOT_FOUND, "invite not found".into()))?;
     let before = invite.share_ids.len();
+    let wbefore = invite.write_share_ids.len();
     invite.share_ids.retain(|s| s != &req.share_id);
-    if invite.share_ids.len() != before {
+    // Drop the write binding too, so a detached share leaves no dangling
+    // write_share_ids entry (the subset invariant).
+    invite.write_share_ids.retain(|s| s != &req.share_id);
+    if invite.share_ids.len() != before || invite.write_share_ids.len() != wbefore {
         storage::save_invite(Path::new(&state.config.server.data_dir), invite)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
@@ -391,7 +425,7 @@ pub async fn invite_shares(
 ) -> Result<Json<Vec<ShareGrant>>, (StatusCode, String)> {
     let signing = signing_or_503(&state)?;
 
-    let share_ids = {
+    let (share_ids, write_ids) = {
         let invites = state.invites.read().await;
         let invite = invites
             .get(&token)
@@ -406,7 +440,7 @@ pub async fn invite_shares(
         if invite.consumed_at.is_some() {
             return Err((StatusCode::GONE, "invite revoked".into()));
         }
-        invite.share_ids.clone()
+        (invite.share_ids.clone(), invite.write_share_ids.clone())
     };
 
     let now = now_unix();
@@ -416,7 +450,15 @@ pub async fn invite_shares(
     for sid in &share_ids {
         // Skip shares that were unregistered after being attached.
         if let Some(rec) = shares.get(sid) {
-            let token = sign_share_token(&signing.signing_key, sid, exp);
+            // Write scope needs both master switches: a write binding on the
+            // invite and a writable record (LLD-28 п. 2.2, п. 3.2). Either one
+            // missing keeps the grant read-only.
+            let scope = if rec.writable && write_ids.contains(sid) {
+                format!("{SCOPE_READ} {SCOPE_WRITE}")
+            } else {
+                SCOPE_READ.to_string()
+            };
+            let token = sign_share_token(&signing.signing_key, sid, &scope, exp);
             // A relay-reachable share gets a relay leg next to the direct address
             // (LLD-23 §2.4): its own transit token, bound to this agent+share, and
             // the relay descriptor. The consumer tries direct first, relay last.
@@ -461,6 +503,10 @@ mod tests {
     const TOKEN: &str = "abcdefghij0123456789AB";
 
     fn share(id: &str, agent_pk: &str, via_relay: bool) -> ShareRecord {
+        share_rec(id, agent_pk, via_relay, false)
+    }
+
+    fn share_rec(id: &str, agent_pk: &str, via_relay: bool, writable: bool) -> ShareRecord {
         ShareRecord {
             share_id: id.into(),
             name: id.into(),
@@ -471,10 +517,22 @@ mod tests {
             created_at: String::new(),
             comment: String::new(),
             via_relay,
+            writable,
         }
     }
 
     fn state_with(config_toml: &str, hub: SigningKey, shares: Vec<ShareRecord>) -> Arc<AppState> {
+        state_with_writes(config_toml, hub, shares, Vec::new())
+    }
+
+    /// Like [`state_with`] but with an explicit write-binding subset on the invite
+    /// (LLD-28): `write_ids` go into `write_share_ids`, all shares into `share_ids`.
+    fn state_with_writes(
+        config_toml: &str,
+        hub: SigningKey,
+        shares: Vec<ShareRecord>,
+        write_ids: Vec<String>,
+    ) -> Arc<AppState> {
         let config: HubConfig = toml::from_str(config_toml).unwrap();
         let ids: Vec<String> = shares.iter().map(|s| s.share_id.clone()).collect();
         let invite = Invite {
@@ -496,6 +554,7 @@ mod tests {
                 servers: Vec::new(),
             },
             share_ids: ids,
+            write_share_ids: write_ids,
         };
         let mut invites = HashMap::new();
         invites.insert(TOKEN.to_string(), invite);
@@ -599,5 +658,95 @@ mod tests {
         let desc = r.descriptor();
         assert_eq!(desc.addr, "relay.example.com");
         assert_eq!(desc.obf, r.obf);
+    }
+
+    /// The scope carried by a grant's token blob (base64url JSON).
+    fn grant_scope(blob: &str) -> String {
+        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(blob).unwrap();
+        serde_json::from_slice::<xr_proto::share::ShareToken>(&json).unwrap().scope
+    }
+
+    #[tokio::test]
+    async fn test_grant_write_scope_only_for_write_binding() {
+        // LLD-28: write scope is minted only when the record is writable AND the
+        // invite has a write binding. Missing either keeps the grant read-only.
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let agent_pk = base64::engine::general_purpose::STANDARD
+            .encode(SigningKey::from_bytes(&[7u8; 32]).verifying_key().as_bytes());
+        let state = state_with_writes(
+            "[server]\n[admin]\nusers = []\n",
+            hub.clone(),
+            vec![
+                share_rec("w", &agent_pk, false, true),   // writable + write binding
+                share_rec("wr", &agent_pk, false, true),  // writable, read binding only
+                share_rec("nw", &agent_pk, false, false), // write binding, not writable
+            ],
+            vec!["w".into(), "nw".into()],
+        );
+
+        let Json(grants) = invite_shares(State(state), AxPath(TOKEN.to_string()))
+            .await
+            .unwrap();
+        let scope = |id: &str| grant_scope(&grants.iter().find(|g| g.share_id == id).unwrap().token);
+
+        assert_eq!(scope("w"), "share:read share:write");
+        assert_eq!(scope("wr"), "share:read", "writable record but no write binding stays read");
+        assert_eq!(scope("nw"), "share:read", "write binding but not writable stays read");
+
+        // The write token actually verifies as writable against the hub key.
+        let tok_blob = &grants.iter().find(|g| g.share_id == "w").unwrap().token;
+        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(tok_blob).unwrap();
+        let tok: xr_proto::share::ShareToken = serde_json::from_slice(&json).unwrap();
+        assert!(xr_proto::share::verify_share_token(
+            &tok, &hub.verifying_key(), "w", SCOPE_WRITE, now_unix()
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_attach_write_subset() {
+        // attach --writable adds a write binding, a plain re-attach clears it, and
+        // detach drops the share from both lists: write_share_ids stays a subset
+        // of share_ids throughout (LLD-28).
+        let dir = tempfile::tempdir().unwrap();
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let identity = SigningKey::from_bytes(&[7u8; 32]);
+        let agent_pk = base64::engine::general_purpose::STANDARD
+            .encode(identity.verifying_key().as_bytes());
+        let cred = encode_blob(&sign_agent_credential(&hub, &agent_pk, now_unix() + 3600));
+        let config = format!(
+            "[server]\ndata_dir = {:?}\n[admin]\nusers = []\n",
+            dir.path().display().to_string()
+        );
+        let state = state_with(&config, hub, vec![share_rec("s", &agent_pk, false, true)]);
+        let req = |write: bool| AttachReq {
+            credential: cred.clone(),
+            share_id: "s".into(),
+            invite_token: TOKEN.into(),
+            write,
+        };
+        let snapshot = |state: &Arc<AppState>| {
+            let state = state.clone();
+            async move {
+                let invites = state.invites.read().await;
+                let inv = invites.get(TOKEN).unwrap();
+                (inv.share_ids.clone(), inv.write_share_ids.clone())
+            }
+        };
+
+        // Start: state_with put "s" in share_ids as a read binding.
+        assert_eq!(snapshot(&state).await, (vec!["s".to_string()], vec![]));
+
+        attach(State(state.clone()), Json(req(true))).await.unwrap();
+        assert_eq!(snapshot(&state).await, (vec!["s".to_string()], vec!["s".to_string()]));
+
+        // A plain re-attach downgrades to read only; share_ids unchanged (idempotent).
+        attach(State(state.clone()), Json(req(false))).await.unwrap();
+        assert_eq!(snapshot(&state).await, (vec!["s".to_string()], vec![]));
+
+        // detach removes it from both.
+        attach(State(state.clone()), Json(req(true))).await.unwrap();
+        detach(State(state.clone()), Json(req(true))).await.unwrap();
+        assert_eq!(snapshot(&state).await, (vec![], vec![]));
     }
 }

@@ -310,6 +310,7 @@ pub(crate) async fn build_invite(
         comment,
         payload,
         share_ids: Vec::new(),
+        write_share_ids: Vec::new(),
     };
 
     let data_dir = Path::new(&state.config.server.data_dir);
@@ -374,6 +375,7 @@ mod tests {
                 servers: Vec::new(),
             },
             share_ids: Vec::new(),
+            write_share_ids: Vec::new(),
         };
 
         let mut invites = HashMap::new();
