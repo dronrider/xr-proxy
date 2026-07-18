@@ -995,6 +995,10 @@ pub const ERR_NO_IMPORT_PLUGIN: &str = "no_plugin: нет плагина под 
 /// A poll answered `404` for a job we started: the agent restarted and its
 /// in-memory job table is gone (LLD-29 п. 3.7).
 pub const ERR_IMPORT_JOB_LOST: &str = "job_lost: агент перезапустился, задание потерялось";
+/// The agent answered `403`: the share has no import flag or no plugins there.
+pub const ERR_IMPORT_OFF: &str = "import_off: импорт на этой шаре выключен у агента";
+/// The agent answered `429`: one job runs, the short queue is full.
+pub const ERR_IMPORT_QUEUE_FULL: &str = "queue_full: очередь импорта занята, попробуй позже";
 
 /// One import job's state as the agent reports it (LLD-29 п. 2.5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1058,6 +1062,19 @@ pub async fn import_url(
                         .ok_or_else(|| "parse: нет job_id в ответе".to_string())
                 }
                 422 => Err(ERR_NO_IMPORT_PLUGIN.to_string()),
+                403 => Err(ERR_IMPORT_OFF.to_string()),
+                429 => Err(ERR_IMPORT_QUEUE_FULL.to_string()),
+                // The 400 body is the agent's worded reason (URL gate, height
+                // range): pass it through instead of an opaque code.
+                400 => {
+                    let body = resp.text().await.unwrap_or_default();
+                    let body = body.trim();
+                    Err(if body.is_empty() {
+                        "bad_request: агент отклонил запрос".to_string()
+                    } else {
+                        format!("bad_request: {body}")
+                    })
+                }
                 code => Err(format!("http_{code}")),
             }
         },
@@ -2011,15 +2028,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_import_error_mapping() {
-        // 422 on start means no plugin takes the URL; 404 on poll means the
-        // agent restarted and lost the job (LLD-29 п. 3.7). Both map to their
-        // named errors, single-sourced here for the UI.
-        let (addr, _rx) = serve_capture_json("HTTP/1.1 422 Unprocessable Entity", "").await;
-        let grant = write_grant(addr, IMPORT_SCOPE);
-        let err = import_url(&grant, "https://example.org/x", "", None, Duration::from_secs(5))
-            .await
-            .unwrap_err();
-        assert_eq!(err, ERR_NO_IMPORT_PLUGIN);
+        // The agent's refusals map to named errors, single-sourced here for the
+        // UI: 422 no plugin, 403 import off, 429 queue full, 404 on poll means
+        // the agent restarted and lost the job (LLD-29 п. 3.7). A 400 carries
+        // the agent's worded reason through instead of an opaque http_400.
+        let start_err = |status: &'static str, body: &'static str| async move {
+            let (addr, _rx) = serve_capture_json(status, body).await;
+            let grant = write_grant(addr, IMPORT_SCOPE);
+            import_url(&grant, "https://example.org/x", "", None, Duration::from_secs(5))
+                .await
+                .unwrap_err()
+        };
+        assert_eq!(start_err("HTTP/1.1 422 Unprocessable Entity", "").await, ERR_NO_IMPORT_PLUGIN);
+        assert_eq!(start_err("HTTP/1.1 403 Forbidden", "").await, ERR_IMPORT_OFF);
+        assert_eq!(start_err("HTTP/1.1 429 Too Many Requests", "").await, ERR_IMPORT_QUEUE_FULL);
+        assert_eq!(
+            start_err("HTTP/1.1 400 Bad Request", "адрес в приватном диапазоне").await,
+            "bad_request: адрес в приватном диапазоне"
+        );
 
         let (addr, _rx) = serve_capture_json("HTTP/1.1 404 Not Found", "").await;
         let grant = write_grant(addr, IMPORT_SCOPE);
