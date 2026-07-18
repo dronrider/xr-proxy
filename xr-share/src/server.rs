@@ -25,19 +25,21 @@ use axum::extract::{Path as AxPath, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
+use axum::{Json, Router};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use http_body_util::BodyExt;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use xr_proto::share::{
     sign_share_manifest, verify_share_token, ShareManifest, MANIFEST_SIGNED_AT_HEADER,
-    MANIFEST_SIG_HEADER, SCOPE_READ, SCOPE_WRITE,
+    MANIFEST_SIG_HEADER, SCOPE_IMPORT, SCOPE_READ, SCOPE_WRITE,
 };
 
 use crate::auth::extract_token;
+use crate::import::{self, ImportManager, JobSpec};
 use crate::manifest::{
     build_listing, build_listing_for_file, build_manifest, build_manifest_for_file, HashCache,
     UPLOAD_TEMP_PREFIX,
@@ -51,6 +53,9 @@ pub struct ShareRoot {
     pub path: PathBuf,
     pub is_file: bool,
     pub writable: bool,
+    /// URL-import jobs are accepted into this share (LLD-29): the local opt-in
+    /// on top of `writable`, valid only for a writable directory.
+    pub import: bool,
 }
 
 impl ShareRoot {
@@ -111,7 +116,12 @@ pub fn build_shares(entries: &[crate::config::ShareEntry]) -> SharesMap {
                 if e.writable && is_file {
                     tracing::warn!("share {}: writable ignored, a file share is read-only", e.share_id);
                 }
-                map.insert(e.share_id.clone(), ShareRoot { path: canon, is_file, writable });
+                // Import is a kind of write (LLD-29), so it needs writable too.
+                let import = e.import && writable;
+                if e.import && !writable {
+                    tracing::warn!("share {}: import ignored, share is not writable", e.share_id);
+                }
+                map.insert(e.share_id.clone(), ShareRoot { path: canon, is_file, writable, import });
             }
             Err(err) => {
                 tracing::warn!("share {}: path unreadable ({err}), skipping: {}", e.share_id, e.path)
@@ -129,11 +139,14 @@ pub fn build_shares(entries: &[crate::config::ShareEntry]) -> SharesMap {
 pub struct AgentState {
     pub shares: RwLock<Arc<SharesMap>>,
     pub hub_key: VerifyingKey,
-    pub hash_cache: HashCache,
+    pub hash_cache: Arc<HashCache>,
     pub identity: Option<SigningKey>,
     /// Upload size cap in mebibytes (LLD-28), `None` for no limit. Applies to the
     /// write path only; read routes are unaffected.
     pub max_file_mb: Option<u64>,
+    /// URL-import job registry + plugin config (LLD-29). Always present; with no
+    /// `[import]` block it just answers that import is off.
+    pub import: Arc<ImportManager>,
 }
 
 impl AgentState {
@@ -163,6 +176,12 @@ pub fn router(state: Arc<AgentState>) -> Router {
             "/{share_id}/file/{*path}",
             get(serve_file).put(put_file).delete(delete_file),
         )
+        // URL-import jobs (LLD-29), v2-only: start, poll, cancel.
+        .route("/{share_id}/import", axum::routing::post(start_import))
+        .route(
+            "/{share_id}/import/{job_id}",
+            get(import_status).delete(import_cancel),
+        )
         // legacy: share selected by the token (single-share v1 consumers).
         .route("/manifest", get(get_manifest_legacy))
         .route("/file/{*path}", get(serve_file_legacy))
@@ -183,7 +202,19 @@ fn check_token(
     required_scope: &str,
     req: &Request,
 ) -> Result<(), (StatusCode, &'static str)> {
-    let token = extract_token(req.headers(), req.uri())
+    check_token_parts(state, share_id, required_scope, req.headers(), req.uri())
+}
+
+/// [`check_token`] for a handler that consumed the request body (the import
+/// routes take a JSON extractor, so only parts remain).
+fn check_token_parts(
+    state: &AgentState,
+    share_id: &str,
+    required_scope: &str,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+) -> Result<(), (StatusCode, &'static str)> {
+    let token = extract_token(headers, uri)
         .ok_or((StatusCode::UNAUTHORIZED, "missing or malformed token"))?;
     verify_share_token(&token, &state.hub_key, share_id, required_scope, now_unix())
         .map_err(|_| (StatusCode::FORBIDDEN, "token rejected"))
@@ -463,6 +494,136 @@ async fn handle_delete(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+// -- import path (LLD-29) -------------------------------------------
+
+#[derive(Deserialize)]
+struct ImportReq {
+    url: String,
+    /// Destination directory inside the share, "" (the default) is the root.
+    #[serde(default)]
+    dest: String,
+    /// Wanted frame height; clamped to the plugin's `max_height`.
+    #[serde(default)]
+    height: Option<u32>,
+}
+
+/// Gates shared by all three import routes (LLD-29 п. 2.6, steps 1-3): the
+/// share exists (`404`), is writable + import-enabled with at least one plugin
+/// configured (`403`), and the token carries `share:import` (`401`/`403`).
+/// Returns the share's canonical root for the POST handler's later steps.
+fn import_gates(
+    state: &AgentState,
+    share_id: &str,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+) -> Result<PathBuf, (StatusCode, &'static str)> {
+    let shares = state.snapshot();
+    let share = shares
+        .get(share_id)
+        .ok_or((StatusCode::NOT_FOUND, "no such share"))?;
+    if !share.writable || !share.import || !state.import.has_plugins() {
+        return Err((StatusCode::FORBIDDEN, "import is off for this share"));
+    }
+    check_token_parts(state, share_id, SCOPE_IMPORT, headers, uri)?;
+    Ok(share.path.clone())
+}
+
+/// `POST /{share_id}/import`: start a job (LLD-29 п. 2.5). After the shared
+/// gates: safepath the destination (`403`), the URL gate (`400`), plugin
+/// routing (`422`) and the height clamp (`400`), then enqueue (`429` full).
+async fn start_import(
+    State(state): State<Arc<AgentState>>,
+    AxPath(share_id): AxPath<String>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    Json(req): Json<ImportReq>,
+) -> Response {
+    let root = match import_gates(&state, &share_id, &headers, &uri) {
+        Ok(root) => root,
+        Err(e) => return e.into_response(),
+    };
+    let Ok(dest_abs) = resolve_within(&root, &req.dest) else {
+        return (StatusCode::FORBIDDEN, "path rejected").into_response();
+    };
+    if dest_abs.is_file() {
+        return (StatusCode::CONFLICT, "dest is a file").into_response();
+    }
+    // Normalized share-relative destination for reporting published paths.
+    let dest_rel = dest_abs
+        .strip_prefix(&root)
+        .map(|p| p.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"))
+        .unwrap_or_default();
+
+    let host = match import::check_url(&req.url).await {
+        Ok(host) => host,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    // Config snapshot: routing, limits and sandbox come from one version.
+    let Some(cfg) = state.import.config() else {
+        return (StatusCode::FORBIDDEN, "import is off for this share").into_response();
+    };
+    let Some(plugin) = import::route_plugin(&cfg.plugins, &host) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "нет плагина под этот URL").into_response();
+    };
+    let height = match import::effective_height(req.height, plugin) {
+        Ok(h) => h,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+
+    let spec = JobSpec {
+        share_root: root,
+        dest_rel,
+        url: req.url.trim().to_string(),
+        height,
+        plugin: plugin.clone(),
+        timeout: std::time::Duration::from_secs(cfg.timeout_min.saturating_mul(60)),
+        max_total_bytes: cfg.max_total_mb.map(|m| m.saturating_mul(1024 * 1024)),
+        max_file_bytes: state.max_file_mb.map(|m| m.saturating_mul(1024 * 1024)),
+        sandbox: cfg.sandbox.clone(),
+    };
+    match state.import.enqueue(spec) {
+        Some(job_id) => {
+            tracing::info!("import share={share_id} host={host} job={job_id}");
+            (StatusCode::ACCEPTED, Json(serde_json::json!({ "job_id": job_id }))).into_response()
+        }
+        None => (StatusCode::TOO_MANY_REQUESTS, "import queue is full").into_response(),
+    }
+}
+
+/// `GET /{share_id}/import/{job_id}`: poll a job. A `404` may equally mean an
+/// unknown id or a table lost to a restart (LLD-29 п. 3.7).
+async fn import_status(
+    State(state): State<Arc<AgentState>>,
+    AxPath((share_id, job_id)): AxPath<(String, String)>,
+    req: Request,
+) -> Response {
+    if let Err(e) = import_gates(&state, &share_id, req.headers(), req.uri()) {
+        return e.into_response();
+    }
+    match state.import.status(&job_id) {
+        Some(dto) => Json(dto).into_response(),
+        None => (StatusCode::NOT_FOUND, "no such job").into_response(),
+    }
+}
+
+/// `DELETE /{share_id}/import/{job_id}`: cancel. SIGKILL the plugin's process
+/// group, forget the job (LLD-29 п. 2.5).
+async fn import_cancel(
+    State(state): State<Arc<AgentState>>,
+    AxPath((share_id, job_id)): AxPath<(String, String)>,
+    req: Request,
+) -> Response {
+    if let Err(e) = import_gates(&state, &share_id, req.headers(), req.uri()) {
+        return e.into_response();
+    }
+    if state.import.cancel(&job_id) {
+        tracing::info!("import share={share_id} job={job_id} cancelled");
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "no such job").into_response()
+    }
+}
+
 /// Optimistic-concurrency preconditions for a `PUT` (LLD-28 п. 3.7):
 /// `If-None-Match: *` requires the target not to exist; `If-Match: <sha>`
 /// requires the target's current content hash to equal `<sha>`. A violated
@@ -648,18 +809,20 @@ mod tests {
     }
 
     fn state_with_cap(shares: SharesMap, key: &SigningKey, max_file_mb: Option<u64>) -> Arc<AgentState> {
+        let cache = Arc::new(HashCache::new());
         Arc::new(AgentState {
             shares: RwLock::new(Arc::new(shares)),
             hub_key: key.verifying_key(),
-            hash_cache: HashCache::new(),
+            hash_cache: cache.clone(),
             identity: Some(SigningKey::from_bytes(&[77u8; 32])),
             max_file_mb,
+            import: ImportManager::new(None, cache),
         })
     }
 
     /// A directory share; `writable` opts into the write path (LLD-28).
     fn dir_share(path: PathBuf, writable: bool) -> ShareRoot {
-        ShareRoot { path, is_file: false, writable }
+        ShareRoot { path, is_file: false, writable, import: false }
     }
 
     fn get_with_token(uri: &str, tok: Option<&ShareToken>) -> HttpRequest<Body> {
@@ -747,7 +910,7 @@ mod tests {
         let file = dir.path().join("report.pdf");
         std::fs::write(&file, b"hello").unwrap();
         let mut shares = SharesMap::new();
-        shares.insert("F".into(), ShareRoot { path: file.canonicalize().unwrap(), is_file: true, writable: false });
+        shares.insert("F".into(), ShareRoot { path: file.canonicalize().unwrap(), is_file: true, writable: false, import: false });
         let app = router(state_with(shares, &key));
         let tok = sign_share_token(&key, "F", SCOPE_READ, now_unix() + 1000);
 
@@ -813,12 +976,14 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), b"hi").unwrap();
         let mut shares = SharesMap::new();
         shares.insert("A".into(), dir_share(dir.path().canonicalize().unwrap(), false));
+        let cache = Arc::new(HashCache::new());
         let state = Arc::new(AgentState {
             shares: RwLock::new(Arc::new(shares)),
             hub_key: key.verifying_key(),
-            hash_cache: HashCache::new(),
+            hash_cache: cache.clone(),
             identity: None,
             max_file_mb: None,
+            import: ImportManager::new(None, cache),
         });
         let app = router(state);
 
@@ -1119,6 +1284,7 @@ mod tests {
             path: file.display().to_string(),
             name: None,
             writable: true,
+            import: false,
         }];
         let shares = build_shares(&entries);
         assert!(!shares.get("F").unwrap().writable, "a file share must not be writable");
@@ -1130,5 +1296,476 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+
+    // -- import path (LLD-29) -------------------------------------------
+
+    use std::time::Duration;
+
+    use crate::config::{ImportConfig, ImportPlugin};
+
+    /// The scope a write-binding grant carries (LLD-29 п. 2.2).
+    fn rwi_scope() -> String {
+        format!("{SCOPE_READ} {SCOPE_WRITE} {SCOPE_IMPORT}")
+    }
+
+    /// A public-literal URL that passes the gate without any DNS.
+    const PUB_URL: &str = "http://93.184.216.34/video";
+
+    fn one_plugin(cmd: &str, args: &[&str], patterns: &[&str], max_height: u32) -> ImportConfig {
+        ImportConfig {
+            timeout_min: 30,
+            max_total_mb: None,
+            sandbox: "none".into(),
+            plugins: vec![ImportPlugin {
+                name: "тест".into(),
+                patterns: patterns.iter().map(|s| s.to_string()).collect(),
+                max_height,
+                cmd: cmd.into(),
+                args: args.iter().map(|s| s.to_string()).collect(),
+            }],
+        }
+    }
+
+    /// One import-enabled writable share "I" with a live job runner.
+    fn import_app(
+        key: &SigningKey,
+        dir: &Path,
+        cfg: Option<ImportConfig>,
+        max_file_mb: Option<u64>,
+    ) -> (Router, ShareToken) {
+        let mut shares = SharesMap::new();
+        shares.insert(
+            "I".into(),
+            ShareRoot { path: dir.canonicalize().unwrap(), is_file: false, writable: true, import: true },
+        );
+        let cache = Arc::new(HashCache::new());
+        let state = Arc::new(AgentState {
+            shares: RwLock::new(Arc::new(shares)),
+            hub_key: key.verifying_key(),
+            hash_cache: cache.clone(),
+            identity: Some(SigningKey::from_bytes(&[77u8; 32])),
+            max_file_mb,
+            import: ImportManager::new(cfg, cache),
+        });
+        state.import.spawn_runner();
+        let tok = sign_share_token(key, "I", &rwi_scope(), now_unix() + 1000);
+        (router(state), tok)
+    }
+
+    /// A fake plugin: an executable shell script the test writes (LLD-29 п. 4).
+    #[cfg(unix)]
+    fn write_script(dir: &Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("plugin.sh");
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p.display().to_string()
+    }
+
+    async fn post_import(
+        app: &Router,
+        tok: Option<&ShareToken>,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut b = HttpRequest::post(uri).header("content-type", "application/json");
+        if let Some(t) = tok {
+            b = b.header("authorization", format!("Bearer {}", blob(t)));
+        }
+        let r = app.clone().oneshot(b.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        let status = r.status();
+        let bytes = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let v = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
+        });
+        (status, v)
+    }
+
+    async fn get_status(app: &Router, tok: &ShareToken, job_id: &str) -> (StatusCode, serde_json::Value) {
+        let r = app
+            .clone()
+            .oneshot(get_with_token(&format!("/I/import/{job_id}"), Some(tok)))
+            .await
+            .unwrap();
+        let status = r.status();
+        let bytes = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let v = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
+        });
+        (status, v)
+    }
+
+    /// Poll until the job leaves queued/running (bounded, so a hung test fails
+    /// loudly instead of forever).
+    async fn wait_finished(app: &Router, tok: &ShareToken, job_id: &str) -> serde_json::Value {
+        for _ in 0..300 {
+            let (status, v) = get_status(app, tok, job_id).await;
+            assert_eq!(status, StatusCode::OK, "status poll failed: {v}");
+            match v.get("state").and_then(|s| s.as_str()) {
+                Some("done") | Some("failed") => return v,
+                _ => tokio::time::sleep(Duration::from_millis(30)).await,
+            }
+        }
+        panic!("job {job_id} did not finish in time");
+    }
+
+    /// No service dirs left behind in the share root.
+    fn no_job_dirs(dir: &Path) -> bool {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .all(|e| !e.file_name().to_string_lossy().starts_with(crate::import::JOB_DIR_PREFIX))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_import_happy_path() {
+        let key = SigningKey::from_bytes(&[30u8; 32]);
+        let share = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        // The fake plugin reports progress and drops a file named from
+        // "metadata" (like yt-dlp names by the video title).
+        let script = write_script(
+            bin.path(),
+            "echo 'xr-progress 25'\necho 'xr-progress  60.5%'\nprintf 'video-bytes' > 'Ролик [abc].mp4'",
+        );
+        let (app, tok) = import_app(&key, share.path(), Some(one_plugin(&script, &["{url}"], &["*"], 1080)), None);
+
+        let (status, v) = post_import(
+            &app, Some(&tok), "/I/import",
+            serde_json::json!({ "url": PUB_URL, "dest": "видео" }),
+        ).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{v}");
+        let job_id = v["job_id"].as_str().unwrap().to_string();
+
+        let v = wait_finished(&app, &tok, &job_id).await;
+        assert_eq!(v["state"], "done", "{v}");
+        // The last xr-progress line stuck (progress got parsed).
+        assert_eq!(v["progress"], 60.5);
+        assert_eq!(v["files"], serde_json::json!(["видео/Ролик [abc].mp4"]));
+
+        // The file really lies in the dest dir and the job dir is gone.
+        let published = share.path().join("видео/Ролик [abc].mp4");
+        assert_eq!(std::fs::read(&published).unwrap(), b"video-bytes");
+        assert!(no_job_dirs(share.path()));
+
+        // Visible in the manifest, already hashed (the cache was seeded).
+        let r = app.clone().oneshot(get_with_token("/I/manifest", Some(&tok))).await.unwrap();
+        let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let m: ShareManifest = serde_json::from_slice(&body).unwrap();
+        let entry = m.entries.iter().find(|e| e.path == "видео/Ролик [abc].mp4").expect("в манифесте");
+        assert_eq!(entry.sha256, sha_hex(b"video-bytes"));
+    }
+
+    #[tokio::test]
+    async fn test_import_gates() {
+        let key = SigningKey::from_bytes(&[31u8; 32]);
+        let share = tempfile::tempdir().unwrap();
+        let cfg = one_plugin("true", &["{url}"], &["*"], 1080);
+        let (app, tok) = import_app(&key, share.path(), Some(cfg.clone()), None);
+        let body = serde_json::json!({ "url": PUB_URL, "dest": "" });
+
+        // Unknown share -> 404 (before any token logic).
+        let (status, _) = post_import(&app, Some(&tok), "/X/import", body.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // No token -> 401; a read+write token without share:import -> 403.
+        let (status, _) = post_import(&app, None, "/I/import", body.clone()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let rw = sign_share_token(&key, "I", &rw_scope(), now_unix() + 1000);
+        let (status, _) = post_import(&app, Some(&rw), "/I/import", body.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // dest with traversal or a reserved component -> 403.
+        for dest in ["..", ".xr-import-1", "sub/.xr-part-x"] {
+            let (status, _) = post_import(
+                &app, Some(&tok), "/I/import",
+                serde_json::json!({ "url": PUB_URL, "dest": dest }),
+            ).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "dest {dest}");
+        }
+
+        // A share without the import flag -> 403 even with a good token.
+        let mut shares = SharesMap::new();
+        shares.insert(
+            "I".into(),
+            ShareRoot { path: share.path().canonicalize().unwrap(), is_file: false, writable: true, import: false },
+        );
+        let cache = Arc::new(HashCache::new());
+        let no_flag = router(Arc::new(AgentState {
+            shares: RwLock::new(Arc::new(shares)),
+            hub_key: key.verifying_key(),
+            hash_cache: cache.clone(),
+            identity: None,
+            max_file_mb: None,
+            import: ImportManager::new(Some(cfg), cache),
+        }));
+        let (status, _) = post_import(&no_flag, Some(&tok), "/I/import", body.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // No plugins configured -> 403 too (the double local opt-in).
+        let (app_nocfg, tok2) = import_app(&key, share.path(), None, None);
+        let (status, _) = post_import(&app_nocfg, Some(&tok2), "/I/import", body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_import_url_guard_and_routing() {
+        let key = SigningKey::from_bytes(&[32u8; 32]);
+        let share = tempfile::tempdir().unwrap();
+        // No catch-all: only youtube.com is routed.
+        let (app, tok) = import_app(&key, share.path(), Some(one_plugin("true", &["{url}"], &["youtube.com"], 1080)), None);
+
+        // Bad scheme and private addresses -> 400 up front (LLD-29 п. 2.6).
+        for url in [
+            "file:///etc/passwd",
+            "http://192.168.1.1/router-admin",
+            "http://127.0.0.1:8443/secret",
+            "http://[fe80::1]/x",
+            "http://localhost/x",
+        ] {
+            let (status, _) = post_import(
+                &app, Some(&tok), "/I/import",
+                serde_json::json!({ "url": url, "dest": "" }),
+            ).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "url {url}");
+        }
+
+        // Public host, but no plugin takes it -> 422.
+        let (status, v) = post_import(
+            &app, Some(&tok), "/I/import",
+            serde_json::json!({ "url": PUB_URL, "dest": "" }),
+        ).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+
+        // A height outside the sane range -> 400 before any enqueue.
+        let (app2, tok2) = import_app(&key, share.path(), Some(one_plugin("true", &["{url}"], &["*"], 1080)), None);
+        let (status, _) = post_import(
+            &app2, Some(&tok2), "/I/import",
+            serde_json::json!({ "url": PUB_URL, "dest": "", "height": 99999 }),
+        ).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_import_failures() {
+        let key = SigningKey::from_bytes(&[33u8; 32]);
+        let share = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+
+        // Non-zero exit: failed with the stderr tail, nothing published.
+        let script = write_script(bin.path(), "echo 'сайт не отдал видео' >&2\nexit 3");
+        let (app, tok) = import_app(&key, share.path(), Some(one_plugin(&script, &["{url}"], &["*"], 1080)), None);
+        let (status, v) = post_import(
+            &app, Some(&tok), "/I/import",
+            serde_json::json!({ "url": PUB_URL, "dest": "" }),
+        ).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let v = wait_finished(&app, &tok, v["job_id"].as_str().unwrap()).await;
+        assert_eq!(v["state"], "failed");
+        assert!(v["error"].as_str().unwrap().contains("сайт не отдал видео"), "{v}");
+        assert!(no_job_dirs(share.path()));
+
+        // A file over max_file_mb: failed, nothing published (LLD-29 п. 2.7).
+        let script = write_script(bin.path(), "head -c 2097160 /dev/zero > big.bin");
+        let (app, tok) = import_app(&key, share.path(), Some(one_plugin(&script, &["{url}"], &["*"], 1080)), Some(1));
+        let (_, v) = post_import(
+            &app, Some(&tok), "/I/import",
+            serde_json::json!({ "url": PUB_URL, "dest": "" }),
+        ).await;
+        let v = wait_finished(&app, &tok, v["job_id"].as_str().unwrap()).await;
+        assert_eq!(v["state"], "failed", "{v}");
+        assert!(v["error"].as_str().unwrap().contains("max_file_mb"), "{v}");
+        assert!(!share.path().join("big.bin").exists());
+        assert!(no_job_dirs(share.path()));
+
+        // A successful exit with an empty output dir is failed too, not a
+        // silent done-with-nothing.
+        let script = write_script(bin.path(), "exit 0");
+        let (app, tok) = import_app(&key, share.path(), Some(one_plugin(&script, &["{url}"], &["*"], 1080)), None);
+        let (_, v) = post_import(
+            &app, Some(&tok), "/I/import",
+            serde_json::json!({ "url": PUB_URL, "dest": "" }),
+        ).await;
+        let v = wait_finished(&app, &tok, v["job_id"].as_str().unwrap()).await;
+        assert_eq!(v["state"], "failed", "{v}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_import_timeout_and_total_cap() {
+        // The watchdog kills a job past its deadline or over max_total_mb;
+        // driven through the manager directly to use sub-minute limits.
+        use crate::import::JobSpec;
+        let share = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let cache = Arc::new(HashCache::new());
+        let mgr = ImportManager::new(None, cache);
+        mgr.spawn_runner();
+        let plugin = |cmd: &str| ImportPlugin {
+            name: "тест".into(),
+            patterns: vec!["*".into()],
+            max_height: 1080,
+            cmd: cmd.into(),
+            args: vec!["{url}".into()],
+        };
+        let spec = |cmd: &str, timeout: Duration, cap: Option<u64>| JobSpec {
+            share_root: share.path().canonicalize().unwrap(),
+            dest_rel: String::new(),
+            url: PUB_URL.into(),
+            height: 1080,
+            plugin: plugin(cmd),
+            timeout,
+            max_total_bytes: cap,
+            max_file_bytes: None,
+            sandbox: "none".into(),
+        };
+        let wait = |mgr: Arc<ImportManager>, id: String| async move {
+            for _ in 0..300 {
+                if let Some(dto) = mgr.status(&id) {
+                    if dto.state == "done" || dto.state == "failed" {
+                        return dto;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            panic!("job did not finish");
+        };
+
+        // Lifetime cap: the sleeper is killed, the job fails, the dir is gone.
+        let sleeper = write_script(bin.path(), "sleep 30");
+        let id = mgr.enqueue(spec(&sleeper, Duration::from_millis(200), None)).unwrap();
+        let dto = wait(mgr.clone(), id).await;
+        assert_eq!(dto.state, "failed");
+        assert!(dto.error.unwrap().contains("предел времени"));
+        assert!(no_job_dirs(share.path()));
+
+        // Total-size cap: writes past the cap, gets killed mid-download.
+        let hog = write_script(bin.path(), "head -c 100000 /dev/zero > part.bin\nsleep 30");
+        let id = mgr.enqueue(spec(&hog, Duration::from_secs(60), Some(1000))).unwrap();
+        let dto = wait(mgr.clone(), id).await;
+        assert_eq!(dto.state, "failed");
+        assert!(dto.error.unwrap().contains("max_total_mb"));
+        assert!(no_job_dirs(share.path()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_import_height() {
+        let key = SigningKey::from_bytes(&[34u8; 32]);
+        let share = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        // The fake plugin records the substituted height: args are
+        // ["<height>", "<url>"], so $1 is the effective height.
+        let script = write_script(bin.path(), "printf '%s' \"$1\" > out.txt");
+        let cfg = one_plugin(&script, &["{height}", "{url}"], &["*"], 1080);
+        let (app, tok) = import_app(&key, share.path(), Some(cfg), None);
+
+        let share_root = share.path().to_path_buf();
+        let run = |height: Option<u32>| {
+            let app = app.clone();
+            let tok = tok.clone();
+            let share_root = share_root.clone();
+            async move {
+                let mut body = serde_json::json!({ "url": PUB_URL, "dest": "" });
+                if let Some(h) = height {
+                    body["height"] = serde_json::json!(h);
+                }
+                let (status, v) = post_import(&app, Some(&tok), "/I/import", body).await;
+                assert_eq!(status, StatusCode::ACCEPTED, "{v}");
+                let v = wait_finished(&app, &tok, v["job_id"].as_str().unwrap()).await;
+                assert_eq!(v["state"], "done", "{v}");
+                std::fs::read_to_string(share_root.join("out.txt")).unwrap()
+            }
+        };
+
+        // A wish over the owner's cap clamps to the cap; below passes as is;
+        // no wish takes the cap (LLD-29 п. 3.9).
+        assert_eq!(run(Some(4000)).await, "1080");
+        assert_eq!(run(Some(720)).await, "720");
+        assert_eq!(run(None).await, "1080");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_import_cancel() {
+        let key = SigningKey::from_bytes(&[35u8; 32]);
+        let share = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let script = write_script(bin.path(), "sleep 30");
+        let (app, tok) = import_app(&key, share.path(), Some(one_plugin(&script, &["{url}"], &["*"], 1080)), None);
+
+        let (_, v) = post_import(
+            &app, Some(&tok), "/I/import",
+            serde_json::json!({ "url": PUB_URL, "dest": "" }),
+        ).await;
+        let job_id = v["job_id"].as_str().unwrap().to_string();
+
+        // Let it actually start (the process must be up for the kill path).
+        for _ in 0..200 {
+            let (_, v) = get_status(&app, &tok, &job_id).await;
+            if v["state"] == "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let r = app
+            .clone()
+            .oneshot(write_req("DELETE", &format!("/I/import/{job_id}"), Some(&tok), &[], b""))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+
+        // Polls now answer 404 (the job is forgotten, LLD-29 п. 2.5).
+        let (status, _) = get_status(&app, &tok, &job_id).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // The runner reaps the killed process and removes the job dir.
+        for _ in 0..300 {
+            if no_job_dirs(share.path()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(no_job_dirs(share.path()));
+
+        // Cancelling the unknown id again -> 404.
+        let r = app
+            .oneshot(write_req("DELETE", &format!("/I/import/{job_id}"), Some(&tok), &[], b""))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_import_output_filter() {
+        let key = SigningKey::from_bytes(&[36u8; 32]);
+        let share = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        // The plugin leaves a visible file, a hidden cache, a reserved-looking
+        // name and a subdir; only the visible file is published (LLD-29 п. 2.4).
+        let script = write_script(
+            bin.path(),
+            "printf 'ok' > visible.txt\nprintf 'x' > .hidden\nprintf 'y' > '.xr-хитрость'\nmkdir sub\nprintf 'z' > sub/nested.txt",
+        );
+        let (app, tok) = import_app(&key, share.path(), Some(one_plugin(&script, &["{url}"], &["*"], 1080)), None);
+
+        let (_, v) = post_import(
+            &app, Some(&tok), "/I/import",
+            serde_json::json!({ "url": PUB_URL, "dest": "" }),
+        ).await;
+        let v = wait_finished(&app, &tok, v["job_id"].as_str().unwrap()).await;
+        assert_eq!(v["state"], "done", "{v}");
+        assert_eq!(v["files"], serde_json::json!(["visible.txt"]));
+
+        assert_eq!(std::fs::read(share.path().join("visible.txt")).unwrap(), b"ok");
+        assert!(!share.path().join(".hidden").exists());
+        assert!(!share.path().join(".xr-хитрость").exists());
+        assert!(!share.path().join("sub").exists());
+        assert!(no_job_dirs(share.path()));
     }
 }

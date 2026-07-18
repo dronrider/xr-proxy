@@ -355,14 +355,16 @@ mod tests {
         let mut shares = SharesMap::new();
         shares.insert(
             "S".into(),
-            ShareRoot { path: dir.path().canonicalize().unwrap(), is_file: false, writable: false },
+            ShareRoot { path: dir.path().canonicalize().unwrap(), is_file: false, writable: false, import: false },
         );
+        let cache = Arc::new(HashCache::new());
         let state = Arc::new(AgentState {
             shares: RwLock::new(Arc::new(shares)),
             hub_key: hub.verifying_key(),
-            hash_cache: HashCache::new(),
+            hash_cache: cache.clone(),
             identity: Some(identity.clone()),
             max_file_mb: None,
+            import: crate::import::ImportManager::new(None, cache),
         });
         let cred = sign_agent_credential(&hub, &agent_pk, now() + 3600);
         let cred_blob =

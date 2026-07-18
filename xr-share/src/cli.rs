@@ -15,7 +15,7 @@ use base64::Engine;
 use clap::Args;
 use ed25519_dalek::SigningKey;
 
-use crate::config::{AgentConfig, ShareEntry};
+use crate::config::{AgentConfig, ImportConfig, ShareEntry};
 use crate::setup;
 
 /// Split a `--setup` blob back into (reg_token, invite_token). Inverse of the
@@ -121,6 +121,13 @@ pub struct ShareArgs {
     /// back off. Off by default.
     #[arg(long)]
     pub writable: bool,
+    /// Разрешить импорт по URL в эту шару (LLD-29): держатели write-инвайта
+    /// запускают скачивание страниц плагином агента (референс yt-dlp). Только
+    /// вместе с --writable. Если в конфиге ещё нет блока [import], команда
+    /// впишет референсный (yt-dlp, планка 1080p), предварительно проверив, что
+    /// yt-dlp и ffmpeg стоят в PATH.
+    #[arg(long)]
+    pub import: bool,
 }
 
 /// `xr-share install` — set up the binary + service with **no** folder binding.
@@ -222,6 +229,7 @@ pub fn install(config_path: &Path, args: InstallArgs) -> Result<()> {
         relay: relay_cfg,
         default_invite: setup_invite,
         max_file_mb: None,
+        import: None,
         shares: Vec::new(),
         dir: None,
         share_id: None,
@@ -280,6 +288,13 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     if args.writable && canon.is_file() {
         bail!("--writable недопустим для файла: писабельной может быть только папка");
     }
+    // Импорт это подвид записи (LLD-29): без права записи джобе некуда класть.
+    if args.import && !args.writable {
+        bail!("--import работает только вместе с --writable");
+    }
+    if args.import {
+        bootstrap_import(&mut cfg, &|bin| crate::import::which(bin).is_some())?;
+    }
     let name = args.name.clone().unwrap_or_else(|| {
         canon
             .file_name()
@@ -326,6 +341,7 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
         path: canon.display().to_string(),
         name: Some(name.clone()),
         writable: args.writable,
+        import: args.import,
     });
     write_config(config_path, &cfg)?;
 
@@ -353,6 +369,9 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     if args.writable {
         println!("  запись:   разрешена (держатели инвайта могут заливать и удалять файлы)");
     }
+    if args.import {
+        println!("  импорт:   разрешён (держатели write-инвайта запускают скачивание по URL)");
+    }
     if addr_is_private(&addr) {
         eprintln!("\n  ВНИМАНИЕ: адрес {addr} приватный, шара видна только в локальной сети.");
         eprintln!("  Снаружи она недоступна. Регистрируй с хоста агента (хаб подставит белый IP сам),");
@@ -365,6 +384,30 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     } else {
         println!("\n  Получатели с привязанным инвайтом уже видят шару (xr-share pull / приложение).");
     }
+    Ok(())
+}
+
+/// Вписать референсный `[import]`-блок в конфиг без него (LLD-29 п. 3.10),
+/// перед этим убедившись, что бинари референс-плагина стоят в PATH: честный
+/// отказ с подсказкой лучше «включённого» импорта, у которого падает каждая
+/// джоба. Уже настроенный блок не трогается (свои плагины, своя планка).
+fn bootstrap_import(cfg: &mut AgentConfig, has_bin: &dyn Fn(&str) -> bool) -> Result<()> {
+    if cfg.import.is_some() {
+        return Ok(());
+    }
+    let missing: Vec<&str> = ["yt-dlp", "ffmpeg"]
+        .into_iter()
+        .filter(|bin| !has_bin(bin))
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "для импорта нужны {} (не найдены в PATH). Поставь их (yt-dlp: `pip install -U yt-dlp`, \
+             ffmpeg пакетным менеджером) и повтори команду",
+            missing.join(" и ")
+        );
+    }
+    cfg.import = Some(ImportConfig::reference());
+    println!("  в конфиг вписан референсный блок [import] (yt-dlp, планка 1080p)");
     Ok(())
 }
 
@@ -619,7 +662,140 @@ fn drop_previous_shares(path: &Path, old: &AgentConfig) {
     }
 }
 
-// ── hub client ──────────────────────────────────────────────────────
+// -- харнесс импорта (LLD-29 п. 2.8) --------------------------------
+
+#[derive(Args)]
+pub struct ImportArgs {
+    /// Инвайт с write-привязкой к шаре (даёт скоуп share:import).
+    #[arg(long)]
+    pub invite: String,
+    /// Базовый URL хаба (по умолчанию боевой).
+    #[arg(long)]
+    pub hub: Option<String>,
+    /// Какая шара, по share_id или имени.
+    #[arg(long)]
+    pub share: String,
+    /// Ссылка на страницу с контентом.
+    pub url: String,
+    /// Каталог внутри шары (по умолчанию корень); агент создаст его сам.
+    #[arg(long)]
+    pub to: Option<String>,
+    /// Желаемая высота кадра; агент зажмёт её планкой владельца.
+    #[arg(long)]
+    pub height: Option<u32>,
+    /// Ходить к агенту по https (по умолчанию http).
+    #[arg(long)]
+    pub https: bool,
+}
+
+/// `xr-share import`: запустить джобу импорта и поллить её до конца, печатая
+/// прогресс. Инструмент проверки без устройства, симметричный `push`/`pull`.
+pub fn import(args: ImportArgs) -> Result<()> {
+    let hub = args.hub.clone().unwrap_or_else(|| crate::pull::HUB_DEFAULT.to_string());
+    let share = crate::push::select_share(&hub, &args.invite, &args.share)?;
+    // До сети: read-инвайт даёт токен без share:import, джобу он не запустит.
+    let token = crate::auth::decode_token_blob(&share.token)
+        .context("токен гранта не декодируется")?;
+    if !xr_proto::share::scope_contains(&token.scope, xr_proto::share::SCOPE_IMPORT) {
+        bail!(
+            "нет права импорта: инвайт даёт шару «{}» без share:import \
+             (нужна write-привязка на хабе и шара с --writable --import)",
+            share.name
+        );
+    }
+
+    let scheme = if args.https { "https" } else { "http" };
+    let base = format!("{scheme}://{}:{}/{}", share.addr, share.port, share.share_id);
+    let mut body = serde_json::json!({
+        "url": args.url,
+        "dest": args.to.clone().unwrap_or_default(),
+    });
+    if let Some(h) = args.height {
+        body["height"] = serde_json::json!(h);
+    }
+    let resp: serde_json::Value = agent_post_json(&format!("{base}/import"), &share.token, &body)?;
+    let job_id = str_field(&resp, "job_id")?;
+    println!("джоба запущена: {job_id}");
+
+    let mut last_progress: Option<String> = None;
+    loop {
+        std::thread::sleep(Duration::from_secs(2));
+        let status: serde_json::Value =
+            match agent_get_json(&format!("{base}/import/{job_id}"), &share.token) {
+                Ok(v) => v,
+                Err(e) if e.to_string().contains("HTTP 404") => {
+                    bail!("агент перезапустился, задание потерялось; запусти импорт заново")
+                }
+                Err(e) => return Err(e),
+            };
+        match status.get("state").and_then(|s| s.as_str()).unwrap_or("") {
+            "done" => {
+                println!("готово, файлы в шаре:");
+                if let Some(files) = status.get("files").and_then(|f| f.as_array()) {
+                    for f in files {
+                        println!("  {}", f.as_str().unwrap_or_default());
+                    }
+                }
+                return Ok(());
+            }
+            "failed" => bail!(
+                "импорт не удался: {}",
+                status.get("error").and_then(|e| e.as_str()).unwrap_or("причина неизвестна")
+            ),
+            state => {
+                let line = match status.get("progress").and_then(|p| p.as_f64()) {
+                    Some(p) => format!("{state}: {p:.1}%"),
+                    None => state.to_string(),
+                };
+                // Не спамить одинаковыми строками при опросе раз в 2 секунды.
+                if last_progress.as_deref() != Some(line.as_str()) {
+                    println!("  {line}");
+                    last_progress = Some(line);
+                }
+            }
+        }
+    }
+}
+
+/// POST JSON к агенту с bearer-токеном шары.
+fn agent_post_json(url: &str, token: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+    match ureq::post(url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("content-type", "application/json")
+        .timeout(Duration::from_secs(30))
+        .send_string(&body.to_string())
+    {
+        Ok(r) => {
+            let s = r.into_string().context("чтение ответа агента")?;
+            serde_json::from_str(&s).context("разбор ответа агента")
+        }
+        Err(ureq::Error::Status(code, r)) => bail!(
+            "агент отклонил запрос (HTTP {code}): {}",
+            r.into_string().unwrap_or_default()
+        ),
+        Err(e) => bail!("сеть при запросе к агенту: {e}"),
+    }
+}
+
+fn agent_get_json(url: &str, token: &str) -> Result<serde_json::Value> {
+    match ureq::get(url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .timeout(Duration::from_secs(30))
+        .call()
+    {
+        Ok(r) => {
+            let s = r.into_string().context("чтение ответа агента")?;
+            serde_json::from_str(&s).context("разбор ответа агента")
+        }
+        Err(ureq::Error::Status(code, r)) => bail!(
+            "агент отклонил запрос (HTTP {code}): {}",
+            r.into_string().unwrap_or_default()
+        ),
+        Err(e) => bail!("сеть при запросе к агенту: {e}"),
+    }
+}
+
+// -- hub client ------------------------------------------------------
 
 /// Trade a reg-token for an agent credential blob (`POST /share/exchange`),
 /// plus the hub's relay descriptor if it advertises one (LLD-23 §2.4).
@@ -693,7 +869,7 @@ fn write_config(path: &Path, cfg: &AgentConfig) -> Result<()> {
 fn normalize_legacy(cfg: &mut AgentConfig) {
     if let (Some(dir), Some(id)) = (cfg.dir.take(), cfg.share_id.take()) {
         if !cfg.shares.iter().any(|s| s.share_id == id) {
-            cfg.shares.push(ShareEntry { share_id: id, path: dir, name: None, writable: false });
+            cfg.shares.push(ShareEntry { share_id: id, path: dir, name: None, writable: false, import: false });
         }
     }
 }
@@ -751,7 +927,8 @@ mod tests {
             relay: None,
             default_invite: None,
             max_file_mb: None,
-            shares: vec![ShareEntry { share_id: "s1".into(), path: "/srv/x".into(), name: None, writable: false }],
+            import: None,
+            shares: vec![ShareEntry { share_id: "s1".into(), path: "/srv/x".into(), name: None, writable: false, import: false }],
             dir: None,
             share_id: None,
         }
@@ -883,6 +1060,35 @@ mod tests {
         cfg.agent_credential = Some("mandate".into());
         cfg.hub_url = None;
         assert!(unshare_target(&cfg).is_none());
+    }
+
+    #[test]
+    fn test_import_bootstrap() {
+        // На конфиге без [import] бутстрап вписывает референс-блок, и тот
+        // проходит парсинг и собственную валидацию (LLD-29 п. 3.10).
+        let mut cfg = minimal_cfg();
+        bootstrap_import(&mut cfg, &|_| true).unwrap();
+        let block = cfg.import.as_ref().expect("блок вписан");
+        assert_eq!(block.plugins[0].name, "yt-dlp");
+        assert!(block.plugins[0].patterns.contains(&"*".to_string()));
+        let text = toml::to_string(&cfg).unwrap();
+        let back: AgentConfig = toml::from_str(&text).unwrap();
+        back.validate_import().unwrap();
+        assert_eq!(back.import.unwrap().plugins.len(), 1);
+
+        // Без бинарей в PATH отказ с подсказкой, конфиг не тронут.
+        let mut cfg = minimal_cfg();
+        let err = bootstrap_import(&mut cfg, &|bin| bin != "ffmpeg").unwrap_err().to_string();
+        assert!(err.contains("ffmpeg"), "подсказка называет недостающее: {err}");
+        assert!(cfg.import.is_none(), "конфиг не должен меняться при отказе");
+
+        // Уже настроенный блок не перетирается референсом.
+        let mut cfg = minimal_cfg();
+        let mut custom = ImportConfig::reference();
+        custom.plugins[0].name = "свой".into();
+        cfg.import = Some(custom);
+        bootstrap_import(&mut cfg, &|_| false).unwrap();
+        assert_eq!(cfg.import.unwrap().plugins[0].name, "свой");
     }
 
     #[test]

@@ -118,6 +118,9 @@ the token. The write routes are v2 only.
 | `GET /{id}/file/{*path}`       | `share:read`  | file bytes; supports `Range` (resume)              |
 | `PUT /{id}/file/{*path}`       | `share:write` | upload a file; `201` new, `204` overwrite          |
 | `DELETE /{id}/file/{*path}`    | `share:write` | remove a file; `204`, `404` missing, `409` a dir   |
+| `POST /{id}/import`            | `share:import`| start a URL-import job; `202 {"job_id"}`           |
+| `GET /{id}/import/{job}`       | `share:import`| poll: `state`, `progress`, `files`/`error`         |
+| `DELETE /{id}/import/{job}`    | `share:import`| cancel the job (kills the plugin); `204`           |
 
 Token is presented as a URL-safe base64 blob of the hub's `ShareToken` JSON, via
 `Authorization: Bearer <blob>`, `X-Share-Token: <blob>`, or `?token=<blob>`
@@ -126,15 +129,17 @@ Token is presented as a URL-safe base64 blob of the hub's `ShareToken` JSON, via
 otherwise `401` (no/garbled token) or `403` (wrong share, expired, bad signature,
 or missing scope). Tokens are never logged.
 
-### Scope model (LLD-28)
+### Scope model (LLD-28, LLD-29)
 
 The token carries an OAuth-style `scope` string inside its signed bytes: today
-`share:read` and `share:write`. Read routes need `share:read`, write routes
-`share:write`; a grant with write access gets both names. Write scope is minted
-by a single path only, `GET /api/v1/invite/{token}/shares` for an invite that has
-a **write-binding** to a **writable** share; the share link and `/share/mint`
-always hand out read-only tokens. A holder reads its own rights by decoding the
-grant's token blob and looking for `share:write` in `scope`.
+`share:read`, `share:write` and `share:import`. Read routes need `share:read`,
+write routes `share:write`, import routes `share:import`. Write and import
+scopes are minted by a single path only, `GET /api/v1/invite/{token}/shares` for
+an invite that has a **write-binding** to a **writable** share (import rides on
+the write binding; a separate axis appears when someone needs one without the
+other); the share link and `/share/mint` always hand out read-only tokens. A
+holder reads its own rights by decoding the grant's token blob and looking for
+the names in `scope`.
 
 ### Write path (PUT / DELETE)
 
@@ -163,6 +168,55 @@ Optional headers:
 - `max_file_mb` in the agent config caps an upload: over the cap is `413` (by
   `Content-Length` up front, else while streaming). A full disk is `507`; the
   temp is removed on any failure.
+
+### URL import (LLD-29)
+
+A writable share can also accept **import jobs**: an invite holder sends a page
+URL, and the *agent* downloads its content into the share with an external
+plugin (the reference is a yt-dlp + ffmpeg wrapper). The core stays a thin file
+server: nothing is vendored, the owner installs the tools and lists them in the
+`[import]` config block (see [configs/share.toml](../configs/share.toml)).
+Enable per share:
+
+```sh
+sudo xr-share share /srv/dropbox --writable --import
+```
+
+If the config has no `[import]` block yet, `share --import` bootstraps the
+reference yt-dlp block itself, after checking that `yt-dlp` and `ffmpeg` are in
+`PATH` (a clear refusal with an install hint otherwise). The desktop harness
+runs an import without a device:
+
+```sh
+xr-share import --invite <TOKEN> --share <id|name> "https://youtu.be/..." \
+  [--to <subdir>] [--height 720]
+```
+
+Plugin contract: the agent runs `cmd` + `args` as one process per job, cwd is a
+private `.xr-import-<rand>/` dir in the share root. The `{url}` args element is
+replaced by the link as **one literal argv argument** (no shell); `{height}`
+inside any element becomes the effective frame height, `min(requested,
+max_height)`. On exit 0 the agent publishes the cwd's top-level non-hidden
+regular files into the destination through the same hash + fsync + rename
+contour as an upload. Optional `xr-progress <percent>` lines on stdout feed the
+job's progress; the stderr tail becomes the error text of a failed job.
+
+Jobs are asynchronous and ephemeral: one runs at a time (a short queue behind
+it, then `429`), finished ones stay pollable for an hour, an agent restart
+forgets the table (a poll then answers `404`) and sweeps leftover
+`.xr-import-*` dirs. The whole `.xr-` name prefix is reserved in every route
+and hidden from the manifest. Limits: `timeout_min` per job, `max_total_mb`
+per job's output (checked while downloading), `max_file_mb` per published file.
+
+**SSRF stance.** The URL comes from a device but is fetched from the owner's
+machine inside their LAN, so before the plugin starts the agent refuses
+non-http(s) schemes and any host resolving to a private/special range
+(loopback, RFC1918, link-local, CGNAT, multicast, v6 ULA...). On Linux with
+systemd the plugin additionally runs in a `systemd-run` scope with those same
+ranges denied at the kernel (`IPAddressDeny`), which also covers redirects and
+DNS rebinding after the check; on Windows or systemd-less Linux the pre-start
+gate is the only barrier -- an accepted residual risk in a trusted write
+circle. `sandbox = "none"` turns the wrapper off explicitly.
 
 The manifest response is signed with the agent's identity key (XR-046): the
 `x-xr-manifest-sig` / `x-xr-manifest-signed-at` headers carry an ed25519

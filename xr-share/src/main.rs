@@ -6,6 +6,7 @@
 mod auth;
 mod cli;
 mod config;
+mod import;
 mod manifest;
 mod pull;
 mod push;
@@ -69,6 +70,9 @@ enum Commands {
     Push(push::PushArgs),
     /// Remove a file from a writable share on an invite (desktop).
     Rm(push::RmArgs),
+    /// Start a URL-import job on a writable share and poll it to completion
+    /// (LLD-29): the agent downloads the page's content with its plugin.
+    Import(cli::ImportArgs),
     /// Manage OS autostart (systemd on Linux, Scheduled Task on Windows).
     Service {
         #[command(subcommand)]
@@ -108,6 +112,7 @@ fn main() -> Result<()> {
         Some(Commands::Pull(args)) => return pull::pull(args),
         Some(Commands::Push(args)) => return push::push(args),
         Some(Commands::Rm(args)) => return push::rm(args),
+        Some(Commands::Import(args)) => return cli::import(args),
         Some(Commands::Service { action }) => {
             return match action {
                 ServiceAction::Install => setup::service_install(&config_path),
@@ -167,21 +172,37 @@ async fn run(path: &Path) -> Result<()> {
         ),
     }
 
+    // A broken import surface (bad plugin template, import without writable)
+    // stops the agent here, not at the first job (LLD-29).
+    cfg.validate_import()?;
+
     // Resolve the configured shares. An empty set is allowed (the agent runs and
     // waits for `xr-share share <path>` to add one, picked up by hot-reload).
     let shares = server::build_shares(&cfg.resolved_shares());
     if shares.is_empty() {
-        tracing::warn!("no shares configured yet — add one with `xr-share share <path>`");
+        tracing::warn!("no shares configured yet, add one with `xr-share share <path>`");
     } else {
         tracing::info!("serving {} share(s)", shares.len());
     }
 
+    // Leftovers of a previous run: half-written upload temps and import job
+    // dirs whose in-memory table died with the process (LLD-29 п. 3.7).
+    for root in shares.values() {
+        if !root.is_file {
+            import::sweep_share_root(&root.path);
+        }
+    }
+
+    let hash_cache = Arc::new(manifest::HashCache::new());
+    let import_mgr = import::ImportManager::new(cfg.import.clone(), hash_cache.clone());
+    import_mgr.spawn_runner();
     let state = Arc::new(AgentState {
         shares: RwLock::new(Arc::new(shares)),
         hub_key,
-        hash_cache: manifest::HashCache::new(),
+        hash_cache,
         identity,
         max_file_mb: cfg.max_file_mb,
+        import: import_mgr,
     });
 
     // Hot reload: pick up `share`/`unshare` edits to the config without restart.
@@ -280,11 +301,14 @@ fn spawn_config_watcher(state: Arc<AgentState>, path: PathBuf) {
                 continue;
             }
             last = cur;
-            match reload_share_entries(&path) {
-                Ok(entries) => {
-                    let map = server::build_shares(&entries);
+            match reload_config(&path) {
+                Ok(cfg) => {
+                    let map = server::build_shares(&cfg.resolved_shares());
                     let n = map.len();
                     *state.shares.write().expect("shares lock poisoned") = Arc::new(map);
+                    // `share --import` bootstraps the [import] block into the
+                    // config while the agent runs; pick it up the same way.
+                    state.import.set_config(cfg.import);
                     tracing::info!("config changed, {n} share(s) now served");
                 }
                 Err(e) => tracing::warn!("config reload failed, keeping current shares: {e:#}"),
@@ -311,11 +335,14 @@ fn mtime_of(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-fn reload_share_entries(path: &Path) -> Result<Vec<config::ShareEntry>> {
+fn reload_config(path: &Path) -> Result<AgentConfig> {
     let cfg: AgentConfig =
         toml::from_str(&std::fs::read_to_string(path).context("reading config")?)
             .context("parsing config")?;
-    Ok(cfg.resolved_shares())
+    // The same fail-fast as startup: a hot-edited broken import block keeps the
+    // previous config instead of half-applying.
+    cfg.validate_import()?;
+    Ok(cfg)
 }
 
 /// Generate and print an ed25519 identity keypair (base64).

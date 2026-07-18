@@ -29,7 +29,7 @@ relay = [
 
 [dependencies]
 xr-proto = { path = "../xr-proto", features = ["share"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "fs", "process", "sync"] }
 axum = { version = "0.8", features = ["json"] }
 axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
 tower = "0.5"
@@ -54,6 +54,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+
+# Убить группу процессов плагина импорта (LLD-29): yt-dlp порождает ffmpeg, и
+# child.kill() оставил бы его сиротой качать дальше. Только unix, на Windows
+# группы нет и убивается сам child.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Реверс-туннель к relay (feature `relay`, default off): identity-TLS сервер над
 # реверс-стримами mux. ring-бэкенд, чтобы кросс-сборка не тянула aws-lc.

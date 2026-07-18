@@ -23,16 +23,21 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 use xr_proto::share::{ShareManifest, ShareManifestEntry};
 
-/// Reserved prefix for an in-flight upload's temp file (LLD-28). A `PUT` streams
-/// into `.xr-part-<rand>` next to its target and renames on completion; the walk
-/// skips these so a half-written file never shows in the manifest, and
-/// [`crate::safepath`] refuses any request path with a component of this prefix
-/// so no one can read or overwrite another upload's partial.
+/// Reserved name prefix for everything service-owned inside a share (LLD-29
+/// п. 3.8): upload temps (`.xr-part-*`), import job dirs (`.xr-import-*`) and
+/// any future private names. The walk skips such components (files *and*
+/// directories), and [`crate::safepath`] refuses request paths naming them, so
+/// nothing half-done is ever listed, read, overwritten or deleted via a route.
+pub const RESERVED_PREFIX: &str = ".xr-";
+
+/// Prefix of an in-flight upload's temp file (LLD-28), one name inside the
+/// reserved [`RESERVED_PREFIX`] namespace. A `PUT` streams into
+/// `.xr-part-<rand>` next to its target and renames on completion.
 pub const UPLOAD_TEMP_PREFIX: &str = ".xr-part-";
 
-/// True if `name` is a reserved upload temp file (see [`UPLOAD_TEMP_PREFIX`]).
-fn is_upload_temp(name: &std::ffi::OsStr) -> bool {
-    name.to_string_lossy().starts_with(UPLOAD_TEMP_PREFIX)
+/// True if `name` is service-owned (see [`RESERVED_PREFIX`]).
+fn is_reserved(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with(RESERVED_PREFIX)
 }
 
 /// Per-file SHA-256 cache keyed by absolute path. Shared across all shares and
@@ -111,20 +116,28 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+/// The walk both manifest builders share: no symlink following, and every
+/// reserved `.xr-` component pruned. Pruning (not per-entry filtering) matters
+/// for directories: an import job dir's contents must never surface, however
+/// the files inside are named (LLD-29 п. 3.8). The root itself is exempt so an
+/// oddly-named share still serves.
+fn walk_share(root: &Path) -> impl Iterator<Item = walkdir::Result<walkdir::DirEntry>> {
+    WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !is_reserved(e.file_name()))
+}
+
 /// Walk `root` and produce a manifest, hashing through `cache`. Entries are
 /// sorted by path so the output is deterministic (stable diffs, reproducible
 /// tests).
 pub fn build_manifest(root: &Path, cache: &HashCache) -> Result<ShareManifest> {
     let mut entries = Vec::new();
 
-    for entry in WalkDir::new(root).follow_links(false).into_iter() {
+    for entry in walk_share(root) {
         let entry = entry.context("walking share directory")?;
-        // Only regular files — skip dirs and symlinks.
+        // Only regular files (dirs and symlinks are skipped).
         if !entry.file_type().is_file() {
-            continue;
-        }
-        // An in-flight upload's temp file is not part of the share (LLD-28).
-        if is_upload_temp(entry.file_name()) {
             continue;
         }
         let path = entry.path();
@@ -159,12 +172,9 @@ pub fn build_manifest(root: &Path, cache: &HashCache) -> Result<ShareManifest> {
 pub fn build_listing(root: &Path, cache: &HashCache) -> Result<ShareManifest> {
     let mut entries = Vec::new();
 
-    for entry in WalkDir::new(root).follow_links(false).into_iter() {
+    for entry in walk_share(root) {
         let entry = entry.context("walking share directory")?;
         if !entry.file_type().is_file() {
-            continue;
-        }
-        if is_upload_temp(entry.file_name()) {
             continue;
         }
         let path = entry.path();
@@ -318,14 +328,18 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_skips_upload_temp() {
-        // An in-flight upload's `.xr-part-*` file must not appear in the listing
-        // or the hashed manifest (LLD-28): a consumer never sees a half-write.
+    fn test_manifest_skips_xr_namespace() {
+        // Nothing service-owned may appear in the listing or the hashed manifest:
+        // an in-flight upload's `.xr-part-*` (LLD-28) and a whole `.xr-import-*`
+        // job directory with its contents (LLD-29), whatever the files inside
+        // are called.
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("real.txt"), b"hello").unwrap();
         fs::write(dir.path().join(".xr-part-abc123"), b"half").unwrap();
         fs::create_dir(dir.path().join("sub")).unwrap();
         fs::write(dir.path().join("sub/.xr-part-def"), b"partial").unwrap();
+        fs::create_dir(dir.path().join(".xr-import-77")).unwrap();
+        fs::write(dir.path().join(".xr-import-77/Ролик.mp4"), b"downloading").unwrap();
 
         let cache = HashCache::new();
         let m = build_manifest(dir.path(), &cache).unwrap();

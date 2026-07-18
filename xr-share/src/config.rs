@@ -57,6 +57,10 @@ pub struct AgentConfig {
     /// refused with `413` before it is written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_file_mb: Option<u64>,
+    /// URL-import settings + plugin registry (LLD-29). Absent block means no
+    /// import anywhere: the local opt-in on top of the `share:import` scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import: Option<ImportConfig>,
     /// The shares this agent serves. Each `[[share]]` is a `share_id` + path.
     #[serde(default, rename = "share")]
     pub shares: Vec<ShareEntry>,
@@ -85,6 +89,89 @@ pub struct ShareEntry {
     /// writable; a file share stays read-only. Set by `xr-share share --writable`.
     #[serde(default)]
     pub writable: bool,
+    /// The agent accepts URL-import jobs into this share (LLD-29). Off by
+    /// default and only valid together with `writable`: import is a kind of
+    /// write. Set by `xr-share share --writable --import`.
+    #[serde(default)]
+    pub import: bool,
+}
+
+/// Job limits and the plugin registry for URL import (LLD-29 п. 2.3). The block
+/// is agent-global; each share still opts in with its own `import` flag.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ImportConfig {
+    /// Hard cap on one job's lifetime, minutes. The process is killed past it.
+    #[serde(default = "default_import_timeout_min")]
+    pub timeout_min: u64,
+    /// Optional cap on a job's total output, in mebibytes, checked while it
+    /// downloads. `None` means unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_mb: Option<u64>,
+    /// `auto` wraps the plugin in systemd-run with private ranges denied
+    /// (Linux); `none` disables the wrapper explicitly.
+    #[serde(default = "default_import_sandbox")]
+    pub sandbox: String,
+    #[serde(default, rename = "plugin")]
+    pub plugins: Vec<ImportPlugin>,
+}
+
+/// One external fetcher: a command plus the host suffixes it takes.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ImportPlugin {
+    pub name: String,
+    /// Host suffixes matched at label boundaries; `"*"` makes it the catch-all.
+    pub patterns: Vec<String>,
+    /// The owner's quality ceiling: a job never downloads above this height,
+    /// whatever the device asked (LLD-29 п. 3.9).
+    #[serde(default = "default_import_max_height")]
+    pub max_height: u32,
+    pub cmd: String,
+    /// argv template. The element equal to `{url}` is replaced by the link as
+    /// one literal argument (no shell); `{height}` inside any element is
+    /// replaced by the validated effective height.
+    pub args: Vec<String>,
+}
+
+fn default_import_timeout_min() -> u64 {
+    30
+}
+
+fn default_import_sandbox() -> String {
+    "auto".into()
+}
+
+fn default_import_max_height() -> u32 {
+    1080
+}
+
+impl ImportConfig {
+    /// The reference block `share --import` bootstraps into a config that has no
+    /// `[import]` yet (LLD-29 п. 3.10): a catch-all yt-dlp wrapper capped at
+    /// 1080p. Mirrors `configs/share.toml`.
+    pub fn reference() -> Self {
+        Self {
+            timeout_min: default_import_timeout_min(),
+            max_total_mb: Some(4096),
+            sandbox: default_import_sandbox(),
+            plugins: vec![ImportPlugin {
+                name: "yt-dlp".into(),
+                patterns: vec!["youtube.com".into(), "youtu.be".into(), "*".into()],
+                max_height: default_import_max_height(),
+                cmd: "yt-dlp".into(),
+                args: vec![
+                    "--no-playlist".into(),
+                    "--newline".into(),
+                    "-f".into(),
+                    "bv*[height<={height}]+ba/b[height<={height}]".into(),
+                    "--progress-template".into(),
+                    "download:xr-progress %(progress._percent_str)s".into(),
+                    "-o".into(),
+                    "%(title).200B [%(id)s].%(ext)s".into(),
+                    "{url}".into(),
+                ],
+            }],
+        }
+    }
 }
 
 /// The relay this agent tunnels through for NAT'd shares (LLD-23 §2.4). Mirror
@@ -176,10 +263,50 @@ impl AgentConfig {
                     name: None,
                     // Legacy single-share configs predate writable shares.
                     writable: false,
+                    import: false,
                 });
             }
         }
         shares
+    }
+
+    /// Fail-fast checks for the import surface (LLD-29 п. 2.3): a broken plugin
+    /// template or an `import` flag without `writable` must stop the agent at
+    /// startup, not fail every job at runtime.
+    pub fn validate_import(&self) -> Result<()> {
+        if let Some(import) = &self.import {
+            if import.sandbox != "auto" && import.sandbox != "none" {
+                anyhow::bail!("[import] sandbox must be \"auto\" or \"none\", got {:?}", import.sandbox);
+            }
+            for p in &import.plugins {
+                if p.patterns.is_empty() {
+                    anyhow::bail!("import plugin {:?}: patterns must not be empty", p.name);
+                }
+                // {url} carries untrusted input, so it may only ever be a whole
+                // argv element; embedded in a string it would invite quoting
+                // games in whatever the command does with it.
+                if !p.args.iter().any(|a| a == "{url}") {
+                    anyhow::bail!("import plugin {:?}: args must contain \"{{url}}\" as its own element", p.name);
+                }
+                if p.args.iter().any(|a| a != "{url}" && a.contains("{url}")) {
+                    anyhow::bail!("import plugin {:?}: \"{{url}}\" must be a whole argv element, not part of one", p.name);
+                }
+                if !(crate::import::HEIGHT_MIN..=crate::import::HEIGHT_MAX).contains(&p.max_height) {
+                    anyhow::bail!(
+                        "import plugin {:?}: max_height must be {}..{}",
+                        p.name,
+                        crate::import::HEIGHT_MIN,
+                        crate::import::HEIGHT_MAX
+                    );
+                }
+            }
+        }
+        for s in self.resolved_shares() {
+            if s.import && !s.writable {
+                anyhow::bail!("share {}: import = true requires writable = true", s.share_id);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -264,7 +391,8 @@ mod tests {
             relay: None,
             default_invite: Some("inv123".into()),
             max_file_mb: Some(100),
-            shares: vec![ShareEntry { share_id: "a".into(), path: "/srv/x".into(), name: Some("X".into()), writable: true }],
+            import: None,
+            shares: vec![ShareEntry { share_id: "a".into(), path: "/srv/x".into(), name: Some("X".into()), writable: true, import: true }],
             dir: None,
             share_id: None,
         };
@@ -272,9 +400,67 @@ mod tests {
         let back: AgentConfig = toml::from_str(&text).unwrap();
         assert_eq!(back.resolved_shares().len(), 1);
         assert!(back.resolved_shares()[0].writable, "writable flag must survive the roundtrip");
+        assert!(back.resolved_shares()[0].import, "import flag must survive the roundtrip");
         assert_eq!(back.max_file_mb, Some(100));
         assert_eq!(back.hub_url.as_deref(), Some("https://hub"));
         assert_eq!(back.default_invite.as_deref(), Some("inv123"));
         assert!(back.dir.is_none());
+    }
+
+    #[test]
+    fn test_import_config_parse() {
+        // The [import] block with a plugin parses, survives a roundtrip (the
+        // bootstrap in `share --import` rewrites the config), and the reference
+        // block is itself valid.
+        let toml_text = r#"
+            listen = "0.0.0.0:8443"
+            hub_pubkey = "QQ=="
+            [import]
+            timeout_min = 10
+            max_total_mb = 512
+            [[import.plugin]]
+            name = "yt-dlp"
+            patterns = ["youtube.com", "*"]
+            max_height = 720
+            cmd = "yt-dlp"
+            args = ["-f", "b[height<={height}]", "{url}"]
+            [[share]]
+            share_id = "w"
+            path = "/srv/x"
+            writable = true
+            import = true
+        "#;
+        let cfg: AgentConfig = toml::from_str(toml_text).unwrap();
+        cfg.validate_import().unwrap();
+        let import = cfg.import.as_ref().unwrap();
+        assert_eq!(import.timeout_min, 10);
+        assert_eq!(import.max_total_mb, Some(512));
+        assert_eq!(import.sandbox, "auto");
+        assert_eq!(import.plugins[0].max_height, 720);
+        assert!(cfg.resolved_shares()[0].import);
+
+        let back: AgentConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.import.as_ref().unwrap().plugins.len(), 1);
+        assert!(back.resolved_shares()[0].import);
+
+        // {url} inside a string, not its own argv element -> startup error.
+        let mut broken = cfg.clone();
+        broken.import.as_mut().unwrap().plugins[0].args = vec!["--get={url}".into()];
+        assert!(broken.validate_import().is_err());
+
+        // No {url} at all is just as dead.
+        let mut broken = cfg.clone();
+        broken.import.as_mut().unwrap().plugins[0].args = vec!["-f".into(), "b".into()];
+        assert!(broken.validate_import().is_err());
+
+        // import = true without writable -> startup error.
+        let mut broken = cfg.clone();
+        broken.shares[0].writable = false;
+        assert!(broken.validate_import().is_err());
+
+        // The bootstrap reference block passes its own validation.
+        let mut with_ref = cfg;
+        with_ref.import = Some(ImportConfig::reference());
+        with_ref.validate_import().unwrap();
     }
 }

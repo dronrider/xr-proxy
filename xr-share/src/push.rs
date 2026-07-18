@@ -140,7 +140,8 @@ pub fn rm(args: RmArgs) -> Result<()> {
 }
 
 /// Fetch the invite's shares and pick the one named by `--share` (id or name).
-fn select_share(hub: &str, invite: &str, want: &str) -> Result<InviteShareDto> {
+/// Shared with the `import` harness (`crate::cli`), which selects the same way.
+pub(crate) fn select_share(hub: &str, invite: &str, want: &str) -> Result<InviteShareDto> {
     let url = format!("{}/api/v1/invite/{}/shares", hub.trim_end_matches('/'), invite);
     let shares: Vec<InviteShareDto> = get_json(&url, None).context("список шар по инвайту")?;
     shares
