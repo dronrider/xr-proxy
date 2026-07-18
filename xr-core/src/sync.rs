@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use xr_proto::share::{
     scope_contains, RelayGrant, ShareGrant, ShareInfo, ShareManifest, ShareManifestEntry,
-    ShareToken, SCOPE_WRITE,
+    ShareToken, SCOPE_IMPORT, SCOPE_WRITE,
 };
 
 // ── Transfer control (progress + cancel) ─────────────────────────────
@@ -984,6 +984,154 @@ async fn delete_with(
     }
 }
 
+// -- import path (LLD-29) -------------------------------------------
+
+/// Returned by the import calls when the grant's token has no `share:import`
+/// scope: refused before the network, worded for the user (as
+/// [`ERR_NO_WRITE_SCOPE`]).
+pub const ERR_NO_IMPORT_SCOPE: &str = "no_import_scope: нет права импорта на эту шару";
+/// The agent answered `422`: no configured plugin takes this URL's host.
+pub const ERR_NO_IMPORT_PLUGIN: &str = "no_plugin: нет плагина под эту ссылку";
+/// A poll answered `404` for a job we started: the agent restarted and its
+/// in-memory job table is gone (LLD-29 п. 3.7).
+pub const ERR_IMPORT_JOB_LOST: &str = "job_lost: агент перезапустился, задание потерялось";
+
+/// One import job's state as the agent reports it (LLD-29 п. 2.5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportStatus {
+    /// `queued` | `running` | `done` | `failed`.
+    pub state: String,
+    #[serde(default)]
+    pub progress: Option<f64>,
+    /// Published share-relative paths; present only on `done`.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Human-readable reason; present only on `failed`.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Start a URL-import job on the grant's share (LLD-29 п. 2.8): the agent
+/// downloads the page's content with its configured plugin into `dest` (a
+/// share-relative directory, "" = the root). `height` is the wanted frame
+/// height; the agent clamps it to the owner's cap. Same transport as the write
+/// path: direct first, relay fallback. Refused before the network when the
+/// grant's token lacks `share:import`.
+pub async fn import_url(
+    grant: &ShareGrant,
+    url: &str,
+    dest: &str,
+    height: Option<u32>,
+    timeout: Duration,
+) -> Result<String, String> {
+    let token = decode_share_token(&grant.token)?;
+    if !scope_contains(&token.scope, SCOPE_IMPORT) {
+        return Err(ERR_NO_IMPORT_SCOPE.to_string());
+    }
+    let direct_base = format!("http://{}:{}/{}", grant.addr, grant.port, grant.share_id);
+    let token = &token;
+    direct_then_relay(
+        &direct_base,
+        &grant.agent_pubkey,
+        grant.relay.as_ref(),
+        &token.share_id,
+        timeout,
+        |client, base| async move {
+            let mut body = serde_json::json!({ "url": url, "dest": dest });
+            if let Some(h) = height {
+                body["height"] = serde_json::json!(h);
+            }
+            let resp = client
+                .post(format!("{}/import", base.trim_end_matches('/')))
+                .bearer_auth(token_blob(token))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("network: {e}"))?;
+            match resp.status().as_u16() {
+                202 => {
+                    let v: serde_json::Value =
+                        resp.json().await.map_err(|e| format!("parse: {e}"))?;
+                    v.get("job_id")
+                        .and_then(|j| j.as_str())
+                        .map(str::to_string)
+                        .ok_or_else(|| "parse: нет job_id в ответе".to_string())
+                }
+                422 => Err(ERR_NO_IMPORT_PLUGIN.to_string()),
+                code => Err(format!("http_{code}")),
+            }
+        },
+    )
+    .await
+}
+
+/// Poll a job started by [`import_url`]. A `404` maps to
+/// [`ERR_IMPORT_JOB_LOST`] (the UI shows it as "the job got lost").
+pub async fn import_status(
+    grant: &ShareGrant,
+    job_id: &str,
+    timeout: Duration,
+) -> Result<ImportStatus, String> {
+    let token = decode_share_token(&grant.token)?;
+    if !scope_contains(&token.scope, SCOPE_IMPORT) {
+        return Err(ERR_NO_IMPORT_SCOPE.to_string());
+    }
+    let direct_base = format!("http://{}:{}/{}", grant.addr, grant.port, grant.share_id);
+    let token = &token;
+    direct_then_relay(
+        &direct_base,
+        &grant.agent_pubkey,
+        grant.relay.as_ref(),
+        &token.share_id,
+        timeout,
+        |client, base| async move {
+            let resp = client
+                .get(format!("{}/import/{job_id}", base.trim_end_matches('/')))
+                .bearer_auth(token_blob(token))
+                .send()
+                .await
+                .map_err(|e| format!("network: {e}"))?;
+            match resp.status().as_u16() {
+                200 => resp.json().await.map_err(|e| format!("parse: {e}")),
+                404 => Err(ERR_IMPORT_JOB_LOST.to_string()),
+                code => Err(format!("http_{code}")),
+            }
+        },
+    )
+    .await
+}
+
+/// Cancel a running/queued import job; the agent kills the plugin and forgets
+/// the job. Cancelling one that is already gone is not an error.
+pub async fn import_cancel(grant: &ShareGrant, job_id: &str, timeout: Duration) -> Result<(), String> {
+    let token = decode_share_token(&grant.token)?;
+    if !scope_contains(&token.scope, SCOPE_IMPORT) {
+        return Err(ERR_NO_IMPORT_SCOPE.to_string());
+    }
+    let direct_base = format!("http://{}:{}/{}", grant.addr, grant.port, grant.share_id);
+    let token = &token;
+    direct_then_relay(
+        &direct_base,
+        &grant.agent_pubkey,
+        grant.relay.as_ref(),
+        &token.share_id,
+        timeout,
+        |client, base| async move {
+            let resp = client
+                .delete(format!("{}/import/{job_id}", base.trim_end_matches('/')))
+                .bearer_auth(token_blob(token))
+                .send()
+                .await
+                .map_err(|e| format!("network: {e}"))?;
+            match resp.status().as_u16() {
+                204 | 404 => Ok(()),
+                code => Err(format!("http_{code}")),
+            }
+        },
+    )
+    .await
+}
+
 /// A connect/timeout failure (as opposed to an authoritative HTTP/signature
 /// answer): only this warrants falling back to the relay.
 fn is_unreachable(err: &str) -> bool {
@@ -1796,6 +1944,102 @@ mod tests {
 
         let req = rx.await.unwrap();
         assert!(req.starts_with("DELETE /S/file/old.txt "), "wrong request line: {req}");
+    }
+
+    // -- import path (LLD-29) -------------------------------------------
+
+    /// [`serve_capture`] with a JSON body in the answer (the import routes
+    /// return payloads, not just status lines).
+    async fn serve_capture_json(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let resp = format!(
+                "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+            let _ = tx.send(req);
+        });
+        (addr, rx)
+    }
+
+    const IMPORT_SCOPE: &str = "share:read share:write share:import";
+
+    #[tokio::test]
+    async fn test_import_roundtrip() {
+        // Start: POST /S/import with the url/dest/height body -> job_id.
+        let (addr, rx) = serve_capture_json("HTTP/1.1 202 Accepted", r#"{"job_id":"ab12"}"#).await;
+        let grant = write_grant(addr, IMPORT_SCOPE);
+        let job = import_url(&grant, "https://youtu.be/x", "видео", Some(720), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(job, "ab12");
+        let req = rx.await.unwrap();
+        assert!(req.starts_with("POST /S/import "), "wrong request line: {req}");
+        assert!(req.contains(r#""height":720"#), "height missing: {req}");
+        assert!(req.contains(r#""dest":"видео""#), "dest missing: {req}");
+
+        // Poll: GET /S/import/{id} -> the parsed status.
+        let (addr, rx) = serve_capture_json(
+            "HTTP/1.1 200 OK",
+            r#"{"state":"done","progress":100.0,"files":["видео/Ролик.mp4"]}"#,
+        )
+        .await;
+        let grant = write_grant(addr, IMPORT_SCOPE);
+        let st = import_status(&grant, "ab12", Duration::from_secs(5)).await.unwrap();
+        assert_eq!(st.state, "done");
+        assert_eq!(st.files, vec!["видео/Ролик.mp4".to_string()]);
+        assert!(rx.await.unwrap().starts_with("GET /S/import/ab12 "));
+
+        // Cancel: DELETE -> 204 is Ok.
+        let (addr, rx) = serve_capture_json("HTTP/1.1 204 No Content", "").await;
+        let grant = write_grant(addr, IMPORT_SCOPE);
+        import_cancel(&grant, "ab12", Duration::from_secs(5)).await.unwrap();
+        assert!(rx.await.unwrap().starts_with("DELETE /S/import/ab12 "));
+    }
+
+    #[tokio::test]
+    async fn test_import_error_mapping() {
+        // 422 on start means no plugin takes the URL; 404 on poll means the
+        // agent restarted and lost the job (LLD-29 п. 3.7). Both map to their
+        // named errors, single-sourced here for the UI.
+        let (addr, _rx) = serve_capture_json("HTTP/1.1 422 Unprocessable Entity", "").await;
+        let grant = write_grant(addr, IMPORT_SCOPE);
+        let err = import_url(&grant, "https://example.org/x", "", None, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(err, ERR_NO_IMPORT_PLUGIN);
+
+        let (addr, _rx) = serve_capture_json("HTTP/1.1 404 Not Found", "").await;
+        let grant = write_grant(addr, IMPORT_SCOPE);
+        let err = import_status(&grant, "gone", Duration::from_secs(5)).await.unwrap_err();
+        assert_eq!(err, ERR_IMPORT_JOB_LOST);
+    }
+
+    #[tokio::test]
+    async fn import_refused_without_scope_before_network() {
+        // A grant without share:import is refused locally: the unreachable
+        // address is never dialed.
+        let grant = write_grant("127.0.0.1:1".parse().unwrap(), "share:read share:write");
+        let err = import_url(&grant, "https://x/y", "", None, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert_eq!(err, ERR_NO_IMPORT_SCOPE);
+        let err = import_status(&grant, "j", Duration::from_secs(2)).await.unwrap_err();
+        assert_eq!(err, ERR_NO_IMPORT_SCOPE);
+        let err = import_cancel(&grant, "j", Duration::from_secs(2)).await.unwrap_err();
+        assert_eq!(err, ERR_NO_IMPORT_SCOPE);
     }
 
     #[tokio::test]
