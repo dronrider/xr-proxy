@@ -364,8 +364,8 @@ private fun ExplorerView(
                 contentPadding = PaddingValues(horizontal = 8.dp),
             ) { Text("‹ Назад") }
             Spacer(Modifier.weight(1f))
-            // Импорт по URL (LLD-29): агент скачает страницу в открытую папку.
-            // Действие видно только когда грант несёт share:import.
+            // URL import (LLD-29): the agent downloads the page into the open
+            // folder. Shown only when the grant carries share:import.
             if (cfg.canImport) {
                 IconButton(onClick = { vm.openImportDialog(cfg.shareId) }) {
                     Icon(Icons.Default.AddLink, contentDescription = "Импорт по URL")
@@ -404,8 +404,8 @@ private fun ExplorerView(
         }
         val p = ui.progress
         if (p != null) ProgressBar(p) { vm.cancelTransfer() }
-        // Строка живой джобы импорта (LLD-29): качает агент, тут только счётчик
-        // и отмена; уход с экрана скачивание не прерывает.
+        // The live import job's row (LLD-29): the agent downloads, this is just
+        // the counter and the cancel; leaving the screen does not interrupt.
         val importJob = ui.importJob
         if (importJob != null && importJob.shareId == cfg.shareId) {
             ImportRow(importJob) { vm.cancelImport(cfg) }
@@ -461,15 +461,16 @@ private fun ExplorerView(
     }
 }
 
-// -- импорт по URL (LLD-29, тексты из п. 2.8) -----------------------
+// -- URL import (LLD-29, UI texts fixed in п. 2.8) ------------------
 
-/** Диалог запуска импорта: поле ссылки и ряд чипов качества. Выбор качества
- *  это пожелание сверху вниз: «Максимум» не шлёт высоту, и планку тогда
- *  держит только владелец агента. */
+/** The import dialog: a link field and a row of quality chips. Quality is a
+ *  top-down wish: "Максимум" sends no height, so only the owner's cap
+ *  limits the download. */
 @Composable
 private fun ImportDialog(onStart: (String, Int?) -> Unit, onDismiss: () -> Unit) {
     var url by remember { mutableStateOf("") }
-    // null это «Максимум»; чипы фиксированы, планку владельца телефон не знает.
+    // null means "Максимум"; the chips are fixed since the phone does not
+    // know the owner's cap.
     var height by remember { mutableStateOf<Int?>(1080) }
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -513,7 +514,7 @@ private fun ImportDialog(onStart: (String, Int?) -> Unit, onDismiss: () -> Unit)
     )
 }
 
-/** Строка задачи над списком файлов: «Импорт: N%» с крестиком-отменой. */
+/** The task row above the file list: "Импорт: N%" with a cancel cross. */
 @Composable
 private fun ImportRow(job: FilesViewModel.ImportJob, onCancel: () -> Unit) {
     Card(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {

@@ -177,9 +177,9 @@ class ShareRepository(private val context: Context) {
         }.getOrElse { SyncOutcome(0, 0, 0, it.message ?: "sync error") }
     }
 
-    /** Запустить импорт по URL в папку [dest] шары (LLD-29): качает агент, мы
-     *  получаем job_id и дальше поллим [importStatus]. [height] null отдаёт
-     *  выбор качества планке владельца. */
+    /** Start a URL import into the share's [dest] folder (LLD-29): the agent
+     *  downloads, we get a job_id and poll [importStatus]. A null [height]
+     *  leaves the quality choice to the owner's cap. */
     fun importUrl(config: ShareConfig, url: String, dest: String, height: Int?): Result<String> {
         val token = config.tokenJson
             ?: return Result.failure(IllegalStateException("no token"))
@@ -196,8 +196,8 @@ class ShareRepository(private val context: Context) {
         }
     }
 
-    /** Состояние джобы импорта; потерянная агентом джоба приходит ошибкой
-     *  `job_lost: ...` (текст уже человеческий, из Rust). */
+    /** An import job's state; a job the agent forgot (restart) comes back as
+     *  the `job_lost: ...` error, already human-worded in Rust. */
     fun importStatus(config: ShareConfig, jobId: String): Result<ImportState> {
         val token = config.tokenJson
             ?: return Result.failure(IllegalStateException("no token"))
@@ -209,7 +209,7 @@ class ShareRepository(private val context: Context) {
         )
     }
 
-    /** Отменить джобу импорта (агент убивает скачивание и забывает её). */
+    /** Cancel an import job (the agent kills the download and forgets it). */
     fun importCancel(config: ShareConfig, jobId: String) {
         val token = config.tokenJson ?: return
         NativeBridge.nativeImportCancel(
@@ -239,8 +239,9 @@ class ShareRepository(private val context: Context) {
         /** Transfers may be multi-GB; the engine uses a 10s connect-timeout, so a
          *  long total just bounds a genuinely stuck transfer. */
         private const val XFER_TIMEOUT_MS = 3_600_000L
-        /** Запуск и опрос джобы импорта это короткие метадата-вызовы: качает
-         *  агент у себя, а не телефон, долгий таймаут тут ни к чему. */
+        /** Starting and polling an import job are short metadata calls: the
+         *  agent downloads on its own machine, not the phone, so no long
+         *  timeout is needed here. */
         private const val IMPORT_TIMEOUT_MS = 30_000L
     }
 }

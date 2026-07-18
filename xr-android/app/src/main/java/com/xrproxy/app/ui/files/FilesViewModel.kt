@@ -86,18 +86,18 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
          *  open (XR-135), or null. A manual sync with an empty selection is a
          *  destructive delete-only pass, so it asks before wiping the copy. */
         val confirmDeleteAllFor: String? = null,
-        /** Шара, для которой открыт диалог «Импорт по URL» (LLD-29), или null. */
+        /** Share whose "Импорт по URL" dialog is open (LLD-29), or null. */
         val importDialogFor: String? = null,
-        /** Живая джоба импорта: агент качает, экран поллит раз в 2 секунды.
-         *  Уход с экрана опрос останавливает, скачивание на агенте нет. */
+        /** Live import job: the agent downloads, this screen polls every 2
+         *  seconds. Leaving the screen stops the poll, not the download. */
         val importJob: ImportJob? = null,
     )
 
-    /** Джоба импорта по URL, за которой следит открытый экран (LLD-29). */
+    /** A URL-import job the open screen is tracking (LLD-29). */
     data class ImportJob(
         val shareId: String,
         val jobId: String,
-        /** Проценты от агента; null, пока плагин их не прислал. */
+        /** Percent from the agent; null until the plugin reports any. */
         val progress: Double? = null,
     )
 
@@ -273,8 +273,8 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun closeShare() {
-        // Опрос живёт, пока открыт экран шары; скачивание на агенте продолжится
-        // и без нас, готовый файл догонит листинг при следующем открытии.
+        // The poll lives as long as the share screen; the agent-side download
+        // continues without us and the file shows up on the next open.
         stopImportPolling()
         _ui.update {
             it.copy(
@@ -440,16 +440,26 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update { it.copy(message = "Останавливаю…") }
     }
 
-    // -- импорт по URL (LLD-29) -------------------------------------
+    // -- URL import (LLD-29) ----------------------------------------
 
     private var importPoll: Job? = null
+
+    /** Consecutive failed polls tolerated before giving up: one lost poll on a
+     *  network handover must not orphan a job that keeps running on the agent. */
+    private val importPollFailureLimit = 3
 
     fun openImportDialog(shareId: String) = _ui.update { it.copy(importDialogFor = shareId) }
     fun dismissImportDialog() = _ui.update { it.copy(importDialogFor = null) }
 
-    /** Запустить импорт [url] в открытую сейчас папку шары. [height] null это
-     *  «Максимум»: планку качества тогда держит только владелец агента. */
+    /** Start importing [url] into the currently open folder of the share.
+     *  [height] null means "Максимум": the owner's cap alone limits quality. */
     fun startImport(config: ShareConfig, url: String, height: Int?) {
+        // One tracked job at a time: a second start would orphan the first
+        // (untrackable, uncancellable) on the agent's single-worker queue.
+        if (_ui.value.importJob != null) {
+            _ui.update { it.copy(importDialogFor = null, message = "Импорт уже идёт, дождись или отмени его") }
+            return
+        }
         val dest = _ui.value.currentPath
         _ui.update { it.copy(importDialogFor = null) }
         viewModelScope.launch {
@@ -470,7 +480,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Крестик на строке импорта: убить скачивание на агенте и забыть джобу. */
+    /** The cross on the import row: kill the download on the agent, forget the job. */
     fun cancelImport(config: ShareConfig) {
         val job = _ui.value.importJob ?: return
         stopImportPolling()
@@ -478,25 +488,31 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) { repo.importCancel(config, job.jobId) }
     }
 
-    /** Опрос раз в 2 секунды, пока экран открыт (LLD-29 п. 2.8): по done
-     *  строка исчезает и листинг обновляется, по failed показывается текст
-     *  ошибки агента. */
+    /** Poll every 2 seconds while the screen is open (LLD-29 п. 2.8): on done
+     *  the row disappears and the listing refreshes, on failed the agent's
+     *  error text is shown. Transient poll failures are tolerated up to
+     *  [importPollFailureLimit] in a row: the job runs on the agent and one
+     *  lost network round-trip says nothing about it. */
     private fun startImportPolling(config: ShareConfig, jobId: String) {
         stopImportPolling()
         importPoll = viewModelScope.launch {
+            var failures = 0
             while (true) {
                 delay(2_000)
                 val result = withContext(Dispatchers.IO) { repo.importStatus(config, jobId) }
                 val state = result.getOrNull()
                 when {
                     state == null -> {
-                        _ui.update {
-                            it.copy(
-                                importJob = null,
-                                message = "Импорт: ${humanImportError(result.exceptionOrNull()?.message ?: "ошибка")}",
-                            )
+                        failures++
+                        if (failures >= importPollFailureLimit) {
+                            _ui.update {
+                                it.copy(
+                                    importJob = null,
+                                    message = "Импорт: ${humanImportError(result.exceptionOrNull()?.message ?: "ошибка")}",
+                                )
+                            }
+                            break
                         }
-                        break
                     }
                     state.state == "done" -> {
                         _ui.update { it.copy(importJob = null, message = "Импорт завершён") }
@@ -512,8 +528,11 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                         }
                         break
                     }
-                    else -> _ui.update { st ->
-                        st.copy(importJob = st.importJob?.copy(progress = state.progress))
+                    else -> {
+                        failures = 0
+                        _ui.update { st ->
+                            st.copy(importJob = st.importJob?.copy(progress = state.progress))
+                        }
                     }
                 }
             }
@@ -525,13 +544,13 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         importPoll = null
     }
 
-    /** Ошибки импорта приходят с машинным префиксом (`no_plugin: ...`), текст
-     *  после него уже человеческий и живёт в Rust (единый источник). */
+    /** Import errors carry a machine prefix (`no_plugin: ...`); the text after
+     *  it is already human-worded and single-sourced in Rust. */
     private fun humanImportError(e: String): String =
         if (Regex("^[a-z_]+: ").containsMatchIn(e)) e.substringAfter(": ") else e
 
-    /** Перечитать манифест открытой шары после завершившегося импорта, чтобы
-     *  файл появился в листинге без ручного обновления. */
+    /** Re-fetch the open share's manifest after a finished import, so the new
+     *  file shows up in the listing without a manual refresh. */
     private suspend fun refreshOpenShare(config: ShareConfig) {
         if (_ui.value.openShareId != config.shareId) return
         val result = withContext(Dispatchers.IO) { repo.fetchManifest(config) }

@@ -183,8 +183,9 @@ data class ShareConfig(
     /** Relay leg for the native calls; empty string means direct-only. */
     val relayArg: String get() = relayJson ?: ""
 
-    /** Импорт по URL доступен, когда хаб сминтил share:import в скоуп токена
-     *  (write-привязка инвайта, LLD-29). Остальные гейты держит агент. */
+    /** URL import is available when the hub minted share:import into the token
+     *  scope (a write-binding on the invite, LLD-29); the agent holds the rest
+     *  of the gates. Same whole-name semantics as Rust's scope_contains. */
     val canImport: Boolean
         get() = runCatching {
             JSONObject(tokenJson ?: return false).optString("scope")
@@ -237,7 +238,7 @@ data class ShareConfig(
     }
 }
 
-/** Состояние джобы импорта по URL, как его отдаёт агент (LLD-29). */
+/** A URL-import job's state as the agent reports it (LLD-29). */
 data class ImportState(
     val state: String,
     val progress: Double?,
