@@ -18,7 +18,7 @@ use xr_core::update;
 use xr_proto::config::RoutingConfig;
 use xr_proto::invite_url;
 use xr_core::sync::LocalFile;
-use xr_proto::share::{RelayGrant, ShareManifest, ShareManifestEntry, ShareToken};
+use xr_proto::share::{RelayGrant, ShareGrant, ShareManifest, ShareManifestEntry, ShareToken};
 
 use base64::Engine as _;
 use std::collections::HashSet;
@@ -1461,6 +1461,159 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
             }
             json_error(&e)
         }
+    };
+    jstring_into_raw(&mut env, json)
+}
+
+/// Rebuild the [`ShareGrant`] the import calls take from the pieces Kotlin
+/// stores per share (LLD-29): the decoded token JSON goes back to its blob
+/// form, the share id comes from the token itself.
+fn grant_from_parts(
+    addr: String,
+    port: u16,
+    token: ShareToken,
+    agent_pubkey: String,
+    relay: Option<RelayGrant>,
+) -> ShareGrant {
+    let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&token).expect("serialize token"));
+    ShareGrant {
+        share_id: token.share_id.clone(),
+        name: String::new(),
+        addr,
+        port,
+        agent_pubkey,
+        token: blob,
+        exp: token.exp,
+        relay,
+    }
+}
+
+/// Start a URL-import job on a share (LLD-29): the agent downloads the page's
+/// content with its plugin into `dest` (share-relative dir, "" = root).
+/// `height` is the wanted frame height, `<= 0` means "the owner's cap".
+/// Returns `{"job_id":".."}` or `{"error":".."}`; the scope check runs before
+/// any network, so a read-only grant fails fast with a human message.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeImportUrl(
+    mut env: JNIEnv,
+    _class: JClass,
+    addr: JString,
+    port: jint,
+    token_json: JString,
+    agent_pubkey: JString,
+    relay_json: JString,
+    url: JString,
+    dest: JString,
+    height: jint,
+    timeout_ms: jlong,
+) -> jstring {
+    let parts = (|| -> Result<(String, ShareToken, String, Option<RelayGrant>, String, String), String> {
+        let addr = read_jstring(&mut env, &addr)?;
+        let token = read_jstring(&mut env, &token_json).and_then(|s| parse_token(&s))?;
+        let pubkey = read_jstring(&mut env, &agent_pubkey)?;
+        let relay = read_jstring(&mut env, &relay_json).ok().and_then(|s| parse_relay(&s));
+        let url = read_jstring(&mut env, &url)?;
+        let dest = read_jstring(&mut env, &dest)?;
+        Ok((addr, token, pubkey, relay, url, dest))
+    })();
+    let (addr, token, pubkey, relay, url, dest) = match parts {
+        Ok(p) => p,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let share_id = token.share_id.clone();
+    let grant = grant_from_parts(addr, port.max(0) as u16, token, pubkey, relay);
+    let wanted = (height > 0).then_some(height as u32);
+    let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+
+    let json = match with_onboarding_runtime(sync::import_url(&grant, &url, &dest, wanted, timeout)) {
+        Ok(Ok(job_id)) => {
+            journal_log("INFO", "files", &format!("импорт запущен, шара {share_id}, джоба {job_id}"));
+            serde_json::json!({ "job_id": job_id }).to_string()
+        }
+        Ok(Err(e)) | Err(e) => {
+            journal_log("WARN", "files", &format!("импорт не запустился, шара {share_id}: {e}"));
+            json_error(&e)
+        }
+    };
+    jstring_into_raw(&mut env, json)
+}
+
+/// Poll an import job: returns the agent's status JSON
+/// (`{"state":"..","progress":..,"files":[..],"error":".."}`) or
+/// `{"error":".."}`. A lost job (agent restart) comes back as the named
+/// `job_lost: ...` error, worded in Rust.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeImportStatus(
+    mut env: JNIEnv,
+    _class: JClass,
+    addr: JString,
+    port: jint,
+    token_json: JString,
+    agent_pubkey: JString,
+    relay_json: JString,
+    job_id: JString,
+    timeout_ms: jlong,
+) -> jstring {
+    let parts = (|| -> Result<(String, ShareToken, String, Option<RelayGrant>, String), String> {
+        let addr = read_jstring(&mut env, &addr)?;
+        let token = read_jstring(&mut env, &token_json).and_then(|s| parse_token(&s))?;
+        let pubkey = read_jstring(&mut env, &agent_pubkey)?;
+        let relay = read_jstring(&mut env, &relay_json).ok().and_then(|s| parse_relay(&s));
+        let job_id = read_jstring(&mut env, &job_id)?;
+        Ok((addr, token, pubkey, relay, job_id))
+    })();
+    let (addr, token, pubkey, relay, job_id) = match parts {
+        Ok(p) => p,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let grant = grant_from_parts(addr, port.max(0) as u16, token, pubkey, relay);
+    let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+
+    let json = match with_onboarding_runtime(sync::import_status(&grant, &job_id, timeout)) {
+        Ok(Ok(status)) => serde_json::to_string(&status)
+            .unwrap_or_else(|e| json_error(&format!("serialize: {e}"))),
+        Ok(Err(e)) | Err(e) => json_error(&e),
+    };
+    jstring_into_raw(&mut env, json)
+}
+
+/// Cancel an import job (the agent kills the plugin and forgets the job).
+/// Returns `{"ok":true}` or `{"error":".."}`.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeImportCancel(
+    mut env: JNIEnv,
+    _class: JClass,
+    addr: JString,
+    port: jint,
+    token_json: JString,
+    agent_pubkey: JString,
+    relay_json: JString,
+    job_id: JString,
+    timeout_ms: jlong,
+) -> jstring {
+    let parts = (|| -> Result<(String, ShareToken, String, Option<RelayGrant>, String), String> {
+        let addr = read_jstring(&mut env, &addr)?;
+        let token = read_jstring(&mut env, &token_json).and_then(|s| parse_token(&s))?;
+        let pubkey = read_jstring(&mut env, &agent_pubkey)?;
+        let relay = read_jstring(&mut env, &relay_json).ok().and_then(|s| parse_relay(&s));
+        let job_id = read_jstring(&mut env, &job_id)?;
+        Ok((addr, token, pubkey, relay, job_id))
+    })();
+    let (addr, token, pubkey, relay, job_id) = match parts {
+        Ok(p) => p,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let share_id = token.share_id.clone();
+    let grant = grant_from_parts(addr, port.max(0) as u16, token, pubkey, relay);
+    let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+
+    let json = match with_onboarding_runtime(sync::import_cancel(&grant, &job_id, timeout)) {
+        Ok(Ok(())) => {
+            journal_log("INFO", "files", &format!("импорт отменён, шара {share_id}, джоба {job_id}"));
+            serde_json::json!({ "ok": true }).to_string()
+        }
+        Ok(Err(e)) | Err(e) => json_error(&e),
     };
     jstring_into_raw(&mut env, json)
 }
