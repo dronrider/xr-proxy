@@ -2,6 +2,7 @@ package com.xrproxy.app.data
 
 import android.content.Context
 import com.xrproxy.app.jni.NativeBridge
+import com.xrproxy.app.model.ImportState
 import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
 import com.xrproxy.app.model.ShareGrant
@@ -176,6 +177,47 @@ class ShareRepository(private val context: Context) {
         }.getOrElse { SyncOutcome(0, 0, 0, it.message ?: "sync error") }
     }
 
+    /** Запустить импорт по URL в папку [dest] шары (LLD-29): качает агент, мы
+     *  получаем job_id и дальше поллим [importStatus]. [height] null отдаёт
+     *  выбор качества планке владельца. */
+    fun importUrl(config: ShareConfig, url: String, dest: String, height: Int?): Result<String> {
+        val token = config.tokenJson
+            ?: return Result.failure(IllegalStateException("no token"))
+        val res = NativeBridge.nativeImportUrl(
+            config.addr, config.port, token, config.agentPubkey, config.relayArg,
+            url, dest, height ?: 0, IMPORT_TIMEOUT_MS,
+        )
+        return runCatching {
+            val o = JSONObject(res)
+            o.optString("error").takeIf { it.isNotBlank() && it != "null" }?.let {
+                throw IllegalStateException(it)
+            }
+            o.getString("job_id")
+        }
+    }
+
+    /** Состояние джобы импорта; потерянная агентом джоба приходит ошибкой
+     *  `job_lost: ...` (текст уже человеческий, из Rust). */
+    fun importStatus(config: ShareConfig, jobId: String): Result<ImportState> {
+        val token = config.tokenJson
+            ?: return Result.failure(IllegalStateException("no token"))
+        return ImportState.parse(
+            NativeBridge.nativeImportStatus(
+                config.addr, config.port, token, config.agentPubkey, config.relayArg,
+                jobId, IMPORT_TIMEOUT_MS,
+            ),
+        )
+    }
+
+    /** Отменить джобу импорта (агент убивает скачивание и забывает её). */
+    fun importCancel(config: ShareConfig, jobId: String) {
+        val token = config.tokenJson ?: return
+        NativeBridge.nativeImportCancel(
+            config.addr, config.port, token, config.agentPubkey, config.relayArg,
+            jobId, IMPORT_TIMEOUT_MS,
+        )
+    }
+
     /** The share's persistent hash-index file (XR-098). Lives in the app's
      *  private [Context.getFilesDir], never inside the share directory: that one
      *  is walked by [localPaths]/[localManifest] for the UI, cleaned by the
@@ -197,5 +239,8 @@ class ShareRepository(private val context: Context) {
         /** Transfers may be multi-GB; the engine uses a 10s connect-timeout, so a
          *  long total just bounds a genuinely stuck transfer. */
         private const val XFER_TIMEOUT_MS = 3_600_000L
+        /** Запуск и опрос джобы импорта это короткие метадата-вызовы: качает
+         *  агент у себя, а не телефон, долгий таймаут тут ни к чему. */
+        private const val IMPORT_TIMEOUT_MS = 30_000L
     }
 }

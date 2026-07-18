@@ -183,6 +183,14 @@ data class ShareConfig(
     /** Relay leg for the native calls; empty string means direct-only. */
     val relayArg: String get() = relayJson ?: ""
 
+    /** Импорт по URL доступен, когда хаб сминтил share:import в скоуп токена
+     *  (write-привязка инвайта, LLD-29). Остальные гейты держит агент. */
+    val canImport: Boolean
+        get() = runCatching {
+            JSONObject(tokenJson ?: return false).optString("scope")
+                .split(' ').contains("share:import")
+        }.getOrDefault(false)
+
     /** Selection as the JSON array the native sync/plan calls expect. */
     fun selectionJson(): String = JSONArray().apply { selection.forEach { put(it) } }.toString()
 
@@ -226,6 +234,33 @@ data class ShareConfig(
             storageChosen = o.optBoolean("storage_chosen", false),
             relayJson = o.optString("relay_json").takeIf { it.isNotBlank() && it != "null" },
         )
+    }
+}
+
+/** Состояние джобы импорта по URL, как его отдаёт агент (LLD-29). */
+data class ImportState(
+    val state: String,
+    val progress: Double?,
+    val files: List<String>,
+    val error: String?,
+) {
+    val finished: Boolean get() = state == "done" || state == "failed"
+
+    companion object {
+        fun parse(json: String): Result<ImportState> = runCatching {
+            val o = JSONObject(json)
+            o.optString("error").takeIf { it.isNotBlank() && it != "null" && !o.has("state") }?.let {
+                throw IllegalStateException(it)
+            }
+            ImportState(
+                state = o.getString("state"),
+                progress = if (o.isNull("progress")) null else o.optDouble("progress"),
+                files = (o.optJSONArray("files") ?: JSONArray()).let { arr ->
+                    (0 until arr.length()).map { arr.getString(it) }
+                },
+                error = o.optString("error").takeIf { it.isNotBlank() && it != "null" },
+            )
+        }
     }
 }
 

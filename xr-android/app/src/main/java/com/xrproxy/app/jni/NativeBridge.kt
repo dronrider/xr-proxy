@@ -266,6 +266,48 @@ object NativeBridge {
         timeoutMs: Long,
     ): String
 
+    /** Start a URL-import job on a writable share (LLD-29): the agent downloads
+     *  the page's content with its plugin into [dest] (share-relative folder,
+     *  "" = the root). [height] is the wanted frame height, `<= 0` leaves the
+     *  choice to the owner's cap. Returns `{"job_id":".."}` or `{"error":".."}`
+     *  (a grant without share:import fails before any network). */
+    external fun nativeImportUrl(
+        addr: String,
+        port: Int,
+        tokenJson: String,
+        agentPubkey: String,
+        relayJson: String,
+        url: String,
+        dest: String,
+        height: Int,
+        timeoutMs: Long,
+    ): String
+
+    /** Poll an import job: `{"state":"queued|running|done|failed","progress":..,
+     *  "files":[..],"error":".."}` or `{"error":".."}`. A job the agent forgot
+     *  (restart) comes back as the named `job_lost: ...` error. */
+    external fun nativeImportStatus(
+        addr: String,
+        port: Int,
+        tokenJson: String,
+        agentPubkey: String,
+        relayJson: String,
+        jobId: String,
+        timeoutMs: Long,
+    ): String
+
+    /** Cancel an import job (the agent kills its plugin and forgets the job).
+     *  Returns `{"ok":true}` or `{"error":".."}`. */
+    external fun nativeImportCancel(
+        addr: String,
+        port: Int,
+        tokenJson: String,
+        agentPubkey: String,
+        relayJson: String,
+        jobId: String,
+        timeoutMs: Long,
+    ): String
+
     /** Move a share's downloaded files from [srcDir] to [dstDir] after a storage-
      *  directory change (XR-043), without re-downloading. Same-volume moves are
      *  renames; cross-volume is copy+remove, pre-checked against free space. Holds

@@ -25,6 +25,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AddLink
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DriveFileMove
 import androidx.compose.material.icons.filled.Folder
@@ -35,11 +37,13 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -360,6 +364,13 @@ private fun ExplorerView(
                 contentPadding = PaddingValues(horizontal = 8.dp),
             ) { Text("‹ Назад") }
             Spacer(Modifier.weight(1f))
+            // Импорт по URL (LLD-29): агент скачает страницу в открытую папку.
+            // Действие видно только когда грант несёт share:import.
+            if (cfg.canImport) {
+                IconButton(onClick = { vm.openImportDialog(cfg.shareId) }) {
+                    Icon(Icons.Default.AddLink, contentDescription = "Импорт по URL")
+                }
+            }
             // Sync the selected subset; the icon + count light up once something is
             // ticked. The count is "<to download> / <total selected files>".
             IconButton(onClick = { vm.syncNow(cfg) }) {
@@ -393,6 +404,12 @@ private fun ExplorerView(
         }
         val p = ui.progress
         if (p != null) ProgressBar(p) { vm.cancelTransfer() }
+        // Строка живой джобы импорта (LLD-29): качает агент, тут только счётчик
+        // и отмена; уход с экрана скачивание не прерывает.
+        val importJob = ui.importJob
+        if (importJob != null && importJob.shareId == cfg.shareId) {
+            ImportRow(importJob) { vm.cancelImport(cfg) }
+        }
         HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
 
         when {
@@ -418,6 +435,13 @@ private fun ExplorerView(
         }
     }
 
+    if (ui.importDialogFor == cfg.shareId) {
+        ImportDialog(
+            onStart = { url, height -> vm.startImport(cfg, url, height) },
+            onDismiss = { vm.dismissImportDialog() },
+        )
+    }
+
     detailsFor?.let { e ->
         AlertDialog(
             onDismissRequest = { detailsFor = null },
@@ -434,6 +458,78 @@ private fun ExplorerView(
                 }
             },
         )
+    }
+}
+
+// -- импорт по URL (LLD-29, тексты из п. 2.8) -----------------------
+
+/** Диалог запуска импорта: поле ссылки и ряд чипов качества. Выбор качества
+ *  это пожелание сверху вниз: «Максимум» не шлёт высоту, и планку тогда
+ *  держит только владелец агента. */
+@Composable
+private fun ImportDialog(onStart: (String, Int?) -> Unit, onDismiss: () -> Unit) {
+    var url by remember { mutableStateOf("") }
+    // null это «Максимум»; чипы фиксированы, планку владельца телефон не знает.
+    var height by remember { mutableStateOf<Int?>(1080) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Импорт по URL") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = url,
+                    onValueChange = { url = it },
+                    label = { Text("Ссылка") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    FilterChip(
+                        selected = height == 720,
+                        onClick = { height = 720 },
+                        label = { Text("720p") },
+                    )
+                    FilterChip(
+                        selected = height == 1080,
+                        onClick = { height = 1080 },
+                        label = { Text("1080p") },
+                    )
+                    FilterChip(
+                        selected = height == null,
+                        onClick = { height = null },
+                        label = { Text("Максимум") },
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onStart(url, height) },
+                enabled = url.isNotBlank(),
+            ) { Text("Импортировать") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
+    )
+}
+
+/** Строка задачи над списком файлов: «Импорт: N%» с крестиком-отменой. */
+@Composable
+private fun ImportRow(job: FilesViewModel.ImportJob, onCancel: () -> Unit) {
+    Card(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                job.progress?.let { "Импорт: ${it.toInt()}%" } ?: "Импорт...",
+                fontSize = 13.sp,
+                modifier = Modifier.weight(1f),
+            )
+            IconButton(onClick = onCancel) {
+                Icon(Icons.Default.Close, contentDescription = "Отменить импорт")
+            }
+        }
     }
 }
 

@@ -86,6 +86,19 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
          *  open (XR-135), or null. A manual sync with an empty selection is a
          *  destructive delete-only pass, so it asks before wiping the copy. */
         val confirmDeleteAllFor: String? = null,
+        /** Шара, для которой открыт диалог «Импорт по URL» (LLD-29), или null. */
+        val importDialogFor: String? = null,
+        /** Живая джоба импорта: агент качает, экран поллит раз в 2 секунды.
+         *  Уход с экрана опрос останавливает, скачивание на агенте нет. */
+        val importJob: ImportJob? = null,
+    )
+
+    /** Джоба импорта по URL, за которой следит открытый экран (LLD-29). */
+    data class ImportJob(
+        val shareId: String,
+        val jobId: String,
+        /** Проценты от агента; null, пока плагин их не прислал. */
+        val progress: Double? = null,
     )
 
     /** A sync action deferred until the user makes the first-sync storage choice. */
@@ -259,8 +272,16 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun closeShare() = _ui.update {
-        it.copy(openShareId = null, currentPath = "", manifest = emptyList(), localPaths = emptySet())
+    fun closeShare() {
+        // Опрос живёт, пока открыт экран шары; скачивание на агенте продолжится
+        // и без нас, готовый файл догонит листинг при следующем открытии.
+        stopImportPolling()
+        _ui.update {
+            it.copy(
+                openShareId = null, currentPath = "", manifest = emptyList(),
+                localPaths = emptySet(), importJob = null, importDialogFor = null,
+            )
+        }
     }
 
     fun navigateTo(path: String) = _ui.update { it.copy(currentPath = path) }
@@ -417,6 +438,111 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     fun cancelTransfer() {
         viewModelScope.launch { withContext(Dispatchers.IO) { NativeBridge.nativeCancelTransfer() } }
         _ui.update { it.copy(message = "Останавливаю…") }
+    }
+
+    // -- импорт по URL (LLD-29) -------------------------------------
+
+    private var importPoll: Job? = null
+
+    fun openImportDialog(shareId: String) = _ui.update { it.copy(importDialogFor = shareId) }
+    fun dismissImportDialog() = _ui.update { it.copy(importDialogFor = null) }
+
+    /** Запустить импорт [url] в открытую сейчас папку шары. [height] null это
+     *  «Максимум»: планку качества тогда держит только владелец агента. */
+    fun startImport(config: ShareConfig, url: String, height: Int?) {
+        val dest = _ui.value.currentPath
+        _ui.update { it.copy(importDialogFor = null) }
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                repo.importUrl(config, url.trim(), dest, height)
+            }
+            result.fold(
+                onSuccess = { jobId ->
+                    _ui.update { it.copy(importJob = ImportJob(config.shareId, jobId)) }
+                    startImportPolling(config, jobId)
+                },
+                onFailure = { e ->
+                    _ui.update {
+                        it.copy(message = "Импорт: ${humanImportError(e.message ?: "ошибка")}")
+                    }
+                },
+            )
+        }
+    }
+
+    /** Крестик на строке импорта: убить скачивание на агенте и забыть джобу. */
+    fun cancelImport(config: ShareConfig) {
+        val job = _ui.value.importJob ?: return
+        stopImportPolling()
+        _ui.update { it.copy(importJob = null) }
+        viewModelScope.launch(Dispatchers.IO) { repo.importCancel(config, job.jobId) }
+    }
+
+    /** Опрос раз в 2 секунды, пока экран открыт (LLD-29 п. 2.8): по done
+     *  строка исчезает и листинг обновляется, по failed показывается текст
+     *  ошибки агента. */
+    private fun startImportPolling(config: ShareConfig, jobId: String) {
+        stopImportPolling()
+        importPoll = viewModelScope.launch {
+            while (true) {
+                delay(2_000)
+                val result = withContext(Dispatchers.IO) { repo.importStatus(config, jobId) }
+                val state = result.getOrNull()
+                when {
+                    state == null -> {
+                        _ui.update {
+                            it.copy(
+                                importJob = null,
+                                message = "Импорт: ${humanImportError(result.exceptionOrNull()?.message ?: "ошибка")}",
+                            )
+                        }
+                        break
+                    }
+                    state.state == "done" -> {
+                        _ui.update { it.copy(importJob = null, message = "Импорт завершён") }
+                        refreshOpenShare(config)
+                        break
+                    }
+                    state.state == "failed" -> {
+                        _ui.update {
+                            it.copy(
+                                importJob = null,
+                                message = "Импорт не удался: ${state.error ?: "причина неизвестна"}",
+                            )
+                        }
+                        break
+                    }
+                    else -> _ui.update { st ->
+                        st.copy(importJob = st.importJob?.copy(progress = state.progress))
+                    }
+                }
+            }
+        }
+    }
+
+    private fun stopImportPolling() {
+        importPoll?.cancel()
+        importPoll = null
+    }
+
+    /** Ошибки импорта приходят с машинным префиксом (`no_plugin: ...`), текст
+     *  после него уже человеческий и живёт в Rust (единый источник). */
+    private fun humanImportError(e: String): String =
+        if (Regex("^[a-z_]+: ").containsMatchIn(e)) e.substringAfter(": ") else e
+
+    /** Перечитать манифест открытой шары после завершившегося импорта, чтобы
+     *  файл появился в листинге без ручного обновления. */
+    private suspend fun refreshOpenShare(config: ShareConfig) {
+        if (_ui.value.openShareId != config.shareId) return
+        val result = withContext(Dispatchers.IO) { repo.fetchManifest(config) }
+        val local = withContext(Dispatchers.IO) { repo.localPaths(config) }
+        _ui.update { st ->
+            if (st.openShareId != config.shareId) return@update st
+            result.fold(
+                onSuccess = { st.copy(manifest = it, localPaths = local, offlineLocal = false) },
+                onFailure = { st },
+            )
+        }
     }
 
     // ── storage directory (XR-043) ──────────────────────────────────
