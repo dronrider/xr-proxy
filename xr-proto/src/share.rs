@@ -79,6 +79,10 @@ pub struct ShareToken {
 pub const SCOPE_READ: &str = "share:read";
 /// Scope name that authorizes writing to a share (`PUT`/`DELETE`).
 pub const SCOPE_WRITE: &str = "share:write";
+/// Scope name that authorizes URL-import jobs on a share (LLD-29). A new name in
+/// the scope string, no format bump: minted next to [`SCOPE_WRITE`] today, but
+/// kept separate so the hub can split the two later without touching agents.
+pub const SCOPE_IMPORT: &str = "share:import";
 
 /// True if the space-separated OAuth `scope` string grants `name`. Unknown names
 /// are ignored (resource-server semantics), so a scope minted by a newer hub with
