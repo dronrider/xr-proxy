@@ -96,11 +96,22 @@ pub fn push(args: PushArgs) -> Result<()> {
     let if_match = if args.force {
         None
     } else {
-        current_hash(&base, &share, &rel)?
+        match target_state(&base, &share, &rel)? {
+            TargetState::Absent => None,
+            TargetState::Hashed(h) => {
+                println!("  перезапись {rel}: If-Match по текущей версии (--force чтобы обойти)");
+                Some(h)
+            }
+            // Manifest lists the file but the agent has not hashed it yet (cold
+            // cache after a restart): without a hash the guard cannot protect a
+            // newer version, so refuse rather than clobber silently.
+            TargetState::Unhashed => bail!(
+                "файл {rel} уже есть на агенте, но его хеш ещё не посчитан \
+                 (холодный кеш после рестарта): без хеша перезапись не защитить от \
+                 затирания чужой версии. Повтори чуть позже или перезалей с --force"
+            ),
+        }
     };
-    if if_match.is_some() {
-        println!("  перезапись {rel}: If-Match по текущей версии (--force чтобы обойти)");
-    }
 
     let sha = sha256_file(local).with_context(|| format!("хеш файла {}", args.file))?;
     let status = put_file(&base, &share, &rel, local, if_match.as_deref(), &sha)?;
@@ -153,18 +164,24 @@ fn ensure_writable_grant(share: &InviteShareDto) -> Result<()> {
     Ok(())
 }
 
-/// The current hash of `rel` in the share's manifest, or `None` if the file is
-/// not there yet (a fresh upload needs no `If-Match`) or the agent has not hashed
-/// it (cold cache, empty sha256, nothing to match against).
-fn current_hash(base: &str, share: &InviteShareDto, rel: &str) -> Result<Option<String>> {
+/// State of the target path in the share's manifest, deciding the `If-Match`
+/// guard for an overwrite (LLD-28): absent (a fresh upload, no guard), present
+/// with a known hash (guard on it), or present but not yet hashed (cold cache,
+/// empty sha256 - the guard is impossible, the caller refuses without `--force`).
+enum TargetState {
+    Absent,
+    Hashed(String),
+    Unhashed,
+}
+
+fn target_state(base: &str, share: &InviteShareDto, rel: &str) -> Result<TargetState> {
     let manifest = fetch_manifest_verified(&format!("{base}/manifest"), share)
         .with_context(|| format!("манифест шары «{}»", share.name))?;
-    Ok(manifest
-        .entries
-        .into_iter()
-        .find(|e| e.path == rel)
-        .map(|e| e.sha256)
-        .filter(|s| !s.is_empty()))
+    Ok(match manifest.entries.into_iter().find(|e| e.path == rel) {
+        None => TargetState::Absent,
+        Some(e) if e.sha256.is_empty() => TargetState::Unhashed,
+        Some(e) => TargetState::Hashed(e.sha256),
+    })
 }
 
 /// PUT the local file, streaming it (constant memory), returning the HTTP status

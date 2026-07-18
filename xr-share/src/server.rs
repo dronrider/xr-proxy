@@ -346,7 +346,7 @@ async fn file_response(state: &AgentState, share_id: &str, rel: &str, req: Reque
 /// target on success; the temp is removed on any failure. `201` for a new file,
 /// `204` for an overwrite.
 async fn handle_put(
-    state: &AgentState,
+    state: &Arc<AgentState>,
     share_id: &str,
     rel: &str,
     req: Request,
@@ -368,13 +368,18 @@ async fn handle_put(
     }
     let existed = target.is_file();
 
-    // All header-based checks before the body is consumed.
-    check_put_preconditions(req.headers(), state, &target, existed)?;
+    // Cheapest gate first: a declared over-cap body is refused before we hash the
+    // current target for a precondition (no point reading a large cold file for a
+    // request that is doomed anyway).
     if let (Some(cap_mb), Some(len)) = (state.max_file_mb, content_length(req.headers())) {
         if len > cap_mb.saturating_mul(1024 * 1024) {
             return Err((StatusCode::PAYLOAD_TOO_LARGE, "file too large"));
         }
     }
+    // Optimistic-concurrency preconditions (LLD-28 п. 3.7). All header-based, so
+    // done before the body is consumed; current-target hashing runs off the async
+    // worker like the read path, so a large cold file does not stall the runtime.
+    check_put_preconditions(state, &target, existed, req.headers()).await?;
     let expected_sha = header_str(req.headers(), "x-xr-sha256").map(|s| s.trim().to_string());
 
     let parent = target
@@ -419,7 +424,7 @@ async fn handle_put(
 /// [`handle_put`], then `409` for a directory, `404` for a missing file, and an
 /// optional `If-Match` precondition (`412`) before the removal (LLD-28 п. 2.3).
 async fn handle_delete(
-    state: &AgentState,
+    state: &Arc<AgentState>,
     share_id: &str,
     rel: &str,
     req: Request,
@@ -445,10 +450,7 @@ async fn handle_delete(
     // If-Match against the current content, if the client asked (last-write-wins
     // by default). The target is known to exist here.
     if let Some(want) = if_match_hash(req.headers()) {
-        let current = state
-            .hash_cache
-            .hash_of(&target)
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "hash failed"))?;
+        let current = current_hash_blocking(state, &target).await?;
         if !current.eq_ignore_ascii_case(&want) {
             return Err((StatusCode::PRECONDITION_FAILED, "version mismatch"));
         }
@@ -464,12 +466,13 @@ async fn handle_delete(
 /// Optimistic-concurrency preconditions for a `PUT` (LLD-28 п. 3.7):
 /// `If-None-Match: *` requires the target not to exist; `If-Match: <sha>`
 /// requires the target's current content hash to equal `<sha>`. A violated
-/// precondition is `412` and the target is left untouched.
-fn check_put_preconditions(
-    headers: &HeaderMap,
-    state: &AgentState,
+/// precondition is `412` and the target is left untouched. The current-target
+/// hash is computed off the async runtime (see [`current_hash_blocking`]).
+async fn check_put_preconditions(
+    state: &Arc<AgentState>,
     target: &Path,
     existed: bool,
+    headers: &HeaderMap,
 ) -> Result<(), (StatusCode, &'static str)> {
     if let Some(v) = header_str(headers, "if-none-match") {
         if v.trim() == "*" && existed {
@@ -480,15 +483,29 @@ fn check_put_preconditions(
         if !existed {
             return Err((StatusCode::PRECONDITION_FAILED, "no current version to match"));
         }
-        let current = state
-            .hash_cache
-            .hash_of(target)
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "hash failed"))?;
+        let current = current_hash_blocking(state, target).await?;
         if !current.eq_ignore_ascii_case(&want) {
             return Err((StatusCode::PRECONDITION_FAILED, "version mismatch"));
         }
     }
     Ok(())
+}
+
+/// The target's current content hash for an `If-Match` check, computed on a
+/// blocking thread. `HashCache::hash_of` stats and (on a cold cache) reads the
+/// whole file; the read/manifest path already moves this off the runtime with
+/// `spawn_blocking`, and the write path must not stall a worker on a large
+/// un-warmed file either.
+async fn current_hash_blocking(
+    state: &Arc<AgentState>,
+    target: &Path,
+) -> Result<String, (StatusCode, &'static str)> {
+    let st = state.clone();
+    let path = target.to_path_buf();
+    tokio::task::spawn_blocking(move || st.hash_cache.hash_of(&path))
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "hash task failed"))?
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "hash failed"))
 }
 
 /// The `If-Match` value as a bare sha256 hex (tolerating ETag-style quotes). The
