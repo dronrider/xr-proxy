@@ -27,7 +27,8 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use xr_proto::share::{
     sign_agent_credential, sign_relay_token, sign_share_token, verify_agent_credential,
-    AgentCredential, RelayDescriptor, RelayGrant, ShareGrant, ShareRecord, SCOPE_READ, SCOPE_WRITE,
+    AgentCredential, RelayDescriptor, RelayGrant, ShareGrant, ShareRecord, SCOPE_IMPORT, SCOPE_READ,
+    SCOPE_WRITE,
 };
 
 use crate::api::register::{client_ip, now_unix, validate_ed25519_pubkey, verify_reg_token};
@@ -452,9 +453,11 @@ pub async fn invite_shares(
         if let Some(rec) = shares.get(sid) {
             // Write scope needs both master switches: a write binding on the
             // invite and a writable record (LLD-28 п. 2.2, п. 3.2). Either one
-            // missing keeps the grant read-only.
+            // missing keeps the grant read-only. Import rides on the same
+            // binding (LLD-29 п. 2.2): a separate attach axis appears only when
+            // someone actually needs import without write.
             let scope = if rec.writable && write_ids.contains(sid) {
-                format!("{SCOPE_READ} {SCOPE_WRITE}")
+                format!("{SCOPE_READ} {SCOPE_WRITE} {SCOPE_IMPORT}")
             } else {
                 SCOPE_READ.to_string()
             };
@@ -667,9 +670,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_grant_write_scope_only_for_write_binding() {
+    async fn test_import_scope_minted_with_write() {
         // LLD-28: write scope is minted only when the record is writable AND the
         // invite has a write binding. Missing either keeps the grant read-only.
+        // LLD-29: share:import rides on the same write binding, so a read-only
+        // grant carries neither.
         let hub = SigningKey::from_bytes(&[42u8; 32]);
         let agent_pk = base64::engine::general_purpose::STANDARD
             .encode(SigningKey::from_bytes(&[7u8; 32]).verifying_key().as_bytes());
@@ -689,7 +694,7 @@ mod tests {
             .unwrap();
         let scope = |id: &str| grant_scope(&grants.iter().find(|g| g.share_id == id).unwrap().token);
 
-        assert_eq!(scope("w"), "share:read share:write");
+        assert_eq!(scope("w"), "share:read share:write share:import");
         assert_eq!(scope("wr"), "share:read", "writable record but no write binding stays read");
         assert_eq!(scope("nw"), "share:read", "write binding but not writable stays read");
 
