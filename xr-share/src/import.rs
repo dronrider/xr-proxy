@@ -23,7 +23,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::Notify;
 
@@ -82,6 +81,9 @@ impl JobState {
 /// a config hot-swap mid-flight cannot change a job's limits under it.
 #[derive(Clone)]
 pub struct JobSpec {
+    /// The share this job belongs to: polls and cancels are share-scoped, a
+    /// token for one share must not reach another share's jobs.
+    pub share_id: String,
     /// Canonical share root; the job dir is created here (same filesystem as
     /// the target, so the final rename is atomic).
     pub share_root: PathBuf,
@@ -100,6 +102,8 @@ pub struct JobSpec {
 }
 
 struct Job {
+    /// Owning share; [`ImportManager::status`]/[`cancel`] match on it.
+    share_id: String,
     state: JobState,
     progress: Option<f64>,
     files: Vec<String>,
@@ -156,12 +160,6 @@ impl ImportManager {
         self.config.read().expect("import config lock").clone()
     }
 
-    /// True when at least one plugin is configured: without any, import answers
-    /// `403` like a share without the flag (LLD-29 п. 2.6).
-    pub fn has_plugins(&self) -> bool {
-        self.config().is_some_and(|c| !c.plugins.is_empty())
-    }
-
     /// Add a job to the queue. `None` when the queue is full (`429`).
     pub fn enqueue(&self, spec: JobSpec) -> Option<String> {
         let mut jobs = self.jobs.lock().expect("import jobs lock");
@@ -174,6 +172,7 @@ impl ImportManager {
         jobs.insert(
             id.clone(),
             Job {
+                share_id: spec.share_id.clone(),
                 state: JobState::Queued,
                 progress: None,
                 files: Vec::new(),
@@ -189,12 +188,14 @@ impl ImportManager {
         Some(id)
     }
 
-    /// `None` for an unknown (or swept, or forgotten-by-restart) job: the
-    /// consumer turns the `404` into "the job got lost" (LLD-29 п. 3.7).
-    pub fn status(&self, job_id: &str) -> Option<JobStatusDto> {
+    /// `None` for an unknown (or swept, or forgotten-by-restart) job, and for a
+    /// job of *another* share: the table is agent-global, so a token for share
+    /// A must not see share B's jobs. The consumer turns the `404` into "the
+    /// job got lost" (LLD-29 п. 3.7).
+    pub fn status(&self, share_id: &str, job_id: &str) -> Option<JobStatusDto> {
         let mut jobs = self.jobs.lock().expect("import jobs lock");
         sweep_finished(&mut jobs);
-        jobs.get(job_id).map(|j| JobStatusDto {
+        jobs.get(job_id).filter(|j| j.share_id == share_id).map(|j| JobStatusDto {
             state: j.state.name(),
             progress: j.progress,
             files: (j.state == JobState::Done).then(|| j.files.clone()),
@@ -203,12 +204,17 @@ impl ImportManager {
     }
 
     /// Cancel: kill the process group (if running), drop the job from the table
-    /// so later polls see `404`. The runner cleans the job dir up when the kill
-    /// lands. True if the job existed.
-    pub fn cancel(&self, job_id: &str) -> bool {
-        let Some(job) = self.jobs.lock().expect("import jobs lock").remove(job_id) else {
+    /// so later polls see `404`. Share-scoped like [`status`](Self::status).
+    /// The runner notices the removal (its watchdog tick) and kills the child
+    /// handle too, which also covers Windows and the spawn window where the
+    /// pid is not registered yet. True if the job existed on this share.
+    pub fn cancel(&self, share_id: &str, job_id: &str) -> bool {
+        let mut jobs = self.jobs.lock().expect("import jobs lock");
+        if !jobs.get(job_id).is_some_and(|j| j.share_id == share_id) {
             return false;
-        };
+        }
+        let job = jobs.remove(job_id).expect("checked above");
+        drop(jobs);
         if let Some(pid) = job.pid {
             kill_group(pid);
         }
@@ -358,8 +364,13 @@ impl ImportManager {
             String::from_utf8_lossy(&Vec::from(tail)).into_owned()
         });
 
-        // Wait with a watchdog: kill on the lifetime cap or on the job dir
-        // outgrowing max_total_mb (checked every few seconds, LLD-29 п. 2.7).
+        // Wait with a watchdog: kill on the lifetime cap, on the job dir
+        // outgrowing max_total_mb (checked every few seconds, LLD-29 п. 2.7),
+        // or on cancellation. Cancellation is detected by the job's absence
+        // from the table: `cancel` kills the process group itself, but only
+        // this task holds the child handle, so the tick is what makes a cancel
+        // land in the spawn window (pid not registered yet) and on Windows
+        // (no process groups there).
         let started = Instant::now();
         let mut tick = tokio::time::interval(WATCH_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -368,24 +379,27 @@ impl ImportManager {
             tokio::select! {
                 status = child.wait() => break status,
                 _ = tick.tick() => {
-                    if started.elapsed() >= spec.timeout {
-                        kill_reason = Some(format!(
-                            "джоба превысила предел времени ({} мин)",
-                            spec.timeout.as_secs() / 60
-                        ));
-                    } else if let Some(cap) = spec.max_total_bytes {
-                        let dir = job_dir.to_path_buf();
-                        let size = tokio::task::spawn_blocking(move || dir_size(&dir))
-                            .await
-                            .unwrap_or(0);
-                        if size > cap {
+                    let cancelled = self.with_job(id, |_| ()).is_none();
+                    if !cancelled {
+                        if started.elapsed() >= spec.timeout {
                             kill_reason = Some(format!(
-                                "выхлоп джобы превысил max_total_mb ({} МиБ)",
-                                cap / (1024 * 1024)
+                                "джоба превысила предел времени ({} мин)",
+                                spec.timeout.as_secs() / 60
                             ));
+                        } else if let Some(cap) = spec.max_total_bytes {
+                            let dir = job_dir.to_path_buf();
+                            let size = tokio::task::spawn_blocking(move || dir_size(&dir))
+                                .await
+                                .unwrap_or(0);
+                            if size > cap {
+                                kill_reason = Some(format!(
+                                    "выхлоп джобы превысил max_total_mb ({} МиБ)",
+                                    cap / (1024 * 1024)
+                                ));
+                            }
                         }
                     }
-                    if kill_reason.is_some() {
+                    if cancelled || kill_reason.is_some() {
                         if let Some(pid) = pid {
                             kill_group(pid);
                         }
@@ -466,7 +480,15 @@ fn sandbox_wrap(cmd: String, args: Vec<String>, sandbox: &str) -> (String, Vec<S
         warn_no_sandbox_once();
         return (cmd, args);
     }
-    let mut wrapped = vec![
+    let mut wrapped = Vec::new();
+    // A non-root agent (a by-hand run without the service) may not create
+    // system-level scopes: polkit refuses non-interactively and every job
+    // would die. The user manager applies the same cgroup properties.
+    #[cfg(target_os = "linux")]
+    if unsafe { libc::geteuid() } != 0 {
+        wrapped.push("--user".to_string());
+    }
+    wrapped.extend([
         "--scope".to_string(),
         "--collect".to_string(),
         "--quiet".to_string(),
@@ -475,7 +497,7 @@ fn sandbox_wrap(cmd: String, args: Vec<String>, sandbox: &str) -> (String, Vec<S
         "--property=MemoryMax=2G".to_string(),
         "--".to_string(),
         cmd,
-    ];
+    ]);
     wrapped.extend(args);
     ("systemd-run".to_string(), wrapped)
 }
@@ -507,8 +529,9 @@ fn warn_no_sandbox_once() {
     });
 }
 
-/// SIGKILL the whole process group led by `pid` (unix). On Windows only the
-/// direct child is killed by the caller; the accepted platform gap.
+/// SIGKILL the whole process group led by `pid` (unix). On Windows this is a
+/// no-op and the runner's watchdog tick kills the child handle instead (only
+/// grandchildren like ffmpeg may then linger; the accepted platform gap).
 fn kill_group(pid: u32) {
     #[cfg(unix)]
     unsafe {
@@ -597,15 +620,21 @@ fn publish_one(src: &Path, spec: &PublishSpec, name: &str, cache: &HashCache) ->
             return Err(format!("файл больше лимита агента (max_file_mb): {} байт", meta.len()));
         }
     }
-    let sha = sha256_file(src).map_err(|e| format!("хеш: {e}"))?;
-    let file = std::fs::File::open(src).map_err(|e| format!("открытие: {e}"))?;
+    // One handle for both the hash and the fsync: Windows refuses
+    // FlushFileBuffers on a read-only handle, so open with write access.
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(src)
+        .map_err(|e| format!("открытие: {e}"))?;
+    let sha = crate::manifest::sha256_stream(&mut file).map_err(|e| format!("хеш: {e}"))?;
     file.sync_all().map_err(|e| format!("fsync: {e}"))?;
     drop(file);
 
     let target = spec.dest_dir.join(name);
     rename_replace_sync(src, &target).map_err(|e| format!("rename: {e}"))?;
     if let Ok(meta) = std::fs::metadata(&target) {
-        cache.seed(&target, meta.len(), mtime_secs(&meta), sha);
+        cache.seed(&target, meta.len(), crate::manifest::mtime_secs(&meta), sha);
     }
     Ok(())
 }
@@ -635,35 +664,6 @@ fn rename_replace_sync(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-fn sha256_file(path: &Path) -> std::io::Result<String> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let digest = hasher.finalize();
-    use std::fmt::Write;
-    let mut s = String::with_capacity(64);
-    for b in digest {
-        let _ = write!(s, "{b:02x}");
-    }
-    Ok(s)
-}
-
-fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 // -- startup sweep ---------------------------------------------------
 
 /// Remove leftover service files from a share root at startup: `.xr-import-*`
@@ -671,7 +671,9 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
 /// and orphaned `.xr-part-*` upload temps, wherever they sit in the tree.
 pub fn sweep_share_root(root: &Path) {
     let mut it = walkdir::WalkDir::new(root).follow_links(false).into_iter();
-    while let Some(Ok(entry)) = it.next() {
+    while let Some(res) = it.next() {
+        // An unreadable entry must not end the sweep for the rest of the tree.
+        let Ok(entry) = res else { continue };
         if entry.depth() == 0 {
             continue;
         }
@@ -694,6 +696,12 @@ pub fn sweep_share_root(root: &Path) {
 /// tolerated and ignored; a v6 literal comes bracketed.
 pub fn parse_url(url: &str) -> Result<(String, String), String> {
     let url = url.trim();
+    // WHATWG parsers treat a backslash as an authority terminator, so
+    // `http://192.168.1.1\@host` reads as host here and as 192.168.1.1 in a
+    // browser-stack plugin. No legitimate URL needs one; refuse the class.
+    if url.contains('\\') {
+        return Err("не URL: бэкслеш недопустим".into());
+    }
     let (scheme, rest) = url.split_once("://").ok_or("не URL: нет схемы")?;
     let scheme = scheme.to_ascii_lowercase();
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();

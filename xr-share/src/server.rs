@@ -510,22 +510,24 @@ struct ImportReq {
 /// Gates shared by all three import routes (LLD-29 п. 2.6, steps 1-3): the
 /// share exists (`404`), is writable + import-enabled with at least one plugin
 /// configured (`403`), and the token carries `share:import` (`401`/`403`).
-/// Returns the share's canonical root for the POST handler's later steps.
+/// Returns the share's canonical root and the config snapshot the gate judged,
+/// so the POST handler routes and limits against the same version.
 fn import_gates(
     state: &AgentState,
     share_id: &str,
     headers: &HeaderMap,
     uri: &axum::http::Uri,
-) -> Result<PathBuf, (StatusCode, &'static str)> {
+) -> Result<(PathBuf, Arc<crate::config::ImportConfig>), (StatusCode, &'static str)> {
     let shares = state.snapshot();
     let share = shares
         .get(share_id)
         .ok_or((StatusCode::NOT_FOUND, "no such share"))?;
-    if !share.writable || !share.import || !state.import.has_plugins() {
+    let import_cfg = state.import.config().filter(|c| !c.plugins.is_empty());
+    let (true, true, Some(cfg)) = (share.writable, share.import, import_cfg) else {
         return Err((StatusCode::FORBIDDEN, "import is off for this share"));
-    }
+    };
     check_token_parts(state, share_id, SCOPE_IMPORT, headers, uri)?;
-    Ok(share.path.clone())
+    Ok((share.path.clone(), cfg))
 }
 
 /// `POST /{share_id}/import`: start a job (LLD-29 п. 2.5). After the shared
@@ -538,8 +540,8 @@ async fn start_import(
     headers: HeaderMap,
     Json(req): Json<ImportReq>,
 ) -> Response {
-    let root = match import_gates(&state, &share_id, &headers, &uri) {
-        Ok(root) => root,
+    let (root, cfg) = match import_gates(&state, &share_id, &headers, &uri) {
+        Ok(ok) => ok,
         Err(e) => return e.into_response(),
     };
     let Ok(dest_abs) = resolve_within(&root, &req.dest) else {
@@ -558,10 +560,6 @@ async fn start_import(
         Ok(host) => host,
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
     };
-    // Config snapshot: routing, limits and sandbox come from one version.
-    let Some(cfg) = state.import.config() else {
-        return (StatusCode::FORBIDDEN, "import is off for this share").into_response();
-    };
     let Some(plugin) = import::route_plugin(&cfg.plugins, &host) else {
         return (StatusCode::UNPROCESSABLE_ENTITY, "нет плагина под этот URL").into_response();
     };
@@ -571,6 +569,7 @@ async fn start_import(
     };
 
     let spec = JobSpec {
+        share_id: share_id.clone(),
         share_root: root,
         dest_rel,
         url: req.url.trim().to_string(),
@@ -600,7 +599,7 @@ async fn import_status(
     if let Err(e) = import_gates(&state, &share_id, req.headers(), req.uri()) {
         return e.into_response();
     }
-    match state.import.status(&job_id) {
+    match state.import.status(&share_id, &job_id) {
         Some(dto) => Json(dto).into_response(),
         None => (StatusCode::NOT_FOUND, "no such job").into_response(),
     }
@@ -616,7 +615,7 @@ async fn import_cancel(
     if let Err(e) = import_gates(&state, &share_id, req.headers(), req.uri()) {
         return e.into_response();
     }
-    if state.import.cancel(&job_id) {
+    if state.import.cancel(&share_id, &job_id) {
         tracing::info!("import share={share_id} job={job_id} cancelled");
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -1612,6 +1611,7 @@ mod tests {
             args: vec!["{url}".into()],
         };
         let spec = |cmd: &str, timeout: Duration, cap: Option<u64>| JobSpec {
+            share_id: "I".into(),
             share_root: share.path().canonicalize().unwrap(),
             dest_rel: String::new(),
             url: PUB_URL.into(),
@@ -1624,7 +1624,7 @@ mod tests {
         };
         let wait = |mgr: Arc<ImportManager>, id: String| async move {
             for _ in 0..300 {
-                if let Some(dto) = mgr.status(&id) {
+                if let Some(dto) = mgr.status("I", &id) {
                     if dto.state == "done" || dto.state == "failed" {
                         return dto;
                     }
@@ -1738,6 +1738,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_import_job_share_scoped() {
+        // The job table is agent-global, but polls and cancels are share-bound:
+        // a share:import token for J must not see or kill I's job, even knowing
+        // its id (review finding on XR-141).
+        let key = SigningKey::from_bytes(&[37u8; 32]);
+        let dir_i = tempfile::tempdir().unwrap();
+        let dir_j = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let script = write_script(bin.path(), "sleep 30");
+        let mut shares = SharesMap::new();
+        for (id, dir) in [("I", dir_i.path()), ("J", dir_j.path())] {
+            shares.insert(
+                id.into(),
+                ShareRoot { path: dir.canonicalize().unwrap(), is_file: false, writable: true, import: true },
+            );
+        }
+        let cache = Arc::new(HashCache::new());
+        let state = Arc::new(AgentState {
+            shares: RwLock::new(Arc::new(shares)),
+            hub_key: key.verifying_key(),
+            hash_cache: cache.clone(),
+            identity: None,
+            max_file_mb: None,
+            import: ImportManager::new(Some(one_plugin(&script, &["{url}"], &["*"], 1080)), cache),
+        });
+        state.import.spawn_runner();
+        let app = router(state);
+        let tok_i = sign_share_token(&key, "I", &rwi_scope(), now_unix() + 1000);
+        let tok_j = sign_share_token(&key, "J", &rwi_scope(), now_unix() + 1000);
+
+        let (_, v) = post_import(
+            &app, Some(&tok_i), "/I/import",
+            serde_json::json!({ "url": PUB_URL, "dest": "" }),
+        ).await;
+        let job_id = v["job_id"].as_str().unwrap().to_string();
+
+        // J's own valid token against I's job id: not found, nothing leaked.
+        let r = app
+            .clone()
+            .oneshot(get_with_token(&format!("/J/import/{job_id}"), Some(&tok_j)))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let r = app
+            .clone()
+            .oneshot(write_req("DELETE", &format!("/J/import/{job_id}"), Some(&tok_j), &[], b""))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+
+        // The job is alive and still owned by I, which can cancel it.
+        let (status, _) = get_status(&app, &tok_i, &job_id).await;
+        assert_eq!(status, StatusCode::OK);
+        let r = app
+            .oneshot(write_req("DELETE", &format!("/I/import/{job_id}"), Some(&tok_i), &[], b""))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
     }
 
     #[cfg(unix)]

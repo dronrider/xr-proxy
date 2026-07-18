@@ -108,7 +108,9 @@ impl HashCache {
     }
 }
 
-fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
+/// Shared by the import publish path too, so a seeded cache entry keys on the
+/// same rounding the manifest walk uses.
+pub(crate) fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -245,15 +247,20 @@ pub fn build_manifest_for_file(path: &Path, cache: &HashCache) -> Result<ShareMa
     })
 }
 
-/// Streaming SHA-256 of a file → lowercase hex. Reads in 64 KiB chunks so a
+/// Streaming SHA-256 of a file as lowercase hex. Reads in 64 KiB chunks so a
 /// large file is never held in memory at once (mirrors `xr-core::update`).
 fn sha256_file(path: &Path) -> Result<String> {
-    use std::io::Read;
     let mut file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    Ok(sha256_stream(&mut file)?)
+}
+
+/// The hashing loop behind [`sha256_file`], on any reader. The import publish
+/// path hashes from an already-open handle so it can fsync the same descriptor.
+pub(crate) fn sha256_stream(r: &mut impl std::io::Read) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = file.read(&mut buf)?;
+        let n = r.read(&mut buf)?;
         if n == 0 {
             break;
         }

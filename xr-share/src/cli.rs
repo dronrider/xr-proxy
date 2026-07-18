@@ -759,30 +759,26 @@ pub fn import(args: ImportArgs) -> Result<()> {
 
 /// POST JSON к агенту с bearer-токеном шары.
 fn agent_post_json(url: &str, token: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
-    match ureq::post(url)
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("content-type", "application/json")
-        .timeout(Duration::from_secs(30))
-        .send_string(&body.to_string())
-    {
-        Ok(r) => {
-            let s = r.into_string().context("чтение ответа агента")?;
-            serde_json::from_str(&s).context("разбор ответа агента")
-        }
-        Err(ureq::Error::Status(code, r)) => bail!(
-            "агент отклонил запрос (HTTP {code}): {}",
-            r.into_string().unwrap_or_default()
-        ),
-        Err(e) => bail!("сеть при запросе к агенту: {e}"),
-    }
+    let req = ureq::post(url).set("content-type", "application/json");
+    agent_json(req, token, |r| r.send_string(&body.to_string()))
 }
 
 fn agent_get_json(url: &str, token: &str) -> Result<serde_json::Value> {
-    match ureq::get(url)
+    agent_json(ureq::get(url), token, |r| r.call())
+}
+
+/// Общая часть запросов к агенту: bearer, таймаут и один на всех разбор
+/// исхода. Поллинг в `import` ловит потерянную джобу по тексту "HTTP 404"
+/// отсюда, так что формат ошибки живёт в одном месте.
+fn agent_json(
+    req: ureq::Request,
+    token: &str,
+    send: impl FnOnce(ureq::Request) -> std::result::Result<ureq::Response, ureq::Error>,
+) -> Result<serde_json::Value> {
+    let req = req
         .set("Authorization", &format!("Bearer {token}"))
-        .timeout(Duration::from_secs(30))
-        .call()
-    {
+        .timeout(Duration::from_secs(30));
+    match send(req) {
         Ok(r) => {
             let s = r.into_string().context("чтение ответа агента")?;
             serde_json::from_str(&s).context("разбор ответа агента")
