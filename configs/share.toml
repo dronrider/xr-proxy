@@ -46,11 +46,63 @@ name = "Photos"
 # share is always read-only. This is the agent-side master switch: even a valid
 # share:write token is refused unless `writable` is true here, so a compromised
 # hub cannot write. Set by `xr-share share <dir> --writable`.
+# `import = true` (LLD-29, only valid together with writable) additionally lets
+# write-invite holders start URL-import jobs into this share; the download runs
+# on this machine by a plugin from the [import] block below. Set by
+# `xr-share share <dir> --writable --import`.
 [[share]]
 share_id = "REPLACE_WITH_ANOTHER_SHARE_ID"
 path = "/srv/dropbox"
 name = "Dropbox"
 writable = true
+import = true
+
+# -- URL import: job limits + plugin registry (LLD-29) ---------------------
+# Agent-global; each share still opts in with `import = true` above. No [import]
+# block (or no plugins) means the import routes answer 403 everywhere. This very
+# block is what `xr-share share --import` bootstraps into a config without one.
+[import]
+# Hard cap on one job's lifetime, minutes (default 30): a stuck download is
+# killed, not left to hold the queue.
+timeout_min = 30
+# Cap on one job's total output, MiB, checked while it downloads (optional).
+# Bounds the damage of a link to a playlist-giant.
+max_total_mb = 4096
+# "auto" (default) wraps the plugin in a systemd-run scope with private ranges
+# denied at the kernel (Linux with systemd): a redirect or DNS rebinding to the
+# LAN dies even after the pre-start URL gate. Elsewhere (Windows, no systemd)
+# the plugin runs bare and the gate is the only barrier; "none" disables the
+# wrapper explicitly.
+sandbox = "auto"
+
+# One plugin per [[import.plugin]]: an external command the owner installed.
+# Nothing is vendored -- update yt-dlp with your package manager, not an agent
+# release. Contract: argv in (the {url} element is replaced by the link as ONE
+# literal argument, no shell; {height} inside any element becomes the validated
+# effective height), files out in the job's cwd (top-level, non-hidden ones are
+# published), optional `xr-progress <percent>` lines on stdout.
+[[import.plugin]]
+name = "yt-dlp"
+# Host suffixes matched at label boundaries (youtu.be also matches
+# www.youtu.be, but evil-youtu.be does not); "*" makes it the catch-all --
+# yt-dlp knows thousands of sites anyway. Longest matching suffix wins.
+patterns = ["youtube.com", "youtu.be", "*"]
+# The owner's quality ceiling: a device may ask lower, never higher (LLD-29).
+# The requested height is clamped to this and substituted for {height} in the
+# -f format below, so the download never exceeds the ceiling.
+max_height = 1080
+cmd = "yt-dlp"
+args = [
+  # One video per job, not a whole playlist by accident.
+  "--no-playlist", "--newline",
+  "-f", "bv*[height<={height}]+ba/b[height<={height}]",
+  # Progress lines the agent parses (the percent lands in the job status).
+  "--progress-template", "download:xr-progress %(progress._percent_str)s",
+  # The published file is named from the video title (plus the id, so two
+  # videos with one title do not clobber each other).
+  "-o", "%(title).200B [%(id)s].%(ext)s",
+  "{url}",
+]
 
 # Optional TLS. Without it the agent serves plain HTTP (dev, or behind a TLS
 # terminator). The consumer pins the agent's identity (TOFU), so a self-signed
