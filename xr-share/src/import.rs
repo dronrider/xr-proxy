@@ -509,12 +509,29 @@ fn systemd_run_usable() -> bool {
         && which("systemd-run").is_some()
 }
 
-/// First `PATH` hit for `name`, like the shell would resolve it.
+/// First `PATH` hit for `name`, like the shell would resolve it. On Windows
+/// the shell also tries `name.exe`, and the tools there really are
+/// `yt-dlp.exe`/`ffmpeg.exe`: without the suffix the bootstrap check refused
+/// a perfectly working PATH (found on the XR-141 prod check).
 pub fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| {
-        let candidate = dir.join(name);
-        candidate.is_file().then_some(candidate)
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    which_in(name, &dirs, cfg!(windows))
+}
+
+fn which_in(name: &str, dirs: &[PathBuf], with_exe: bool) -> Option<PathBuf> {
+    dirs.iter().find_map(|dir| {
+        let exact = dir.join(name);
+        if exact.is_file() {
+            return Some(exact);
+        }
+        if with_exe {
+            let exe = dir.join(format!("{name}.exe"));
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+        None
     })
 }
 
@@ -819,6 +836,21 @@ pub fn effective_height(requested: Option<u32>, plugin: &ImportPlugin) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_which_windows_exe_suffix() {
+        // On Windows the tools are `yt-dlp.exe`/`ffmpeg.exe`: the lookup must
+        // accept the suffixed name like the shell does, or the bootstrap check
+        // refuses a working PATH (found on the XR-141 prod check).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("yt-dlp.exe"), b"x").unwrap();
+        let dirs = vec![dir.path().to_path_buf()];
+        assert!(which_in("yt-dlp", &dirs, true).is_some());
+        assert!(which_in("yt-dlp", &dirs, false).is_none(), "без .exe-суффикса совпадения нет");
+        // An exact extension-less hit keeps working everywhere.
+        std::fs::write(dir.path().join("ffmpeg"), b"x").unwrap();
+        assert!(which_in("ffmpeg", &dirs, false).is_some());
+    }
 
     fn plugin(name: &str, patterns: &[&str], max_height: u32) -> ImportPlugin {
         ImportPlugin {
