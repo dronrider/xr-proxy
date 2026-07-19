@@ -1296,7 +1296,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeDownloadFile(
     // stop a large single-file download too. The guard locks out a concurrent
     // transfer (e.g. the background mirror worker) instead of sharing counters
     // and the same `.part`; "busy" tells the UI to ask the user to retry.
-    let json = match sync::TransferGuard::acquire(1, entry.size) {
+    let json = match sync::TransferGuard::acquire(&token.share_id, 1, entry.size) {
         None => json_error("busy"),
         Some(_guard) => {
             sync::transfer_file(&entry.path, 0);
@@ -1362,6 +1362,38 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePlanSync(
     let plan = sync::plan_with_selection(&manifest, &local, selection.as_ref());
     let json =
         serde_json::to_string(&plan).unwrap_or_else(|e| json_error(&format!("serialize: {e}")));
+    jstring_into_raw(&mut env, json)
+}
+
+/// Drop `target` (a file or folder path) from a selection, splitting a covering
+/// folder prefix into its sibling branches (XR-044, `sync::expand_deselect`).
+/// `selection_json` and `manifest_json` are JSON string arrays (selection
+/// entries and manifest paths); returns the reworked selection as a JSON array.
+/// Pure logic, no I/O; lives in Rust so the split and the mirror planner agree
+/// on what a selection entry covers.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeExpandDeselect(
+    mut env: JNIEnv,
+    _class: JClass,
+    selection_json: JString,
+    manifest_json: JString,
+    target: JString,
+) -> jstring {
+    let selection: HashSet<String> = match read_jstring(&mut env, &selection_json) {
+        Ok(s) => serde_json::from_str::<Vec<String>>(&s).unwrap_or_default().into_iter().collect(),
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let manifest: Vec<String> = match read_jstring(&mut env, &manifest_json) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let target = match read_jstring(&mut env, &target) {
+        Ok(s) => s,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let mut out: Vec<String> = sync::expand_deselect(&selection, &manifest, &target).into_iter().collect();
+    out.sort_unstable();
+    let json = serde_json::to_string(&out).unwrap_or_else(|e| json_error(&format!("serialize: {e}")));
     jstring_into_raw(&mut env, json)
 }
 
@@ -1640,7 +1672,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeMigrateShareD
         Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
     };
     let (files, bytes) = sync::dir_totals(&src);
-    let json = match sync::TransferGuard::acquire(files, bytes) {
+    let json = match sync::TransferGuard::acquire("", files, bytes) {
         None => json_error("busy"),
         Some(_guard) => match sync::migrate_dir(&src, &dst) {
             Ok(report) => {
