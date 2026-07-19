@@ -253,7 +253,7 @@ private fun ShareListView(
                 )
             }
         }
-        ui.progress?.let { p -> item { ProgressBar(p) { vm.cancelTransfer() } } }
+        if (ui.migratingShareId != null) item { ProgressBar(ui.transfer) { vm.cancelTransfer() } }
         if (ui.loadingHub) item { CircularProgressIndicator(modifier = Modifier.padding(8.dp)) }
 
         if (addable.isNotEmpty()) {
@@ -332,6 +332,19 @@ private fun ExplorerView(
 ) {
     var detailsFor by remember { mutableStateOf<ManifestEntry?>(null) }
     val level = explorerLevel(ui.manifest, ui.currentPath)
+    // Row state is derived once per state change, not per row: a big manifest
+    // with a long queue would otherwise rescan both for every visible row on
+    // every 500ms progress tick.
+    val queuedPaths = remember(ui.queue, cfg.shareId) {
+        ui.queue.asSequence().filter { it.shareId == cfg.shareId }.map { it.entry.path }.toHashSet()
+    }
+    val headPath = ui.queue.firstOrNull()?.takeIf { it.shareId == cfg.shareId }?.entry?.path
+    val failedByPath = remember(ui.failed, cfg.shareId) {
+        ui.failed.filter { it.shareId == cfg.shareId }.associateBy { it.path }
+    }
+    val folderPresence = remember(ui.manifest, ui.localPaths, queuedPaths, ui.currentPath) {
+        folderPresence(ui.manifest, ui.currentPath, ui.localPaths, queuedPaths)
+    }
 
     Column(modifier = modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
         Row(
@@ -370,8 +383,7 @@ private fun ExplorerView(
                 modifier = Modifier.padding(vertical = 2.dp),
             )
         }
-        val p = ui.progress
-        if (p != null) ProgressBar(p) { vm.cancelTransfer() }
+        if (ui.migratingShareId != null) ProgressBar(ui.transfer) { vm.cancelTransfer() }
         // The live import job's row (LLD-29): the agent downloads, this is just
         // the counter and the cancel; leaving the screen does not interrupt.
         val importJob = ui.importJob
@@ -393,8 +405,13 @@ private fun ExplorerView(
             else -> LazyColumn {
                 items(level, key = { it.path }) { node ->
                     when (node) {
-                        is TreeNode.Folder -> FolderRow(node, cfg, ui, vm)
-                        is TreeNode.FileNode -> FileRow(node, cfg, ui, vm) { detailsFor = it }
+                        is TreeNode.Folder -> FolderRow(node, folderPresence[node.path], cfg, vm)
+                        is TreeNode.FileNode -> FileRow(
+                            node, cfg, ui, vm,
+                            isHead = node.entry.path == headPath,
+                            queued = node.entry.path != headPath && node.entry.path in queuedPaths,
+                            failed = failedByPath[node.entry.path],
+                        ) { detailsFor = it }
                     }
                     HorizontalDivider()
                 }
@@ -508,24 +525,14 @@ private fun ImportRow(job: FilesViewModel.ImportJob, onCancel: () -> Unit) {
 @Composable
 private fun FolderRow(
     node: TreeNode.Folder,
+    presence: FolderPresence?,
     cfg: ShareConfig,
-    ui: FilesViewModel.UiState,
     vm: FilesViewModel,
 ) {
-    val prefix = "${node.path}/"
-    var total = 0
-    var present = 0
-    ui.manifest.forEach { e ->
-        if (!e.path.startsWith(prefix)) return@forEach
-        total++
-        if (e.path in ui.localPaths ||
-            ui.queue.any { it.shareId == cfg.shareId && it.entry.path == e.path }
-        ) present++
-    }
     val state = when {
-        total > 0 && present == total -> ToggleableState.On
-        present > 0 -> ToggleableState.Indeterminate
-        else -> ToggleableState.Off
+        presence == null || presence.present == 0 -> ToggleableState.Off
+        presence.present == presence.total -> ToggleableState.On
+        else -> ToggleableState.Indeterminate
     }
     Row(
         modifier = Modifier.fillMaxWidth().clickable { vm.navigateTo(node.path) }.padding(vertical = 3.dp),
@@ -554,23 +561,23 @@ private fun FolderRow(
  *  current state: plus = queue the download, cross = cancel it, minus = delete
  *  the local copy, replay = resume a broken download from its partial. The row
  *  tap only opens a downloaded file; progress (ours or the background mirror's,
- *  matched by path) is painted behind the row itself. */
+ *  matched by share + path) is painted behind the row itself. */
 @Composable
 private fun FileRow(
     node: TreeNode.FileNode,
     cfg: ShareConfig,
     ui: FilesViewModel.UiState,
     vm: FilesViewModel,
+    isHead: Boolean,
+    queued: Boolean,
+    failed: FilesViewModel.FailedDownload?,
     onDetails: (ManifestEntry) -> Unit,
 ) {
     val path = node.entry.path
     val downloaded = ui.localPaths.contains(path)
-    val head = ui.queue.firstOrNull()
-    val isHead = head != null && head.shareId == cfg.shareId && head.entry.path == path
-    val queued = !isHead && ui.queue.any { it.shareId == cfg.shareId && it.entry.path == path }
-    val failed = ui.failed.firstOrNull { it.shareId == cfg.shareId && it.path == path }
-    val snap = ui.transfer
-    val transferring = !downloaded && snap != null && snap.file == path
+    // The native transfer snapshot claimed by this row (ours or the mirror's).
+    val snap = ui.transfer?.takeIf { !downloaded && it.share == cfg.shareId && it.file == path }
+    val transferring = snap != null
     // Transferring but neither ours nor queued: the background mirror fetches it.
     val bgFetch = transferring && !isHead && !queued
 
@@ -579,9 +586,9 @@ private fun FileRow(
     // A multi-file mirror pass reports aggregate bytes, a per-row fraction is
     // only honest for a single-file transfer.
     val fillFrac = when {
-        transferring && snap != null && snap.filesTotal == 1L && snap.bytesTotal > 0 ->
+        snap != null && snap.filesTotal == 1L && snap.bytesTotal > 0 ->
             (snap.bytesDone.toFloat() / snap.bytesTotal).coerceIn(0f, 1f)
-        !transferring && !queued && failed != null && failed.bytesTotal > 0 ->
+        snap == null && !queued && failed != null && failed.bytesTotal > 0 ->
             (failed.bytesDone.toFloat() / failed.bytesTotal).coerceIn(0f, 1f)
         else -> 0f
     }
@@ -611,7 +618,7 @@ private fun FileRow(
             Text(
                 when {
                     downloaded -> humanSize(node.entry.size) + " - скачано, тап откроет"
-                    transferring && snap != null && snap.filesTotal == 1L ->
+                    snap != null && snap.filesTotal == 1L ->
                         "${humanSize(snap.bytesDone)} из ${humanSize(node.entry.size)}" +
                             " - ${humanSize(snap.speedBytesPerSec)}/с"
                     bgFetch -> "качается фоновым синком"
@@ -632,13 +639,10 @@ private fun FileRow(
             downloaded -> IconButton(onClick = { vm.removeLocal(cfg, node.entry) }) {
                 Icon(Icons.Default.Remove, contentDescription = "Удалить с устройства")
             }
-            isHead -> IconButton(onClick = { vm.cancelActive() }) {
+            isHead || bgFetch -> IconButton(onClick = { vm.cancelDownload(cfg.shareId, path) }) {
                 Icon(Icons.Default.Close, contentDescription = "Отменить загрузку")
             }
-            bgFetch -> IconButton(onClick = { vm.cancelBackgroundFetch(cfg.shareId, path) }) {
-                Icon(Icons.Default.Close, contentDescription = "Отменить загрузку")
-            }
-            queued -> IconButton(onClick = { vm.dequeue(cfg.shareId, path) }) {
+            queued -> IconButton(onClick = { vm.cancelDownload(cfg.shareId, path) }) {
                 Icon(Icons.Default.Schedule, contentDescription = "Убрать из очереди")
             }
             failed != null -> IconButton(onClick = { vm.enqueue(cfg, node.entry) }) {
@@ -651,14 +655,41 @@ private fun FileRow(
     }
 }
 
+/** How much of a folder's subtree is on the device or queued, per sub-folder of
+ *  the open level. One pass over the manifest instead of a rescan per row. */
+private data class FolderPresence(val total: Int, val present: Int)
+
+private fun folderPresence(
+    manifest: List<ManifestEntry>,
+    dir: String,
+    localPaths: Set<String>,
+    queuedPaths: Set<String>,
+): Map<String, FolderPresence> {
+    val prefix = if (dir.isEmpty()) "" else "$dir/"
+    val acc = HashMap<String, IntArray>()
+    for (e in manifest) {
+        if (!e.path.startsWith(prefix)) continue
+        val rest = e.path.substring(prefix.length)
+        val slash = rest.indexOf('/')
+        if (slash < 0) continue
+        val folder = if (dir.isEmpty()) rest.substring(0, slash) else "$dir/${rest.substring(0, slash)}"
+        val a = acc.getOrPut(folder) { IntArray(2) }
+        a[0]++
+        if (e.path in localPaths || e.path in queuedPaths) a[1]++
+    }
+    return acc.mapValues { FolderPresence(it.value[0], it.value[1]) }
+}
+
+/** The storage-migration card. [p] null means the native side has not flipped
+ *  active yet (still listing files), rendered as an indeterminate start. */
 @Composable
-private fun ProgressBar(p: FilesViewModel.Progress, onCancel: () -> Unit) {
-    val frac = if (p.bytesTotal > 0) (p.bytesDone.toFloat() / p.bytesTotal).coerceIn(0f, 1f) else 0f
+private fun ProgressBar(p: FilesViewModel.Progress?, onCancel: () -> Unit) {
+    val frac = if (p != null && p.bytesTotal > 0) (p.bytesDone.toFloat() / p.bytesTotal).coerceIn(0f, 1f) else 0f
     Card(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
         Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    p.file.substringAfterLast('/').ifEmpty { "Подготовка…" },
+                    p?.file?.substringAfterLast('/')?.ifEmpty { null } ?: "Подготовка...",
                     maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 12.sp,
                     modifier = Modifier.weight(1f),
                 )
@@ -666,8 +697,9 @@ private fun ProgressBar(p: FilesViewModel.Progress, onCancel: () -> Unit) {
             }
             LinearProgressIndicator(progress = { frac }, modifier = Modifier.fillMaxWidth())
             Text(
-                "${humanSize(p.bytesDone)} / ${humanSize(p.bytesTotal)} · ${humanSize(p.speedBytesPerSec)}/с" +
-                    if (p.filesTotal > 1) " · файл ${p.filesDone + 1}/${p.filesTotal}" else "",
+                if (p == null) "Подготовка..."
+                else "${humanSize(p.bytesDone)} / ${humanSize(p.bytesTotal)} - ${humanSize(p.speedBytesPerSec)}/с" +
+                    if (p.filesTotal > 1) ", файл ${p.filesDone + 1}/${p.filesTotal}" else "",
                 fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 2.dp),
             )

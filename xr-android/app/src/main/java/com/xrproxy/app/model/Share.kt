@@ -289,46 +289,11 @@ fun coveredByAncestor(path: String, selection: Set<String>): Boolean {
     }
 }
 
-/** A path is selected if it is listed itself or sits under a listed folder. */
+/** A path is selected if it is listed itself or sits under a listed folder.
+ *  Mirrors `path_selected` in `xr-core::sync` (the planner's rule); the
+ *  selection-rewriting counterpart lives in Rust too (`expand_deselect`). */
 fun isSelected(path: String, selection: Set<String>): Boolean =
     selection.contains(path) || coveredByAncestor(path, selection)
-
-/**
- * Remove [target] (a file or a folder) from [selection]. The direct entry and
- * everything under it just leave the set; when the target is covered by a
- * selected ancestor folder, that ancestor is split instead: every sibling
- * branch along the chain down to the target gets its own entry, the target
- * stays out. Deselecting one file therefore does not silently unselect the
- * rest of its folder.
- */
-fun expandDeselect(
-    selection: Set<String>,
-    manifestPaths: Collection<String>,
-    target: String,
-): Set<String> {
-    val sel = selection.toMutableSet()
-    sel.removeAll { it == target || it.startsWith("$target/") }
-    while (coveredByAncestor(target, sel)) {
-        var ancestor = target
-        while (true) {
-            ancestor = ancestor.substringBeforeLast('/')
-            if (sel.contains(ancestor)) break
-        }
-        sel.remove(ancestor)
-        var dir = ancestor
-        for (comp in target.substring(ancestor.length + 1).split('/')) {
-            val prefix = "$dir/"
-            manifestPaths.asSequence()
-                .filter { it.startsWith(prefix) }
-                .map { it.substring(prefix.length).substringBefore('/') }
-                .distinct()
-                .filter { it != comp }
-                .forEach { sel.add("$dir/$it") }
-            dir = "$dir/$comp"
-        }
-    }
-    return sel
-}
 
 /**
  * Compute the immediate children of folder [dir] (`""` = root) from a flat

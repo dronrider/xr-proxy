@@ -7,6 +7,7 @@ import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
 import com.xrproxy.app.model.ShareGrant
 import com.xrproxy.app.model.parseManifest
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
@@ -66,11 +67,13 @@ class ShareRepository(private val context: Context) {
     /** The local file for a share-relative path (for opening / existence checks). */
     fun fileFor(config: ShareConfig, relPath: String): File = File(destDir(config), relPath)
 
-    /** Share-relative paths already downloaded locally (drives the "downloaded" mark). */
+    /** Share-relative paths already downloaded locally (drives the "downloaded"
+     *  mark). Resume partials are not downloads and stay out: listing them
+     *  would adopt them into the selection and show them as files (XR-044). */
     fun localPaths(config: ShareConfig): Set<String> {
         val root = destDir(config)
         val out = HashSet<String>()
-        root.walkTopDown().filter { it.isFile }.forEach {
+        root.walkTopDown().filter { it.isFile && !it.name.endsWith(PART_SUFFIX) }.forEach {
             out.add(it.relativeTo(root).path.replace(File.separatorChar, '/'))
         }
         return out
@@ -106,6 +109,25 @@ class ShareRepository(private val context: Context) {
         return File(f.parentFile, f.name + PART_SUFFIX).length()
     }
 
+    /** Drop [target] from a selection, splitting a covering folder prefix into
+     *  its sibling branches. The algebra lives in Rust next to the mirror
+     *  planner (`sync::expand_deselect`, unit-tested there); this only
+     *  marshals the sets. Falls back to removing the direct entries if the
+     *  native answer does not parse. */
+    fun expandDeselect(selection: Set<String>, manifestPaths: List<String>, target: String): Set<String> {
+        val res = NativeBridge.nativeExpandDeselect(
+            JSONArray().apply { selection.forEach { put(it) } }.toString(),
+            JSONArray().apply { manifestPaths.forEach { put(it) } }.toString(),
+            target,
+        )
+        return runCatching {
+            val arr = JSONArray(res)
+            (0 until arr.length()).map { arr.getString(it) }.toSet()
+        }.getOrElse {
+            selection.filterNot { it == target || it.startsWith("$target/") }.toSet()
+        }
+    }
+
     /** Walk up from [dir] removing directories the delete left empty, stopping
      *  at the share root (File.delete refuses non-empty ones, so this is safe). */
     private fun pruneEmptyDirs(root: File, dir: File?) {
@@ -121,7 +143,7 @@ class ShareRepository(private val context: Context) {
      *  viewable and openable. Hash is empty (unknown offline); size/mtime local. */
     fun localManifest(config: ShareConfig): List<ManifestEntry> {
         val root = destDir(config)
-        return root.walkTopDown().filter { it.isFile }.map {
+        return root.walkTopDown().filter { it.isFile && !it.name.endsWith(PART_SUFFIX) }.map {
             ManifestEntry(
                 path = it.relativeTo(root).path.replace(File.separatorChar, '/'),
                 size = it.length(),

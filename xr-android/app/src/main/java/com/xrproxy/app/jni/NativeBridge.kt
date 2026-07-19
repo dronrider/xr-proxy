@@ -316,8 +316,20 @@ object NativeBridge {
      *  [..],"failed":[[path,reason]..],"cancelled":bool}` or `{"error":".."}`. */
     external fun nativeMigrateShareDir(srcDir: String, dstDir: String): String
 
-    /** Poll the running transfer's progress: `{active,cancelled,file,files_done,
-     *  files_total,bytes_done,bytes_total}` (`active:false` when idle). */
+    /** Drop [target] (a file or folder path) from a selection, splitting a
+     *  covering folder prefix into its sibling branches (XR-044). Arguments and
+     *  result are JSON string arrays (selection entries / manifest paths). Pure
+     *  logic in Rust, next to the mirror planner, so both agree on what a
+     *  selection entry covers. */
+    external fun nativeExpandDeselect(
+        selectionJson: String,
+        manifestJson: String,
+        target: String,
+    ): String
+
+    /** Poll the running transfer's progress: `{active,cancelled,share,file,
+     *  files_done,files_total,bytes_done,bytes_total}` (`active:false` when
+     *  idle; `share` is empty for a storage migration). */
     external fun nativeTransferProgress(): String
 
     /** Cancel the running sync/download (aborts at the next chunk). */
