@@ -331,10 +331,10 @@ private fun ExplorerView(
     modifier: Modifier,
 ) {
     var detailsFor by remember { mutableStateOf<ManifestEntry?>(null) }
-    val level = explorerLevel(ui.manifest, ui.currentPath)
-    // Row state is derived once per state change, not per row: a big manifest
-    // with a long queue would otherwise rescan both for every visible row on
+    // Derived once per state change, not per recomposition: a big manifest
+    // with a long queue would otherwise be rescanned for every visible row on
     // every 500ms progress tick.
+    val level = remember(ui.manifest, ui.currentPath) { explorerLevel(ui.manifest, ui.currentPath) }
     val queuedPaths = remember(ui.queue, cfg.shareId) {
         ui.queue.asSequence().filter { it.shareId == cfg.shareId }.map { it.entry.path }.toHashSet()
     }

@@ -249,6 +249,14 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     failed = st.failed.filterNot { it.shareId == shareId },
                 )
             }
+            // A live transfer of the removed share (our head or its mirror
+            // pass) would otherwise write into the dead directory for up to an
+            // hour and hold the single-transfer lock the whole time.
+            freshSnapshot()?.let { o ->
+                if (o.optString("share") == shareId) {
+                    withContext(Dispatchers.IO) { NativeBridge.nativeCancelTransfer() }
+                }
+            }
             if (_ui.value.openShareId == shareId) closeShare()
         }
     }
@@ -504,19 +512,24 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     it.shareId == config.shareId && it.entry.path.startsWith(prefix)
                 })
             }
-            // If the native side is writing under this folder (our head or the
-            // mirror), abort and wait for the writer to leave: deleting the
-            // subtree from under it would just see the partial re-created.
-            withContext(Dispatchers.IO) {
-                val o = runCatching { JSONObject(NativeBridge.nativeTransferProgress()) }.getOrNull()
-                if (o != null && o.optBoolean("active") && o.optString("share") == config.shareId &&
-                    o.optString("file").startsWith(prefix)
+            // Abort the share's native writer before deleting: our head under
+            // the folder, or the mirror's multi-file pass, whose plan was built
+            // from the old selection and would re-create files under the folder
+            // right after the delete. A single-file transfer elsewhere in this
+            // share is a queued row of another folder and stays.
+            freshSnapshot()?.let { o ->
+                if (o.optString("share") == config.shareId &&
+                    (o.optString("file").startsWith(prefix) || o.optLong("files_total") > 1)
                 ) {
-                    NativeBridge.nativeCancelTransfer()
+                    withContext(Dispatchers.IO) { NativeBridge.nativeCancelTransfer() }
                 }
             }
             awaitWriterLeft(config.shareId, prefix)
             deselectPath(config.shareId, path)
+            // Offline the selection may keep covering the folder (see
+            // deselectPath); warn like the file minus does.
+            val stillWanted = store().get(config.shareId)
+                ?.let { isSelected(path, it.selection) } == true
             val local = withContext(Dispatchers.IO) {
                 repo.deleteLocalUnder(config, path)
                 repo.localPaths(config)
@@ -525,6 +538,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                 st.copy(
                     localPaths = if (st.openShareId == config.shareId) local else st.localPaths,
                     failed = st.failed.filterNot { it.shareId == config.shareId && it.path.startsWith(prefix) },
+                    message = if (stillWanted) "Офлайн: папка остаётся выбранной и вернётся при синке" else st.message,
                 )
             }
         }
@@ -565,27 +579,34 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** A fresh native transfer snapshot, or null when idle or unparsable. The
+     *  UI one is up to 500ms stale; cancel decisions need the current owner. */
+    private suspend fun freshSnapshot(): JSONObject? = withContext(Dispatchers.IO) {
+        runCatching { JSONObject(NativeBridge.nativeTransferProgress()) }.getOrNull()
+            ?.takeIf { it.optBoolean("active") }
+    }
+
     /** Abort the native transfer only if it is running exactly this share's
-     *  [path], checked against a fresh snapshot (the UI one is up to 500ms
-     *  stale): a cancel must never kill an unrelated mirror pass or a storage
+     *  [path]: a cancel must never kill an unrelated mirror pass or a storage
      *  migration. Aborting a mirror that fetches this very file is the user's
      *  intent; the pass's remaining files return on its next cycle. */
-    private suspend fun maybeCancelNative(shareId: String, path: String) = withContext(Dispatchers.IO) {
-        val o = runCatching { JSONObject(NativeBridge.nativeTransferProgress()) }.getOrNull()
-            ?: return@withContext
-        if (o.optBoolean("active") && o.optString("share") == shareId && o.optString("file") == path) {
-            NativeBridge.nativeCancelTransfer()
+    private suspend fun maybeCancelNative(shareId: String, path: String) {
+        freshSnapshot()?.let { o ->
+            if (o.optString("share") == shareId && o.optString("file") == path) {
+                withContext(Dispatchers.IO) { NativeBridge.nativeCancelTransfer() }
+            }
         }
     }
 
-    /** Bounded wait until the native writer is outside [prefix] (a cancelled
-     *  download flushes its partial at the next chunk, so this is quick). */
+    /** Bounded wait until the native writer can no longer touch [prefix]: not
+     *  inside it and not a multi-file pass of this share (a cancelled download
+     *  flushes its partial at the next chunk, so this is quick). */
     private suspend fun awaitWriterLeft(shareId: String, prefix: String) = withContext(Dispatchers.IO) {
         repeat(30) {
             val o = runCatching { JSONObject(NativeBridge.nativeTransferProgress()) }.getOrNull()
                 ?: return@withContext
             if (!o.optBoolean("active") || o.optString("share") != shareId ||
-                !o.optString("file").startsWith(prefix)
+                (!o.optString("file").startsWith(prefix) && o.optLong("files_total") <= 1)
             ) {
                 return@withContext
             }
@@ -909,11 +930,17 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun refreshOpenShare(config: ShareConfig) {
         if (_ui.value.openShareId != config.shareId) return
         val result = withContext(Dispatchers.IO) { repo.fetchManifest(config) }
-        val local = withContext(Dispatchers.IO) { repo.localPaths(config) }
+        val localManifest = withContext(Dispatchers.IO) { repo.localManifest(config) }
         _ui.update { st ->
             if (st.openShareId != config.shareId) return@update st
             result.fold(
-                onSuccess = { st.copy(manifest = it, localPaths = local, offlineLocal = false) },
+                onSuccess = {
+                    st.copy(
+                        manifest = withLocalOnly(it, localManifest),
+                        localPaths = localManifest.asSequence().map { e -> e.path }.toSet(),
+                        offlineLocal = false,
+                    )
+                },
                 onFailure = { st },
             )
         }
