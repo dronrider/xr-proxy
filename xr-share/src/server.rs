@@ -1396,14 +1396,15 @@ mod tests {
     }
 
     /// Poll until the job leaves queued/running (bounded, so a hung test fails
-    /// loudly instead of forever).
+    /// loudly instead of forever; generous, so a loaded build machine that
+    /// starves the fake plugin's spawn does not flake the test).
     async fn wait_finished(app: &Router, tok: &ShareToken, job_id: &str) -> serde_json::Value {
-        for _ in 0..300 {
+        for _ in 0..600 {
             let (status, v) = get_status(app, tok, job_id).await;
             assert_eq!(status, StatusCode::OK, "status poll failed: {v}");
             match v.get("state").and_then(|s| s.as_str()) {
                 Some("done") | Some("failed") => return v,
-                _ => tokio::time::sleep(Duration::from_millis(30)).await,
+                _ => tokio::time::sleep(Duration::from_millis(50)).await,
             }
         }
         panic!("job {job_id} did not finish in time");
@@ -1623,13 +1624,13 @@ mod tests {
             sandbox: "none".into(),
         };
         let wait = |mgr: Arc<ImportManager>, id: String| async move {
-            for _ in 0..300 {
+            for _ in 0..600 {
                 if let Some(dto) = mgr.status("I", &id) {
                     if dto.state == "done" || dto.state == "failed" {
                         return dto;
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(30)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
             panic!("job did not finish");
         };
