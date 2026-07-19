@@ -336,11 +336,25 @@ impl ImportManager {
             let id = id.to_string();
             tokio::spawn(async move {
                 let Some(out) = stdout else { return };
-                let mut lines = BufReader::new(out).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if let Some(p) = parse_progress(&line) {
-                        if let Some(j) = jobs.lock().expect("import jobs lock").get_mut(&id) {
-                            j.progress = Some(p);
+                // Raw bytes, not UTF-8 lines: yt-dlp on Windows writes the
+                // console codepage (cp1251), and a strict line reader dying on
+                // the first non-UTF-8 title stops draining the pipe, which
+                // kills the plugin with EINVAL mid-download (found on the
+                // XR-141 prod check). The progress lines themselves are ASCII,
+                // so a lossy decode parses them regardless of the rest.
+                let mut reader = BufReader::new(out);
+                let mut buf = Vec::new();
+                loop {
+                    buf.clear();
+                    match reader.read_until(b'\n', &mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            let line = String::from_utf8_lossy(&buf);
+                            if let Some(p) = parse_progress(line.trim_end()) {
+                                if let Some(j) = jobs.lock().expect("import jobs lock").get_mut(&id) {
+                                    j.progress = Some(p);
+                                }
+                            }
                         }
                     }
                 }

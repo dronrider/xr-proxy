@@ -1420,6 +1420,35 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn test_import_progress_survives_non_utf8_output() {
+        // yt-dlp on Windows prints the console codepage (cp1251): a stdout
+        // line that is not valid UTF-8 must not kill the progress reader,
+        // otherwise the pipe stops draining and the plugin dies with EINVAL
+        // mid-download (found on the XR-141 prod check). Progress after the
+        // bad line still counts.
+        let key = SigningKey::from_bytes(&[39u8; 32]);
+        let share = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let script = write_script(
+            bin.path(),
+            "printf '\\320\\240\\377\\376 codepage title\\n'\necho 'xr-progress 50'\nprintf 'x' > out.bin",
+        );
+        let (app, tok) = import_app(&key, share.path(), Some(one_plugin(&script, &["{url}"], &["*"], 1080)), None);
+
+        let (status, v) = post_import(
+            &app, Some(&tok), "/I/import",
+            serde_json::json!({ "url": PUB_URL, "dest": "" }),
+        ).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{v}");
+        let job_id = v["job_id"].as_str().unwrap().to_string();
+
+        let v = wait_finished(&app, &tok, &job_id).await;
+        assert_eq!(v["state"], "done", "{v}");
+        assert_eq!(v["progress"], 50.0, "прогресс после не-UTF-8 строки потерян: {v}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn test_import_happy_path() {
         let key = SigningKey::from_bytes(&[30u8; 32]);
         let share = tempfile::tempdir().unwrap();
