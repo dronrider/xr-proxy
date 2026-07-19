@@ -55,18 +55,20 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 
-# Убить группу процессов плагина импорта (LLD-29): yt-dlp порождает ffmpeg, и
-# child.kill() оставил бы его сиротой качать дальше. Только unix, на Windows
-# группы нет и убивается сам child.
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 # Реверс-туннель к relay (feature `relay`, default off): identity-TLS сервер над
 # реверс-стримами mux. ring-бэкенд, чтобы кросс-сборка не тянула aws-lc.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"], optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
 hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["server", "tokio", "service"], optional = true }
+
+# Убить группу процессов плагина импорта (LLD-29): yt-dlp порождает ffmpeg, и
+# child.kill() оставил бы его сиротой качать дальше. Только unix, на Windows
+# группы нет и убивается сам child. Секция target-зависимостей стоит строго
+# после обычных [dependencies]: всё, что ниже её заголовка, уехало бы в
+# unix-only и пропало из windows-сборки.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
