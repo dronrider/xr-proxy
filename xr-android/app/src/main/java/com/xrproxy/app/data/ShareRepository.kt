@@ -76,6 +76,46 @@ class ShareRepository(private val context: Context) {
         return out
     }
 
+    /** Delete one downloaded file (the per-row minus, XR-044). The caller removes
+     *  the path from the selection first, otherwise the next mirror pass would
+     *  fetch it right back. Also drops a resume partial of the same file and
+     *  prunes directories the deletion emptied. */
+    fun deleteLocal(config: ShareConfig, relPath: String) {
+        val root = destDir(config)
+        val f = fileFor(config, relPath)
+        f.delete()
+        File(f.parentFile, f.name + PART_SUFFIX).delete()
+        pruneEmptyDirs(root, f.parentFile)
+    }
+
+    /** Delete every downloaded file under a share folder (folder untick, XR-044).
+     *  The subtree belongs to the share alone (its own directory or the per-share
+     *  subfolder on shared storage), so a recursive delete cannot reach foreign
+     *  files. */
+    fun deleteLocalUnder(config: ShareConfig, relDir: String) {
+        val root = destDir(config)
+        File(root, relDir).deleteRecursively()
+        pruneEmptyDirs(root, File(root, relDir).parentFile)
+    }
+
+    /** Size of the resume partial for a path: the saved progress of a broken
+     *  download, shown on the red row and picked up by the retry (XR-044).
+     *  Zero when there is no partial. */
+    fun partialSize(config: ShareConfig, relPath: String): Long {
+        val f = fileFor(config, relPath)
+        return File(f.parentFile, f.name + PART_SUFFIX).length()
+    }
+
+    /** Walk up from [dir] removing directories the delete left empty, stopping
+     *  at the share root (File.delete refuses non-empty ones, so this is safe). */
+    private fun pruneEmptyDirs(root: File, dir: File?) {
+        var d = dir
+        while (d != null && d.absolutePath != root.absolutePath && d.absolutePath.startsWith(root.absolutePath)) {
+            if (!d.delete()) break
+            d = d.parentFile
+        }
+    }
+
     /** A manifest built from the locally-downloaded files, for offline browsing:
      *  when the agent is unreachable the already-downloaded files must stay
      *  viewable and openable. Hash is empty (unknown offline); size/mtime local. */
@@ -146,18 +186,17 @@ class ShareRepository(private val context: Context) {
 
     /**
      * Mirror the selected subset of a share into its app directory. True mirror:
-     * files that were unticked or vanished on the server are removed locally.
+     * files that were deselected or vanished on the server are removed locally.
      *
-     * An empty selection is "nothing ticked", not "mirror the whole share". By
-     * default ([deleteAll] false, the background worker) it is a no-op: auto-
-     * downloading the whole share would hold the transfer lock and block taps
-     * with a false "busy", and auto-deleting everything on a schedule would be
-     * worse. With [deleteAll] set (an explicit user action behind a confirmation,
-     * XR-135) an empty selection becomes a delete-only pass that removes every
-     * local copy of the share.
+     * An empty selection is "nothing wanted on the device", not "mirror the
+     * whole share", and the pass is a no-op: auto-downloading the whole share
+     * would hold the transfer lock and block the foreground queue with a false
+     * "busy", and auto-deleting everything on a schedule would be worse.
+     * Removing local copies is a foreground action ([deleteLocal] and
+     * [deleteLocalUnder] behind the per-row controls, XR-044).
      */
-    fun syncOnce(config: ShareConfig, deleteAll: Boolean = false): SyncOutcome {
-        if (config.selection.isEmpty() && !deleteAll) return SyncOutcome(0, 0, 0)
+    fun syncOnce(config: ShareConfig): SyncOutcome {
+        if (config.selection.isEmpty()) return SyncOutcome(0, 0, 0)
         val token = config.tokenJson ?: return SyncOutcome(0, 0, 0, "no token")
         val res = NativeBridge.nativeSyncShare(
             config.agentBaseUrl, token, config.agentPubkey, destDir(config).absolutePath,
@@ -231,6 +270,8 @@ class ShareRepository(private val context: Context) {
     private fun sanitize(s: String): String = s.replace(Regex("[^A-Za-z0-9_.-]"), "_")
 
     companion object {
+        /** Resume-partial suffix, must match `PART_SUFFIX` in `xr-core::sync`. */
+        private const val PART_SUFFIX = ".xrsync-part"
         /** Invite-share listing is a quick hub metadata call; keep it short so a
          *  slow/unreachable hub clears the refresh spinner fast instead of hanging. */
         private const val INVITE_TIMEOUT_MS = 15_000L

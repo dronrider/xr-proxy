@@ -10,6 +10,8 @@ import com.xrproxy.app.jni.NativeBridge
 import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
 import com.xrproxy.app.model.ShareGrant
+import com.xrproxy.app.model.expandDeselect
+import com.xrproxy.app.model.isSelected
 import com.xrproxy.app.service.ShareSyncScheduler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -26,7 +28,11 @@ import java.io.File
 /**
  * Drives the Files screen (LLD-19, XR-031): a list of shares ("drives") and an
  * Explorer over one share's folders. Files mirror into the app's own directory.
- * Transfers report progress (polled from native) and can be cancelled.
+ *
+ * One axis of state per file (XR-044): "on the device or on its way". The
+ * per-row control queues a download, cancels it, retries after a failure or
+ * deletes the local copy; the selection set is kept in lockstep with those
+ * actions, so the background mirror wants exactly what the rows show.
  */
 class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -42,7 +48,8 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     private val _configs = MutableStateFlow<List<ShareConfig>>(emptyList())
     val configs: StateFlow<List<ShareConfig>> = _configs
 
-    /** Live progress of the running sync/download. */
+    /** Live progress of the running native transfer (queue download, background
+     *  mirror or a storage migration). */
     data class Progress(
         val file: String,
         val filesDone: Long,
@@ -50,6 +57,19 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         val bytesDone: Long,
         val bytesTotal: Long,
         val speedBytesPerSec: Long,
+    )
+
+    /** One file waiting in (or at the head of) the download queue (XR-044). */
+    data class QueueItem(val shareId: String, val entry: ManifestEntry)
+
+    /** A download that broke mid-way: the row keeps the saved progress under a
+     *  red tint and offers a retry that resumes from the partial (XR-044). */
+    data class FailedDownload(
+        val shareId: String,
+        val path: String,
+        val bytesDone: Long,
+        val bytesTotal: Long,
+        val error: String,
     )
 
     data class UiState(
@@ -73,6 +93,16 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
          *  [manifest] it renders the "no network, nothing downloaded" state. */
         val offlineLocal: Boolean = false,
         val localPaths: Set<String> = emptySet(),
+        /** FIFO of files queued with the per-row plus (XR-044); the head is the
+         *  one being downloaded (or waiting out the background mirror's lock). */
+        val queue: List<QueueItem> = emptyList(),
+        val failed: List<FailedDownload> = emptyList(),
+        /** Snapshot of the native transfer, polled while the explorer is open;
+         *  rows recognise themselves by the share-relative path in [Progress.file],
+         *  which also makes the background mirror's progress visible (XR-044). */
+        val transfer: Progress? = null,
+        /** Share whose storage migration is running (XR-043), or null. Queue
+         *  downloads do not set this: they have per-row progress instead. */
         val busyShareId: String? = null,
         val progress: Progress? = null,
         val openFileEvent: File? = null,
@@ -82,10 +112,6 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         /** True when the dialog is the first-sync prompt (auto-continues the
          *  deferred action on choice) vs. a later "change folder" from settings. */
         val storagePromptMode: Boolean = false,
-        /** Share whose "no ticks: delete everything downloaded?" confirmation is
-         *  open (XR-135), or null. A manual sync with an empty selection is a
-         *  destructive delete-only pass, so it asks before wiping the copy. */
-        val confirmDeleteAllFor: String? = null,
         /** Share whose "Импорт по URL" dialog is open (LLD-29), or null. */
         val importDialogFor: String? = null,
         /** Live import job: the agent downloads, this screen polls every 2
@@ -101,10 +127,10 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         val progress: Double? = null,
     )
 
-    /** A sync action deferred until the user makes the first-sync storage choice. */
+    /** An action deferred until the user makes the first-sync storage choice. */
     private sealed interface Pending {
-        data class Download(val shareId: String, val entry: ManifestEntry) : Pending
-        data class Sync(val shareId: String) : Pending
+        data class Enqueue(val shareId: String, val entry: ManifestEntry) : Pending
+        data class EnqueueFolder(val shareId: String, val path: String) : Pending
         data class EnableSync(val shareId: String) : Pending
     }
 
@@ -124,7 +150,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     fun consumeMessage() = _ui.update { it.copy(message = null) }
     fun consumeOpenEvent() = _ui.update { it.copy(openFileEvent = null) }
 
-    // ── share list ──────────────────────────────────────────────────
+    // -- share list --------------------------------------------------
 
     fun refreshHub(hubUrl: String?, inviteToken: String?) {
         if (hubUrl.isNullOrBlank() || inviteToken.isNullOrBlank()) {
@@ -209,11 +235,12 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             store().remove(shareId)
             rescheduleIfNeeded()
+            _ui.update { st -> st.copy(queue = st.queue.filterNot { it.shareId == shareId }) }
             if (_ui.value.openShareId == shareId) closeShare()
         }
     }
 
-    // ── explorer ────────────────────────────────────────────────────
+    // -- explorer ----------------------------------------------------
 
     fun openShare(config: ShareConfig) {
         _ui.update {
@@ -222,6 +249,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                 manifest = emptyList(), manifestLoading = true, offlineLocal = false,
             )
         }
+        ensureTransferPolling()
         viewModelScope.launch {
             // Cache-first (XR-059): the already-downloaded files show up right
             // away, the fresh manifest replaces them when the fetch lands. The
@@ -231,6 +259,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             // upstream), so the connect-timeout never fires.
             val localManifest = withContext(Dispatchers.IO) { repo.localManifest(config) }
             val local = localManifest.map { it.path }.toSet()
+            adoptLocalIntoSelection(config.shareId, local)
             if (localManifest.isNotEmpty()) {
                 _ui.update { st ->
                     if (st.openShareId != config.shareId) return@update st
@@ -272,6 +301,46 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Re-fetch the open share's listing (the explicit refresh action, split off
+     *  the old sync button that confused both meanings, XR-044). */
+    fun refreshManifest(config: ShareConfig) {
+        _ui.update { it.copy(manifestLoading = true) }
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { repo.fetchManifest(config) }
+            val local = withContext(Dispatchers.IO) { repo.localPaths(config) }
+            _ui.update { st ->
+                if (st.openShareId != config.shareId) return@update st
+                result.fold(
+                    onSuccess = {
+                        st.copy(manifest = it, manifestLoading = false, localPaths = local, offlineLocal = false)
+                    },
+                    onFailure = { e ->
+                        st.copy(
+                            manifestLoading = false,
+                            message = "Список: ${humanError(e.message ?: "ошибка")}",
+                        )
+                    },
+                )
+            }
+        }
+    }
+
+    /**
+     * Fold the files already on disk into the share's selection (one-time
+     * migration to the single axis, XR-044): before the redesign a file could be
+     * downloaded without being selected, and the redesigned rows derive their
+     * state from the disk + queue alone. Anything on the device counts as
+     * wanted there, so the mirror must not prune it. Idempotent, folder
+     * selections already covering a path win over a per-file entry.
+     */
+    private suspend fun adoptLocalIntoSelection(shareId: String, local: Set<String>) {
+        if (local.isEmpty()) return
+        val cfg = store().get(shareId) ?: return
+        val missing = local.filterNot { isSelected(it, cfg.selection) }
+        if (missing.isEmpty()) return
+        store().update(shareId) { it.copy(selection = it.selection + missing) }
+    }
+
     fun closeShare() {
         // The poll lives as long as the share screen; the agent-side download
         // continues without us and the file shows up on the next open.
@@ -292,8 +361,157 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         else _ui.update { it.copy(currentPath = p.substringBeforeLast('/', "")) }
     }
 
-    fun setSelected(shareId: String, path: String, selected: Boolean) {
-        viewModelScope.launch { applySelection(shareId, path, selected) }
+    /** Tap a downloaded row: hand the local file to a viewer app. */
+    fun openLocal(config: ShareConfig, entry: ManifestEntry) {
+        viewModelScope.launch {
+            val existing = withContext(Dispatchers.IO) { localFile(config, entry.path) }
+            if (existing != null) _ui.update { it.copy(openFileEvent = existing) }
+        }
+    }
+
+    /** Hits the filesystem (destDir does mkdirs), so call from Dispatchers.IO. */
+    private fun localFile(config: ShareConfig, relPath: String): File? =
+        repo.fileFor(config, relPath).takeIf { it.isFile }
+
+    // -- download queue (XR-044) -------------------------------------
+
+    /** The per-row plus (and the retry after a failure): mark the file wanted
+     *  and put it at the tail of the download queue. Several taps queue several
+     *  files; nothing is silently dropped any more. */
+    fun enqueue(config: ShareConfig, entry: ManifestEntry) {
+        viewModelScope.launch {
+            // A download writes, so settle where it lands first (only on the
+            // very first download of this share, XR-043).
+            if (!config.storageChosen) {
+                promptStorage(config.shareId, Pending.Enqueue(config.shareId, entry))
+                return@launch
+            }
+            // Selection lands before the download starts: a mirror pass running
+            // in between would prune a file that is not selected yet.
+            applySelection(config.shareId, entry.path, true)
+            _ui.update { st ->
+                if (st.queue.any { it.shareId == config.shareId && it.entry.path == entry.path }) st
+                else st.copy(
+                    queue = st.queue + QueueItem(config.shareId, entry),
+                    failed = st.failed.filterNot { it.shareId == config.shareId && it.path == entry.path },
+                )
+            }
+            ensureQueueRunning()
+        }
+    }
+
+    /** Folder tap on a not-fully-present folder: select it and queue whatever
+     *  is missing ("докачать недостающее", the Drive/Dropbox convention). */
+    fun downloadFolder(config: ShareConfig, path: String) {
+        viewModelScope.launch {
+            if (!config.storageChosen) {
+                promptStorage(config.shareId, Pending.EnqueueFolder(config.shareId, path))
+                return@launch
+            }
+            applySelection(config.shareId, path, true)
+            val prefix = "$path/"
+            val st = _ui.value
+            val missing = st.manifest.filter { e ->
+                e.path.startsWith(prefix) && e.path !in st.localPaths &&
+                    st.queue.none { it.shareId == config.shareId && it.entry.path == e.path }
+            }
+            _ui.update { s ->
+                s.copy(
+                    queue = s.queue + missing.map { QueueItem(config.shareId, it) },
+                    failed = s.failed.filterNot { it.shareId == config.shareId && it.path.startsWith(prefix) },
+                )
+            }
+            ensureQueueRunning()
+        }
+    }
+
+    /** Folder tap on a fully-present folder: unselect the subtree and remove its
+     *  local copies (files stay on the server). */
+    fun removeFolder(config: ShareConfig, path: String) {
+        viewModelScope.launch {
+            val prefix = "$path/"
+            val head = _ui.value.queue.firstOrNull()
+            _ui.update { st ->
+                st.copy(queue = st.queue.filterNot {
+                    it.shareId == config.shareId && it.entry.path.startsWith(prefix) && it != head
+                })
+            }
+            if (head != null && head.shareId == config.shareId && head.entry.path.startsWith(prefix)) {
+                cancelHead(head)
+            }
+            deselectPath(config.shareId, path)
+            val local = withContext(Dispatchers.IO) {
+                repo.deleteLocalUnder(config, path)
+                repo.localPaths(config)
+            }
+            _ui.update { st ->
+                st.copy(
+                    localPaths = if (st.openShareId == config.shareId) local else st.localPaths,
+                    failed = st.failed.filterNot { it.shareId == config.shareId && it.path.startsWith(prefix) },
+                )
+            }
+        }
+    }
+
+    /** The per-row minus on a downloaded file: unselect it and delete the local
+     *  copy (the server keeps the file; the plus brings it back). */
+    fun removeLocal(config: ShareConfig, entry: ManifestEntry) {
+        viewModelScope.launch {
+            deselectPath(config.shareId, entry.path)
+            val local = withContext(Dispatchers.IO) {
+                repo.deleteLocal(config, entry.path)
+                repo.localPaths(config)
+            }
+            _ui.update { st ->
+                if (st.openShareId == config.shareId) st.copy(localPaths = local) else st
+            }
+        }
+    }
+
+    /** Cancel on the row being downloaded by the queue. The partial stays on
+     *  disk, so a later plus resumes instead of restarting. */
+    fun cancelActive() {
+        val head = _ui.value.queue.firstOrNull() ?: return
+        viewModelScope.launch { cancelHead(head) }
+    }
+
+    /** Cancel on a queued (not yet started) row: just take it off the list. */
+    fun dequeue(shareId: String, path: String) {
+        viewModelScope.launch {
+            deselectPath(shareId, path)
+            _ui.update { st ->
+                val head = st.queue.firstOrNull()
+                st.copy(queue = st.queue.filterNot {
+                    it.shareId == shareId && it.entry.path == path && it != head
+                })
+            }
+        }
+    }
+
+    /** Cancel on a row the background mirror is fetching: drop the file from
+     *  the wanted set, then abort the native transfer. The mirror's remaining
+     *  files come back on its next cycle; this one does not (deselected). */
+    fun cancelBackgroundFetch(shareId: String, path: String) {
+        viewModelScope.launch {
+            deselectPath(shareId, path)
+            withContext(Dispatchers.IO) { NativeBridge.nativeCancelTransfer() }
+        }
+    }
+
+    private suspend fun cancelHead(head: QueueItem) {
+        deselectPath(head.shareId, head.entry.path)
+        // The download may have just finished: then the head already changed and
+        // aborting the native transfer would hit whatever runs next.
+        if (_ui.value.queue.firstOrNull() != head) return
+        if (activeInFlight) {
+            // The worker sees "cancelled" from the native call and drops the item.
+            withContext(Dispatchers.IO) { NativeBridge.nativeCancelTransfer() }
+        } else {
+            // Waiting out the background mirror's transfer lock: cancelling the
+            // native transfer would kill that mirror, so just drop the item and
+            // let the worker notice the head changed.
+            _ui.update { st -> st.copy(queue = st.queue.filterNot { it == head }) }
+        }
     }
 
     private suspend fun applySelection(shareId: String, path: String, selected: Boolean) {
@@ -305,55 +523,136 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Tap a file: open it if downloaded, else download (with progress) then open.
-     *  A tap is a manual sync of this file: it is added to the selection so it is
-     *  treated exactly like a ticked + synced file (kept locally, re-mirrored when
-     *  the toggle is on, never pruned as an ad-hoc copy). */
-    fun downloadAndOpen(config: ShareConfig, entry: ManifestEntry) {
-        viewModelScope.launch {
-            // Selection lands before the download starts: a mirror pass running
-            // in between would prune a file that is not selected yet.
-            applySelection(config.shareId, entry.path, true)
-            val existing = withContext(Dispatchers.IO) { localFile(config, entry.path) }
-            if (existing != null) {
-                _ui.update { st -> st.copy(openFileEvent = existing) }
-                return@launch
-            }
-            // A download writes, so settle where it lands first (only on the very
-            // first sync of this share); an already-downloaded file opened above.
-            if (!config.storageChosen) {
-                promptStorage(config.shareId, Pending.Download(config.shareId, entry))
-                return@launch
-            }
-            if (_ui.value.busyShareId != null) return@launch
-            _ui.update { it.copy(busyShareId = config.shareId, progress = preparing()) }
-            val poll = launchPolling()
-            val err = withContext(Dispatchers.IO) { repo.downloadOne(config, entry) }
-            poll.cancel()
-            val local = withContext(Dispatchers.IO) { repo.localPaths(config) }
-            _ui.update {
-                it.copy(
-                    busyShareId = null, localPaths = local, progress = null,
-                    openFileEvent = if (err == null) repo.fileFor(config, entry.path) else null,
-                    message = when {
-                        err == null -> null
-                        err == "busy" -> "Идёт синхронизация, попробуй ещё раз"
-                        // A dead share deserves its verdict here too, not the
-                        // catch-all text (XR-134).
-                        err.startsWith("agent_offline") ->
-                            humanError(err).replaceFirstChar { c -> c.uppercaseChar() }
-                        else -> "Не удалось скачать"
-                    },
-                )
+    /** Unselect [path], splitting a covering folder selection into the sibling
+     *  branches so only this file (or folder) leaves the wanted set. */
+    private suspend fun deselectPath(shareId: String, path: String) {
+        val manifestPaths = _ui.value.manifest.map { it.path }
+        store().update(shareId) {
+            it.copy(selection = expandDeselect(it.selection, manifestPaths, path))
+        }
+    }
+
+    /** True while a queue download is inside the native call (vs waiting out a
+     *  "busy" from the background mirror): tells cancel whether aborting the
+     *  native transfer is ours to do. */
+    @Volatile
+    private var activeInFlight = false
+
+    private var queueJob: Job? = null
+
+    private fun ensureQueueRunning() {
+        ensureTransferPolling()
+        if (queueJob?.isActive == true) return
+        queueJob = viewModelScope.launch {
+            while (true) {
+                val item = _ui.value.queue.firstOrNull() ?: break
+                val cfg = store().get(item.shareId)
+                var err: String? = null
+                if (cfg == null) {
+                    // The share was removed while its file sat in the queue.
+                    err = "cancelled"
+                } else {
+                    while (true) {
+                        activeInFlight = true
+                        err = withContext(Dispatchers.IO) { repo.downloadOne(cfg, item.entry) }
+                        activeInFlight = false
+                        if (err != "busy") break
+                        // The background mirror holds the single-transfer lock:
+                        // wait it out, unless the user took the file off the queue.
+                        delay(2_000)
+                        if (_ui.value.queue.firstOrNull() != item) {
+                            err = "cancelled"
+                            break
+                        }
+                    }
+                }
+                val done = err == null
+                // Saved progress of a failure comes from the resume partial on
+                // disk, not the transfer snapshot: the poller may have cleared
+                // the snapshot already, the partial is what the retry resumes.
+                val bytesDone = if (!done && err != "cancelled" && cfg != null) {
+                    withContext(Dispatchers.IO) { repo.partialSize(cfg, item.entry.path) }
+                } else {
+                    0L
+                }
+                val local = if (done && cfg != null) {
+                    withContext(Dispatchers.IO) { repo.localPaths(cfg) }
+                } else {
+                    null
+                }
+                _ui.update { st ->
+                    st.copy(
+                        queue = st.queue.filterNot { it == item },
+                        localPaths = if (local != null && st.openShareId == item.shareId) local else st.localPaths,
+                        failed = if (done || err == "cancelled") st.failed
+                        else st.failed + FailedDownload(
+                            item.shareId, item.entry.path,
+                            bytesDone, item.entry.size, humanError(err ?: "ошибка"),
+                        ),
+                    )
+                }
             }
         }
     }
 
-    /** Hits the filesystem (destDir does mkdirs), so call from Dispatchers.IO. */
-    private fun localFile(config: ShareConfig, relPath: String): File? =
-        repo.fileFor(config, relPath).takeIf { it.isFile }
+    // -- transfer progress on rows -----------------------------------
 
-    // ── sync + transfer control ─────────────────────────────────────
+    private var transferPoll: Job? = null
+
+    /**
+     * Poll the native transfer snapshot while the explorer is open or the queue
+     * is busy. One poller covers both the foreground queue and the background
+     * mirror: rows match themselves against [Progress.file] (a share-relative
+     * path), which is what makes background sync visible per row (XR-044).
+     * When a transfer ends the local set is re-read, so freshly mirrored files
+     * flip their rows without reopening the share.
+     */
+    private fun ensureTransferPolling() {
+        if (transferPoll?.isActive == true) return
+        transferPoll = viewModelScope.launch {
+            var lastBytes = 0L
+            var lastTime = System.currentTimeMillis()
+            var wasActive = false
+            while (_ui.value.openShareId != null || _ui.value.queue.isNotEmpty()) {
+                val snap = withContext(Dispatchers.IO) { NativeBridge.nativeTransferProgress() }
+                runCatching { JSONObject(snap) }.getOrNull()?.let { o ->
+                    val active = o.optBoolean("active", false)
+                    val bytesDone = if (active) o.optLong("bytes_done") else 0L
+                    val now = System.currentTimeMillis()
+                    val dt = (now - lastTime).coerceAtLeast(1)
+                    val speed = if (active) ((bytesDone - lastBytes) * 1000 / dt).coerceAtLeast(0) else 0
+                    lastBytes = bytesDone
+                    lastTime = now
+                    _ui.update {
+                        it.copy(
+                            transfer = if (!active) null else Progress(
+                                file = o.optString("file"),
+                                filesDone = o.optLong("files_done"),
+                                filesTotal = o.optLong("files_total"),
+                                bytesDone = bytesDone,
+                                bytesTotal = o.optLong("bytes_total"),
+                                speedBytesPerSec = speed,
+                            ),
+                        )
+                    }
+                    if (wasActive && !active) refreshLocal()
+                    wasActive = active
+                }
+                delay(500)
+            }
+            _ui.update { it.copy(transfer = null) }
+        }
+    }
+
+    /** Re-read the open share's local files (after a transfer finished). */
+    private suspend fun refreshLocal() {
+        val id = _ui.value.openShareId ?: return
+        val cfg = store().get(id) ?: return
+        val local = withContext(Dispatchers.IO) { repo.localPaths(cfg) }
+        _ui.update { st -> if (st.openShareId == id) st.copy(localPaths = local) else st }
+    }
+
+    // -- background mirror toggle ------------------------------------
 
     fun setSyncEnabled(shareId: String, enabled: Boolean) {
         viewModelScope.launch {
@@ -372,72 +671,15 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             rescheduleIfNeeded()
             if (enabled) {
                 withContext(Dispatchers.IO) { ShareSyncScheduler.syncNow(getApplication()) }
-                _ui.update { it.copy(message = "Синк включён (зеркалит выбранное, удаляет лишнее)") }
+                _ui.update { it.copy(message = "Фоновый синк включён: докачивает выбранное и убирает удалённое на сервере") }
             }
         }
     }
 
-    fun syncNow(config: ShareConfig, deleteAll: Boolean = false) {
-        if (config.selection.isEmpty() && !deleteAll) {
-            // No ticks: a manual sync means "remove every local copy of this
-            // share" (XR-135). Nothing downloaded, nothing to do; otherwise ask
-            // before the destructive delete-only pass.
-            viewModelScope.launch {
-                val hasLocal = withContext(Dispatchers.IO) { repo.localPaths(config).isNotEmpty() }
-                _ui.update {
-                    if (hasLocal) it.copy(confirmDeleteAllFor = config.shareId)
-                    else it.copy(message = "Отметь галочками файлы или папки для синка")
-                }
-            }
-            return
-        }
-        if (!config.storageChosen) {
-            promptStorage(config.shareId, Pending.Sync(config.shareId))
-            return
-        }
-        if (_ui.value.busyShareId != null) {
-            // Another transfer holds the lock. Say so instead of a silent return:
-            // for a confirmed delete-all the user expects something to happen.
-            _ui.update { it.copy(message = "Идёт синхронизация, подождите") }
-            return
-        }
-        _ui.update { it.copy(busyShareId = config.shareId, progress = preparing()) }
-        val poll = launchPolling()
-        viewModelScope.launch {
-            val outcome = withContext(Dispatchers.IO) { repo.syncOnce(config, deleteAll) }
-            poll.cancel()
-            val local = withContext(Dispatchers.IO) { repo.localPaths(config) }
-            _ui.update {
-                it.copy(
-                    busyShareId = null, progress = null, localPaths = local,
-                    message = when {
-                        outcome.ok ->
-                            "Синк «${config.name}»: +${outcome.fetched} −${outcome.deleted}" +
-                                if (outcome.failed > 0) " (ошибок ${outcome.failed})" else ""
-                        outcome.error == "busy" -> "Идёт синхронизация, подождите"
-                        else -> "Синк «${config.name}»: ${humanError(outcome.error ?: "ошибка")}"
-                    },
-                )
-            }
-        }
-    }
-
-    /** User confirmed the "no ticks, delete everything" prompt (XR-135): run the
-     *  delete-only pass that wipes the share's local copy. The prompt only opens
-     *  when local files exist, which means storage was already settled, so
-     *  syncNow's first-sync storage detour is not reachable from here. */
-    fun confirmDeleteAll() {
-        val shareId = _ui.value.confirmDeleteAllFor ?: return
-        _ui.update { it.copy(confirmDeleteAllFor = null) }
-        val config = _configs.value.firstOrNull { it.shareId == shareId } ?: return
-        syncNow(config, deleteAll = true)
-    }
-
-    fun dismissDeleteAll() = _ui.update { it.copy(confirmDeleteAllFor = null) }
-
+    /** Cancel the running native transfer (the storage-migration card's stop). */
     fun cancelTransfer() {
         viewModelScope.launch { withContext(Dispatchers.IO) { NativeBridge.nativeCancelTransfer() } }
-        _ui.update { it.copy(message = "Останавливаю…") }
+        _ui.update { it.copy(message = "Останавливаю...") }
     }
 
     // -- URL import (LLD-29) ----------------------------------------
@@ -564,7 +806,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ── storage directory (XR-043) ──────────────────────────────────
+    // -- storage directory (XR-043) ----------------------------------
 
     private fun promptStorage(shareId: String, action: Pending) {
         pending = action
@@ -609,7 +851,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                 runPending(shareId)
                 return@launch
             }
-            if (_ui.value.busyShareId != null) {
+            if (_ui.value.busyShareId != null || _ui.value.queue.isNotEmpty()) {
                 _ui.update { it.copy(message = "Идёт передача, попробуйте позже") }
                 return@launch
             }
@@ -647,15 +889,15 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         pending = null
         if (p.shareIdOf() != shareId) return
         when (p) {
-            is Pending.Download -> store().get(p.shareId)?.let { downloadAndOpen(it, p.entry) }
-            is Pending.Sync -> store().get(p.shareId)?.let { syncNow(it) }
+            is Pending.Enqueue -> store().get(p.shareId)?.let { enqueue(it, p.entry) }
+            is Pending.EnqueueFolder -> store().get(p.shareId)?.let { downloadFolder(it, p.path) }
             is Pending.EnableSync -> setSyncEnabled(p.shareId, true)
         }
     }
 
     private fun Pending.shareIdOf(): String = when (this) {
-        is Pending.Download -> shareId
-        is Pending.Sync -> shareId
+        is Pending.Enqueue -> shareId
+        is Pending.EnqueueFolder -> shareId
         is Pending.EnableSync -> shareId
     }
 
@@ -669,13 +911,13 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             (if (o.failed > 0) ", ошибок ${o.failed}" else "")
     }
 
-    private fun preparing() = Progress("Подготовка…", 0, 0, 0, 0, 0)
+    private fun preparing() = Progress("Подготовка...", 0, 0, 0, 0, 0)
 
     /**
-     * Poll native transfer progress until the launching operation cancels this
-     * job. It does NOT stop on `active == false`: at the start the native side is
-     * still fetching the manifest (not yet active), so breaking there would hide
-     * the bar until a second tap. Speed is computed from the byte delta.
+     * Poll native transfer progress for the storage-migration card until the
+     * launching operation cancels this job. It does NOT stop on `active ==
+     * false`: at the start the native side is not active yet, so breaking there
+     * would hide the bar. Speed is computed from the byte delta.
      */
     private fun launchPolling(): Job = viewModelScope.launch {
         var lastBytes = 0L
@@ -696,7 +938,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update {
                     it.copy(
                         progress = Progress(
-                            file = if (active) o.optString("file").ifEmpty { "Подготовка…" } else "Подготовка…",
+                            file = if (active) o.optString("file").ifEmpty { "Подготовка..." } else "Подготовка...",
                             filesDone = if (active) o.optLong("files_done") else 0,
                             filesTotal = if (active) o.optLong("files_total") else 0,
                             bytesDone = bytesDone,

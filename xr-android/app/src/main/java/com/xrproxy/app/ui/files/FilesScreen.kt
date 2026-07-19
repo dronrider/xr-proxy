@@ -25,17 +25,19 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddLink
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DriveFileMove
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material.icons.filled.Remove
+import androidx.compose.material.icons.filled.Replay
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
-import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -47,6 +49,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TriStateCheckbox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -57,8 +60,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -73,9 +78,11 @@ import java.io.File
 
 /**
  * Files tab (LLD-19, XR-031): a list of shares ("drives") and an Explorer that
- * navigates one share's folders. Tap a file to download + open it; tick files or
- * whole folders to mirror. A compact progress bar with speed + cancel covers any
- * running transfer.
+ * navigates one share's folders. One control per file row (XR-044): the plus
+ * queues a download, the running row shows progress with a cancel, the minus
+ * removes the local copy, a broken download keeps its progress under a red tint
+ * with a retry. The row tap only opens a downloaded file. Folders are tri-state
+ * like selective sync in Drive/Dropbox.
  */
 @Composable
 fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modifier) {
@@ -157,23 +164,6 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
             onAppDir = { vm.chooseStorage(storageCfg.shareId, null) },
             onCustom = { vm.hideStorageDialog(); startCustomPick(storageCfg.shareId) },
             onDismiss = { vm.dismissStorageDialog() },
-        )
-    }
-
-    val deleteAllCfg = configs.firstOrNull { it.shareId == ui.confirmDeleteAllFor }
-    if (deleteAllCfg != null) {
-        AlertDialog(
-            onDismissRequest = { vm.dismissDeleteAll() },
-            title = { Text("Удалить всё скачанное?") },
-            text = {
-                Text(
-                    "Галочек нет. Синк удалит все локальные копии шары «${deleteAllCfg.name}». " +
-                        "На сервере файлы останутся.",
-                    fontSize = 13.sp,
-                )
-            },
-            confirmButton = { TextButton(onClick = { vm.confirmDeleteAll() }) { Text("Удалить") } },
-            dismissButton = { TextButton(onClick = { vm.dismissDeleteAll() }) { Text("Отмена") } },
         )
     }
 }
@@ -343,17 +333,6 @@ private fun ExplorerView(
     var detailsFor by remember { mutableStateOf<ManifestEntry?>(null) }
     val level = explorerLevel(ui.manifest, ui.currentPath)
 
-    // Resolve the selection to actual files: total selected, and how many are not
-    // yet downloaded (what a sync would fetch). Folders expand to their files.
-    var totalFiles = 0
-    var newFiles = 0
-    ui.manifest.forEach { e ->
-        if (isSelected(e.path, cfg.selection)) {
-            totalFiles++
-            if (e.path !in ui.localPaths) newFiles++
-        }
-    }
-
     Column(modifier = modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
@@ -371,22 +350,11 @@ private fun ExplorerView(
                     Icon(Icons.Default.AddLink, contentDescription = "Импорт по URL")
                 }
             }
-            // Sync the selected subset; the icon + count light up once something is
-            // ticked. The count is "<to download> / <total selected files>".
-            IconButton(onClick = { vm.syncNow(cfg) }) {
-                Icon(
-                    Icons.Default.Sync,
-                    contentDescription = "Синкать выбранное",
-                    tint = if (totalFiles > 0) MaterialTheme.colorScheme.primary
-                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            if (totalFiles > 0) {
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(end = 4.dp)) {
-                    Text("$newFiles", color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                    Text("/$totalFiles", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
-                }
+            // Refresh the listing from the agent. Deliberately not the sync
+            // action: the old circular-arrows button confused both meanings
+            // (XR-044), downloads now go through the per-row controls.
+            IconButton(onClick = { vm.refreshManifest(cfg) }) {
+                Icon(Icons.Default.Refresh, contentDescription = "Обновить список")
             }
             Spacer(Modifier.width(6.dp))
             Text("Синк", fontSize = 12.sp)
@@ -425,7 +393,7 @@ private fun ExplorerView(
             else -> LazyColumn {
                 items(level, key = { it.path }) { node ->
                     when (node) {
-                        is TreeNode.Folder -> FolderRow(node, cfg, vm)
+                        is TreeNode.Folder -> FolderRow(node, cfg, ui, vm)
                         is TreeNode.FileNode -> FileRow(node, cfg, ui, vm) { detailsFor = it }
                     }
                     HorizontalDivider()
@@ -534,17 +502,41 @@ private fun ImportRow(job: FilesViewModel.ImportJob, onCancel: () -> Unit) {
     }
 }
 
+/** A folder row (XR-044): tri-state like selective-sync folders in Drive or
+ *  Dropbox. Off and indeterminate taps queue whatever is missing under the
+ *  folder; the On tap unselects the subtree and removes its local copies. */
 @Composable
-private fun FolderRow(node: TreeNode.Folder, cfg: ShareConfig, vm: FilesViewModel) {
-    val coveredByParent = coveredByAncestor(node.path, cfg.selection)
+private fun FolderRow(
+    node: TreeNode.Folder,
+    cfg: ShareConfig,
+    ui: FilesViewModel.UiState,
+    vm: FilesViewModel,
+) {
+    val prefix = "${node.path}/"
+    var total = 0
+    var present = 0
+    ui.manifest.forEach { e ->
+        if (!e.path.startsWith(prefix)) return@forEach
+        total++
+        if (e.path in ui.localPaths ||
+            ui.queue.any { it.shareId == cfg.shareId && it.entry.path == e.path }
+        ) present++
+    }
+    val state = when {
+        total > 0 && present == total -> ToggleableState.On
+        present > 0 -> ToggleableState.Indeterminate
+        else -> ToggleableState.Off
+    }
     Row(
         modifier = Modifier.fillMaxWidth().clickable { vm.navigateTo(node.path) }.padding(vertical = 3.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Checkbox(
-            checked = cfg.selection.contains(node.path) || coveredByParent,
-            enabled = !coveredByParent,
-            onCheckedChange = { vm.setSelected(cfg.shareId, node.path, it) },
+        TriStateCheckbox(
+            state = state,
+            onClick = {
+                if (state == ToggleableState.On) vm.removeFolder(cfg, node.path)
+                else vm.downloadFolder(cfg, node.path)
+            },
         )
         Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(24.dp))
         Spacer(Modifier.width(8.dp))
@@ -553,11 +545,16 @@ private fun FolderRow(node: TreeNode.Folder, cfg: ShareConfig, vm: FilesViewMode
             Text("${node.fileCount} файл(ов)", fontSize = 10.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        Text("›", fontSize = 22.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(">", fontSize = 22.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.width(6.dp))
     }
 }
 
+/** One file row (XR-044). The trailing control always carries an action for the
+ *  current state: plus = queue the download, cross = cancel it, minus = delete
+ *  the local copy, replay = resume a broken download from its partial. The row
+ *  tap only opens a downloaded file; progress (ours or the background mirror's,
+ *  matched by path) is painted behind the row itself. */
 @Composable
 private fun FileRow(
     node: TreeNode.FileNode,
@@ -566,30 +563,90 @@ private fun FileRow(
     vm: FilesViewModel,
     onDetails: (ManifestEntry) -> Unit,
 ) {
-    val downloaded = ui.localPaths.contains(node.entry.path)
-    val coveredByParent = coveredByAncestor(node.entry.path, cfg.selection)
+    val path = node.entry.path
+    val downloaded = ui.localPaths.contains(path)
+    val head = ui.queue.firstOrNull()
+    val isHead = head != null && head.shareId == cfg.shareId && head.entry.path == path
+    val queued = !isHead && ui.queue.any { it.shareId == cfg.shareId && it.entry.path == path }
+    val failed = ui.failed.firstOrNull { it.shareId == cfg.shareId && it.path == path }
+    val snap = ui.transfer
+    val transferring = !downloaded && snap != null && snap.file == path
+    // Transferring but neither ours nor queued: the background mirror fetches it.
+    val bgFetch = transferring && !isHead && !queued
+
+    val errorColor = MaterialTheme.colorScheme.error
+    val primary = MaterialTheme.colorScheme.primary
+    // A multi-file mirror pass reports aggregate bytes, a per-row fraction is
+    // only honest for a single-file transfer.
+    val fillFrac = when {
+        transferring && snap != null && snap.filesTotal == 1L && snap.bytesTotal > 0 ->
+            (snap.bytesDone.toFloat() / snap.bytesTotal).coerceIn(0f, 1f)
+        !transferring && !queued && failed != null && failed.bytesTotal > 0 ->
+            (failed.bytesDone.toFloat() / failed.bytesTotal).coerceIn(0f, 1f)
+        else -> 0f
+    }
+    val showError = failed != null && !transferring && !queued && !downloaded
+
     Row(
         modifier = Modifier.fillMaxWidth()
+            .drawBehind {
+                if (showError) {
+                    drawRect(errorColor.copy(alpha = 0.10f))
+                    if (fillFrac > 0f) {
+                        drawRect(errorColor.copy(alpha = 0.25f), size = size.copy(width = size.width * fillFrac))
+                    }
+                } else if (transferring && fillFrac > 0f) {
+                    drawRect(primary.copy(alpha = 0.15f), size = size.copy(width = size.width * fillFrac))
+                }
+            }
             .combinedClickable(
-                onClick = { vm.downloadAndOpen(cfg, node.entry) },
+                onClick = { if (downloaded) vm.openLocal(cfg, node.entry) },
                 onLongClick = { onDetails(node.entry) },
             )
             .padding(vertical = 3.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Checkbox(
-            checked = cfg.selection.contains(node.entry.path) || coveredByParent,
-            enabled = !coveredByParent,
-            onCheckedChange = { vm.setSelected(cfg.shareId, node.entry.path, it) },
-        )
-        Column(modifier = Modifier.weight(1f).padding(start = 2.dp)) {
+        Column(modifier = Modifier.weight(1f).padding(start = 14.dp)) {
             Text(node.name, maxLines = 1, fontSize = 13.sp, modifier = Modifier.basicMarquee())
             Text(
-                humanSize(node.entry.size) + if (downloaded) " · скачано, тап откроет" else " · тап скачает и откроет",
+                when {
+                    downloaded -> humanSize(node.entry.size) + " - скачано, тап откроет"
+                    transferring && snap != null && snap.filesTotal == 1L ->
+                        "${humanSize(snap.bytesDone)} из ${humanSize(node.entry.size)}" +
+                            " - ${humanSize(snap.speedBytesPerSec)}/с"
+                    bgFetch -> "качается фоновым синком"
+                    isHead -> "готовится..."
+                    queued -> humanSize(node.entry.size) + " - в очереди"
+                    failed != null -> "оборвалось на ${humanSize(failed.bytesDone)} из ${humanSize(failed.bytesTotal)}"
+                    else -> humanSize(node.entry.size)
+                },
                 fontSize = 10.sp,
-                color = if (downloaded) MaterialTheme.colorScheme.primary
-                else MaterialTheme.colorScheme.onSurfaceVariant,
+                color = when {
+                    showError -> errorColor
+                    downloaded -> primary
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                },
             )
+        }
+        when {
+            downloaded -> IconButton(onClick = { vm.removeLocal(cfg, node.entry) }) {
+                Icon(Icons.Default.Remove, contentDescription = "Удалить с устройства")
+            }
+            isHead -> IconButton(onClick = { vm.cancelActive() }) {
+                Icon(Icons.Default.Close, contentDescription = "Отменить загрузку")
+            }
+            bgFetch -> IconButton(onClick = { vm.cancelBackgroundFetch(cfg.shareId, path) }) {
+                Icon(Icons.Default.Close, contentDescription = "Отменить загрузку")
+            }
+            queued -> IconButton(onClick = { vm.dequeue(cfg.shareId, path) }) {
+                Icon(Icons.Default.Schedule, contentDescription = "Убрать из очереди")
+            }
+            failed != null -> IconButton(onClick = { vm.enqueue(cfg, node.entry) }) {
+                Icon(Icons.Default.Replay, contentDescription = "Докачать", tint = errorColor)
+            }
+            else -> IconButton(onClick = { vm.enqueue(cfg, node.entry) }) {
+                Icon(Icons.Default.Add, contentDescription = "Скачать", tint = DownloadGreen)
+            }
         }
     }
 }
@@ -652,19 +709,8 @@ private fun SectionLabel(text: String) {
 
 // ── helpers ─────────────────────────────────────────────────────────
 
-private fun coveredByAncestor(path: String, selection: Set<String>): Boolean {
-    var p = path
-    while (true) {
-        val i = p.lastIndexOf('/')
-        if (i < 0) return false
-        p = p.substring(0, i)
-        if (selection.contains(p)) return true
-    }
-}
-
-/** A file is selected if it is ticked itself or sits under a ticked folder. */
-private fun isSelected(path: String, selection: Set<String>): Boolean =
-    selection.contains(path) || coveredByAncestor(path, selection)
+/** The plus control's "get it" green; same tone as the log screen's info colour. */
+private val DownloadGreen = Color(0xFF4CAF50)
 
 private fun openLocalFile(context: Context, file: File) {
     try {
