@@ -44,6 +44,11 @@ struct TransferControl {
     files_done: AtomicU64,
     files_total: AtomicU64,
     file: Mutex<String>,
+    // Which share the transfer belongs to (empty for a storage migration).
+    // Without it the UI can only match a transfer to a row by the relative
+    // path, and two shares holding the same path misattribute progress and,
+    // worse, a cancel (XR-044).
+    share: Mutex<String>,
 }
 
 impl TransferControl {
@@ -56,6 +61,7 @@ impl TransferControl {
             files_done: AtomicU64::new(0),
             files_total: AtomicU64::new(0),
             file: Mutex::new(String::new()),
+            share: Mutex::new(String::new()),
         }
     }
 }
@@ -73,7 +79,9 @@ static TRANSFER: TransferControl = TransferControl::new();
 pub struct TransferGuard(());
 
 impl TransferGuard {
-    pub fn acquire(files_total: usize, bytes_total: u64) -> Option<Self> {
+    /// `share_id` names the owner in [`transfer_snapshot`]; a storage
+    /// migration passes `""` (it has no share on the native side).
+    pub fn acquire(share_id: &str, files_total: usize, bytes_total: u64) -> Option<Self> {
         if TRANSFER
             .active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -87,6 +95,7 @@ impl TransferGuard {
         TRANSFER.files_done.store(0, Ordering::Relaxed);
         TRANSFER.files_total.store(files_total as u64, Ordering::Relaxed);
         *TRANSFER.file.lock().expect("transfer lock") = String::new();
+        *TRANSFER.share.lock().expect("transfer lock") = share_id.to_string();
         Some(Self(()))
     }
 }
@@ -101,6 +110,7 @@ impl Drop for TransferGuard {
         TRANSFER.files_done.store(0, Ordering::Relaxed);
         TRANSFER.files_total.store(0, Ordering::Relaxed);
         *TRANSFER.file.lock().expect("transfer lock") = String::new();
+        *TRANSFER.share.lock().expect("transfer lock") = String::new();
         TRANSFER.active.store(false, Ordering::Relaxed);
     }
 }
@@ -129,6 +139,10 @@ fn transfer_add_bytes(n: u64) {
 pub struct TransferSnapshot {
     pub active: bool,
     pub cancelled: bool,
+    /// Owner share of the transfer, `""` for a storage migration. Lets the UI
+    /// attribute progress (and a cancel) to the right share's row when two
+    /// shares hold the same relative path (XR-044).
+    pub share: String,
     pub file: String,
     pub files_done: u64,
     pub files_total: u64,
@@ -140,6 +154,7 @@ pub fn transfer_snapshot() -> TransferSnapshot {
     TransferSnapshot {
         active: TRANSFER.active.load(Ordering::Relaxed),
         cancelled: TRANSFER.cancel.load(Ordering::Relaxed),
+        share: TRANSFER.share.lock().expect("transfer lock").clone(),
         file: TRANSFER.file.lock().expect("transfer lock").clone(),
         files_done: TRANSFER.files_done.load(Ordering::Relaxed),
         files_total: TRANSFER.files_total.load(Ordering::Relaxed),
@@ -253,6 +268,61 @@ pub fn plan_with_selection(
     fetch.sort_by(|a, b| a.path.cmp(&b.path));
     delete.sort();
     SyncPlan { fetch, delete }
+}
+
+/// Remove `target` (a file or a folder) from a selection, splitting a covering
+/// folder prefix instead of dropping it whole (XR-044). The direct entry and
+/// everything under it leave the set; when the target sits under a selected
+/// ancestor folder, that ancestor is replaced by entries for every sibling
+/// branch along the chain down to the target, so deselecting one file keeps
+/// the rest of its folder selected. Lives next to [`plan_with_selection`]
+/// because the two must agree on what a selection entry means (the same
+/// exact-or-`{s}/` prefix rule as `path_selected`). Note the split freezes the
+/// former folder's coverage to the branches visible in `manifest_paths`:
+/// server files added to it later are no longer covered.
+pub fn expand_deselect(
+    selection: &HashSet<String>,
+    manifest_paths: &[String],
+    target: &str,
+) -> HashSet<String> {
+    let mut sel: HashSet<String> = selection
+        .iter()
+        .filter(|s| s.as_str() != target && !s.starts_with(&format!("{target}/")))
+        .cloned()
+        .collect();
+    loop {
+        // Nearest selected ancestor, if the target is still covered.
+        let mut ancestor: Option<&str> = None;
+        let mut p = target;
+        while let Some(i) = p.rfind('/') {
+            p = &p[..i];
+            if sel.contains(p) {
+                ancestor = Some(p);
+                break;
+            }
+        }
+        let Some(a) = ancestor else { return sel };
+        let a = a.to_string();
+        sel.remove(&a);
+        // Re-select the sibling branches at each level from the ancestor down
+        // to the target; the branch containing the target descends instead.
+        let mut dir = a;
+        for comp in target[dir.len() + 1..].to_string().split('/') {
+            let prefix = format!("{dir}/");
+            let mut siblings: Vec<&str> = manifest_paths
+                .iter()
+                .filter(|m| m.starts_with(&prefix))
+                .map(|m| m[prefix.len()..].split('/').next().unwrap_or(""))
+                .filter(|c| !c.is_empty() && *c != comp)
+                .collect();
+            siblings.sort_unstable();
+            siblings.dedup();
+            for c in siblings {
+                sel.insert(format!("{dir}/{c}"));
+            }
+            dir = format!("{dir}/{comp}");
+        }
+    }
 }
 
 /// Resolve a share-relative path to a local destination under `root`, refusing
@@ -1266,7 +1336,7 @@ async fn run_sync(
     // Refuse to run a second transfer in parallel with another one (e.g. the
     // background worker while the user taps a file): they would corrupt the
     // shared progress and the same `.part`. The skipped sync runs next cycle.
-    let _guard = match TransferGuard::acquire(plan.fetch.len(), bytes_total) {
+    let _guard = match TransferGuard::acquire(&token.share_id, plan.fetch.len(), bytes_total) {
         Some(g) => g,
         None => return Err("busy".into()),
     };
@@ -2251,6 +2321,82 @@ mod tests {
         let m2 = manifest(vec![entry("docs2/x", "x"), entry("docs/y", "y")]);
         let plan2 = plan_with_selection(&m2, &[], Some(&sel));
         assert_eq!(plan2.fetch.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), vec!["docs/y"]);
+    }
+
+    fn sel_of(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn paths_of(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_expand_deselect_direct_entries() {
+        let paths = paths_of(&["a.txt", "docs/b.txt", "docs/sub/c.txt"]);
+        // A directly selected file just leaves.
+        let sel = expand_deselect(&sel_of(&["a.txt", "docs"]), &paths, "a.txt");
+        assert_eq!(sel, sel_of(&["docs"]));
+        // A selected folder takes its descendants' entries with it.
+        let sel = expand_deselect(&sel_of(&["docs", "docs/sub/c.txt", "a.txt"]), &paths, "docs");
+        assert_eq!(sel, sel_of(&["a.txt"]));
+        // Not covered at all: a no-op.
+        let sel = expand_deselect(&sel_of(&["a.txt"]), &paths, "docs/b.txt");
+        assert_eq!(sel, sel_of(&["a.txt"]));
+    }
+
+    #[test]
+    fn test_expand_deselect_splits_covering_folder() {
+        let paths = paths_of(&["docs/a.txt", "docs/b.txt", "docs/sub/c.txt", "other/x.txt"]);
+        // Dropping one file re-selects its sibling file and sibling folder.
+        let sel = expand_deselect(&sel_of(&["docs"]), &paths, "docs/a.txt");
+        assert_eq!(sel, sel_of(&["docs/b.txt", "docs/sub"]));
+        // The result must plan exactly "everything under docs except a.txt".
+        let m = manifest(vec![
+            entry("docs/a.txt", "a"),
+            entry("docs/b.txt", "b"),
+            entry("docs/sub/c.txt", "c"),
+            entry("other/x.txt", "x"),
+        ]);
+        let plan = plan_with_selection(&m, &[], Some(&sel));
+        assert_eq!(
+            plan.fetch.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            vec!["docs/b.txt", "docs/sub/c.txt"]
+        );
+    }
+
+    #[test]
+    fn test_expand_deselect_multi_level_split() {
+        let paths = paths_of(&[
+            "d/a.txt",
+            "d/s1/b.txt",
+            "d/s1/s2/c.txt",
+            "d/s1/s2/gone.txt",
+        ]);
+        // The chain d -> s1 -> s2 splits level by level; only the target leaves.
+        let sel = expand_deselect(&sel_of(&["d"]), &paths, "d/s1/s2/gone.txt");
+        assert_eq!(sel, sel_of(&["d/a.txt", "d/s1/b.txt", "d/s1/s2/c.txt"]));
+    }
+
+    #[test]
+    fn test_expand_deselect_no_prefix_confusion() {
+        // "a/b" selected must not cover "a/bc" (same rule as path_selected),
+        // and splitting must not resurrect the removed branch.
+        let paths = paths_of(&["a/b/x.txt", "a/bc/y.txt"]);
+        let sel = expand_deselect(&sel_of(&["a"]), &paths, "a/b/x.txt");
+        assert_eq!(sel, sel_of(&["a/bc"]));
+        let m = manifest(vec![entry("a/b/x.txt", "x"), entry("a/bc/y.txt", "y")]);
+        let plan = plan_with_selection(&m, &[], Some(&sel));
+        assert_eq!(plan.fetch.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), vec!["a/bc/y.txt"]);
+    }
+
+    #[test]
+    fn test_expand_deselect_folder_under_covering_folder() {
+        let paths = paths_of(&["d/keep.txt", "d/sub/a.txt", "d/sub/b.txt"]);
+        // Unticking a folder under a selected ancestor splits the ancestor and
+        // drops the whole subtree.
+        let sel = expand_deselect(&sel_of(&["d"]), &paths, "d/sub");
+        assert_eq!(sel, sel_of(&["d/keep.txt"]));
     }
 
     #[test]
