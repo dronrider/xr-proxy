@@ -144,6 +144,12 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
     private var pending: Pending? = null
 
+    // The invite the Files screen was opened with, kept so a share opened with a
+    // stale token can pull a fresh grant without threading these through every
+    // call (XR-167). Set on each refreshHub, which the screen calls on entry.
+    private var hubUrl: String? = null
+    private var inviteToken: String? = null
+
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui
 
@@ -161,6 +167,8 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     // -- share list --------------------------------------------------
 
     fun refreshHub(hubUrl: String?, inviteToken: String?) {
+        this.hubUrl = hubUrl
+        this.inviteToken = inviteToken
         if (hubUrl.isNullOrBlank() || inviteToken.isNullOrBlank()) {
             _ui.update { it.copy(message = "Нет инвайта, добавьте сервер по инвайту") }
             return
@@ -197,11 +205,26 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
      *  authoritative verdict, unlike the transport-level "network: ...". */
     private fun Throwable.isAgentOffline(): Boolean = message?.startsWith("agent_offline") == true
 
-    /** Native error strings are category-prefixed and (for agent_offline) carry
-     *  the human wording after the prefix; show that instead of the machine
-     *  category, keeping the text's single source in Rust (XR-134). */
-    private fun humanError(e: String): String =
-        if (e.startsWith("agent_offline")) e.substringAfter(": ", "агент шары не на связи") else e
+    /** The stored token no longer parses: a share added before scopes (XR-139)
+     *  holds a pre-scope token. Not an error to show, a cue to refresh the grant
+     *  and retry (XR-167). */
+    private fun Throwable.isStaleToken(): Boolean = message?.startsWith("stale_token") == true
+
+    /** The share fell off the invite (or the invite itself is gone): the token
+     *  will never refresh, so the access is over (XR-167). Synthesized by
+     *  [fetchManifestHealing] after a failed heal, never returned by the agent. */
+    private fun Throwable.isAccessExpired(): Boolean = message?.startsWith("access_expired") == true
+
+    /** Native error strings are category-prefixed and carry the human wording
+     *  after the prefix; show that instead of the machine category, keeping the
+     *  text's single source in Rust (XR-134). A stale token has no per-error
+     *  detail worth showing, so it gets a fixed line (XR-167). */
+    private fun humanError(e: String): String = when {
+        e.startsWith("agent_offline") -> e.substringAfter(": ", "агент шары не на связи")
+        e.startsWith("access_expired") -> e.substringAfter(": ", "доступ к шаре истёк")
+        e.startsWith("stale_token") -> "токен шары устарел, обновите список по инвайту"
+        else -> e
+    }
 
     /**
      * Refresh of the invite carries the agent's current address/port/token. If a
@@ -231,6 +254,68 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
     }
+
+    /** Outcome of trying to heal a share whose stored token is stale (XR-167). */
+    private sealed interface StaleRecovery {
+        /** The grant was refreshed (token rewritten in the store): retry the fetch. */
+        object Refreshed : StaleRecovery
+        /** The share is no longer on the invite, or the invite itself is gone:
+         *  the token will never refresh, access is over. */
+        object Gone : StaleRecovery
+        /** The hub was unreachable, so nothing could be refreshed: treat as offline. */
+        object Offline : StaleRecovery
+    }
+
+    /** A pre-scope token (XR-139) can only be healed by a fresh grant, so pull the
+     *  invite's shares and reconcile (which rewrites the stored token in place),
+     *  then report whether the share can retry, fell off the invite, or the hub
+     *  was out of reach (XR-167). */
+    private suspend fun recoverStaleToken(shareId: String): StaleRecovery {
+        val hub = hubUrl
+        val invite = inviteToken
+        if (hub.isNullOrBlank() || invite.isNullOrBlank()) return StaleRecovery.Gone
+        return withContext(Dispatchers.IO) { repo.inviteShares(hub, invite) }.fold(
+            onSuccess = { grants ->
+                reconcileShares(grants)
+                _ui.update { it.copy(hubShares = grants, hubOffline = false) }
+                if (grants.any { it.shareId == shareId }) StaleRecovery.Refreshed
+                else StaleRecovery.Gone
+            },
+            onFailure = { e ->
+                if (e.isOffline()) {
+                    _ui.update { it.copy(hubOffline = true) }
+                    StaleRecovery.Offline
+                } else {
+                    // The hub answered (invite expired or revoked): access is gone,
+                    // not a passing outage.
+                    StaleRecovery.Gone
+                }
+            },
+        )
+    }
+
+    /** Fetch the manifest, transparently healing an old pre-scope token (XR-167):
+     *  on a stale-token error refresh the invite's grant once and retry. A share
+     *  that fell off the invite comes back as [ERR_ACCESS_EXPIRED], an unreachable
+     *  hub as an offline error; neither ever surfaces the raw serde text. */
+    private suspend fun fetchManifestHealing(config: ShareConfig): Result<List<ManifestEntry>> {
+        val first = withContext(Dispatchers.IO) { repo.fetchManifest(config) }
+        if (first.exceptionOrNull()?.isStaleToken() != true) return first
+        return when (recoverStaleToken(config.shareId)) {
+            StaleRecovery.Refreshed -> {
+                val fresh = store().get(config.shareId) ?: config
+                val retry = withContext(Dispatchers.IO) { repo.fetchManifest(fresh) }
+                // Still stale after a fresh grant means the grant carried no usable
+                // token either: access is over, not a transient parse blip.
+                if (retry.exceptionOrNull()?.isStaleToken() == true) accessExpired() else retry
+            }
+            StaleRecovery.Gone -> accessExpired()
+            StaleRecovery.Offline -> Result.failure(IllegalStateException(ERR_HUB_OFFLINE))
+        }
+    }
+
+    private fun accessExpired(): Result<List<ManifestEntry>> =
+        Result.failure(IllegalStateException(ERR_ACCESS_EXPIRED))
 
     fun addShare(grant: ShareGrant) {
         viewModelScope.launch {
@@ -287,7 +372,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     st.copy(manifest = localManifest, manifestLoading = false, localPaths = local, offlineLocal = true)
                 }
             }
-            val result = withContext(Dispatchers.IO) { repo.fetchManifest(config) }
+            val result = fetchManifestHealing(config)
             _ui.update { st ->
                 if (st.openShareId != config.shareId) return@update st
                 result.fold(
@@ -307,6 +392,14 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                                     manifestLoading = false, offlineLocal = true,
                                     message = humanError(e.message.orEmpty())
                                         .replaceFirstChar { c -> c.uppercaseChar() },
+                                )
+                            // The stored token was pre-scope and the grant refresh
+                            // proved the access is gone: say so plainly, keep any
+                            // downloaded files viewable, never show serde (XR-167).
+                            e.isAccessExpired() ->
+                                st.copy(
+                                    manifestLoading = false, offlineLocal = true,
+                                    message = humanError(e.message.orEmpty()),
                                 )
                             // The agent answered (expired token, http_4xx): a real
                             // error the user should see, unlike a mere no-network.
@@ -332,7 +425,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     fun refreshManifest(config: ShareConfig) {
         _ui.update { it.copy(manifestLoading = true) }
         viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) { repo.fetchManifest(config) }
+            val result = fetchManifestHealing(config)
             val localManifest = withContext(Dispatchers.IO) { repo.localManifest(config) }
             _ui.update { st ->
                 if (st.openShareId != config.shareId) return@update st
@@ -346,7 +439,10 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     onFailure = { e ->
                         st.copy(
                             manifestLoading = false,
-                            message = "Список: ${humanError(e.message ?: "ошибка")}",
+                            // No network (also the offline outcome of a stale-token
+                            // heal, XR-167): a clean line, not the raw reqwest text.
+                            message = if (e.isOffline()) "Список: хаб недоступен, попробуйте позже"
+                            else "Список: ${humanError(e.message ?: "ошибка")}",
                         )
                     },
                 )
@@ -1063,5 +1159,17 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) {
             if (store().enabledShares().isNotEmpty()) ShareSyncScheduler.syncNow(getApplication())
         }
+    }
+
+    private companion object {
+        /** A stale token whose grant refresh proved the access is gone (XR-167).
+         *  Category-prefixed like the native errors so [humanError] renders the
+         *  wording after the colon and the folds route it apart from serde. */
+        const val ERR_ACCESS_EXPIRED =
+            "access_expired: Доступ к шаре истёк, удалите её или перевыпустите инвайт"
+
+        /** Stale token, but the hub was unreachable to refresh the grant: reuse
+         *  the "network:" category so the offline handling kicks in (XR-167). */
+        const val ERR_HUB_OFFLINE = "network: хаб недоступен, обновите список позже"
     }
 }
