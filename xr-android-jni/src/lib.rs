@@ -1083,9 +1083,14 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeVerifyApk(
 // identity is an Android-side follow-up; today the engine works over HTTP and
 // CA-valid HTTPS.
 
-/// Parse a ShareToken JSON string into the typed token.
+/// Parse a stored ShareToken JSON into the typed token. A failure means the
+/// stored token is unusable as is: shares added before scopes (XR-139) hold a
+/// pre-scope token with no `scope` field, and it no longer parses. The only fix
+/// is a fresh grant from the invite, so the error is categorized `stale_token:`
+/// for the UI to heal (refresh grants, retry) instead of toasting the raw serde
+/// text (XR-167). The serde detail is kept after the prefix for the log.
 fn parse_token(json: &str) -> Result<ShareToken, String> {
-    serde_json::from_str::<ShareToken>(json).map_err(|e| format!("bad token json: {e}"))
+    serde_json::from_str::<ShareToken>(json).map_err(|e| format!("stale_token: {e}"))
 }
 
 /// Parse the optional relay leg (a [`RelayGrant`] JSON, or empty for
@@ -1815,6 +1820,26 @@ domains = ["youtube.com", "*.youtube.com"]"#;
         assert!(parse_selection("{").is_err());
         assert!(parse_selection(r#"{"x":1}"#).is_err());
         assert!(parse_selection("[1,2]").is_err());
+    }
+
+    #[test]
+    fn v1_token_without_scope_is_stale() {
+        // XR-167 regression: shares added before scopes (XR-139) stored a token
+        // with no `scope` field. It no longer parses, and the UI heals it by
+        // refreshing the grant. The error must be categorized `stale_token:`, not
+        // the old raw `bad token json:`, so the Kotlin side recognises it instead
+        // of toasting serde.
+        let v1 = r#"{"share_id":"abc","exp":9999999999,"signature":"AAAA"}"#;
+        let err = parse_token(v1).unwrap_err();
+        assert!(err.starts_with("stale_token:"), "got: {err}");
+    }
+
+    #[test]
+    fn v2_token_with_scope_parses() {
+        let v2 = r#"{"share_id":"abc","scope":"share:read","exp":9999999999,"signature":"AAAA"}"#;
+        let t = parse_token(v2).unwrap();
+        assert_eq!(t.share_id, "abc");
+        assert_eq!(t.scope, "share:read");
     }
 
     #[test]
