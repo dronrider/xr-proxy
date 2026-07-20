@@ -11,3 +11,4 @@ CLAUDE.local.md
 
 # Локальная обвязка выката, живёт только на машине.
 .devkit/*.local
+release-staging/
