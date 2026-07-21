@@ -1188,6 +1188,8 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeInviteShares(
                         "share_id": g.share_id,
                         "name": g.name,
                         "addr": g.addr,
+                        // Extra LAN candidates the consumer tries before addr (XR-050).
+                        "addrs": g.addrs,
                         "port": g.port,
                         "agent_pubkey": g.agent_pubkey,
                         "token": token_json,
@@ -1514,10 +1516,18 @@ fn grant_from_parts(
 ) -> ShareGrant {
     let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(serde_json::to_vec(&token).expect("serialize token"));
+    // `addr` may be a newline-joined candidate list (XR-050): the first line is
+    // the primary/public address, the rest are extra (LAN) candidates. They land
+    // in `addrs`, which `ShareGrant::candidate_addrs` walks before `addr`, so the
+    // import calls try LAN before public just like sync and manifest do.
+    let mut lines = addr.split('\n').map(str::trim).filter(|s| !s.is_empty());
+    let primary = lines.next().unwrap_or("").to_string();
+    let extras: Vec<String> = lines.map(str::to_string).collect();
     ShareGrant {
         share_id: token.share_id.clone(),
         name: String::new(),
-        addr,
+        addr: primary,
+        addrs: extras,
         port,
         agent_pubkey,
         token: blob,
