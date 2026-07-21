@@ -969,13 +969,23 @@ pub async fn upload_file(
     }
     let candidates = grant_direct_bases(grant);
     let token = &token; // move the reference (Copy) into the op, not the token
+    let agent_pubkey = grant.agent_pubkey.as_str();
+    // Only a multi-address share can collide with a wrong host at a private IP;
+    // a single (public) address has no such risk, so it skips the extra fetch and
+    // behaves exactly as before (XR-050).
+    let verify = candidates.len() > 1;
     direct_then_relay(
         &candidates,
         &grant.agent_pubkey,
         grant.relay.as_ref(),
         &token.share_id,
         timeout,
-        |client, base| async move { upload_with(&client, &base, token, rel, local_path, expected_hash).await },
+        |client, base| async move {
+            if verify {
+                verify_agent_at(&client, &base, token, agent_pubkey).await?;
+            }
+            upload_with(&client, &base, token, rel, local_path, expected_hash).await
+        },
     )
     .await
 }
@@ -995,13 +1005,20 @@ pub async fn delete_file(
     }
     let candidates = grant_direct_bases(grant);
     let token = &token; // move the reference (Copy) into the op, not the token
+    let agent_pubkey = grant.agent_pubkey.as_str();
+    let verify = candidates.len() > 1; // wrong-host guard only for multi-address (XR-050)
     direct_then_relay(
         &candidates,
         &grant.agent_pubkey,
         grant.relay.as_ref(),
         &token.share_id,
         timeout,
-        |client, base| async move { delete_with(&client, &base, token, rel, expected_hash).await },
+        |client, base| async move {
+            if verify {
+                verify_agent_at(&client, &base, token, agent_pubkey).await?;
+            }
+            delete_with(&client, &base, token, rel, expected_hash).await
+        },
     )
     .await
 }
@@ -1107,6 +1124,8 @@ pub async fn import_url(
     }
     let candidates = grant_direct_bases(grant);
     let token = &token;
+    let agent_pubkey = grant.agent_pubkey.as_str();
+    let verify = candidates.len() > 1; // wrong-host guard only for multi-address (XR-050)
     direct_then_relay(
         &candidates,
         &grant.agent_pubkey,
@@ -1114,6 +1133,11 @@ pub async fn import_url(
         &token.share_id,
         timeout,
         |client, base| async move {
+            // Confirm the pinned agent before starting a job on it (XR-050): a
+            // wrong host at a colliding LAN-IP must not receive the import.
+            if verify {
+                verify_agent_at(&client, &base, token, agent_pubkey).await?;
+            }
             let mut body = serde_json::json!({ "url": url, "dest": dest });
             if let Some(h) = height {
                 body["height"] = serde_json::json!(h);
@@ -1345,6 +1369,23 @@ fn grant_direct_bases(grant: &ShareGrant) -> Vec<String> {
 /// expired token) is not retried across addresses.
 fn should_try_next(err: &str) -> bool {
     is_unreachable(err) || err.starts_with("manifest_signature") || err == "manifest_unsigned"
+}
+
+/// Confirm the pinned agent actually answers at `base` before a mutating op runs
+/// (XR-050): a signature-verified manifest fetch. The read path pins the agent
+/// identity through the manifest signature, but a write/import goes straight to
+/// the address; with LAN candidates tried first, a remote consumer whose own LAN
+/// reuses the agent's private IP could otherwise `PUT`/`DELETE`/import against a
+/// wrong host. A signature failure here surfaces as `manifest_*`, which
+/// [`should_try_next`] routes to the next candidate. A no-op when the grant
+/// carries no pinned key (legacy), exactly like the read path.
+async fn verify_agent_at(
+    client: &reqwest::Client,
+    base: &str,
+    token: &ShareToken,
+    agent_pubkey: &str,
+) -> Result<(), String> {
+    fetch_manifest_with(client, base, token, agent_pubkey).await.map(|_| ())
 }
 
 /// Error category of a share whose agent is gone from the relay: the relay leg
@@ -2994,6 +3035,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(m.entries[0].sha256, "aa", "must serve the correct agent's manifest");
+    }
+
+    /// A mock agent that answers `GET .../manifest` with a signed empty manifest
+    /// and any mutating request with `mutate_status`, forwarding the mutating
+    /// request line on the channel. Serves until dropped. Lets the write-path test
+    /// exercise verify-then-mutate: the walk first fetches+verifies the manifest,
+    /// then performs the mutation on the confirmed agent.
+    async fn serve_agent(
+        key: ed25519_dalek::SigningKey,
+        share_id: &'static str,
+        mutate_status: &'static str,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let manifest = http_response("{\"entries\":[]}", &signed_headers(&key, share_id, 1, "{\"entries\":[]}"));
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let manifest = manifest.clone();
+                let mutate = format!("{mutate_status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if req.starts_with("GET") && req.contains("/manifest") {
+                        manifest
+                    } else {
+                        let _ = tx.send(req);
+                        mutate
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    #[tokio::test]
+    async fn write_walk_verifies_agent_then_mutates_past_wrong_host() {
+        // A multi-address write: the first (LAN) address is a wrong host that
+        // answers /manifest but without the pinned signature; the walk must reject
+        // it and PUT to the correct agent at the next address, never to the wrong
+        // one (XR-050 write-path guard).
+        let (key, pub_b64) = agent_key();
+        let wrong = serve_manifest_forever(http_response("{\"entries\":[]}", "")).await; // unsigned
+        let (good, mut rx) = serve_agent(key, "S", "HTTP/1.1 201 Created").await;
+        let candidates = vec![format!("{wrong}/S"), format!("{good}/S")];
+        let token = ShareToken {
+            share_id: "S".into(),
+            scope: "share:read share:write".into(),
+            exp: u64::MAX,
+            signature: "sig".into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, b"hi").unwrap();
+        let (tok, pk, fp) = (&token, pub_b64.as_str(), f.as_path());
+        let res: Result<(), String> = direct_then_relay(
+            &candidates,
+            &pub_b64,
+            None,
+            "S",
+            Duration::from_secs(5),
+            |client, base| async move {
+                verify_agent_at(&client, &base, tok, pk).await?;
+                upload_with(&client, &base, tok, "a.txt", fp, None).await
+            },
+        )
+        .await;
+        res.expect("upload should reach the correct agent");
+        // The captured mutation went to the good agent (the wrong host got no PUT).
+        let req = rx.try_recv().expect("the good agent received the PUT");
+        assert!(req.starts_with("PUT /S/file/a.txt "), "wrong request line: {req}");
+        assert!(rx.try_recv().is_err(), "only one PUT, to the correct agent");
     }
 
     #[tokio::test]
