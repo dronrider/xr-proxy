@@ -106,6 +106,9 @@ pub async fn create_share(
         name: name.to_string(),
         owner: req.owner.trim().to_string(),
         addr: addr.to_string(),
+        // Admin entry is a single address; the multi-address list (XR-050) is
+        // populated only through the self-service `xr-share share` path.
+        addrs: Vec::new(),
         port: req.port,
         agent_pubkey: req.agent_pubkey.trim().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),

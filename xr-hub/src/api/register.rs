@@ -259,6 +259,7 @@ pub async fn register(
         name,
         owner: req.owner.trim().to_string(),
         addr: addr.clone(),
+        addrs: Vec::new(),
         port: req.port,
         agent_pubkey: req.agent_pubkey.trim().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
