@@ -208,11 +208,12 @@ data class ShareConfig(
             .distinct()
             .joinToString("\n") { "http://$it:$port" }
 
-    /** The address argument for the native import calls (XR-050): the primary
-     *  [addr] first, then the LAN [addrs], newline-joined. The native side rebuilds
-     *  a grant from it, and the grant walks LAN before public. */
+    /** The address argument for the native import calls (XR-050): the candidate
+     *  addresses in walk order (LAN [addrs] first, public [addr] last),
+     *  newline-joined. Same ordering as [agentBaseUrls]; the native side rebuilds
+     *  a grant from it and walks LAN before public. */
     val importAddrArg: String
-        get() = (listOf(addr) + addrs)
+        get() = (addrs + addr)
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             .distinct()
