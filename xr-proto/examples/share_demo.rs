@@ -45,6 +45,7 @@ fn main() {
         name: "Отпуск 2026".into(),
         owner: "andrew".into(),
         addr: "203.0.113.7".into(),
+        addrs: vec!["192.168.1.10".into()],
         port: 8443,
         // The agent's own TOFU-pinned identity key (separate from the hub key).
         agent_pubkey: "QWdlbnRQdWJLZXlQbGFjZWhvbGRlcjEyMzQ1Njc4OTA=".into(),
