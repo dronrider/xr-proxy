@@ -754,7 +754,10 @@ pub fn import(args: ImportArgs) -> Result<()> {
     }
 
     let scheme = if args.https { "https" } else { "http" };
-    let base = format!("{scheme}://{}:{}/{}", share.addr, share.port, share.share_id);
+    // Resolve a reachable agent address (LAN before public, XR-050); the manifest
+    // probe doubles as the reachability check for the import POST that follows.
+    let (base, _manifest) = crate::pull::resolve_base(scheme, &share)
+        .with_context(|| format!("шара «{}» недоступна", share.name))?;
     let mut body = serde_json::json!({
         "url": args.url,
         "dest": args.to.clone().unwrap_or_default(),
