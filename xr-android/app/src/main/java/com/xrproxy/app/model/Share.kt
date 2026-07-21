@@ -55,12 +55,16 @@ data class ShareGrant(
     val shareId: String,
     val name: String,
     val addr: String,
+    /** Extra reachable addresses beyond [addr] (XR-050): the agent's LAN
+     *  address(es), tried before the public [addr] so a consumer on the same
+     *  network reaches the agent by LAN-IP without router hairpin. */
+    val addrs: List<String> = emptyList(),
     val port: Int,
     val agentPubkey: String,
     val tokenJson: String,
     /** The grant's relay leg as raw JSON (`{addr,port,obf,relay_token}`), or null
      *  for a direct share. Passed to the native calls so the consumer falls back
-     *  to the relay when the direct address is unreachable (LLD-23 §2.4). */
+     *  to the relay when the direct address is unreachable (LLD-23 п. 2.4). */
     val relayJson: String? = null,
 ) {
     companion object {
@@ -76,6 +80,7 @@ data class ShareGrant(
                     shareId = o.getString("share_id"),
                     name = o.getString("name"),
                     addr = o.getString("addr"),
+                    addrs = stringList(o.optJSONArray("addrs")),
                     port = o.getInt("port"),
                     agentPubkey = o.getString("agent_pubkey"),
                     tokenJson = o.getString("token"),
@@ -85,6 +90,10 @@ data class ShareGrant(
         }
     }
 }
+
+/** Read a JSON string array into a Kotlin list (empty when absent/null). */
+private fun stringList(arr: JSONArray?): List<String> =
+    if (arr == null) emptyList() else (0 until arr.length()).map { arr.getString(it) }
 
 /** One file in a share manifest. [sha256] is lowercase hex. */
 data class ManifestEntry(
@@ -159,6 +168,10 @@ data class ShareConfig(
     val shareId: String,
     val name: String,
     val addr: String,
+    /** Extra reachable addresses beyond [addr] (XR-050): the agent's LAN
+     *  address(es), tried before the public [addr] (LAN-IP without router
+     *  hairpin). Persisted so the background mirror walks them too. */
+    val addrs: List<String> = emptyList(),
     val port: Int,
     val agentPubkey: String,
     val tokenJson: String? = null,
@@ -183,6 +196,28 @@ data class ShareConfig(
     /** Relay leg for the native calls; empty string means direct-only. */
     val relayArg: String get() = relayJson ?: ""
 
+    /** Candidate agent base URLs for the native sync/manifest/download calls
+     *  (XR-050): LAN [addrs] first, then the public [addr], deduped and
+     *  newline-joined. `xr-core::sync` splits this and walks the list, taking the
+     *  first reachable address before the relay. A single-address share is one URL,
+     *  identical to [agentBaseUrl]. */
+    val agentBaseUrls: String
+        get() = (addrs + addr)
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .joinToString("\n") { "http://$it:$port" }
+
+    /** The address argument for the native import calls (XR-050): the primary
+     *  [addr] first, then the LAN [addrs], newline-joined. The native side rebuilds
+     *  a grant from it, and the grant walks LAN before public. */
+    val importAddrArg: String
+        get() = (listOf(addr) + addrs)
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .joinToString("\n")
+
     /** URL import is available when the hub minted share:import into the token
      *  scope (a write-binding on the invite, LLD-29); the agent holds the rest
      *  of the gates. Same whole-name semantics as Rust's scope_contains. */
@@ -199,6 +234,7 @@ data class ShareConfig(
         .put("share_id", shareId)
         .put("name", name)
         .put("addr", addr)
+        .put("addrs", JSONArray().apply { addrs.forEach { put(it) } })
         .put("port", port)
         .put("agent_pubkey", agentPubkey)
         .put("token_json", tokenJson ?: JSONObject.NULL)
@@ -214,6 +250,7 @@ data class ShareConfig(
             shareId = g.shareId,
             name = g.name,
             addr = g.addr,
+            addrs = g.addrs,
             port = g.port,
             agentPubkey = g.agentPubkey,
             tokenJson = g.tokenJson,
@@ -224,6 +261,7 @@ data class ShareConfig(
             shareId = o.getString("share_id"),
             name = o.getString("name"),
             addr = o.getString("addr"),
+            addrs = stringList(o.optJSONArray("addrs")),
             port = o.getInt("port"),
             agentPubkey = o.getString("agent_pubkey"),
             tokenJson = o.optString("token_json").takeIf { it.isNotBlank() && it != "null" },

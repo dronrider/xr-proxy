@@ -185,7 +185,7 @@ class ShareRepository(private val context: Context) {
         val token = config.tokenJson ?: return Result.failure(IllegalStateException("no token"))
         return parseManifest(
             NativeBridge.nativeFetchManifest(
-                config.agentBaseUrl, token, config.agentPubkey, config.relayArg, MANIFEST_TIMEOUT_MS,
+                config.agentBaseUrls, token, config.agentPubkey, config.relayArg, MANIFEST_TIMEOUT_MS,
             ),
         )
     }
@@ -196,7 +196,7 @@ class ShareRepository(private val context: Context) {
     fun downloadOne(config: ShareConfig, entry: ManifestEntry): String? {
         val token = config.tokenJson ?: return "no token"
         val res = NativeBridge.nativeDownloadFile(
-            config.agentBaseUrl, token, entry.toJson(), destDir(config).absolutePath,
+            config.agentBaseUrls, token, entry.toJson(), destDir(config).absolutePath,
             config.agentPubkey, config.relayArg, XFER_TIMEOUT_MS,
         )
         return runCatching {
@@ -221,7 +221,7 @@ class ShareRepository(private val context: Context) {
         if (config.selection.isEmpty()) return SyncOutcome(0, 0, 0)
         val token = config.tokenJson ?: return SyncOutcome(0, 0, 0, "no token")
         val res = NativeBridge.nativeSyncShare(
-            config.agentBaseUrl, token, config.agentPubkey, destDir(config).absolutePath,
+            config.agentBaseUrls, token, config.agentPubkey, destDir(config).absolutePath,
             hashIndexPath(config), config.selectionJson(), config.relayArg, false, XFER_TIMEOUT_MS,
         )
         return runCatching {
@@ -245,7 +245,7 @@ class ShareRepository(private val context: Context) {
         val token = config.tokenJson
             ?: return Result.failure(IllegalStateException("no token"))
         val res = NativeBridge.nativeImportUrl(
-            config.addr, config.port, token, config.agentPubkey, config.relayArg,
+            config.importAddrArg, config.port, token, config.agentPubkey, config.relayArg,
             url, dest, height ?: 0, IMPORT_TIMEOUT_MS,
         )
         return runCatching {
@@ -264,7 +264,7 @@ class ShareRepository(private val context: Context) {
             ?: return Result.failure(IllegalStateException("no token"))
         return ImportState.parse(
             NativeBridge.nativeImportStatus(
-                config.addr, config.port, token, config.agentPubkey, config.relayArg,
+                config.importAddrArg, config.port, token, config.agentPubkey, config.relayArg,
                 jobId, IMPORT_TIMEOUT_MS,
             ),
         )
@@ -274,7 +274,7 @@ class ShareRepository(private val context: Context) {
     fun importCancel(config: ShareConfig, jobId: String) {
         val token = config.tokenJson ?: return
         NativeBridge.nativeImportCancel(
-            config.addr, config.port, token, config.agentPubkey, config.relayArg,
+            config.importAddrArg, config.port, token, config.agentPubkey, config.relayArg,
             jobId, IMPORT_TIMEOUT_MS,
         )
     }
