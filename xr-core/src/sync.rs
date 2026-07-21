@@ -904,7 +904,8 @@ pub async fn sync_share_selected_relay(
     relay: Option<&RelayGrant>,
     timeout: Duration,
 ) -> Result<SyncResult, String> {
-    direct_then_relay(agent_url, agent_pubkey, relay, &token.share_id, timeout, |client, base| async move {
+    let candidates = split_candidates(agent_url);
+    direct_then_relay(&candidates, agent_pubkey, relay, &token.share_id, timeout, |client, base| async move {
         run_sync(&client, &base, token, agent_pubkey, dest_root, selection, index_path, dry_run).await
     })
     .await
@@ -925,9 +926,11 @@ pub async fn sync_share_grant(
     timeout: Duration,
 ) -> Result<SyncResult, String> {
     let token = decode_share_token(&grant.token)?;
-    let direct_base = format!("http://{}:{}/{}", grant.addr, grant.port, grant.share_id);
+    // Newline-join the candidate bases so the string-based sync path walks LAN
+    // then public before the relay (XR-050); a single-address grant is one URL.
+    let joined_bases = grant_direct_bases(grant).join("\n");
     sync_share_selected_relay(
-        &direct_base,
+        &joined_bases,
         &token,
         &grant.agent_pubkey,
         dest_root,
@@ -964,10 +967,10 @@ pub async fn upload_file(
     if !scope_contains(&token.scope, SCOPE_WRITE) {
         return Err(ERR_NO_WRITE_SCOPE.to_string());
     }
-    let direct_base = format!("http://{}:{}/{}", grant.addr, grant.port, grant.share_id);
+    let candidates = grant_direct_bases(grant);
     let token = &token; // move the reference (Copy) into the op, not the token
     direct_then_relay(
-        &direct_base,
+        &candidates,
         &grant.agent_pubkey,
         grant.relay.as_ref(),
         &token.share_id,
@@ -990,10 +993,10 @@ pub async fn delete_file(
     if !scope_contains(&token.scope, SCOPE_WRITE) {
         return Err(ERR_NO_WRITE_SCOPE.to_string());
     }
-    let direct_base = format!("http://{}:{}/{}", grant.addr, grant.port, grant.share_id);
+    let candidates = grant_direct_bases(grant);
     let token = &token; // move the reference (Copy) into the op, not the token
     direct_then_relay(
-        &direct_base,
+        &candidates,
         &grant.agent_pubkey,
         grant.relay.as_ref(),
         &token.share_id,
@@ -1102,10 +1105,10 @@ pub async fn import_url(
     if !scope_contains(&token.scope, SCOPE_IMPORT) {
         return Err(ERR_NO_IMPORT_SCOPE.to_string());
     }
-    let direct_base = format!("http://{}:{}/{}", grant.addr, grant.port, grant.share_id);
+    let candidates = grant_direct_bases(grant);
     let token = &token;
     direct_then_relay(
-        &direct_base,
+        &candidates,
         &grant.agent_pubkey,
         grant.relay.as_ref(),
         &token.share_id,
@@ -1163,10 +1166,10 @@ pub async fn import_status(
     if !scope_contains(&token.scope, SCOPE_IMPORT) {
         return Err(ERR_NO_IMPORT_SCOPE.to_string());
     }
-    let direct_base = format!("http://{}:{}/{}", grant.addr, grant.port, grant.share_id);
+    let candidates = grant_direct_bases(grant);
     let token = &token;
     direct_then_relay(
-        &direct_base,
+        &candidates,
         &grant.agent_pubkey,
         grant.relay.as_ref(),
         &token.share_id,
@@ -1195,10 +1198,10 @@ pub async fn import_cancel(grant: &ShareGrant, job_id: &str, timeout: Duration) 
     if !scope_contains(&token.scope, SCOPE_IMPORT) {
         return Err(ERR_NO_IMPORT_SCOPE.to_string());
     }
-    let direct_base = format!("http://{}:{}/{}", grant.addr, grant.port, grant.share_id);
+    let candidates = grant_direct_bases(grant);
     let token = &token;
     direct_then_relay(
-        &direct_base,
+        &candidates,
         &grant.agent_pubkey,
         grant.relay.as_ref(),
         &token.share_id,
@@ -1252,10 +1255,18 @@ async fn direct_reachable(agent_url: &str, probe_timeout: Duration) -> bool {
 /// When a relay is available, the direct path is first probed with a short
 /// deadline ([`direct_reachable`]): a dead-but-TCP-accepting address is skipped in
 /// seconds instead of stalling the whole op timeout before the relay takes over.
-/// With no relay to fall back to, the probe is pointless, so `op` runs directly
-/// under its own timeout as before.
+/// With a single direct candidate and no relay, the probe is pointless, so `op`
+/// runs directly under its own timeout as before.
+///
+/// `candidates` are ordered direct base URLs (XR-050: LAN addresses first, then
+/// the public one). Each is probed with a short deadline when a fallback exists
+/// (another candidate or the relay); the first reachable one runs `op`. A
+/// candidate that answers *unreachable* or with a *pinned-manifest mismatch* (a
+/// wrong host answering at a stale LAN IP, or a MITM) is skipped for the next
+/// candidate; any other error is the agent's authoritative answer and returns at
+/// once. Only after every direct candidate is exhausted does the relay leg open.
 async fn direct_then_relay<T, F, Fut>(
-    agent_url: &str,
+    candidates: &[String],
     agent_pubkey: &str,
     relay: Option<&RelayGrant>,
     share_id: &str,
@@ -1269,24 +1280,67 @@ where
     // The probe must never cost more than the op itself would (a caller may pass a
     // timeout below the probe budget).
     let probe = DIRECT_PROBE_TIMEOUT.min(timeout);
-    let try_direct = relay.is_none() || direct_reachable(agent_url, probe).await;
-    if try_direct {
-        match op(http_client(timeout)?, agent_url.to_string()).await {
+    // With a real choice (more than one address, or a relay behind) a dead
+    // address must be skipped fast; with a lone direct address and no relay the
+    // probe adds nothing, so `op` runs straight under its own timeout as before.
+    let has_fallback = candidates.len() > 1 || relay.is_some();
+    let mut last_err: Option<String> = None;
+    for base in candidates {
+        if has_fallback && !direct_reachable(base, probe).await {
+            last_err = Some(format!("network: {base} недоступен"));
+            continue;
+        }
+        match op(http_client(timeout)?, base.clone()).await {
             Ok(v) => return Ok(v),
-            // Only an unreachable failure with a relay to fall back to is retried;
-            // an authoritative HTTP/signature error is the answer, direct or not.
-            Err(e) if !(is_unreachable(&e) && relay.is_some()) => return Err(e),
-            Err(_) => {}
+            // Unreachable, or a wrong host answering at this address: move on to
+            // the next candidate (and, if none is left, the relay). Any other
+            // error is the agent answering authoritatively, so stop with it.
+            Err(e) if should_try_next(&e) => last_err = Some(e),
+            Err(e) => return Err(e),
         }
     }
 
-    let relay = relay.ok_or_else(|| "network: прямой путь недоступен, relay не задан".to_string())?;
+    let relay = relay.ok_or_else(|| {
+        last_err.unwrap_or_else(|| "network: прямой путь недоступен, relay не задан".to_string())
+    })?;
     let leg = RelayLeg::open(relay).await?;
     let client = pinned_client(agent_pubkey, timeout)?;
     let base = format!("https://{}/{}", leg.local_addr(), share_id);
     let out = map_relay_outcome(op(client, base).await, leg.agent_offline());
     drop(leg); // stop the loopback forwarder once the op is done
     out
+}
+
+/// Split the direct-address argument (XR-050): the Android path passes several
+/// candidate base URLs newline-joined in the single `agent_url` string, the
+/// grant path builds the list itself. Blanks are dropped; a plain single URL
+/// yields a one-element list (the old shape).
+fn split_candidates(agent_url: &str) -> Vec<String> {
+    agent_url
+        .split('\n')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The ordered direct base URLs for a grant (XR-050): `http://<addr>:<port>/<id>`
+/// for each of [`ShareGrant::candidate_addrs`], LAN first then the public addr.
+fn grant_direct_bases(grant: &ShareGrant) -> Vec<String> {
+    grant
+        .candidate_addrs()
+        .into_iter()
+        .map(|a| format!("http://{}:{}/{}", a, grant.port, grant.share_id))
+        .collect()
+}
+
+/// Whether a failed direct attempt should fall through to the next candidate (or
+/// the relay) rather than being returned as the answer: a transport/unreachable
+/// error, or a pinned-manifest mismatch that means something other than our agent
+/// answered at this address. An authoritative agent answer (an HTTP status, an
+/// expired token) is not retried across addresses.
+fn should_try_next(err: &str) -> bool {
+    is_unreachable(err) || err.starts_with("manifest_signature") || err == "manifest_unsigned"
 }
 
 /// Error category of a share whose agent is gone from the relay: the relay leg
@@ -1405,7 +1459,8 @@ pub async fn fetch_manifest_relay(
     relay: Option<&RelayGrant>,
     timeout: Duration,
 ) -> Result<ShareManifest, String> {
-    direct_then_relay(agent_url, agent_pubkey, relay, &token.share_id, timeout, |client, base| async move {
+    let candidates = split_candidates(agent_url);
+    direct_then_relay(&candidates, agent_pubkey, relay, &token.share_id, timeout, |client, base| async move {
         fetch_manifest_with(&client, &base, token, agent_pubkey).await
     })
     .await
@@ -1486,7 +1541,8 @@ pub async fn download_entry_relay(
     relay: Option<&RelayGrant>,
     timeout: Duration,
 ) -> Result<(), String> {
-    direct_then_relay(agent_url, agent_pubkey, relay, &token.share_id, timeout, |client, base| async move {
+    let candidates = split_candidates(agent_url);
+    direct_then_relay(&candidates, agent_pubkey, relay, &token.share_id, timeout, |client, base| async move {
         download_entry_with(&client, &base, token, entry, dest_root).await
     })
     .await
@@ -1872,6 +1928,51 @@ mod tests {
         assert!(!is_unreachable("manifest_signature: bad"));
     }
 
+    #[test]
+    fn split_candidates_trims_and_drops_blanks() {
+        // XR-050: the Android path joins candidate bases with newlines; a plain
+        // single URL is a one-element list (the old shape).
+        assert_eq!(split_candidates("http://a/s"), vec!["http://a/s".to_string()]);
+        assert_eq!(
+            split_candidates("http://a/s\n  http://b/s \n\n"),
+            vec!["http://a/s".to_string(), "http://b/s".to_string()]
+        );
+    }
+
+    #[test]
+    fn grant_direct_bases_lan_first_then_public() {
+        // Each candidate address becomes a base URL, LAN first then public (XR-050).
+        let grant = ShareGrant {
+            share_id: "S".into(),
+            name: "n".into(),
+            addr: "203.0.113.7".into(),
+            addrs: vec!["192.168.1.10".into()],
+            port: 8443,
+            agent_pubkey: String::new(),
+            token: token_blob_of("S"),
+            exp: 9,
+            relay: None,
+        };
+        assert_eq!(
+            grant_direct_bases(&grant),
+            vec![
+                "http://192.168.1.10:8443/S".to_string(),
+                "http://203.0.113.7:8443/S".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn should_try_next_only_for_unreachable_or_wrong_host() {
+        // Fall through to the next address on a transport error or a pinned-manifest
+        // mismatch (a wrong host answering); an authoritative agent answer stops.
+        assert!(should_try_next("network: connection refused"));
+        assert!(should_try_next("manifest_unsigned"));
+        assert!(should_try_next("manifest_signature: bad"));
+        assert!(!should_try_next("http_403"));
+        assert!(!should_try_next("http_412"));
+    }
+
     /// The relay leg fails requests by closing the loopback socket, so `op`
     /// reports a bare transport error; the forwarder's "agent offline" verdict
     /// must replace that noise with the named category, while authoritative
@@ -1902,6 +2003,7 @@ mod tests {
             name: "S".into(),
             // 127.0.0.1:1 refuses fast; no relay leg.
             addr: "127.0.0.1".into(),
+            addrs: Vec::new(),
             port: 1,
             agent_pubkey: String::new(),
             token: token_blob_of("S"),
@@ -1993,6 +2095,7 @@ mod tests {
             share_id: "S".into(),
             name: "S".into(),
             addr: addr.ip().to_string(),
+            addrs: Vec::new(),
             port: addr.port(),
             agent_pubkey: String::new(),
             token: blob,
@@ -2802,6 +2905,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(m.entries.len(), 1);
+    }
+
+    // -- candidate walk: LAN then public (XR-050) -----------------------
+
+    /// A manifest server that answers *every* connection with the same response,
+    /// so a candidate walk that probes then fetches (two connections to the same
+    /// address) is served. Runs until the test drops it.
+    async fn serve_manifest_forever(response: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let response = response.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn walk_skips_dead_lan_candidate_then_uses_public() {
+        // The LAN candidate refuses fast; the walk falls through to the reachable
+        // public address and fetches from it (the XR-050 hairpin case from outside).
+        let (key, pub_b64) = agent_key();
+        let live = serve_manifest_forever(http_response(
+            MANIFEST_BODY,
+            &signed_headers(&key, "s1", 1234, MANIFEST_BODY),
+        ))
+        .await;
+        // Candidate order is LAN (dead) first, then the live public base.
+        let candidates = format!("http://127.0.0.1:1/s1\n{live}/s1");
+        let m = fetch_manifest_relay(&candidates, &test_token("s1"), &pub_b64, None, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(m.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn walk_skips_wrong_host_to_correct_agent() {
+        // A different host answering at the first address serves a manifest whose
+        // signature does not match the pinned key: the walk must not trust it and
+        // must fall through to the correct agent at the next address.
+        let (key, pub_b64) = agent_key();
+        let forged = MANIFEST_BODY.replace("\"aa\"", "\"bb\"");
+        let wrong = serve_manifest_forever(http_response(
+            &forged,
+            &signed_headers(&key, "s1", 1234, MANIFEST_BODY),
+        ))
+        .await;
+        let good = serve_manifest_forever(http_response(
+            MANIFEST_BODY,
+            &signed_headers(&key, "s1", 1234, MANIFEST_BODY),
+        ))
+        .await;
+        let candidates = format!("{wrong}/s1\n{good}/s1");
+        let m = fetch_manifest_relay(&candidates, &test_token("s1"), &pub_b64, None, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(m.entries[0].sha256, "aa", "must serve the correct agent's manifest");
+    }
+
+    #[tokio::test]
+    async fn walk_all_dead_no_relay_reports_unreachable() {
+        // Every direct candidate refuses and there is no relay: a network error,
+        // not a hang or a misleading authoritative answer.
+        let (_key, pub_b64) = agent_key();
+        let candidates = "http://127.0.0.1:1/s1\nhttp://127.0.0.1:2/s1".to_string();
+        let err = fetch_manifest_relay(&candidates, &test_token("s1"), &pub_b64, None, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(is_unreachable(&err), "expected a network error, got {err}");
     }
 
     // direct reachability probe: fast relay fallback (XR-128)
