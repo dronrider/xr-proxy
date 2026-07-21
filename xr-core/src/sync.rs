@@ -1280,13 +1280,17 @@ where
     // The probe must never cost more than the op itself would (a caller may pass a
     // timeout below the probe budget).
     let probe = DIRECT_PROBE_TIMEOUT.min(timeout);
-    // With a real choice (more than one address, or a relay behind) a dead
-    // address must be skipped fast; with a lone direct address and no relay the
-    // probe adds nothing, so `op` runs straight under its own timeout as before.
-    let has_fallback = candidates.len() > 1 || relay.is_some();
     let mut last_err: Option<String> = None;
-    for base in candidates {
-        if has_fallback && !direct_reachable(base, probe).await {
+    let n = candidates.len();
+    for (i, base) in candidates.iter().enumerate() {
+        // Probe only when there is a fallback *after* this candidate (another
+        // address, or the relay): a dead address must be skipped fast so the next
+        // option gets its turn. The last candidate with nothing behind it runs
+        // `op` straight under its own timeout, so a slow-but-reachable agent is
+        // never cut off by the short probe (that was the pre-XR-050 single-address
+        // behaviour, preserved here for the final hop).
+        let more_after = i + 1 < n || relay.is_some();
+        if more_after && !direct_reachable(base, probe).await {
             last_err = Some(format!("network: {base} недоступен"));
             continue;
         }
@@ -2941,6 +2945,26 @@ mod tests {
         ))
         .await;
         // Candidate order is LAN (dead) first, then the live public base.
+        let candidates = format!("http://127.0.0.1:1/s1\n{live}/s1");
+        let m = fetch_manifest_relay(&candidates, &test_token("s1"), &pub_b64, None, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(m.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn walk_does_not_probe_last_candidate() {
+        // The last candidate, with no fallback behind it, must run op directly and
+        // not be probe-gated (XR-050 regression): a one-shot server serving exactly
+        // one connection is enough. The old code probed every candidate whenever
+        // there was any fallback, so the probe would have spent that one connection
+        // and the real fetch would have found nothing behind the public address.
+        let (key, pub_b64) = agent_key();
+        let live = serve_once(http_response(
+            MANIFEST_BODY,
+            &signed_headers(&key, "s1", 1234, MANIFEST_BODY),
+        ))
+        .await;
         let candidates = format!("http://127.0.0.1:1/s1\n{live}/s1");
         let m = fetch_manifest_relay(&candidates, &test_token("s1"), &pub_b64, None, Duration::from_secs(5))
             .await
