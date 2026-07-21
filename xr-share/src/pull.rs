@@ -58,6 +58,10 @@ pub(crate) struct InviteShareDto {
     pub(crate) share_id: String,
     pub(crate) name: String,
     pub(crate) addr: String,
+    /// Extra reachable addresses beyond `addr` (XR-050), LAN first. Tried before
+    /// `addr` when locating a reachable agent.
+    #[serde(default)]
+    pub(crate) addrs: Vec<String>,
     pub(crate) port: u16,
     /// Base64 identity key of the agent; the manifest signature is verified
     /// against it (XR-046). Tolerated absent for an older hub, then the
@@ -65,6 +69,44 @@ pub(crate) struct InviteShareDto {
     #[serde(default)]
     pub(crate) agent_pubkey: String,
     pub(crate) token: String,
+}
+
+impl InviteShareDto {
+    /// Ordered agent base URLs to try (XR-050): the LAN `addrs` first, then the
+    /// public `addr`, deduped. Mirrors `ShareGrant::candidate_addrs` on the
+    /// consumer side, so a receiver on the same LAN reaches the agent by LAN-IP
+    /// without router hairpin.
+    pub(crate) fn candidate_bases(&self, scheme: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for a in self.addrs.iter().chain(std::iter::once(&self.addr)) {
+            let a = a.trim();
+            if a.is_empty() {
+                continue;
+            }
+            let base = format!("{scheme}://{}:{}/{}", a, self.port, self.share_id);
+            if !out.contains(&base) {
+                out.push(base);
+            }
+        }
+        out
+    }
+}
+
+/// Locate a reachable agent for the share and return that base URL together with
+/// its verified manifest (XR-050): try each candidate base LAN-first, take the
+/// first that serves a manifest. A transport failure or a wrong host answering
+/// (signature mismatch) falls through to the next; the last error is reported
+/// when none answer. The manifest comes back so the caller needn't re-fetch it.
+pub(crate) fn resolve_base(scheme: &str, share: &InviteShareDto) -> Result<(String, ShareManifest)> {
+    let bases = share.candidate_bases(scheme);
+    let mut last_err: Option<anyhow::Error> = None;
+    for base in bases {
+        match fetch_manifest_verified(&format!("{base}/manifest"), share) {
+            Ok(m) => return Ok((base, m)),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("у шары «{}» нет адресов", share.name)))
 }
 
 pub fn pull(args: PullArgs) -> Result<()> {
@@ -86,9 +128,10 @@ pub fn pull(args: PullArgs) -> Result<()> {
                 continue;
             }
         }
-        let base = format!("{scheme}://{}:{}/{}", s.addr, s.port, s.share_id);
-        let manifest = fetch_manifest_verified(&format!("{base}/manifest"), s)
-            .with_context(|| format!("манифест шары «{}»", s.name))?;
+        // Try LAN addresses before the public one (XR-050); the first reachable
+        // agent's base is used for the manifest and every download of this share.
+        let (base, manifest) = resolve_base(scheme, s)
+            .with_context(|| format!("шара «{}» недоступна", s.name))?;
         if manifest.entries.is_empty() {
             println!("[{}] пусто", s.name);
             continue;
@@ -381,6 +424,39 @@ mod tests {
         // filter drops it), it must not silently vanish.
         let set = select_paths(&["nope.txt".to_string()], &m);
         assert!(set.contains("nope.txt"));
+    }
+
+    fn dto(addr: &str, addrs: &[&str]) -> InviteShareDto {
+        InviteShareDto {
+            share_id: "S".into(),
+            name: "n".into(),
+            addr: addr.into(),
+            addrs: addrs.iter().map(|s| s.to_string()).collect(),
+            port: 8443,
+            agent_pubkey: String::new(),
+            token: "t".into(),
+        }
+    }
+
+    #[test]
+    fn candidate_bases_lan_first_then_public() {
+        // XR-050: LAN addresses first, public last, deduped, blanks dropped.
+        assert_eq!(
+            dto("203.0.113.7", &["192.168.1.10"]).candidate_bases("http"),
+            vec![
+                "http://192.168.1.10:8443/S".to_string(),
+                "http://203.0.113.7:8443/S".to_string(),
+            ]
+        );
+        assert_eq!(
+            dto("203.0.113.7", &[]).candidate_bases("https"),
+            vec!["https://203.0.113.7:8443/S".to_string()]
+        );
+        // A blank extra is skipped, a duplicate of the public addr is not repeated.
+        assert_eq!(
+            dto("203.0.113.7", &[" ", "203.0.113.7"]).candidate_bases("http"),
+            vec!["http://203.0.113.7:8443/S".to_string()]
+        );
     }
 
     #[test]

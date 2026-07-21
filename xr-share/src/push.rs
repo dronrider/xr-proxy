@@ -24,7 +24,7 @@ use clap::Args;
 use sha2::{Digest, Sha256};
 use xr_proto::share::{scope_contains, SCOPE_WRITE};
 
-use crate::pull::{encode_path, fetch_manifest_verified, get_json, InviteShareDto, HUB_DEFAULT};
+use crate::pull::{encode_path, get_json, InviteShareDto, HUB_DEFAULT};
 
 #[derive(Args)]
 pub struct PushArgs {
@@ -89,14 +89,17 @@ pub fn push(args: PushArgs) -> Result<()> {
     };
 
     let scheme = if args.https { "https" } else { "http" };
-    let base = format!("{scheme}://{}:{}/{}", share.addr, share.port, share.share_id);
+    // Try LAN addresses before the public one (XR-050); the reachable base also
+    // gives us the manifest for the If-Match guard without a second fetch.
+    let (base, manifest) = crate::pull::resolve_base(scheme, &share)
+        .with_context(|| format!("шара «{}» недоступна", share.name))?;
 
     // On overwrite, pin the version we saw so a newer upload is not clobbered
-    // silently. --force skips the fetch and the guard.
+    // silently. --force skips the guard.
     let if_match = if args.force {
         None
     } else {
-        match target_state(&base, &share, &rel)? {
+        match target_state_of(&manifest, &rel) {
             TargetState::Absent => None,
             TargetState::Hashed(h) => {
                 println!("  перезапись {rel}: If-Match по текущей версии (--force чтобы обойти)");
@@ -130,7 +133,10 @@ pub fn rm(args: RmArgs) -> Result<()> {
     ensure_writable_grant(&share)?;
 
     let scheme = if args.https { "https" } else { "http" };
-    let base = format!("{scheme}://{}:{}/{}", share.addr, share.port, share.share_id);
+    // Locate a reachable agent (LAN before public, XR-050); the manifest probe
+    // doubles as the reachability check for the address we then delete against.
+    let (base, _manifest) = crate::pull::resolve_base(scheme, &share)
+        .with_context(|| format!("шара «{}» недоступна", share.name))?;
     let status = delete_file(&base, &share, &args.rel)?;
     match status {
         204 => println!("готово, файл удалён: {}/{}", share.name, args.rel),
@@ -175,14 +181,12 @@ enum TargetState {
     Unhashed,
 }
 
-fn target_state(base: &str, share: &InviteShareDto, rel: &str) -> Result<TargetState> {
-    let manifest = fetch_manifest_verified(&format!("{base}/manifest"), share)
-        .with_context(|| format!("манифест шары «{}»", share.name))?;
-    Ok(match manifest.entries.into_iter().find(|e| e.path == rel) {
+fn target_state_of(manifest: &xr_proto::share::ShareManifest, rel: &str) -> TargetState {
+    match manifest.entries.iter().find(|e| e.path == rel) {
         None => TargetState::Absent,
         Some(e) if e.sha256.is_empty() => TargetState::Unhashed,
-        Some(e) => TargetState::Hashed(e.sha256),
-    })
+        Some(e) => TargetState::Hashed(e.sha256.clone()),
+    }
 }
 
 /// PUT the local file, streaming it (constant memory), returning the HTTP status
@@ -237,6 +241,26 @@ fn put_error(code: u16) -> String {
         422 => "sha256 не сошёлся при заливке".into(),
         507 => "на агенте кончилось место".into(),
         other => format!("агент ответил HTTP {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xr_proto::share::{ShareManifest, ShareManifestEntry};
+
+    fn entry(path: &str, sha: &str) -> ShareManifestEntry {
+        ShareManifestEntry { path: path.into(), size: 1, mtime: 0, sha256: sha.into() }
+    }
+
+    #[test]
+    fn target_state_classifies_manifest_entry() {
+        // The If-Match guard reads the target's state off the manifest: absent,
+        // hashed (guard on the hash), or present-but-unhashed (cold cache).
+        let m = ShareManifest { entries: vec![entry("a.txt", "aa"), entry("b.txt", "")] };
+        assert!(matches!(target_state_of(&m, "missing.txt"), TargetState::Absent));
+        assert!(matches!(target_state_of(&m, "a.txt"), TargetState::Hashed(h) if h == "aa"));
+        assert!(matches!(target_state_of(&m, "b.txt"), TargetState::Unhashed));
     }
 }
 
