@@ -314,6 +314,15 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     if let Some(addr) = args.addr.as_deref() {
         body["addr"] = serde_json::json!(addr);
     }
+    // Advertise this host's LAN address(es) as extra candidates (XR-050): a
+    // consumer on the same network reaches the agent by LAN-IP without router
+    // hairpin, while the hub-seen public IP (or --addr) stays the primary. The
+    // hub dedups these against the primary, so a public-IP host contributes
+    // nothing extra.
+    let lan = local_lan_addrs();
+    if !lan.is_empty() {
+        body["addrs"] = serde_json::json!(lan);
+    }
     if via_relay {
         body["via_relay"] = serde_json::json!(true);
     }
@@ -325,6 +334,12 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     let share_id = str_field(&resp, "share_id")?;
     let addr = str_field(&resp, "addr")?;
     let token = str_field(&resp, "token")?;
+    // The LAN candidates the hub stored, after its trimming/dedup (XR-050).
+    let extra_addrs: Vec<String> = resp
+        .get("addrs")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
 
     // A relay-reachable share gets the relay descriptor back; store it so the
     // running agent brings up its reverse tunnel (LLD-23 §2.4).
@@ -366,6 +381,9 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     println!("  путь:     {}", canon.display());
     println!("  share_id: {share_id}");
     println!("  адрес:    {addr}:{port}");
+    for a in &extra_addrs {
+        println!("  LAN:      {a}:{port} (потребитель в этой же сети пробует его первым)");
+    }
     if args.writable {
         println!("  запись:   разрешена (держатели инвайта могут заливать и удалять файлы)");
     }
@@ -409,6 +427,37 @@ fn bootstrap_import(cfg: &mut AgentConfig, has_bin: &dyn Fn(&str) -> bool) -> Re
     cfg.import = Some(ImportConfig::reference());
     println!("  в конфиг вписан референсный блок [import] (yt-dlp, планка 1080p)");
     Ok(())
+}
+
+/// Best-effort local address(es) of this host (XR-050), advertised as extra
+/// share candidates so a consumer on the same network reaches the agent by
+/// LAN-IP without router hairpin. Uses the no-send UDP-connect trick: connecting
+/// a UDP socket to a public address makes the OS pick the outbound interface, and
+/// `local_addr` reveals its IP; no packet leaves the machine. Two well-known
+/// targets cover a host whose default IPv4 and IPv6 routes differ. A loopback
+/// result (no route, isolated host) is dropped as useless. Empty when nothing can
+/// be determined; the caller simply advertises no extras then.
+fn local_lan_addrs() -> Vec<String> {
+    use std::net::UdpSocket;
+    let mut out: Vec<String> = Vec::new();
+    for target in ["8.8.8.8:80", "[2001:4860:4860::8888]:80"] {
+        let Ok(sock) = UdpSocket::bind(if target.starts_with('[') { "[::]:0" } else { "0.0.0.0:0" }) else {
+            continue;
+        };
+        if sock.connect(target).is_err() {
+            continue;
+        }
+        let Ok(local) = sock.local_addr() else { continue };
+        let ip = local.ip();
+        if ip.is_loopback() || ip.is_unspecified() {
+            continue;
+        }
+        let ip = ip.to_string();
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out
 }
 
 /// True if a resolved address is a private/loopback/link-local IP, so a share at
