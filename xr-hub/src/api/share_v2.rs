@@ -149,6 +149,11 @@ pub struct AddShareReq {
     /// Reachable address; if omitted the hub uses the request's source IP.
     #[serde(default)]
     pub addr: Option<String>,
+    /// Extra reachable addresses beyond `addr` (XR-050): the agent's LAN
+    /// address(es), advertised so a consumer inside the same LAN reaches the
+    /// agent by LAN-IP without router hairpin. Tried before `addr` (LAN first).
+    #[serde(default)]
+    pub addrs: Vec<String>,
     pub port: u16,
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
@@ -170,6 +175,10 @@ pub struct AddShareResp {
     /// Ready-to-hand-out access token blob (base64url of the [`ShareToken`]).
     pub token: String,
     pub exp: u64,
+    /// The extra addresses the hub stored (XR-050), after trimming and dropping
+    /// any that duplicate `addr`, so the agent can print what it advertised.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addrs: Vec<String>,
     /// The relay descriptor, echoed when the share is `via_relay` and the hub has
     /// a relay, so the agent knows where to open its reverse tunnel.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -203,7 +212,12 @@ pub async fn add(
         .filter(|s| !s.is_empty())
         .or_else(|| client_ip(&headers))
         .filter(|s| !s.is_empty())
-        .ok_or((StatusCode::BAD_REQUEST, "could not determine address — pass addr".into()))?;
+        .ok_or((StatusCode::BAD_REQUEST, "could not determine address, pass addr".into()))?;
+
+    // Extra LAN/DDNS candidates (XR-050): trim, drop blanks, dedup, and drop any
+    // that duplicate the primary addr, so the stored list is clean and the
+    // consumer never probes the same address twice.
+    let addrs = sanitize_extra_addrs(&req.addrs, &addr);
 
     let share_id = random_share_id();
     let share = ShareRecord {
@@ -211,6 +225,7 @@ pub async fn add(
         name: name.to_string(),
         owner: String::new(),
         addr: addr.clone(),
+        addrs: addrs.clone(),
         port: req.port,
         // Bind the share to the mandate's identity — consumers pin this key.
         agent_pubkey: cred.agent_pubkey.clone(),
@@ -239,8 +254,24 @@ pub async fn add(
         port: req.port,
         token: encode_blob(&token),
         exp,
+        addrs,
         relay,
     }))
+}
+
+/// Clean the extra-address list a `share/add` carries (XR-050): trim each,
+/// drop blanks, drop any equal to the primary `addr`, and drop later
+/// duplicates. Order is preserved (the agent lists LAN addresses first).
+fn sanitize_extra_addrs(raw: &[String], primary: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for a in raw {
+        let a = a.trim();
+        if a.is_empty() || a == primary || out.iter().any(|x| x == a) {
+            continue;
+        }
+        out.push(a.to_string());
+    }
+    out
 }
 
 // ── mint: credential → token for an existing owned share ────────────
@@ -479,6 +510,8 @@ pub async fn invite_shares(
                 share_id: rec.share_id.clone(),
                 name: rec.name.clone(),
                 addr: rec.addr.clone(),
+                // LAN candidates the consumer tries before the public addr (XR-050).
+                addrs: rec.addrs.clone(),
                 port: rec.port,
                 agent_pubkey: rec.agent_pubkey.clone(),
                 token: encode_blob(&token),
@@ -515,6 +548,7 @@ mod tests {
             name: id.into(),
             owner: String::new(),
             addr: "203.0.113.9".into(),
+            addrs: Vec::new(),
             port: 8443,
             agent_pubkey: agent_pk.into(),
             created_at: String::new(),
@@ -619,6 +653,69 @@ mod tests {
             )
             .is_ok(),
             "relay token must verify against the hub key, bound to this share+agent"
+        );
+    }
+
+    #[test]
+    fn sanitize_extra_addrs_trims_dedups_drops_primary() {
+        // XR-050: the stored extra list is trimmed, blank-free, dedup'd, and never
+        // repeats the primary addr.
+        let raw = vec![
+            " 192.168.1.10 ".into(),
+            String::new(),
+            "203.0.113.9".into(),   // == primary, dropped
+            "192.168.1.10".into(),  // dup, dropped
+            "home.ddns.net".into(),
+        ];
+        assert_eq!(
+            sanitize_extra_addrs(&raw, "203.0.113.9"),
+            vec!["192.168.1.10".to_string(), "home.ddns.net".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn add_stores_and_echoes_extra_addrs() {
+        // XR-050: `share/add` sanitizes the extra addresses, stores them on the
+        // record, and echoes the cleaned list back to the agent.
+        let dir = tempfile::tempdir().unwrap();
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let identity = SigningKey::from_bytes(&[7u8; 32]);
+        let agent_pk = base64::engine::general_purpose::STANDARD
+            .encode(identity.verifying_key().as_bytes());
+        let cred = encode_blob(&sign_agent_credential(&hub, &agent_pk, now_unix() + 3600));
+        let config = format!("[server]\ndata_dir = {:?}\n[admin]\nusers = []\n", dir.path().display().to_string());
+        let state = state_with(&config, hub, vec![]);
+        let req = AddShareReq {
+            credential: cred,
+            name: "Photos".into(),
+            addr: Some("203.0.113.9".into()),
+            addrs: vec!["192.168.1.10".into(), "203.0.113.9".into(), " ".into()],
+            port: 8443,
+            ttl_seconds: None,
+            via_relay: false,
+            writable: false,
+        };
+        let Json(resp) = add(State(state.clone()), HeaderMap::new(), Json(req)).await.unwrap();
+        assert_eq!(resp.addrs, vec!["192.168.1.10".to_string()]);
+        let stored = state.shares.read().await.get(&resp.share_id).unwrap().clone();
+        assert_eq!(stored.addrs, vec!["192.168.1.10".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn invite_shares_carries_extra_addrs() {
+        // The LAN candidate list rides into the grant, so the consumer tries LAN
+        // before the public addr (XR-050).
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let mut rec = share("s", "QQ==", false);
+        rec.addrs = vec!["192.168.1.10".into()];
+        let state = state_with("[server]\n[admin]\nusers = []\n", hub, vec![rec]);
+        let Json(grants) = invite_shares(State(state), AxPath(TOKEN.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(grants[0].addrs, vec!["192.168.1.10".to_string()]);
+        assert_eq!(
+            grants[0].candidate_addrs(),
+            vec!["192.168.1.10".to_string(), "203.0.113.9".to_string()]
         );
     }
 
