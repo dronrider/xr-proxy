@@ -1516,13 +1516,19 @@ fn grant_from_parts(
 ) -> ShareGrant {
     let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(serde_json::to_vec(&token).expect("serialize token"));
-    // `addr` may be a newline-joined candidate list (XR-050): the first line is
-    // the primary/public address, the rest are extra (LAN) candidates. They land
-    // in `addrs`, which `ShareGrant::candidate_addrs` walks before `addr`, so the
-    // import calls try LAN before public just like sync and manifest do.
-    let mut lines = addr.split('\n').map(str::trim).filter(|s| !s.is_empty());
-    let primary = lines.next().unwrap_or("").to_string();
-    let extras: Vec<String> = lines.map(str::to_string).collect();
+    // `addr` may be a newline-joined candidate list in walk order (XR-050): LAN
+    // addresses first, the public address last, same ordering the sync path uses.
+    // The public one is the grant's primary `addr`; the earlier LAN ones become
+    // `addrs`, which `ShareGrant::candidate_addrs` walks first, so the import
+    // calls try LAN before public just like sync and manifest do.
+    let mut parts: Vec<String> = addr
+        .split('\n')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let primary = parts.pop().unwrap_or_default();
+    let extras = parts;
     ShareGrant {
         share_id: token.share_id.clone(),
         name: String::new(),
