@@ -2102,21 +2102,59 @@ mod tests {
 
     // -- write path: upload_file / delete_file (LLD-28) ------------------
 
-    /// A canned one-shot HTTP server that captures the request line + headers and
-    /// answers `status_line`. Returns its address and a channel with the request
-    /// text (enough to assert method/path/headers; the streamed body follows).
+    /// Read a full HTTP request from `sock`: the head plus the body named by
+    /// `Content-Length`. Draining the body before the caller answers is what
+    /// keeps [`serve_capture`]/[`serve_capture_json`] from racing a streamed
+    /// `PUT`/`POST`: answering after only the first read let the server shut the
+    /// socket while the client was still writing, and reqwest then failed the
+    /// whole request with "error sending request" (~1 run in 10, XR-142). Returns
+    /// the request text (head + whatever body arrived) for method/path asserts.
+    async fn read_http_request(sock: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        // First, the head (up to the blank line).
+        let head_end = loop {
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => return String::from_utf8_lossy(&buf).into_owned(),
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                }
+            }
+        };
+        // Then exactly Content-Length body bytes, so the client finishes writing
+        // before we respond.
+        let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+        let want = head
+            .lines()
+            .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")))
+            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while buf.len() < head_end + want {
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// A canned one-shot HTTP server that captures the request (line + headers +
+    /// body) and answers `status_line`. Returns its address and a channel with
+    /// the request text (enough to assert method/path/headers).
     async fn serve_capture(
         status_line: &'static str,
     ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 8192];
-            let n = sock.read(&mut buf).await.unwrap_or(0);
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let req = read_http_request(&mut sock).await;
             let resp = format!("{status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
             let _ = sock.write_all(resp.as_bytes()).await;
             let _ = sock.shutdown().await;
@@ -2189,15 +2227,15 @@ mod tests {
         status_line: &'static str,
         body: &'static str,
     ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 8192];
-            let n = sock.read(&mut buf).await.unwrap_or(0);
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            // Drain the full request (incl. the POST body) before answering, so a
+            // streamed request never sees the socket close mid-write (XR-142).
+            let req = read_http_request(&mut sock).await;
             let resp = format!(
                 "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
