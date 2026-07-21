@@ -231,7 +231,16 @@ fn select_paths(values: &[String], manifest: &ShareManifest) -> HashSet<String> 
 /// a key is pinned: a missing signature (old agent or stripped headers) is a
 /// refusal with a pointer at updating the agent.
 pub(crate) fn fetch_manifest_verified(url: &str, share: &InviteShareDto) -> Result<ShareManifest> {
-    let resp = match ureq::get(url)
+    // A short connect deadline caps the cost of a dead candidate (XR-050): with
+    // several addresses tried LAN-first, an unroutable LAN-IP for a receiver
+    // outside that network must fail in seconds, not stall the whole 30s read
+    // budget before the public address is tried. The overall timeout stays 30s
+    // for a slow but reachable agent.
+    let agent = ureq::builder()
+        .timeout_connect(Duration::from_secs(6))
+        .build();
+    let resp = match agent
+        .get(url)
         .set("Authorization", &format!("Bearer {}", share.token))
         .timeout(Duration::from_secs(30))
         .call()
