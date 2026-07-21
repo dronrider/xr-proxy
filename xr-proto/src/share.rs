@@ -125,10 +125,18 @@ pub struct ShareRecord {
     /// Free-form owner label (who registered it).
     #[serde(default)]
     pub owner: String,
-    /// Reachable host or IP of the agent (manual entry in MVP — owner is
-    /// responsible for reachability; no heartbeat yet).
+    /// Reachable host or IP of the agent (manual entry in MVP, the owner is
+    /// responsible for reachability; no heartbeat yet). The primary/public
+    /// entry point: what the hub echoes and the owner sees.
     pub addr: String,
-    /// Agent listen port.
+    /// Extra reachable addresses beyond [`addr`] (XR-050): the agent's LAN
+    /// address (and any additional DDNS). A consumer inside the same LAN reaches
+    /// the agent by its LAN-IP without router hairpin; a remote one falls through
+    /// to the public [`addr`]. Tried before `addr` (LAN first). `#[serde(default)]`
+    /// keeps pre-XR-050 records loadable; empty is the old direct-only shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addrs: Vec<String>,
+    /// Agent listen port (shared by every address in `addr`/`addrs`).
     pub port: u16,
     /// Base64 ed25519 public key the consumer pins (TOFU, LLD-04). Pinning is
     /// on the *key*, not the address, so a dynamic IP doesn't reset trust.
@@ -160,6 +168,10 @@ pub struct ShareInfo {
     pub share_id: String,
     pub name: String,
     pub addr: String,
+    /// Extra reachable addresses beyond `addr` (XR-050), LAN first. Mirrors
+    /// [`ShareRecord::addrs`]; empty is the old direct-only shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addrs: Vec<String>,
     pub port: u16,
     pub agent_pubkey: String,
 }
@@ -169,22 +181,47 @@ pub struct ShareInfo {
 /// offline. Returned by `GET /api/v1/invite/{token}/shares`. The `token` here is
 /// the URL-safe base64 blob the agent expects as a bearer.
 ///
-/// `relay` (LLD-23 §2.4) is present only for a share the owner marked as
+/// `relay` (LLD-23 п. 2.4) is present only for a share the owner marked as
 /// reachable through a relay: it carries the relay's address, its mux obfuscation
-/// params and a separate [`RelayToken`] gating transit. The consumer tries the
-/// direct `addr:port` first and falls back to the relay last (XR-050 order); an
-/// older consumer that doesn't know the field ignores it (`#[serde(default)]`).
+/// params and a separate [`RelayToken`] gating transit. The consumer walks the
+/// direct addresses in [`candidate_addrs`](ShareGrant::candidate_addrs) order
+/// (LAN candidates first, then the public `addr`) and falls back to the relay
+/// last (XR-050); an older consumer that doesn't know `addrs`/`relay` ignores
+/// them (`#[serde(default)]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareGrant {
     pub share_id: String,
     pub name: String,
     pub addr: String,
+    /// Extra reachable addresses beyond `addr` (XR-050), LAN first. Empty is the
+    /// old single-address shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addrs: Vec<String>,
     pub port: u16,
     pub agent_pubkey: String,
     pub token: String,
     pub exp: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<RelayGrant>,
+}
+
+impl ShareGrant {
+    /// The ordered list of direct addresses to try (XR-050): the LAN `addrs`
+    /// first, then the public `addr` last. Deduped and trimmed, order preserved.
+    /// A consumer inside the agent's LAN reaches it by LAN-IP without router
+    /// hairpin; a remote one falls through to the public address. Never empty in
+    /// practice (always ends with `addr`); a grant with an empty `addr` and no
+    /// `addrs` yields an empty list, which the caller treats as unreachable.
+    pub fn candidate_addrs(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::with_capacity(self.addrs.len() + 1);
+        for a in self.addrs.iter().chain(std::iter::once(&self.addr)) {
+            let a = a.trim();
+            if !a.is_empty() && !out.iter().any(|x| x == a) {
+                out.push(a.to_string());
+            }
+        }
+        out
+    }
 }
 
 /// Obfuscation params for a relay's mux, mirrored from the deployment's
@@ -314,6 +351,7 @@ impl ShareRecord {
             share_id: self.share_id.clone(),
             name: self.name.clone(),
             addr: self.addr.clone(),
+            addrs: self.addrs.clone(),
             port: self.port,
             agent_pubkey: self.agent_pubkey.clone(),
         }
@@ -1235,6 +1273,7 @@ mod tests {
             name: "Photos".into(),
             owner: "andrew".into(),
             addr: "203.0.113.7".into(),
+            addrs: vec!["192.168.1.10".into()],
             port: 8443,
             agent_pubkey: "QQ==".into(),
             created_at: "2026-06-24T00:00:00Z".into(),
@@ -1258,6 +1297,7 @@ mod tests {
             name: "Photos".into(),
             owner: "andrew".into(),
             addr: "203.0.113.7".into(),
+            addrs: vec!["192.168.1.10".into()],
             port: 8443,
             agent_pubkey: "QQ==".into(),
             created_at: "2026-06-24T00:00:00Z".into(),
@@ -1265,9 +1305,53 @@ mod tests {
             via_relay: true,
             writable: true,
         };
-        let json = serde_json::to_string(&rec.info()).unwrap();
+        let info = rec.info();
+        // The LAN candidate list rides along to the consumer view (XR-050).
+        assert_eq!(info.addrs, vec!["192.168.1.10".to_string()]);
+        let json = serde_json::to_string(&info).unwrap();
         assert!(!json.contains("owner"));
         assert!(!json.contains("secret note"));
         assert!(json.contains("agent_pubkey"));
+    }
+
+    #[test]
+    fn candidate_addrs_lan_first_then_public_deduped() {
+        // XR-050: the consumer tries LAN addresses first, then the public addr,
+        // with duplicates and blanks dropped and order preserved.
+        let grant = |addr: &str, addrs: &[&str]| ShareGrant {
+            share_id: "s".into(),
+            name: "n".into(),
+            addr: addr.into(),
+            addrs: addrs.iter().map(|s| s.to_string()).collect(),
+            port: 8443,
+            agent_pubkey: "QQ==".into(),
+            token: "t".into(),
+            exp: 9,
+            relay: None,
+        };
+        // LAN first, public last.
+        assert_eq!(
+            grant("203.0.113.7", &["192.168.1.10", "10.0.0.5"]).candidate_addrs(),
+            vec!["192.168.1.10", "10.0.0.5", "203.0.113.7"]
+        );
+        // No extras: just the public addr, unchanged from the old shape.
+        assert_eq!(grant("203.0.113.7", &[]).candidate_addrs(), vec!["203.0.113.7"]);
+        // The public addr duplicated in addrs is not repeated; blanks are dropped.
+        assert_eq!(
+            grant("203.0.113.7", &["203.0.113.7", " ", "192.168.1.10"]).candidate_addrs(),
+            vec!["203.0.113.7", "192.168.1.10"]
+        );
+    }
+
+    #[test]
+    fn share_grant_addrs_optional_on_wire() {
+        // An older grant without `addrs` still deserializes (default empty), and a
+        // grant with no extras serializes without the field.
+        let json = r#"{"share_id":"s","name":"n","addr":"1.2.3.4","port":8443,"agent_pubkey":"QQ==","token":"t","exp":9}"#;
+        let g: ShareGrant = serde_json::from_str(json).unwrap();
+        assert!(g.addrs.is_empty());
+        assert_eq!(g.candidate_addrs(), vec!["1.2.3.4"]);
+        let back = serde_json::to_string(&g).unwrap();
+        assert!(!back.contains("addrs"), "no extra addresses must not emit the field: {back}");
     }
 }
