@@ -237,7 +237,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         val store = store()
         grants.forEach { g ->
             val existing = store.get(g.shareId) ?: return@forEach
-            if (existing.addr != g.addr || existing.port != g.port ||
+            if (existing.addr != g.addr || existing.addrs != g.addrs || existing.port != g.port ||
                 existing.agentPubkey != g.agentPubkey || existing.tokenJson != g.tokenJson ||
                 existing.relayJson != g.relayJson
             ) {
@@ -245,6 +245,13 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     it.copy(
                         addr = g.addr, port = g.port, agentPubkey = g.agentPubkey,
                         tokenJson = g.tokenJson, name = g.name,
+                        // Carry the grant's extra addresses (XR-050): a share added
+                        // before the hub served them, or whose LAN address changed
+                        // (DHCP), must pick up the new list on refresh. Without this
+                        // the stored share keeps the public address alone and stays
+                        // unreachable from inside the agent's own LAN, where there
+                        // is no hairpin.
+                        addrs = g.addrs,
                         // Carry the grant's relay leg (XR-103): a share that became
                         // relay-reachable after it was first added must gain (or
                         // lose) its relay fallback on refresh, not only on re-add.
