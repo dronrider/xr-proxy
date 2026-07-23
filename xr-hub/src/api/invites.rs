@@ -44,11 +44,21 @@ pub async fn get_invite_info(
     }))
 }
 
-/// GET /invite/:token/view — HTML page with invite info and QR code.
+/// GET /invite/:token/view - HTML page with invite info and QR code.
 pub async fn view_invite(
     State(state): State<Arc<AppState>>,
     extract::Path(token): extract::Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Html<String>, (StatusCode, String)> {
+    // Приложение есть только под Android, поэтому «Открыть в приложении»
+    // (deep link) показываем лишь там. На iOS/десктопе кнопка вела бы в никуда,
+    // получателю остаётся отсканировать QR телефоном или скачать APK.
+    let is_android = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|ua| ua.contains("Android"))
+        .unwrap_or(false);
+
     let invites = state.invites.read().await;
     let invite = invites
         .get(&token)
@@ -92,6 +102,19 @@ pub async fn view_invite(
     let apk_url = "/api/v1/app/download/latest";
     let open_class = if active { "btn primary" } else { "btn primary disabled" };
 
+    // «Открыть в приложении» только на Android (см. is_android выше).
+    let open_in_app = if is_android {
+        format!(r#"<a class="{open_class}" href="{deep_link}">Открыть в приложении</a>"#)
+    } else {
+        String::new()
+    };
+    // На не-Android нет ни deep link, ни смысла в APK: подсказываем QR.
+    let platform_note = if is_android {
+        String::new()
+    } else {
+        r#"<p class="note">Приложение доступно для Android. Отсканируйте QR телефоном или откройте эту ссылку на Android-устройстве.</p>"#.to_string()
+    };
+
     let html = format!(
         r#"<!DOCTYPE html>
 <html lang="ru">
@@ -105,9 +128,12 @@ pub async fn view_invite(
   /* Цвет текста задаём вместе с фоном карточки в каждом правиле: если вебвью
      применит один override и не применит другой (наблюдалось с тёмной темой),
      текст и фон не разъедутся в светлый-на-белом. */
-  .card {{ background: #fff; color: #1a1a2e; border-radius: 16px; padding: 2.25rem 2.5rem; max-width: 720px; width: 100%; box-shadow: 0 6px 28px rgba(0,0,0,0.10); }}
+  .card {{ background: #fff; color: #1a1a2e; border-radius: 16px; padding: 2.25rem 2.5rem; max-width: 760px; width: 100%; box-shadow: 0 6px 28px rgba(0,0,0,0.10); }}
   h1 {{ font-size: 1.7rem; margin: 0 0 0.35rem; text-align: center; color: #12121c; }}
   .meta {{ color: #5a5f6e; font-size: 0.95rem; text-align: center; margin: 0 0 1.75rem; }}
+  .main {{ display: flex; gap: 2.5rem; flex-wrap: wrap; align-items: center; justify-content: center; }}
+  .col-info {{ flex: 1 1 300px; min-width: min(100%, 300px); }}
+  .col-qr {{ flex: 0 0 auto; text-align: center; }}
   .field {{ display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; padding: 0.7rem 0; border-bottom: 1px solid #ececf0; }}
   .field-label {{ color: #6b7080; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; }}
   .field-value {{ color: #12121c; font-size: 1rem; font-weight: 600; text-align: right; }}
@@ -115,20 +141,24 @@ pub async fn view_invite(
   .badge-active {{ color: #1e8e3e; }}
   .badge-expired {{ color: #8a8f9e; }}
   .badge-consumed {{ color: #e8710a; }}
-  .actions {{ display: flex; flex-wrap: wrap; gap: 0.85rem; margin: 1.5rem 0 1rem; }}
-  .btn {{ flex: 1; min-width: 220px; display: block; padding: 0.95rem 1.5rem; border-radius: 10px; font-size: 1.05rem; font-weight: 600; text-align: center; text-decoration: none; cursor: pointer; border: 2px solid transparent; }}
+  .actions {{ display: flex; flex-direction: column; gap: 0.75rem; margin: 1.5rem 0 0; }}
+  .btn {{ display: block; width: 100%; padding: 0.95rem 1.5rem; border-radius: 12px; font-size: 1.05rem; font-weight: 600; text-align: center; text-decoration: none; cursor: pointer; border: 2px solid transparent; }}
   .btn.primary {{ background: #4f46e5; color: #fff; }}
-  .btn.secondary {{ background: #eef0f6; color: #1a1a2e; border-color: #d3d7e2; }}
   .btn.disabled {{ opacity: 0.4; pointer-events: none; }}
-  .hint {{ color: #5a5f6e; font-size: 0.85rem; text-align: center; line-height: 1.45; margin: 0 0 1.5rem; }}
-  .qr {{ text-align: center; }}
-  .qr img {{ background: #fff; padding: 8px; border-radius: 10px; width: 150px; height: 150px; }}
-  .qr-cap {{ color: #7a7f8e; font-size: 0.8rem; margin: 0.6rem 0 0; }}
+  /* Кнопка скачивания в стиле магазина: иконка Android плюс подпись в две строки. */
+  .store-btn {{ display: flex; align-items: center; gap: 0.75rem; width: 100%; padding: 0.7rem 1.25rem; background: #12121c; color: #fff; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; text-decoration: none; }}
+  .store-ic {{ fill: #3ddc84; flex: 0 0 auto; }}
+  .store-tx {{ display: flex; flex-direction: column; line-height: 1.15; text-align: left; }}
+  .store-tx small {{ font-size: 0.72rem; opacity: 0.85; }}
+  .store-tx b {{ font-size: 1.05rem; font-weight: 700; }}
+  .note {{ color: #5a5f6e; font-size: 0.85rem; line-height: 1.45; margin: 1rem 0 0; }}
+  .col-qr img {{ background: #fff; padding: 10px; border-radius: 12px; width: 220px; height: 220px; }}
+  .qr-cap {{ color: #7a7f8e; font-size: 0.82rem; margin: 0.6rem 0 0; }}
   @media (prefers-color-scheme: dark) {{
     body {{ background: #0f1017; }}
     .card {{ background: #1b1e2b; color: #e6e7ee; box-shadow: 0 6px 28px rgba(0,0,0,0.45); }}
     h1 {{ color: #f2f3f8; }}
-    .meta, .hint, .qr-cap {{ color: #9ea3b4; }}
+    .meta, .note, .qr-cap {{ color: #9ea3b4; }}
     .field {{ border-bottom-color: #2b2f40; }}
     .field-label {{ color: #9096a8; }}
     .field-value {{ color: #f2f3f8; }}
@@ -136,25 +166,32 @@ pub async fn view_invite(
     .badge-expired {{ color: #9096a8; }}
     .badge-consumed {{ color: #fb923c; }}
     .btn.primary {{ background: #6366f1; }}
-    .btn.secondary {{ background: #2b2f40; color: #e6e7ee; border-color: #3a3f54; }}
+    .store-btn {{ background: #0d0e14; border-color: #2b2f40; }}
   }}
 </style>
 </head>
 <body>
 <div class="card">
   <h1>Приглашение xr-proxy</h1>
-  <p class="meta">Откройте в приложении или установите его ниже</p>
-  <div class="field"><div class="field-label">Статус</div><div class="field-value">{status_badge}</div></div>
-  <div class="field"><div class="field-label">Действует до</div><div class="field-value">{expires}</div></div>
-  {comment_html}
-  <div class="actions">
-    <a class="{open_class}" href="{deep_link}">Открыть в приложении</a>
-    <a class="btn secondary" href="{apk_url}">Скачать APK</a>
-  </div>
-  <p class="hint">Ещё нет приложения? Скачайте APK, установите и вернитесь по этой ссылке.</p>
-  <div class="qr">
-    <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data={qr_data_encoded}" width="150" height="150" alt="QR-код приглашения">
-    <p class="qr-cap">Или отсканируйте с другого устройства</p>
+  <p class="meta">Подключение к xr-proxy в пару касаний</p>
+  <div class="main">
+    <div class="col-info">
+      <div class="field"><div class="field-label">Статус</div><div class="field-value">{status_badge}</div></div>
+      <div class="field"><div class="field-label">Действует до</div><div class="field-value">{expires}</div></div>
+      {comment_html}
+      <div class="actions">
+        {open_in_app}
+        <a class="store-btn" href="{apk_url}">
+          <svg class="store-ic" viewBox="0 0 24 24" width="30" height="30" aria-hidden="true"><path d="M6 18c0 .55.45 1 1 1h1v3.5c0 .83.67 1.5 1.5 1.5s1.5-.67 1.5-1.5V19h2v3.5c0 .83.67 1.5 1.5 1.5s1.5-.67 1.5-1.5V19h1c.55 0 1-.45 1-1V8H6v10zM3.5 8C2.67 8 2 8.67 2 9.5v7c0 .83.67 1.5 1.5 1.5S5 17.33 5 16.5v-7C5 8.67 4.33 8 3.5 8zm17 0c-.83 0-1.5.67-1.5 1.5v7c0 .83.67 1.5 1.5 1.5s1.5-.67 1.5-1.5v-7c0-.83-.67-1.5-1.5-1.5zm-4.97-5.84l1.3-1.3c.2-.2.2-.51 0-.71-.2-.2-.51-.2-.71 0l-1.48 1.48C13.85 1.23 12.95 1 12 1c-.96 0-1.86.23-2.66.63L7.85.15c-.2-.2-.51-.2-.71 0-.2.2-.2.51 0 .71l1.31 1.31C6.97 3.26 6 5.01 6 7h12c0-1.99-.97-3.75-2.47-4.84zM10 5H9V4h1v1zm5 0h-1V4h1v1z"/></svg>
+          <span class="store-tx"><small>Скачать</small><b>APK для Android</b></span>
+        </a>
+      </div>
+      {platform_note}
+    </div>
+    <div class="col-qr">
+      <img src="https://api.qrserver.com/v1/create-qr-code/?size=300x300&amp;data={qr_data_encoded}" width="220" height="220" alt="QR-код приглашения">
+      <p class="qr-cap">Отсканируйте телефоном</p>
+    </div>
   </div>
 </div>
 </body>
@@ -166,8 +203,8 @@ pub async fn view_invite(
         } else {
             format!(r#"<div class="field"><div class="field-label">Комментарий</div><div class="field-value">{comment}</div></div>"#)
         },
-        open_class = open_class,
-        deep_link = deep_link,
+        open_in_app = open_in_app,
+        platform_note = platform_note,
         apk_url = apk_url,
         qr_data_encoded = urlencoding(&qr_data),
     );
@@ -458,11 +495,18 @@ mod tests {
         String::from_utf8(out).unwrap()
     }
 
-    async fn view_html(state: Arc<AppState>) -> String {
-        let Html(html) = view_invite(State(state), extract::Path(TOKEN.to_string()))
+    async fn view_html_ua(state: Arc<AppState>, ua: &str) -> String {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::USER_AGENT, ua.parse().unwrap());
+        let Html(html) = view_invite(State(state), extract::Path(TOKEN.to_string()), headers)
             .await
             .expect("view_invite failed");
         html
+    }
+
+    /// По умолчанию рендерим как Android: там показывается deep link.
+    async fn view_html(state: Arc<AppState>) -> String {
+        view_html_ua(state, "Mozilla/5.0 (Linux; Android 14; Pixel)").await
     }
 
     // Регрессия XR-032: QR кодировал относительный claim-путь, который
@@ -520,6 +564,30 @@ mod tests {
         assert!(
             html.contains(&format!(r#"class="btn primary disabled" href="xr://invite/{TOKEN}"#)),
             "у просроченного инвайта кнопка открытия должна быть погашена"
+        );
+    }
+
+    // «Открыть в приложении» только на Android: приложение есть лишь под него,
+    // на десктопе и iOS deep link вёл бы в никуда. APK-кнопка остаётся везде.
+    #[tokio::test]
+    async fn view_hides_open_in_app_on_non_android() {
+        let html = view_html_ua(
+            state_with_invite("https://hub.example.com", ""),
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15)",
+        )
+        .await;
+
+        assert!(
+            !html.contains("xr://invite/"),
+            "на не-Android deep link показывать не должны"
+        );
+        assert!(
+            !html.contains("Открыть в приложении"),
+            "на не-Android кнопки открытия быть не должно"
+        );
+        assert!(
+            html.contains(r#"href="/api/v1/app/download/latest""#),
+            "кнопка скачивания APK нужна и на не-Android"
         );
     }
 }
