@@ -187,6 +187,19 @@ pub fn build_https_url(hub_url: &str, token: &str) -> String {
     format!("{trimmed}/invite/{token}")
 }
 
+/// Build the custom-scheme deep link `xr://invite/<token>?hub=<host>`.
+/// Гарантированно перехватывается установленным приложением, в отличие от
+/// HTTPS-ссылки, которую браузер может открыть у себя. `hub_url` приходит со
+/// схемой (`https://host[:port]`), в query кладём голый host[:port].
+pub fn build_custom_url(hub_url: &str, token: &str) -> String {
+    let trimmed = hub_url.trim_end_matches('/');
+    let host = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    format!("xr://invite/{token}?hub={host}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,6 +373,23 @@ mod tests {
         assert_eq!(
             build_https_url("https://hub.example.com/", TOKEN),
             format!("https://hub.example.com/invite/{TOKEN}")
+        );
+    }
+
+    #[test]
+    fn build_custom_roundtrips_with_parse() {
+        let url = build_custom_url("https://hub.example.com", TOKEN);
+        assert_eq!(url, format!("xr://invite/{TOKEN}?hub=hub.example.com"));
+        let parsed = parse_invite_link(&url).unwrap();
+        assert_eq!(parsed.hub_url(), "https://hub.example.com");
+        assert_eq!(parsed.token(), TOKEN);
+    }
+
+    #[test]
+    fn build_custom_keeps_port_strips_scheme_and_slash() {
+        assert_eq!(
+            build_custom_url("https://hub.example.com:8443/", TOKEN),
+            format!("xr://invite/{TOKEN}?hub=hub.example.com:8443")
         );
     }
 }
