@@ -4,10 +4,10 @@
 **Область:** `xr-hub` (реестр роутеров, enrollment, приём статус-отчётов, раздел
 «Роутеры» в Admin SPA), `xr-client` (per-router идентичность, исходящий poll:
 отчёт о статусе), `xr-proto` (типы записи роутера, креденшела, отчёта),
-`xr-bootstrap` (enrollment во время установки, шов с LLD-13).
+`xr-setup` (enrollment во время установки, шов с LLD-13).
 **Зависимости:** [LLD-01](01-control-plane.md): xr-hub, инвайты, ed25519,
 Admin SPA, axum, JSON-стор: расширяем реестром.
-[LLD-13](13-zero-touch-provisioning.md): bootstrap регистрирует роутер и пишет
+[LLD-13](13-zero-touch-provisioning.md): установщик регистрирует роутер и пишет
 per-router ключ в конфиг (это «шов» установка -> учёт).
 [LLD-10](10-client-multi-vps-failover.md): `ServerPool`/`HealthState`, статус,
 который роутер репортит наверх. [LLD-11](11-monitoring-health-panel.md):
@@ -64,15 +64,15 @@ RouterRecord {
 ```
 
 **Enrollment во время установки (шов с LLD-13).** Чтобы не класть admin-креды
-хаба в приложение/bootstrap, переиспользуем механику инвайта (LLD-01):
+хаба в приложение/установщик, переиспользуем механику инвайта (LLD-01):
 
 1. Владелец в админке создаёт **одноразовый enrollment-токен** (TTL, как инвайт),
    либо приложение получает его тем же путём, что и инвайт.
-2. `xr-bootstrap` (LLD-13) на LAN после установки клиента дёргает
+2. `xr-setup` (LLD-13) на LAN после установки клиента дёргает
    `POST /api/v1/enroll {token, name, arch, version}` -> хаб создаёт
    `RouterRecord`, возвращает `{router_id, secret, command_pubkey}`, помечает
    токен `consumed`.
-3. Bootstrap пишет `[control]` в `config.toml` роутера: `hub_url`, `router_id`,
+3. Установщик пишет `[control]` в `config.toml` роутера: `hub_url`, `router_id`,
    `secret` (chmod 600), закреплённый `command_pubkey` (TOFU, как public-key
    LLD-04). Ключ нужен уже здесь, чтобы команды LLD-20 потом проверялись.
 4. Клиент стартует, открывает poll-канал (§2.2) -> роутер виден в реестре
@@ -140,7 +140,7 @@ RouterReport {
 
 ### 3.2 Enrollment через одноразовый токен, а не admin-креды в приложении
 
-Приложение/bootstrap не обязаны быть админом хаба. Переиспользуем механику
+Приложение и установщик не обязаны быть админом хаба. Переиспользуем механику
 инвайта (LLD-01): токен -> `{router_id, secret}`. Один шов, знакомый паттерн.
 
 ### 3.3 Реестр в JSON-сторе, как пресеты/инвайты
@@ -162,7 +162,7 @@ RouterReport {
 | `xr-hub/src/api/...` | `POST /api/v1/enroll` (token -> `{router_id, secret, command_pubkey}`), `POST /api/v1/router/poll` (auth, отчёт-in -> preset-ver out, обновить `last_seen`/`last_report`). Admin: `GET /admin/routers`, `GET /admin/routers/:id`, `DELETE /admin/routers/:id`. |
 | `xr-hub/admin-ui/` | Раздел «Роутеры»: список + карточка статуса (LLD-01 SPA). |
 | `xr-client/src/...` | `[control]` секция конфига (`hub_url`, `router_id`, `secret`, закреплённый `command_pubkey`, `control_poll_interval`); poll-loop task: отправка отчёта, приём версии пресета. |
-| `xr-bootstrap/` (LLD-13) | После установки роутера: `enroll` одноразовым токеном, запись `[control]` в `config.toml`. |
+| `xr-setup/` (LLD-13) | После установки роутера: `enroll` одноразовым токеном, запись `[control]` в `config.toml`. |
 | `docs/ARCHITECTURE.md` §3/§8 | Реестр роутеров и poll-канал; контур наблюдаемости. |
 
 Тесты (Rust, чистые функции, без реальной машины/сети):
@@ -184,7 +184,7 @@ RouterReport {
 
 ## 6. План проверки
 
-1. **Enrollment.** Bootstrap/приложение с одноразовым токеном -> роутер в админке
+1. **Enrollment.** Установщик или приложение с одноразовым токеном -> роутер в админке
    `online`, версия/арка видны; повтор токена -> 410.
 2. **Статус.** Роутер репортит -> в админке скорость/активный сервер/last-seen
    обновляются; убить сервер (scoped-drop) -> класс сбоя виден (LLD-11).
