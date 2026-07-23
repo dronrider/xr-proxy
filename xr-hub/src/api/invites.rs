@@ -128,12 +128,12 @@ pub async fn view_invite(
   /* Цвет текста задаём вместе с фоном карточки в каждом правиле: если вебвью
      применит один override и не применит другой (наблюдалось с тёмной темой),
      текст и фон не разъедутся в светлый-на-белом. */
-  .card {{ background: #fff; color: #1a1a2e; border-radius: 16px; padding: 2rem 2.25rem; max-width: 460px; width: 100%; box-shadow: 0 6px 28px rgba(0,0,0,0.10); }}
+  .card {{ background: #fff; color: #1a1a2e; border-radius: 16px; padding: 2.25rem 2.5rem; max-width: 760px; width: 100%; box-shadow: 0 6px 28px rgba(0,0,0,0.10); }}
   h1 {{ font-size: 1.7rem; margin: 0 0 0.35rem; text-align: center; color: #12121c; }}
   .meta {{ color: #5a5f6e; font-size: 0.95rem; text-align: center; margin: 0 0 1.75rem; }}
-  .main {{ display: flex; flex-direction: column; align-items: center; gap: 1.5rem; }}
-  .col-info {{ width: 100%; }}
-  .col-qr {{ text-align: center; }}
+  .main {{ display: flex; gap: 2.5rem; flex-wrap: wrap; align-items: center; justify-content: center; }}
+  .col-info {{ flex: 1 1 300px; min-width: min(100%, 300px); }}
+  .col-qr {{ flex: 0 0 auto; text-align: center; }}
   .field {{ display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; padding: 0.7rem 0; border-bottom: 1px solid #ececf0; }}
   .field-label {{ color: #6b7080; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; }}
   .field-value {{ color: #12121c; font-size: 1rem; font-weight: 600; text-align: right; }}
@@ -146,13 +146,13 @@ pub async fn view_invite(
   .btn.primary {{ background: #4f46e5; color: #fff; }}
   .btn.disabled {{ opacity: 0.4; pointer-events: none; }}
   /* Кнопка скачивания в стиле магазина: иконка Android плюс подпись в две строки. */
-  .store-btn {{ display: flex; align-items: center; gap: 0.75rem; width: 100%; padding: 0.7rem 1.25rem; background: #12121c; color: #fff; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; text-decoration: none; }}
+  .store-btn {{ display: flex; align-items: center; justify-content: center; gap: 0.75rem; width: 100%; padding: 0.7rem 1.25rem; background: #12121c; color: #fff; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; text-decoration: none; }}
   .store-ic {{ fill: #3ddc84; flex: 0 0 auto; }}
   .store-tx {{ display: flex; flex-direction: column; line-height: 1.15; text-align: left; }}
   .store-tx small {{ font-size: 0.72rem; opacity: 0.85; }}
   .store-tx b {{ font-size: 1.05rem; font-weight: 700; }}
   .note {{ color: #5a5f6e; font-size: 0.85rem; line-height: 1.45; margin: 1rem 0 0; }}
-  .col-qr img {{ background: #fff; padding: 10px; border-radius: 12px; width: 300px; height: 300px; max-width: 100%; }}
+  .col-qr img {{ background: #fff; padding: 10px; border-radius: 12px; width: 220px; height: 220px; max-width: 100%; }}
   .qr-cap {{ color: #7a7f8e; font-size: 0.82rem; margin: 0.6rem 0 0; }}
   @media (prefers-color-scheme: dark) {{
     body {{ background: #0f1017; }}
@@ -189,7 +189,7 @@ pub async fn view_invite(
       {platform_note}
     </div>
     <div class="col-qr">
-      <img src="https://api.qrserver.com/v1/create-qr-code/?size=400x400&amp;data={qr_data_encoded}" width="300" height="300" alt="QR-код приглашения">
+      <img src="https://api.qrserver.com/v1/create-qr-code/?size=300x300&amp;data={qr_data_encoded}" width="220" height="220" alt="QR-код приглашения">
       <p class="qr-cap">Отсканируйте телефоном</p>
     </div>
   </div>
