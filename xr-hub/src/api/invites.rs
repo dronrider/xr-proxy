@@ -63,14 +63,13 @@ pub async fn view_invite(
         "active"
     };
 
-    let preset = &invite.payload.preset;
     let comment = &invite.comment;
     let expires = format_datetime(&invite.expires_at);
     let active = status == "active";
     let status_badge = match status {
-        "active" => r#"<span style="color:#2e7d32;font-weight:600">Активно</span>"#,
-        "expired" => r#"<span style="color:#999">Истекло</span>"#,
-        "consumed" => r#"<span style="color:#f57c00">Уже использовано</span>"#,
+        "active" => r#"<span class="badge badge-active">Активно</span>"#,
+        "expired" => r#"<span class="badge badge-expired">Истекло</span>"#,
+        "consumed" => r#"<span class="badge badge-consumed">Уже использовано</span>"#,
         _ => status,
     };
 
@@ -91,7 +90,7 @@ pub async fn view_invite(
     // Абсолютный от корня путь: страница живёт под /api/v1/..., а раздача APK по
     // /api/v1/app/download (LLD-12), латест-алиас всегда тянет свежий релиз.
     let apk_url = "/api/v1/app/download/latest";
-    let open_class = if active { "btn" } else { "btn disabled" };
+    let open_class = if active { "btn primary" } else { "btn primary disabled" };
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -101,28 +100,50 @@ pub async fn view_invite(
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Приглашение xr-proxy</title>
 <style>
-  body {{ font-family: -apple-system, system-ui, sans-serif; background: #f5f5f5; color: #333; display: flex; justify-content: center; padding: 2rem; }}
-  @media (prefers-color-scheme: dark) {{ body {{ background: #1a1a2e; color: #e0e0e0; }} .card {{ background: #16213e; }} }}
-  .card {{ background: #fff; border-radius: 12px; padding: 2rem; max-width: 400px; width: 100%; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center; }}
-  h1 {{ font-size: 1.5rem; margin-bottom: 0.5rem; }}
-  .meta {{ color: #888; font-size: 0.9rem; margin-bottom: 1rem; }}
-  .field {{ text-align: left; margin-bottom: 0.75rem; }}
-  .field-label {{ font-size: 0.75rem; color: #888; text-transform: uppercase; }}
-  .field-value {{ font-size: 1rem; }}
-  .qr {{ margin: 1.5rem 0; }}
-  .qr img {{ border-radius: 8px; }}
-  .actions {{ display: flex; flex-direction: column; gap: 0.75rem; margin: 1.25rem 0 0.5rem; }}
-  .btn {{ display: block; padding: 0.75rem 2rem; background: #1a1a2e; color: #fff; border: none; border-radius: 6px; font-size: 1rem; text-decoration: none; cursor: pointer; }}
-  .btn.secondary {{ background: transparent; color: inherit; border: 1px solid #888; }}
-  .btn:disabled, .btn.disabled {{ opacity: 0.4; pointer-events: none; }}
-  .hint {{ color: #888; font-size: 0.8rem; margin-top: 1rem; }}
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: -apple-system, system-ui, sans-serif; margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.5rem; background: #eceef2; }}
+  /* Цвет текста задаём вместе с фоном карточки в каждом правиле: если вебвью
+     применит один override и не применит другой (наблюдалось с тёмной темой),
+     текст и фон не разъедутся в светлый-на-белом. */
+  .card {{ background: #fff; color: #1a1a2e; border-radius: 16px; padding: 2.25rem 2.5rem; max-width: 720px; width: 100%; box-shadow: 0 6px 28px rgba(0,0,0,0.10); }}
+  h1 {{ font-size: 1.7rem; margin: 0 0 0.35rem; text-align: center; color: #12121c; }}
+  .meta {{ color: #5a5f6e; font-size: 0.95rem; text-align: center; margin: 0 0 1.75rem; }}
+  .field {{ display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; padding: 0.7rem 0; border-bottom: 1px solid #ececf0; }}
+  .field-label {{ color: #6b7080; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; }}
+  .field-value {{ color: #12121c; font-size: 1rem; font-weight: 600; text-align: right; }}
+  .badge {{ font-weight: 700; }}
+  .badge-active {{ color: #1e8e3e; }}
+  .badge-expired {{ color: #8a8f9e; }}
+  .badge-consumed {{ color: #e8710a; }}
+  .actions {{ display: flex; flex-wrap: wrap; gap: 0.85rem; margin: 1.5rem 0 1rem; }}
+  .btn {{ flex: 1; min-width: 220px; display: block; padding: 0.95rem 1.5rem; border-radius: 10px; font-size: 1.05rem; font-weight: 600; text-align: center; text-decoration: none; cursor: pointer; border: 2px solid transparent; }}
+  .btn.primary {{ background: #4f46e5; color: #fff; }}
+  .btn.secondary {{ background: #eef0f6; color: #1a1a2e; border-color: #d3d7e2; }}
+  .btn.disabled {{ opacity: 0.4; pointer-events: none; }}
+  .hint {{ color: #5a5f6e; font-size: 0.85rem; text-align: center; line-height: 1.45; margin: 0 0 1.5rem; }}
+  .qr {{ text-align: center; }}
+  .qr img {{ background: #fff; padding: 8px; border-radius: 10px; width: 150px; height: 150px; }}
+  .qr-cap {{ color: #7a7f8e; font-size: 0.8rem; margin: 0.6rem 0 0; }}
+  @media (prefers-color-scheme: dark) {{
+    body {{ background: #0f1017; }}
+    .card {{ background: #1b1e2b; color: #e6e7ee; box-shadow: 0 6px 28px rgba(0,0,0,0.45); }}
+    h1 {{ color: #f2f3f8; }}
+    .meta, .hint, .qr-cap {{ color: #9ea3b4; }}
+    .field {{ border-bottom-color: #2b2f40; }}
+    .field-label {{ color: #9096a8; }}
+    .field-value {{ color: #f2f3f8; }}
+    .badge-active {{ color: #4ade80; }}
+    .badge-expired {{ color: #9096a8; }}
+    .badge-consumed {{ color: #fb923c; }}
+    .btn.primary {{ background: #6366f1; }}
+    .btn.secondary {{ background: #2b2f40; color: #e6e7ee; border-color: #3a3f54; }}
+  }}
 </style>
 </head>
 <body>
 <div class="card">
   <h1>Приглашение xr-proxy</h1>
-  <p class="meta">Приглашение в приложение xr-proxy</p>
-  <div class="field"><div class="field-label">Пресет</div><div class="field-value">{preset}</div></div>
+  <p class="meta">Откройте в приложении или установите его ниже</p>
   <div class="field"><div class="field-label">Статус</div><div class="field-value">{status_badge}</div></div>
   <div class="field"><div class="field-label">Действует до</div><div class="field-value">{expires}</div></div>
   {comment_html}
@@ -130,14 +151,14 @@ pub async fn view_invite(
     <a class="{open_class}" href="{deep_link}">Открыть в приложении</a>
     <a class="btn secondary" href="{apk_url}">Скачать APK</a>
   </div>
-  <p class="hint">Ещё нет приложения? Скачайте APK, установите и вернитесь по этой ссылке. Или отсканируйте QR сканером в приложении.</p>
+  <p class="hint">Ещё нет приложения? Скачайте APK, установите и вернитесь по этой ссылке.</p>
   <div class="qr">
-    <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data={qr_data_encoded}" width="200" height="200" alt="QR-код приглашения">
+    <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data={qr_data_encoded}" width="150" height="150" alt="QR-код приглашения">
+    <p class="qr-cap">Или отсканируйте с другого устройства</p>
   </div>
 </div>
 </body>
 </html>"#,
-        preset = preset,
         status_badge = status_badge,
         expires = expires,
         comment_html = if comment.is_empty() {
@@ -497,7 +518,7 @@ mod tests {
 
         let html = view_html(state).await;
         assert!(
-            html.contains(&format!(r#"class="btn disabled" href="xr://invite/{TOKEN}"#)),
+            html.contains(&format!(r#"class="btn primary disabled" href="xr://invite/{TOKEN}"#)),
             "у просроченного инвайта кнопка открытия должна быть погашена"
         );
     }
