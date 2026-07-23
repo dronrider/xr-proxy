@@ -7,7 +7,7 @@ use axum::response::Html;
 use axum::Json;
 use base64::Engine;
 use serde::Deserialize;
-use xr_proto::invite_url::build_https_url;
+use xr_proto::invite_url::{build_custom_url, build_https_url};
 use xr_proto::preset::{Invite, InviteInfo, InvitePayload};
 
 use crate::config::InviteDefaults;
@@ -66,10 +66,11 @@ pub async fn view_invite(
     let preset = &invite.payload.preset;
     let comment = &invite.comment;
     let expires = format_datetime(&invite.expires_at);
+    let active = status == "active";
     let status_badge = match status {
-        "active" => r#"<span style="color:#2e7d32;font-weight:600">Active</span>"#,
-        "expired" => r#"<span style="color:#999">Expired</span>"#,
-        "consumed" => r#"<span style="color:#f57c00">Already used</span>"#,
+        "active" => r#"<span style="color:#2e7d32;font-weight:600">Активно</span>"#,
+        "expired" => r#"<span style="color:#999">Истекло</span>"#,
+        "consumed" => r#"<span style="color:#f57c00">Уже использовано</span>"#,
         _ => status,
     };
 
@@ -82,14 +83,23 @@ pub async fn view_invite(
         invite.payload.hub_url.as_str()
     };
     let qr_data = build_https_url(hub_url, &token);
+    // «Открыть в приложении» это гарантированный deep link на кастомной схеме:
+    // на странице /view приложение заведомо не дефолтный обработчик (иначе
+    // получатель не смотрел бы её в браузере), а xr:// перехватит установленный
+    // клиент напрямую, без chooser'а. Если приложения нет, спасает «Скачать APK».
+    let deep_link = build_custom_url(hub_url, &token);
+    // Абсолютный от корня путь: страница живёт под /api/v1/..., а раздача APK по
+    // /api/v1/app/download (LLD-12), латест-алиас всегда тянет свежий релиз.
+    let apk_url = "/api/v1/app/download/latest";
+    let open_class = if active { "btn" } else { "btn disabled" };
 
     let html = format!(
         r#"<!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>xr-proxy Invite</title>
+<title>Приглашение xr-proxy</title>
 <style>
   body {{ font-family: -apple-system, system-ui, sans-serif; background: #f5f5f5; color: #333; display: flex; justify-content: center; padding: 2rem; }}
   @media (prefers-color-scheme: dark) {{ body {{ background: #1a1a2e; color: #e0e0e0; }} .card {{ background: #16213e; }} }}
@@ -101,20 +111,28 @@ pub async fn view_invite(
   .field-value {{ font-size: 1rem; }}
   .qr {{ margin: 1.5rem 0; }}
   .qr img {{ border-radius: 8px; }}
-  .btn {{ display: inline-block; padding: 0.75rem 2rem; background: #1a1a2e; color: #fff; border: none; border-radius: 6px; font-size: 1rem; text-decoration: none; cursor: pointer; }}
+  .actions {{ display: flex; flex-direction: column; gap: 0.75rem; margin: 1.25rem 0 0.5rem; }}
+  .btn {{ display: block; padding: 0.75rem 2rem; background: #1a1a2e; color: #fff; border: none; border-radius: 6px; font-size: 1rem; text-decoration: none; cursor: pointer; }}
+  .btn.secondary {{ background: transparent; color: inherit; border: 1px solid #888; }}
   .btn:disabled, .btn.disabled {{ opacity: 0.4; pointer-events: none; }}
+  .hint {{ color: #888; font-size: 0.8rem; margin-top: 1rem; }}
 </style>
 </head>
 <body>
 <div class="card">
-  <h1>xr-proxy Invite</h1>
-  <p class="meta">Scan this QR code in the xr-proxy app to connect</p>
-  <div class="field"><div class="field-label">Preset</div><div class="field-value">{preset}</div></div>
-  <div class="field"><div class="field-label">Status</div><div class="field-value">{status_badge}</div></div>
-  <div class="field"><div class="field-label">Expires</div><div class="field-value">{expires}</div></div>
+  <h1>Приглашение xr-proxy</h1>
+  <p class="meta">Приглашение в приложение xr-proxy</p>
+  <div class="field"><div class="field-label">Пресет</div><div class="field-value">{preset}</div></div>
+  <div class="field"><div class="field-label">Статус</div><div class="field-value">{status_badge}</div></div>
+  <div class="field"><div class="field-label">Действует до</div><div class="field-value">{expires}</div></div>
   {comment_html}
+  <div class="actions">
+    <a class="{open_class}" href="{deep_link}">Открыть в приложении</a>
+    <a class="btn secondary" href="{apk_url}">Скачать APK</a>
+  </div>
+  <p class="hint">Ещё нет приложения? Скачайте APK, установите и вернитесь по этой ссылке. Или отсканируйте QR сканером в приложении.</p>
   <div class="qr">
-    <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data={qr_data_encoded}" width="200" height="200" alt="QR Code">
+    <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&amp;data={qr_data_encoded}" width="200" height="200" alt="QR-код приглашения">
   </div>
 </div>
 </body>
@@ -125,8 +143,11 @@ pub async fn view_invite(
         comment_html = if comment.is_empty() {
             String::new()
         } else {
-            format!(r#"<div class="field"><div class="field-label">Comment</div><div class="field-value">{comment}</div></div>"#)
+            format!(r#"<div class="field"><div class="field-label">Комментарий</div><div class="field-value">{comment}</div></div>"#)
         },
+        open_class = open_class,
+        deep_link = deep_link,
+        apk_url = apk_url,
         qr_data_encoded = urlencoding(&qr_data),
     );
 
@@ -442,5 +463,42 @@ mod tests {
         let qr = qr_data_from_view(&view_html(state).await);
 
         assert_eq!(qr, format!("https://fallback.example.com/invite/{TOKEN}"));
+    }
+
+    // XR-033: /view это воронка для получателя без приложения. Кнопка «Открыть
+    // в приложении» несёт гарантированный deep link на кастомной схеме, кнопка
+    // «Скачать APK» ведёт на раздачу релиза.
+    #[tokio::test]
+    async fn view_offers_deep_link_and_apk() {
+        let html = view_html(state_with_invite("https://hub.example.com", "")).await;
+
+        assert!(
+            html.contains(&format!(r#"href="xr://invite/{TOKEN}?hub=hub.example.com""#)),
+            "нет deep link на кастомной схеме"
+        );
+        assert!(
+            html.contains(r#"href="/api/v1/app/download/latest""#),
+            "нет кнопки скачать APK"
+        );
+    }
+
+    // Просроченный инвайт применять нечем: кнопку «Открыть в приложении»
+    // гасим, чтобы не вести в claim, который вернёт 410.
+    #[tokio::test]
+    async fn view_disables_open_for_expired_invite() {
+        let state = state_with_invite("https://hub.example.com", "");
+        state
+            .invites
+            .write()
+            .await
+            .get_mut(TOKEN)
+            .unwrap()
+            .expires_at = "2000-01-01T00:00:00+00:00".into();
+
+        let html = view_html(state).await;
+        assert!(
+            html.contains(&format!(r#"class="btn disabled" href="xr://invite/{TOKEN}"#)),
+            "у просроченного инвайта кнопка открытия должна быть погашена"
+        );
     }
 }
