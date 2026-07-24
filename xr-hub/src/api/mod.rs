@@ -45,6 +45,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/public-key", get(presets::get_public_key))
         .route("/app/latest", get(app::get_latest))
         .route("/app/download/{ver}", get(app::download))
+        // Автоустановка (XR-015): бинари xr-setup/xr-server/xr-hub и install.sh.
+        .route("/setup/{file}", get(dist::serve_setup))
         .route("/shares", get(shares::list_shares))
         .route("/share/register", post(register::register))
         // v2 self-service multishare (agent-authenticated by reg-token/credential).
