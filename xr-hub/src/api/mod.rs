@@ -90,10 +90,97 @@ pub fn router(state: Arc<AppState>) -> Router {
         .nest("/api/v1/admin", admin)
         // Top-level so the install one-liner is a clean URL (xr-share dist).
         .route("/share/{file}", get(dist::serve))
+        // Красивый путь инвайта из QR/шаринга: в браузере ведём на HTML-view
+        // (сама ручка живёт под /api/v1, голый путь иначе уходит в SPA админки).
+        .route("/invite/{token}", get(invites::redirect_to_view))
+        .route("/invite/{token}/view", get(invites::redirect_to_view))
         .with_state(state)
         .layer(cors)
         .layer(TraceLayer::new_for_http());
 
     // SPA fallback for admin UI.
     api.fallback_service(spa_service())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use tokio::sync::RwLock;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    fn empty_state() -> Arc<AppState> {
+        let config: crate::config::HubConfig =
+            toml::from_str("[server]\n[admin]\nusers = []").unwrap();
+        Arc::new(AppState {
+            presets: RwLock::new(HashMap::new()),
+            invites: RwLock::new(HashMap::new()),
+            shares: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashMap::new()),
+            config,
+            signing: None,
+        })
+    }
+
+    async fn get(uri: &str) -> axum::response::Response {
+        router(empty_state())
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    // Регрессия XR-130: голый путь /invite/<token> проваливался в SPA-заглушку
+    // админки (HTTP 200, <title>xr-hub Admin</title>), и ссылка из QR/шаринга не
+    // открывалась у получателя. Теперь верхнеуровневый маршрут редиректит на
+    // HTML-view под /api/v1. Токен в маршрут не заглядывает, инвайт не нужен.
+    #[tokio::test]
+    async fn pretty_invite_path_redirects_to_view() {
+        let resp = get("/invite/SOMETOKEN").await;
+
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "/api/v1/invite/SOMETOKEN/view"
+        );
+    }
+
+    #[tokio::test]
+    async fn pretty_invite_view_path_redirects_to_view() {
+        let resp = get("/invite/SOMETOKEN/view").await;
+
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "/api/v1/invite/SOMETOKEN/view"
+        );
+    }
+
+    // Токен из пути не должен утекать в Location сырьём: подставленные CR/LF
+    // percent-кодируются, инъекции заголовка через голый путь нет.
+    #[tokio::test]
+    async fn pretty_invite_path_escapes_crlf_in_token() {
+        let resp = get("/invite/tok%0d%0aSet-Cookie:x").await;
+
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        let loc = resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+        assert!(!loc.contains('\r') && !loc.contains('\n'), "CR/LF в Location: {loc}");
+    }
+
+    // Голый путь без нашего маршрута отдавал бы страницу админки. Фиксируем, что
+    // раньше туда и проваливалось: SPA-заглушка узнаётся по заголовку страницы.
+    #[tokio::test]
+    async fn unknown_path_still_serves_spa() {
+        let resp = get("/no-such-route").await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("<title>xr-hub Admin</title>"),
+            "неизвестный путь должен отдавать SPA админки"
+        );
+    }
 }

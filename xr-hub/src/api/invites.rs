@@ -44,6 +44,20 @@ pub async fn get_invite_info(
     }))
 }
 
+/// GET /invite/:token и /invite/:token/view на верхнем уровне -> HTML-view.
+///
+/// Красивый путь `https://<host>/invite/<token>` это то, что кодирует QR и что
+/// уходит получателю (build_https_url). Сами ручки инвайта висят под /api/v1, а
+/// голый путь без редиректа проваливается в SPA-заглушку админки. Ведём его на
+/// страницу-воронку, чтобы ссылка открывалась в браузере у того, кто её получил.
+pub async fn redirect_to_view(
+    extract::Path(token): extract::Path<String>,
+) -> axum::response::Redirect {
+    // Токен percent-кодируем: своим набором (base64url) он проходит насквозь, но
+    // подставленные в путь CR/LF так не утекут в заголовок Location.
+    axum::response::Redirect::temporary(&format!("/api/v1/invite/{}/view", urlencoding(&token)))
+}
+
 /// GET /invite/:token/view - HTML page with invite info and QR code.
 pub async fn view_invite(
     State(state): State<Arc<AppState>>,
