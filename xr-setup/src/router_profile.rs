@@ -73,8 +73,21 @@ pub fn resolve(opts: RouterOpts) -> Result<Resolved> {
         salt: opts.salt,
         hub: opts.hub_url.clone().map(|url| (url, opts.preset)),
     };
-    if std::path::Path::new(CLIENT_CONF).exists() && !opts.force {
-        println!("  внимание: {CLIENT_CONF} уже существует и останется как есть (нужен --force)");
+    let mut config = render_router_toml(&params);
+    match std::fs::read_to_string(CLIENT_CONF) {
+        Ok(_) if !opts.force => {
+            println!(
+                "  внимание: {CLIENT_CONF} уже существует и останется как есть (нужен --force)"
+            );
+        }
+        // Перегенерация под --force не должна стирать выданную реестром
+        // идентичность: повторный enroll одноразовым токеном невозможен.
+        Ok(old) => {
+            if let Some(control) = carry_control(&old) {
+                config.push_str(&control);
+            }
+        }
+        Err(_) => {}
     }
 
     let enroll = match (&opts.enroll_token, &opts.hub_url) {
@@ -94,10 +107,24 @@ pub fn resolve(opts: RouterOpts) -> Result<Resolved> {
         arch,
         source: opts.source.map(Arc::new),
         force: opts.force,
-        config: render_router_toml(&params),
+        config,
         enroll,
         ssid: opts.ssid.map(|s| (s, opts.wifi_pass)),
     })
+}
+
+/// Перенести `[control]` из старого конфига в новый как есть. Секция
+/// выдаётся хабом при enroll, из флагов её не восстановить.
+pub fn carry_control(old_config: &str) -> Option<String> {
+    let v: toml::Value = old_config.parse().ok()?;
+    let c = v.get("control")?;
+    let field = |k: &str| c.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    Some(render_control_section(
+        &field("hub_url")?,
+        &field("router_id")?,
+        &field("secret")?,
+        &field("command_pubkey")?,
+    ))
 }
 
 pub fn plan(r: &Resolved) -> Vec<Box<dyn Step>> {
@@ -154,8 +181,11 @@ pub fn plan(r: &Resolved) -> Vec<Box<dyn Step>> {
         }),
     ];
 
-    // Enroll после старта клиента (LLD-13 п. 2.1), SSID строго последним
-    // (п. 5.9): смена сети не должна оборвать ни один шаг после себя.
+    // Enroll после старта клиента (LLD-13 п. 2.1) и после dnsmasq: имя
+    // хаба резолвится уже через Quad9, а не через резолверы провайдера.
+    // SSID строго последним (п. 5.9): смена сети не должна оборвать ни
+    // один шаг после себя.
+    steps.push(Box::new(DnsmasqQuad9));
     if let Some(e) = &r.enroll {
         steps.push(Box::new(EnrollStep {
             config_path: PathBuf::from(CLIENT_CONF),
@@ -165,7 +195,6 @@ pub fn plan(r: &Resolved) -> Vec<Box<dyn Step>> {
             arch: r.arch,
         }));
     }
-    steps.push(Box::new(DnsmasqQuad9));
     if let Some((ssid, pass)) = &r.ssid {
         steps.push(Box::new(WifiSsid {
             ssid: ssid.clone(),
@@ -221,11 +250,20 @@ fn hostname() -> String {
         .unwrap_or_else(|| "openwrt".into())
 }
 
-/// Разбор `addr:port` из --server.
+/// Разбор `addr:port` из --server; IPv6 в скобках, `[::1]:8443`.
 pub fn parse_server(s: &str) -> Result<crate::render::RouterServer> {
-    let (address, port) = s
-        .rsplit_once(':')
-        .with_context(|| format!("--server '{s}': ожидается addr:port"))?;
+    let (address, port) = if let Some(rest) = s.strip_prefix('[') {
+        rest.split_once("]:")
+            .with_context(|| format!("--server '{s}': ожидается [addr6]:port"))?
+    } else {
+        let (a, p) = s
+            .rsplit_once(':')
+            .with_context(|| format!("--server '{s}': ожидается addr:port"))?;
+        if a.contains(':') {
+            bail!("--server '{s}': IPv6 задаётся в скобках, [addr6]:port");
+        }
+        (a, p)
+    };
     Ok(crate::render::RouterServer {
         address: address.to_string(),
         port: port
@@ -285,8 +323,7 @@ impl Step for EnrollStep {
             &resp.secret,
             &resp.command_pubkey,
         ));
-        std::fs::write(&self.config_path, text)
-            .with_context(|| format!("запись {}", self.config_path.display()))?;
+        crate::actions::write_atomic(&self.config_path, text.as_bytes(), 0o600)?;
         Restart::Initd(PathBuf::from(INIT_PATH)).kick()
     }
 }
@@ -352,10 +389,11 @@ mod tests {
     }
 
     #[test]
-    fn enroll_goes_after_service_and_ssid_is_last() {
+    fn enroll_goes_after_service_and_dns_and_ssid_is_last() {
         let names = names(&resolved(true, true));
         let pos = |n: &str| names.iter().position(|x| x == n).unwrap();
         assert!(pos("hub:enroll") > pos("service:xr-proxy"), "enroll после старта клиента");
+        assert!(pos("hub:enroll") > pos("dnsmasq:quad9"), "имя хаба резолвится уже через Quad9");
         assert_eq!(names.last().unwrap(), "wifi:ssid", "смена SSID строго последняя");
     }
 
@@ -395,6 +433,31 @@ mod tests {
         assert_eq!((s.address.as_str(), s.port), ("203.0.113.1", 8443));
         assert!(parse_server("203.0.113.1").is_err());
         assert!(parse_server("host:port").is_err());
+        let v6 = parse_server("[2001:db8::7]:8443").unwrap();
+        assert_eq!((v6.address.as_str(), v6.port), ("2001:db8::7", 8443));
+        assert!(parse_server("2001:db8::7:8443").is_err(), "голый IPv6 неоднозначен");
+        assert!(parse_server("[2001:db8::7]").is_err());
+    }
+
+    #[test]
+    fn force_carries_control_section_over() {
+        let old = format!(
+            "{}{}",
+            render_router_toml(&RouterTomlParams {
+                servers: vec![RouterServer { address: "203.0.113.9".into(), port: 8443 }],
+                key: "QUJD".into(),
+                salt: 7,
+                hub: None,
+            }),
+            render_control_section("https://hub.test", "r1", "s3cr3t", "cGs=")
+        );
+        let carried = carry_control(&old).expect("секция должна переехать");
+        assert!(has_control_section(&format!("[obfuscation]\nkey='k'\n{carried}")));
+        assert!(carried.contains("router_id = \"r1\""));
+        assert!(carried.contains("secret = \"s3cr3t\""));
+
+        assert!(carry_control("[client]\nlisten_port = 1080\n").is_none());
+        assert!(carry_control("[control]\nhub_url = \"x\"\n").is_none(), "неполная секция не переносится");
     }
 
     #[test]

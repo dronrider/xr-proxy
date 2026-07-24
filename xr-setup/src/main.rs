@@ -152,6 +152,20 @@ fn parse_salt(s: &str) -> Result<u32, String> {
     parsed.map_err(|_| format!("'{s}' не salt: ожидается 0xHEX или число"))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::parse_salt;
+
+    #[test]
+    fn salt_accepts_server_output_and_decimal() {
+        assert_eq!(parse_salt("0xDEADBEEF"), Ok(0xDEAD_BEEF));
+        assert_eq!(parse_salt("0Xdeadbeef"), Ok(0xDEAD_BEEF));
+        assert_eq!(parse_salt("12345"), Ok(12345));
+        assert!(parse_salt("beef").is_err(), "hex без префикса неоднозначен");
+        assert!(parse_salt("0x").is_err());
+    }
+}
+
 fn run_server(args: ServerArgs) -> Result<()> {
     ensure_linux_root()?;
 

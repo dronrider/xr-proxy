@@ -74,7 +74,7 @@ impl Restart {
 /// а работающий процесс при замене бинаря продолжает жить со старым inode.
 /// Права выставляются при создании, чтобы секрет ни мгновения не лежал
 /// с правами по umask.
-fn write_atomic(path: &PathBuf, bytes: &[u8], mode: u32) -> Result<()> {
+pub fn write_atomic(path: &PathBuf, bytes: &[u8], mode: u32) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(parent) = path.parent() {
@@ -423,6 +423,31 @@ mod tests {
             restart: None,
         };
         assert!(offline.check().unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn install_script_overwrites_local_edits() {
+        let dir = tmpdir("script");
+        let step = InstallScript {
+            label: "watchdog".into(),
+            path: dir.join("xr-watchdog.sh"),
+            content: "#!/bin/sh\necho v2\n".into(),
+        };
+        assert!(!step.check().unwrap());
+        step.apply().unwrap();
+        assert!(step.check().unwrap());
+        assert_eq!(
+            std::fs::metadata(&step.path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        // Скрипт это код установщика: локальная правка не целевое
+        // состояние, в отличие от конфига она приводится обратно.
+        std::fs::write(&step.path, "#!/bin/sh\necho patched\n").unwrap();
+        assert!(!step.check().unwrap());
+        step.apply().unwrap();
+        assert_eq!(std::fs::read_to_string(&step.path).unwrap(), step.content);
         std::fs::remove_dir_all(&dir).ok();
     }
 
