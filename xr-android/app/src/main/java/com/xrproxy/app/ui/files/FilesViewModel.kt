@@ -482,12 +482,16 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                         )
                     },
                     onFailure = { e ->
+                        // Сетевой провал явного refresh переводит шару в тот же
+                        // офлайн, что и открытие без сети: в списке локальные
+                        // файлы (плашка «показаны только скачанные» обязана им
+                        // соответствовать), а ретрай (XR-099) молча вернёт полный
+                        // список, когда связь появится.
+                        val offline = e.isOffline() || e.isAgentOffline()
                         st.copy(
                             manifestLoading = false,
-                            // Сетевой провал явного refresh переводит шару в
-                            // офлайн: пометка честная, и ретрай (XR-099) молча
-                            // вернёт список, когда связь появится.
-                            offlineLocal = st.offlineLocal || e.isOffline() || e.isAgentOffline(),
+                            manifest = if (offline) localManifest else st.manifest,
+                            offlineLocal = st.offlineLocal || offline,
                             // No network (also the offline outcome of a stale-token
                             // heal, XR-167): a clean line, not the raw reqwest text.
                             message = if (e.isOffline()) "Список: хаб недоступен, попробуйте позже"
