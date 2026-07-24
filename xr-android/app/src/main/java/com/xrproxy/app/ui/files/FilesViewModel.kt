@@ -162,10 +162,14 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     // за физическим аплинком, так что сигнал годится в обоих режимах.
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
-            val st = _ui.value
-            if (st.openShareId != null && st.offlineLocal && !st.manifestLoading) {
-                // Секунда на устаканивание маршрутов после появления сети.
-                startOfflineRetry(firstDelayMs = 1_000)
+            // Колбэк приходит на потоке ConnectivityManager; вся работа с
+            // offlineRetryJob идёт на main, чтобы не гоняться с open/close.
+            viewModelScope.launch {
+                val st = _ui.value
+                if (st.openShareId != null && st.offlineLocal && !st.manifestLoading) {
+                    // Секунда на устаканивание маршрутов после появления сети.
+                    startOfflineRetry(firstDelayMs = 1_000)
+                }
             }
         }
     }
@@ -480,6 +484,10 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     onFailure = { e ->
                         st.copy(
                             manifestLoading = false,
+                            // Сетевой провал явного refresh переводит шару в
+                            // офлайн: пометка честная, и ретрай (XR-099) молча
+                            // вернёт список, когда связь появится.
+                            offlineLocal = st.offlineLocal || e.isOffline() || e.isAgentOffline(),
                             // No network (also the offline outcome of a stale-token
                             // heal, XR-167): a clean line, not the raw reqwest text.
                             message = if (e.isOffline()) "Список: хаб недоступен, попробуйте позже"
@@ -522,7 +530,11 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     applyFreshManifest(config, result.getOrDefault(emptyList()))
                     return@launch
                 }
-                if (result.exceptionOrNull()?.isAccessExpired() == true) return@launch
+                // Содержательный ответ (4xx, истёкший доступ) ретрай не лечит,
+                // а stale_token-ветка при нём ещё и ходила бы в хаб на каждом
+                // круге: продолжаем только на сетевых исходах.
+                val e = result.exceptionOrNull()
+                if (e == null || !(e.isOffline() || e.isAgentOffline())) return@launch
                 attempt++
                 delayMs = OFFLINE_RETRY_DELAYS_MS[minOf(attempt, OFFLINE_RETRY_DELAYS_MS.lastIndex)]
             }
