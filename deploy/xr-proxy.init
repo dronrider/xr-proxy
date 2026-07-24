@@ -50,6 +50,10 @@ start_service() {
     #   retry: макс. попыток (0 = бесконечно)
     procd_set_param respawn 3600 15 0
 
+    # Потолок дескрипторов: mux-пул плюс сотни LAN-соединений не влезают
+    # в дефолтные 1024.
+    procd_set_param limits nofile="16384 16384"
+
     procd_set_param stdout 1
     procd_set_param stderr 1
     procd_close_instance
