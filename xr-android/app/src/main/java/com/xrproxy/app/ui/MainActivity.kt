@@ -33,6 +33,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextAlign
@@ -40,7 +41,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
-import com.xrproxy.app.BuildConfig
+import com.xrproxy.app.R
 import com.xrproxy.app.data.ServerProfile
 import com.xrproxy.app.model.HealthLevel
 import com.xrproxy.app.ui.components.DebugSection
@@ -533,7 +534,7 @@ fun MainScreen(
                     UpdateCheckControls(
                         state = updateState,
                         currentVersionName = appVersion,
-                        buildInfo = "${BuildConfig.BUILD_TIME} · ${BuildConfig.GIT_HASH}",
+                        buildInfo = "${stringResource(R.string.build_time)} \u00B7 ${stringResource(R.string.git_hash)}",
                         checking = updateChecking,
                         onCheck = { viewModel.checkForUpdates(manual = true) },
                         onUpdate = { viewModel.startUpdateDownload() },
@@ -639,9 +640,9 @@ fun ConnectionSection(
 
     // Phase substep
     val substep = when (state.phase) {
-        ConnectPhase.Preparing -> "1/3 · Подготовка"
-        ConnectPhase.Connecting -> "2/3 · Установка туннеля"
-        ConnectPhase.Finalizing -> "3/3 · Проверка маршрутов"
+        ConnectPhase.Preparing -> "1/3 \u00B7 Подготовка"
+        ConnectPhase.Connecting -> "2/3 \u00B7 Установка туннеля"
+        ConnectPhase.Finalizing -> "3/3 \u00B7 Проверка маршрутов"
         else -> null
     }
     if (substep != null) {
@@ -690,7 +691,7 @@ fun ConnectionSection(
     if (state.connected && state.overrideSsid != null) {
         Spacer(Modifier.height(4.dp))
         Text(
-            "включено вручную · доверенная сеть «${state.overrideSsid}»",
+            "включено вручную \u00B7 доверенная сеть «${state.overrideSsid}»",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.tertiary,
         )

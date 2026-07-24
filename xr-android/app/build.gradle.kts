@@ -38,12 +38,18 @@ android {
             ?.takeIf { it.isNotBlank() }
         versionName = releaseVersionName ?: "0.1.0-$gitDescribe-$buildStamp"
 
-        // Дата сборки и коммит уходят в BuildConfig отдельно от versionName:
-        // версия у релиза чистая (0.57.0), а ориентир «какая именно сборка
-        // стоит» даёт строка «Сборка: ...» в блоке обновления (XR-041).
+        // Дата сборки и коммит идут в ресурсы, а не в BuildConfig: версия у
+        // релиза чистая (0.57.0), а ориентир «какая именно сборка стоит» даёт
+        // строка «Сборка: ...» в блоке обновления (XR-041). Через resValue, а
+        // не buildConfigField, потому что `public static final String` в
+        // BuildConfig это compile-time константа, и Kotlin вклеивает её в
+        // call-site при компиляции; пока сам call-site не менялся,
+        // инкрементальная сборка его не перекомпилирует, и на экране остаётся
+        // дата прошлой сборки (XR-108). Ресурсы читаются в рантайме и
+        // подхватываются каждой сборкой.
         val buildTime = SimpleDateFormat("dd.MM.yyyy HH:mm").format(Date())
-        buildConfigField("String", "BUILD_TIME", "\"$buildTime\"")
-        buildConfigField("String", "GIT_HASH", "\"$gitDescribe\"")
+        resValue("string", "build_time", buildTime)
+        resValue("string", "git_hash", gitDescribe)
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
