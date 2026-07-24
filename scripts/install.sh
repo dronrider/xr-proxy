@@ -6,8 +6,9 @@
 #   curl -fsSL https://xr-hub.zoobr.top/api/v1/setup/install.sh \
 #     | sh -s -- server --with-hub --hub-domain xr-hub.example.com
 #
-# Без аргументов ставит бинарь и печатает подсказку. База раздачи
-# переопределяется XR_SETUP_BASE (по умолчанию хаб, отдавший этот скрипт).
+# Без аргументов ставит бинарь и печатает подсказку. База раздачи по
+# умолчанию это основной хаб проекта; при установке с другого хаба задать
+# его явно: XR_SETUP_BASE=https://<хаб>/api/v1/setup.
 set -eu
 
 BASE="${XR_SETUP_BASE:-https://xr-hub.zoobr.top/api/v1/setup}"
@@ -49,10 +50,11 @@ mv "$tmp/$bin" /usr/local/bin/xr-setup
 say "Установлен /usr/local/bin/xr-setup"
 
 if [ $# -gt 0 ]; then
+  rm -rf "$tmp"
   # Бинари компонентов установщик возьмёт с той же раздачи, если источник
-  # не задан явно.
+  # не задан явно (обе формы флага: с пробелом и с =).
   case " $* " in
-    *" --dist-url "*|*" --from-dir "*) exec /usr/local/bin/xr-setup "$@" ;;
+    *" --dist-url"*|*" --from-dir"*) exec /usr/local/bin/xr-setup "$@" ;;
     *) exec /usr/local/bin/xr-setup "$@" --dist-url "$BASE" ;;
   esac
 fi

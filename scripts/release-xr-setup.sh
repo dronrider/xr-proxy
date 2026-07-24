@@ -22,6 +22,13 @@ CRATES=(xr-setup xr-server xr-hub)
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 
+# xr-hub вшивает Admin UI на сборке (build.rs паникует без него), падать
+# лучше сразу и с понятной командой.
+if [ ! -f "$ROOT/xr-hub/admin-ui/dist/index.html" ]; then
+  echo "error: нет xr-hub/admin-ui/dist, собери UI: cd xr-hub/admin-ui && npm ci && npm run build" >&2
+  exit 1
+fi
+
 have() { command -v "$1" >/dev/null 2>&1; }
 sums() { if have sha256sum; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 

@@ -49,6 +49,9 @@ pub struct HubPlan {
     pub admin_user: String,
     pub admin_pass: Option<String>,
     pub pass_generated: bool,
+    /// В существующем конфиге включён hub-native TLS: локальный минт
+    /// инвайта по plain HTTP туда не пройдёт.
+    pub native_tls: bool,
 }
 
 pub struct Resolved {
@@ -63,8 +66,17 @@ pub fn resolve(opts: ServerOpts) -> Result<Resolved> {
     let arch = crate::arch::detect()?;
 
     let server = match std::fs::read_to_string(SERVER_CONF) {
-        Ok(text) if !opts.force => parse_server_conf(&text)
-            .with_context(|| format!("разбор существующего {SERVER_CONF}"))?,
+        Ok(text) if !opts.force => {
+            let parsed = parse_server_conf(&text)
+                .with_context(|| format!("разбор существующего {SERVER_CONF}"))?;
+            if opts.key.as_deref().is_some_and(|k| k != parsed.key) {
+                println!("  внимание: {SERVER_CONF} уже существует, --key проигнорирован (нужен --force)");
+            }
+            if opts.port != 8443 && opts.port != parsed.port {
+                println!("  внимание: {SERVER_CONF} уже существует, --port проигнорирован (нужен --force)");
+            }
+            parsed
+        }
         _ => {
             let key = match &opts.key {
                 Some(k) => validated_key(k)?,
@@ -137,6 +149,7 @@ fn resolve_hub(opts: &ServerOpts, server: &ServerTomlParams) -> Result<HubPlan> 
                 admin_user,
                 admin_pass,
                 pass_generated: false,
+                native_tls: parsed.get("tls").is_some(),
             });
         }
     }
@@ -163,6 +176,7 @@ fn resolve_hub(opts: &ServerOpts, server: &ServerTomlParams) -> Result<HubPlan> 
         admin_user: "admin".into(),
         admin_pass: Some(admin_pass),
         pass_generated,
+        native_tls: false,
     })
 }
 
@@ -238,6 +252,12 @@ pub fn finish(r: &Resolved) -> Result<()> {
         println!("  salt = 0x{:08X}", r.server.salt);
         return Ok(());
     };
+
+    if hub.native_tls {
+        println!("В конфиге хаба включён TLS: минт инвайта по локальному HTTP не пройдёт.");
+        println!("Создай инвайт в админке хаба ({}).", hub.public_hub_url);
+        return Ok(());
+    }
 
     let Some(pass) = &hub.admin_pass else {
         println!("Конфиг хаба уже существовал, пароль админа неизвестен: инвайт не выдан.");
@@ -332,7 +352,14 @@ pub fn pick_public_ip(hostname_i: &str) -> Option<String> {
             IpAddr::V4(v4) => {
                 !v4.is_private() && !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified()
             }
-            IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
+            IpAddr::V6(v6) => {
+                !v6.is_loopback()
+                    && !v6.is_unspecified()
+                    // link-local fe80::/10 и unique-local fc00::/7 снаружи
+                    // недостижимы так же, как приватные v4.
+                    && (v6.segments()[0] & 0xffc0) != 0xfe80
+                    && (v6.segments()[0] & 0xfe00) != 0xfc00
+            }
         })
         .map(|ip| ip.to_string())
 }
@@ -354,6 +381,7 @@ mod tests {
             admin_user: "admin".into(),
             admin_pass: Some("pass".into()),
             pass_generated: true,
+            native_tls: false,
         });
         Resolved {
             arch: Arch::X86_64,
@@ -424,6 +452,15 @@ mod tests {
         );
         assert_eq!(pick_public_ip("127.0.0.1 10.0.0.2"), None);
         assert_eq!(pick_public_ip(""), None);
+    }
+
+    #[test]
+    fn rejects_non_routable_ipv6() {
+        assert_eq!(pick_public_ip("fe80::1 fd12::1 ::1"), None);
+        assert_eq!(
+            pick_public_ip("fe80::1 2001:db8::7").as_deref(),
+            Some("2001:db8::7")
+        );
     }
 
     #[test]

@@ -43,15 +43,26 @@ fn unit_enabled(unit: &str) -> bool {
 
 /// Атомарная запись: файл появляется целиком или не появляется вовсе,
 /// а работающий процесс при замене бинаря продолжает жить со старым inode.
+/// Права выставляются при создании, чтобы секрет ни мгновения не лежал
+/// с правами по umask.
 fn write_atomic(path: &PathBuf, bytes: &[u8], mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("создание {}", parent.display()))?;
     }
     let tmp = path.with_extension("xr-setup.new");
-    std::fs::write(&tmp, bytes).with_context(|| format!("запись {}", tmp.display()))?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+    std::fs::remove_file(&tmp).ok();
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)
+        .with_context(|| format!("создание {}", tmp.display()))?;
+    f.write_all(bytes)
+        .with_context(|| format!("запись {}", tmp.display()))?;
+    drop(f);
     std::fs::rename(&tmp, path).with_context(|| format!("замена {}", path.display()))?;
     Ok(())
 }
@@ -154,10 +165,12 @@ impl Step for WriteConfig {
     }
 
     fn apply(&self) -> Result<()> {
-        write_atomic(&self.path, self.content.as_bytes(), self.mode)?;
+        // Спутник первым: обрыв между записями не должен оставить конфиг
+        // хаба с хешем пароля, которого нигде больше нет.
         if let Some((path, content, mode)) = &self.extra {
             write_atomic(path, content.as_bytes(), *mode)?;
         }
+        write_atomic(&self.path, self.content.as_bytes(), self.mode)?;
         restart_if_active(self.restart_unit.as_deref())
     }
 }
@@ -244,5 +257,131 @@ impl Step for SigningKey {
             crate::secrets::gen_signing_key().as_bytes(),
             0o600,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fetch::BinSource;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("xr-setup-actions-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn write_config_keeps_existing_without_overwrite_and_rewrites_with_it() {
+        let dir = tmpdir("conf");
+        let path = dir.join("etc/server.toml");
+        let step = WriteConfig {
+            label: "server".into(),
+            path: path.clone(),
+            content: "новое".into(),
+            mode: 0o600,
+            overwrite: false,
+            restart_unit: None,
+            extra: None,
+        };
+        assert!(!step.check().unwrap());
+        step.apply().unwrap();
+        assert!(step.check().unwrap());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Существующий файл с другим содержимым: без overwrite целевое
+        // состояние достигнуто, с overwrite шаг требует перезаписи.
+        std::fs::write(&path, "старое").unwrap();
+        assert!(step.check().unwrap(), "чужой конфиг не трогаем");
+        let force = WriteConfig { overwrite: true, ..step };
+        assert!(!force.check().unwrap());
+        force.apply().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "новое");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_config_extra_lands_with_the_config() {
+        let dir = tmpdir("extra");
+        let step = WriteConfig {
+            label: "hub".into(),
+            path: dir.join("config.toml"),
+            content: "conf".into(),
+            mode: 0o600,
+            overwrite: false,
+            restart_unit: None,
+            extra: Some((dir.join("admin.pass"), "pass\n".into(), 0o600)),
+        };
+        step.apply().unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("admin.pass")).unwrap(), "pass\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn install_binary_checks_against_source_and_requires_one_when_missing() {
+        let dir = tmpdir("bin");
+        let src_dir = dir.join("dist");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("xr-server-linux-x86_64"), b"v2").unwrap();
+        let dest = dir.join("bin/xr-server");
+
+        let no_source = InstallBinary {
+            file: "xr-server-linux-x86_64".into(),
+            dest: dest.clone(),
+            source: None,
+            restart_unit: None,
+        };
+        assert!(!no_source.check().unwrap());
+        assert!(
+            no_source.apply().unwrap_err().to_string().contains("источник"),
+            "без бинаря и без источника нужен внятный отказ"
+        );
+
+        let with_source = InstallBinary {
+            source: Some(std::sync::Arc::new(BinSource::Dir(src_dir.clone()))),
+            ..no_source
+        };
+        with_source.apply().unwrap();
+        assert!(with_source.check().unwrap());
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        // Источник обновился: check видит расхождение, apply доводит.
+        std::fs::write(src_dir.join("xr-server-linux-x86_64"), b"v3").unwrap();
+        assert!(!with_source.check().unwrap());
+        with_source.apply().unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"v3");
+
+        // Установленный бинарь без источника это целевое состояние.
+        let offline = InstallBinary {
+            file: "xr-server-linux-x86_64".into(),
+            dest,
+            source: None,
+            restart_unit: None,
+        };
+        assert!(offline.check().unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sysctl_check_compares_content() {
+        let dir = tmpdir("sysctl");
+        let step = Sysctl {
+            path: dir.join("99-xr-proxy.conf"),
+            content: "net.core.default_qdisc=fq\n".into(),
+        };
+        assert!(!step.check().unwrap());
+        std::fs::write(&step.path, "другое\n").unwrap();
+        assert!(!step.check().unwrap());
+        std::fs::write(&step.path, &step.content).unwrap();
+        assert!(step.check().unwrap());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
