@@ -29,7 +29,6 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddLink
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.DriveFileMove
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Remove
@@ -300,14 +299,15 @@ private fun ShareListView(
                             if (cfg.selection.isEmpty()) "ничего не выбрано" else "выбрано: ${cfg.selection.size}",
                             fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                        // Tapping the line itself changes the folder: a third
+                        // trailing icon squeezed the name column (XR-055).
                         Text(
                             "Папка: ${StorageAccess.label(cfg.storagePath)}",
                             fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.fillMaxWidth()
+                                .clickable { vm.openStorageDialog(cfg.shareId) },
                         )
-                    }
-                    IconButton(onClick = { vm.openStorageDialog(cfg.shareId) }) {
-                        Icon(Icons.Default.DriveFileMove, contentDescription = "Папка хранения")
                     }
                     Switch(checked = cfg.syncEnabled, onCheckedChange = { vm.setSyncEnabled(cfg.shareId, it) })
                     IconButton(onClick = { vm.removeShare(cfg.shareId) }) {
