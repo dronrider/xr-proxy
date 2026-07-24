@@ -665,7 +665,24 @@ fun ConnectionSection(
     // Контекст доверенной сети даём компактными строками под статусом, по
     // образцу строки «через X (резерв)»: без карточки метрики и кнопка
     // остаются на месте, а само действие живёт в главной кнопке (XR-049).
-    if (state.paused) {
+    // Пауза переживает пропажу сети, но подписи про доверенную сеть в
+    // авиарежиме врали бы: сети нет, значит нет ни «напрямую», ни
+    // ограничений (XR-095).
+    if (state.paused && state.noNetwork) {
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "Сети нет",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            "VPN включится сам, когда связь вернётся",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.outline,
+            textAlign = TextAlign.Center,
+        )
+    }
+    if (state.paused && !state.noNetwork) {
         Spacer(Modifier.height(4.dp))
         Text(
             state.pausedSsid?.let { "Доверенная сеть «$it»" } ?: "Доверенная сеть",
@@ -688,7 +705,23 @@ fun ConnectionSection(
             )
         }
     }
-    if (state.connected && state.overrideSsid != null) {
+    // Тот же честный кейс при поднятом туннеле: связи нет, движок ждёт её
+    // возвращения, статус Connected сам по себе об этом не говорит.
+    if (state.connected && state.noNetwork) {
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "Сети нет",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            "VPN восстановится сам, когда связь вернётся",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.outline,
+            textAlign = TextAlign.Center,
+        )
+    }
+    if (state.connected && state.overrideSsid != null && !state.noNetwork) {
         Spacer(Modifier.height(4.dp))
         Text(
             "включено вручную \u00B7 доверенная сеть «${state.overrideSsid}»",

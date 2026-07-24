@@ -132,6 +132,9 @@ data class VpnUiState(
     val pausedSsid: String? = null,
     /** While paused: this trusted network failed the restriction probe (task 3b-2 §2). */
     val restrictedNetwork: Boolean = false,
+    /** Дефолтной сети нет вообще: главная показывает «сети нет» вместо
+     *  подписей про доверенную сеть и ограничения (XR-095). */
+    val noNetwork: Boolean = false,
     /** SSID of the trusted network the tunnel is kept up on by explicit user
      *  choice ("Включить здесь"); null when no override is armed (XR-049). */
     val overrideSsid: String? = null,
@@ -1170,6 +1173,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             debugMsg = snap?.debugMsg ?: "",
             pausedSsid = svcState.pausedSsid,
             restrictedNetwork = svcState.restrictedNetwork,
+            noNetwork = svcState.noNetwork,
             overrideSsid = svcState.overrideSsid,
             activeServer = snap?.activeServer ?: "",
             backupActive = snap?.backupActive ?: false,

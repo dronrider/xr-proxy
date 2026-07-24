@@ -132,6 +132,10 @@ class XrVpnService : VpnService() {
          *  ("Включить здесь"), while that override is armed. Lets the UI offer
          *  the way back to the auto-pause without a reconnect (XR-049). */
         val overrideSsid: String? = null,
+        /** Дефолтной сети нет вообще (авиарежим, пропавший Wi-Fi). Пауза это
+         *  состояние переживает, но подписи про доверенную сеть и вердикт
+         *  пробы ограничений без аплинка врут и прячутся (XR-095). */
+        val noNetwork: Boolean = false,
     )
 
     inner class LocalBinder : Binder() {
@@ -649,13 +653,26 @@ class XrVpnService : VpnService() {
             delay(2000)
             var restrictedStreak = 0
             while (isActive && _stateFlow.value.phase == Phase.Paused) {
+                // Без аплинка не пробуем: все хосты недоступны из-за отсутствия
+                // сети, а не из-за DPI (XR-095). Цикл дремлет; вернувшаяся сеть
+                // перезапускает пробу через maybeEvaluate.
+                if (currentDefaultNetwork == null) {
+                    restrictedStreak = 0
+                    delay(PROBE_INTERVAL_MS)
+                    continue
+                }
                 val seed = probeSeed++
                 val net = NativeBridge.underlyingNetwork
                 val ssid = _stateFlow.value.pausedSsid
                 logProbe("── Доверенная сеть «${ssid ?: "?"}» — проверка доступности ресурсов")
                 val result = withContext(Dispatchers.IO) { RestrictionProbe.probe(net, seed, ::logProbe) }
-                // Network may have changed during the probe — only apply if still paused.
+                // Network may have changed during the probe: only apply if still paused.
                 if (_stateFlow.value.phase != Phase.Paused) break
+                // Сеть пропала, пока проба шла: её фейл не вердикт.
+                if (currentDefaultNetwork == null) {
+                    restrictedStreak = 0
+                    continue
+                }
                 restrictedStreak = if (result.restricted) restrictedStreak + 1 else 0
                 val confirmed = restrictedStreak >= RESTRICT_CONFIRM_PROBES
                 if (_stateFlow.value.restrictedNetwork != confirmed) {
@@ -975,12 +992,14 @@ class XrVpnService : VpnService() {
                 ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO,
             ) {
                 override fun onAvailable(network: Network) = onDefaultAvailable(network)
+                override fun onLost(network: Network) = onDefaultLost(network)
                 override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
                     onDefaultCaps(network, caps)
             }
         } else {
             object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) = onDefaultAvailable(network)
+                override fun onLost(network: Network) = onDefaultLost(network)
                 override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
                     onDefaultCaps(network, caps)
             }
@@ -997,6 +1016,10 @@ class XrVpnService : VpnService() {
     private fun onDefaultAvailable(network: Network) {
         val previous = currentDefaultNetwork
         currentDefaultNetwork = network
+        if (_stateFlow.value.noNetwork) {
+            _stateFlow.value = _stateFlow.value.copy(noNetwork = false)
+            updateNotification()
+        }
         // A real switch — owe a re-bind (deferred until onCapabilities tells us
         // the new network isn't trusted; see maybeEvaluate). The user override
         // deliberately survives this point: a Wi-Fi reconnect changes the netId
@@ -1011,6 +1034,23 @@ class XrVpnService : VpnService() {
         // Ignore stale callbacks for a network that's no longer default.
         if (network != currentDefaultNetwork) return
         maybeEvaluate(network, caps)
+    }
+
+    /** Последняя дефолтная сеть ушла, замены нет: авиарежим или пропавший
+     *  Wi-Fi. При обычной смене сетей onAvailable новой приходит раньше
+     *  onLost старой, и guard по currentDefaultNetwork этот случай отсекает.
+     *  Проба ограничений на мёртвом аплинке фейлит все хосты подряд и
+     *  рисовала бы «в сети ограничения» там, где сети нет вовсе (XR-095):
+     *  цикл гасим, вердикт сбрасываем, UI показывает честное «сети нет». */
+    private fun onDefaultLost(network: Network) {
+        if (network != currentDefaultNetwork) return
+        currentDefaultNetwork = null
+        currentRawSsid = null
+        currentDefaultIsWifi = false
+        probeJob?.cancel()
+        probeJob = null
+        _stateFlow.value = _stateFlow.value.copy(noNetwork = true, restrictedNetwork = false)
+        updateNotification()
     }
 
     private fun registerScreenOnReceiver() {
@@ -1251,10 +1291,11 @@ class XrVpnService : VpnService() {
             Phase.Idle, Phase.Preparing -> "Запуск…"
             Phase.Connecting -> "Подключение…"
             Phase.Finalizing -> "Проверка маршрутов…"
-            Phase.Connected -> state.snapshot?.let { s ->
+            Phase.Connected -> if (state.noNetwork) "Сети нет, VPN восстановится сам"
+            else state.snapshot?.let { s ->
                 "↑${formatBytes(s.bytesUp)} ↓${formatBytes(s.bytesDown)} • ${formatUptime(s.uptime)}"
             } ?: "Подключено"
-            Phase.Paused -> {
+            Phase.Paused -> if (state.noNetwork) "На паузе, сети нет" else {
                 val base = state.pausedSsid?.let { "На паузе · доверенная сеть «$it»" }
                     ?: "На паузе · доверенная сеть"
                 if (state.restrictedNetwork) "$base · ⚠ в сети ограничения" else base
