@@ -1,5 +1,5 @@
 [workspace]
-members = ["xr-proto", "xr-client", "xr-server", "xr-core", "xr-android-jni", "xr-hub", "xr-share", "xr-relay"]
+members = ["xr-proto", "xr-client", "xr-server", "xr-core", "xr-android-jni", "xr-hub", "xr-share", "xr-relay", "xr-setup"]
 resolver = "2"
 
 [workspace.package]

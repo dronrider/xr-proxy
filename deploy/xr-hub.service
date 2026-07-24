@@ -1,0 +1,18 @@
+[Unit]
+Description=XR Hub (control plane)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xr-hub --config /etc/xr-hub/config.toml
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+# Security hardening
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -2754,6 +2754,8 @@ dependencies = [
  "once_cell",
  "rustls",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "url",
  "webpki-roots 0.26.11",
 ]
@@ -3532,6 +3534,24 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "xr-proto",
+]
+
+[[package]]
+name = "xr-setup"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "base64",
+ "clap",
+ "libc",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml 0.8.23",
+ "ureq",
  "xr-proto",
 ]
 
