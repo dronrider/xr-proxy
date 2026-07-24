@@ -250,20 +250,17 @@ fn hostname() -> String {
         .unwrap_or_else(|| "openwrt".into())
 }
 
-/// Разбор `addr:port` из --server; IPv6 в скобках, `[::1]:8443`.
+/// Разбор `addr:port` из --server. IPv6 сознательно отклоняется: xr-client
+/// держит адрес голой строкой (склейка `address:port`, отдельное
+/// использование под bind в udp-relay), сплошного IPv6-пути там нет, и
+/// установщик не должен рождать конфиг, с которым клиент не стартует.
 pub fn parse_server(s: &str) -> Result<crate::render::RouterServer> {
-    let (address, port) = if let Some(rest) = s.strip_prefix('[') {
-        rest.split_once("]:")
-            .with_context(|| format!("--server '{s}': ожидается [addr6]:port"))?
-    } else {
-        let (a, p) = s
-            .rsplit_once(':')
-            .with_context(|| format!("--server '{s}': ожидается addr:port"))?;
-        if a.contains(':') {
-            bail!("--server '{s}': IPv6 задаётся в скобках, [addr6]:port");
-        }
-        (a, p)
-    };
+    if s.starts_with('[') || s.matches(':').count() > 1 {
+        bail!("--server '{s}': IPv6 пока не поддержан клиентом, задай IPv4 или домен");
+    }
+    let (address, port) = s
+        .rsplit_once(':')
+        .with_context(|| format!("--server '{s}': ожидается addr:port"))?;
     Ok(crate::render::RouterServer {
         address: address.to_string(),
         port: port
@@ -433,10 +430,10 @@ mod tests {
         assert_eq!((s.address.as_str(), s.port), ("203.0.113.1", 8443));
         assert!(parse_server("203.0.113.1").is_err());
         assert!(parse_server("host:port").is_err());
-        let v6 = parse_server("[2001:db8::7]:8443").unwrap();
-        assert_eq!((v6.address.as_str(), v6.port), ("2001:db8::7", 8443));
-        assert!(parse_server("2001:db8::7:8443").is_err(), "голый IPv6 неоднозначен");
-        assert!(parse_server("[2001:db8::7]").is_err());
+        // IPv6 клиент не тянет, установщик отказывает заранее, а не отдаёт
+        // конфиг, на котором xr-client упадёт «invalid server address».
+        assert!(parse_server("[2001:db8::7]:8443").is_err());
+        assert!(parse_server("2001:db8::7:8443").is_err());
     }
 
     #[test]
