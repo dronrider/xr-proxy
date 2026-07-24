@@ -20,6 +20,7 @@ import android.os.ParcelFileDescriptor
 import androidx.core.content.ContextCompat
 import com.xrproxy.app.R
 import com.xrproxy.app.data.TrustedNetworksRepository
+import com.xrproxy.app.data.UserRulesStore
 import com.xrproxy.app.jni.NativeBridge
 import com.xrproxy.app.model.HealthLevel
 import com.xrproxy.app.model.HealthTracker
@@ -399,7 +400,7 @@ class XrVpnService : VpnService() {
      * failure. MUST be called holding [transitionMutex].
      */
     private suspend fun bringTunnelUp(): Boolean {
-        val configJson = lastConfigJson ?: run {
+        val configJson = lastConfigJson?.let(::withFreshUserRules) ?: run {
             publish(Phase.Error, errorMessage = "Нет конфигурации")
             stopSelf()
             return false
@@ -498,6 +499,22 @@ class XrVpnService : VpnService() {
 
         scope.launch { pollLoop() }
         return true
+    }
+
+    /** Кэш сессии несёт user_rules на момент полного Connect, а правила
+     *  меняются и пока туннель стоит в паузе. Resume, «включить здесь» и
+     *  рестарт после ошибки поднимают туннель из кэша, и добавленное правило
+     *  туда не попадало (XR-118), хотя для пользователя resume и есть то
+     *  «следующее подключение», которое обещает снекбар экрана правил.
+     *  Подменяем массив свежим содержимым user_rules.json на каждом поднятии;
+     *  на нечитаемом кэше поднимаемся как есть, коннект важнее свежести
+     *  правил. */
+    private fun withFreshUserRules(configJson: String): String = try {
+        JSONObject(configJson)
+            .put("user_rules", UserRulesStore.toConfigJson(UserRulesStore.load(filesDir)))
+            .toString()
+    } catch (_: Exception) {
+        configJson
     }
 
     private suspend fun pollLoop() {
