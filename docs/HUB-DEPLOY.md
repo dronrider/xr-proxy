@@ -38,8 +38,11 @@ curl -fsSL https://<хаб-с-раздачей>/api/v1/setup/install.sh \
   выводит nginx с сертификатом (раздел 3); до этого ссылка инвайта у
   получателя не откроется.
 - Раздача `setup-dist` наполняется с машины сборки скриптом
-  `scripts/release-xr-setup.sh` (musl-бинари обеих арок + `install.sh` +
-  `SHA256SUMS` в `/var/lib/xr-hub/setup-dist`).
+  `scripts/release-xr-setup.sh` (musl-бинари обеих арок, включая `xr-client`
+  для роутерной цели, + `install.sh` + `SHA256SUMS` в
+  `/var/lib/xr-hub/setup-dist`).
+- Той же командой ставится и OpenWRT-роутер (`sh -s -- router ...`),
+  подробности в `docs/OPENWRT.md`.
 
 ## Требования
 
