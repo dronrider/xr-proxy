@@ -1,6 +1,9 @@
 package com.xrproxy.app.ui.files
 
 import android.app.Application
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xrproxy.app.data.ShareRepository
@@ -153,12 +156,41 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui
 
+    // Появление сети это повод перезапросить манифест открытой офлайн-шары
+    // сразу, не дожидаясь очередного шага бэкофа (XR-099). Для приложения под
+    // собственным VPN дефолтная сеть это туннель, но и он поднимается следом
+    // за физическим аплинком, так что сигнал годится в обоих режимах.
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            val st = _ui.value
+            if (st.openShareId != null && st.offlineLocal && !st.manifestLoading) {
+                // Секунда на устаканивание маршрутов после появления сети.
+                startOfflineRetry(firstDelayMs = 1_000)
+            }
+        }
+    }
+
     init {
         viewModelScope.launch {
             val store = store()
             _ui.update { it.copy(storeReady = true) }
             store.shares.collect { _configs.value = it }
         }
+        (app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)?.let { cm ->
+            try {
+                cm.registerDefaultNetworkCallback(networkCallback)
+            } catch (_: RuntimeException) {
+                // Без колбэка перезапрос держится на одном бэкофе.
+            }
+        }
+    }
+
+    override fun onCleared() {
+        (getApplication<Application>().getSystemService(Context.CONNECTIVITY_SERVICE)
+            as? ConnectivityManager)?.let { cm ->
+            try { cm.unregisterNetworkCallback(networkCallback) } catch (_: Exception) {}
+        }
+        super.onCleared()
     }
 
     fun consumeMessage() = _ui.update { it.copy(message = null) }
@@ -356,6 +388,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     // -- explorer ----------------------------------------------------
 
     fun openShare(config: ShareConfig) {
+        offlineRetryJob?.cancel()
         _ui.update {
             it.copy(
                 openShareId = config.shareId, currentPath = "",
@@ -423,6 +456,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
             if (result.isSuccess) enqueueMissingSelected(config.shareId)
+            else maybeStartOfflineRetry(result.exceptionOrNull())
         }
     }
 
@@ -455,7 +489,59 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
             if (result.isSuccess) enqueueMissingSelected(config.shareId)
+            else maybeStartOfflineRetry(result.exceptionOrNull())
         }
+    }
+
+    /** Cache-first (XR-059) стрелял fetchManifest один раз при openShare: упал
+     *  запрос, и до перезахода в шару новых попыток не было, вернувшаяся сеть
+     *  ничего не меняла (XR-099). Теперь неудача по сети или по молчащему
+     *  агенту заводит тихий перезапрос по бэкофу; появление сети (колбэк в
+     *  init) перезапускает его немедленно. Ответ агента по существу (4xx,
+     *  истёкший доступ) ретраем не лечится и цикл не заводит. */
+    private fun maybeStartOfflineRetry(error: Throwable?) {
+        if (error == null) return
+        if (error.isOffline() || error.isAgentOffline()) startOfflineRetry()
+    }
+
+    private var offlineRetryJob: Job? = null
+
+    private fun startOfflineRetry(firstDelayMs: Long = OFFLINE_RETRY_DELAYS_MS.first()) {
+        offlineRetryJob?.cancel()
+        offlineRetryJob = viewModelScope.launch {
+            var attempt = 0
+            var delayMs = firstDelayMs
+            while (true) {
+                delay(delayMs)
+                val st = _ui.value
+                val shareId = st.openShareId ?: return@launch
+                if (!st.offlineLocal || st.manifestLoading) return@launch
+                val config = store().get(shareId) ?: return@launch
+                val result = fetchManifestHealing(config)
+                if (result.isSuccess) {
+                    applyFreshManifest(config, result.getOrDefault(emptyList()))
+                    return@launch
+                }
+                if (result.exceptionOrNull()?.isAccessExpired() == true) return@launch
+                attempt++
+                delayMs = OFFLINE_RETRY_DELAYS_MS[minOf(attempt, OFFLINE_RETRY_DELAYS_MS.lastIndex)]
+            }
+        }
+    }
+
+    /** Свежий манифест пришёл вне явного действия пользователя: молча подменить
+     *  список, снять пометку офлайна и доложить недокачанное в очередь. Текущая
+     *  папка живёт в currentPath и подмену переживает. */
+    private suspend fun applyFreshManifest(config: ShareConfig, fresh: List<ManifestEntry>) {
+        val localManifest = withContext(Dispatchers.IO) { repo.localManifest(config) }
+        _ui.update { st ->
+            if (st.openShareId != config.shareId) return@update st
+            st.copy(
+                manifest = withLocalOnly(fresh, localManifest),
+                manifestLoading = false, offlineLocal = false,
+            )
+        }
+        enqueueMissingSelected(config.shareId)
     }
 
     /** The server manifest plus local files it no longer lists: without them a
@@ -513,6 +599,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         // The poll lives as long as the share screen; the agent-side download
         // continues without us and the file shows up on the next open.
         stopImportPolling()
+        offlineRetryJob?.cancel()
         _ui.update {
             it.copy(
                 openShareId = null, currentPath = "", manifest = emptyList(),
@@ -1178,5 +1265,9 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         /** Stale token, but the hub was unreachable to refresh the grant: reuse
          *  the "network:" category so the offline handling kicks in (XR-167). */
         const val ERR_HUB_OFFLINE = "network: хаб недоступен, обновите список позже"
+
+        /** Бэкоф тихого перезапроса манифеста офлайн-шары (XR-099); последний
+         *  шаг повторяется, пока шара открыта. */
+        val OFFLINE_RETRY_DELAYS_MS = longArrayOf(10_000, 30_000, 60_000)
     }
 }
