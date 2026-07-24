@@ -37,6 +37,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -1016,8 +1017,12 @@ class XrVpnService : VpnService() {
     private fun onDefaultAvailable(network: Network) {
         val previous = currentDefaultNetwork
         currentDefaultNetwork = network
-        if (_stateFlow.value.noNetwork) {
-            _stateFlow.value = _stateFlow.value.copy(noNetwork = false)
+        // Через update, не присваиванием: сюда пишет поток ConnectivityManager,
+        // а pollLoop параллельно копирует состояние с Dispatchers.Default, и
+        // проигранная гонка теряла бы один из апдейтов.
+        val cameFromNoNetwork = _stateFlow.value.noNetwork
+        if (cameFromNoNetwork) {
+            _stateFlow.update { it.copy(noNetwork = false) }
             updateNotification()
         }
         // A real switch — owe a re-bind (deferred until onCapabilities tells us
@@ -1025,7 +1030,11 @@ class XrVpnService : VpnService() {
         // deliberately survives this point: a Wi-Fi reconnect changes the netId
         // without leaving the network, so the SSID-keyed override is only
         // re-checked once capabilities arrive (maybeDisarmOverride).
-        if (previous != null && previous != network) {
+        // После полной пропажи сети previous обнулён, но переживший её туннель
+        // сидит на мёртвых сокетах так же, как при смене сетей: re-bind нужен
+        // и на выходе из «сети нет», иначе Connected оживал бы только медленным
+        // нативным детектором таймаутов.
+        if ((previous != null && previous != network) || cameFromNoNetwork) {
             pendingSwitch = true
         }
     }
@@ -1049,7 +1058,7 @@ class XrVpnService : VpnService() {
         currentDefaultIsWifi = false
         probeJob?.cancel()
         probeJob = null
-        _stateFlow.value = _stateFlow.value.copy(noNetwork = true, restrictedNetwork = false)
+        _stateFlow.update { it.copy(noNetwork = true, restrictedNetwork = false) }
         updateNotification()
     }
 
