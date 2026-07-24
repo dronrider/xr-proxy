@@ -177,22 +177,11 @@ private_key = "/var/lib/xr-hub/signing_key"
 
 ## 5. Systemd unit
 
+Юнит лежит в репозитории, тот же файл вшит в xr-setup: ручной и
+автоматический пути ставят одно и то же.
+
 ```bash
-cat > /etc/systemd/system/xr-hub.service <<'EOF'
-[Unit]
-Description=xr-hub control plane
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/xr-hub --config /etc/xr-hub/config.toml
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
+cp deploy/xr-hub.service /etc/systemd/system/xr-hub.service
 systemctl daemon-reload
 systemctl enable --now xr-hub
 ```
