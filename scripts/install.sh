@@ -46,16 +46,19 @@ say "  ok ($actual)"
 
 chmod +x "$tmp/$bin"
 [ "$(id -u)" = 0 ] || die "нужен root: перезапусти через sudo sh"
-mv "$tmp/$bin" /usr/local/bin/xr-setup
-say "Установлен /usr/local/bin/xr-setup"
+# На OpenWRT нет /usr/local/bin (и его нет в PATH), там дом это /usr/bin.
+dest=/usr/local/bin
+[ -d "$dest" ] || dest=/usr/bin
+mv "$tmp/$bin" "$dest/xr-setup"
+say "Установлен $dest/xr-setup"
 
 if [ $# -gt 0 ]; then
   rm -rf "$tmp"
   # Бинари компонентов установщик возьмёт с той же раздачи, если источник
   # не задан явно (обе формы флага: с пробелом и с =).
   case " $* " in
-    *" --dist-url"*|*" --from-dir"*) exec /usr/local/bin/xr-setup "$@" ;;
-    *) exec /usr/local/bin/xr-setup "$@" --dist-url "$BASE" ;;
+    *" --dist-url"*|*" --from-dir"*) exec "$dest/xr-setup" "$@" ;;
+    *) exec "$dest/xr-setup" "$@" --dist-url "$BASE" ;;
   esac
 fi
 say ""

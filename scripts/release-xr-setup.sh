@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Сборка и выкладка setup-dist на хаб (XR-015, LLD-13): статические musl
-# бинари xr-setup, xr-server и xr-hub под обе арки плюс install.sh и
-# SHA256SUMS. С этой раздачи ставится чистый VPS одной командой:
+# Сборка и выкладка setup-dist на хаб (XR-015/XR-177, LLD-13): статические
+# musl бинари xr-setup, xr-server, xr-hub и xr-client под обе арки плюс
+# install.sh и SHA256SUMS. С этой раздачи ставится чистый VPS или роутер
+# одной командой:
 #
 #   curl -fsSL https://<хаб>/api/v1/setup/install.sh | sh -s -- server ...
+#   curl -fsSL https://<хаб>/api/v1/setup/install.sh | sh -s -- router ...
 #
 # musl-сборщик тот же, что у release-xr-share.sh: cargo-zigbuild, если
 # установлен, иначе cross (нужен Docker).
@@ -17,7 +19,7 @@ HUB_DIR="${HUB_DIR:-/var/lib/xr-hub/setup-dist}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SSH="ssh -p $HUB_PORT $HUB_USER@$HUB_HOST"
 SCP="scp -P $HUB_PORT"
-CRATES=(xr-setup xr-server xr-hub)
+CRATES=(xr-setup xr-server xr-hub xr-client)
 
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
@@ -57,7 +59,7 @@ done
 cp "$ROOT/scripts/install.sh" "$stage/install.sh"
 
 echo "== SHA256SUMS =="
-( cd "$stage" && sums xr-setup-* xr-server-* xr-hub-* > SHA256SUMS && cat SHA256SUMS )
+( cd "$stage" && sums xr-setup-* xr-server-* xr-hub-* xr-client-* > SHA256SUMS && cat SHA256SUMS )
 
 echo "== upload to hub $HUB_HOST:$HUB_DIR =="
 $SSH "mkdir -p $HUB_DIR"
@@ -66,3 +68,5 @@ $SCP "$stage"/* "$HUB_USER@$HUB_HOST:$HUB_DIR/"
 echo ""
 echo "Готово. Установка с чистого VPS:"
 echo "  curl -fsSL https://xr-hub.zoobr.top/api/v1/setup/install.sh | sh -s -- server --with-hub --hub-domain <домен>"
+echo "Установка свежего OpenWRT-роутера:"
+echo "  curl -fsSL https://xr-hub.zoobr.top/api/v1/setup/install.sh | sh -s -- router --server <addr:port> --key <b64> --salt <0xHEX>"
