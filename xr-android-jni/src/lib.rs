@@ -184,6 +184,10 @@ fn json_get_str(json: &str, key: &str) -> Result<String, String> {
                 Some('n') => result.push('\n'),
                 Some('"') => result.push('"'),
                 Some('\\') => result.push('\\'),
+                // org.json на Android всегда пишет `/` как `\/`, и после
+                // пересериализации конфига сервисом этот эскейп несёт каждый
+                // URL и почти каждый base64-ключ (XR-118).
+                Some('/') => result.push('/'),
                 Some('t') => result.push('\t'),
                 Some('r') => result.push('\r'),
                 Some(other) => {
@@ -1791,6 +1795,17 @@ domains = ["youtube.com", "*.youtube.com"]"#;
     fn get_str_newline_escape() {
         let json = r#"{"multi":"line1\nline2\nline3"}"#;
         assert_eq!(json_get_str(json, "multi").unwrap(), "line1\nline2\nline3");
+    }
+
+    /// Android'овский org.json при пересериализации конфига всегда экранирует
+    /// `/` как `\/` (легальный JSON-эскейп), а парсер держал обратный слэш в
+    /// значении: base64-ключ с `/` не декодировался, hub_url ломался, и
+    /// туннель в APK 0.80.0 не стартовал ни одним путём (XR-118).
+    #[test]
+    fn get_str_forward_slash_escape() {
+        let json = r#"{"obfuscation_key":"a2V5\/c2\/x=","hub_url":"https:\/\/hub.example"}"#;
+        assert_eq!(json_get_str(json, "obfuscation_key").unwrap(), "a2V5/c2/x=");
+        assert_eq!(json_get_str(json, "hub_url").unwrap(), "https://hub.example");
     }
 
     #[test]
