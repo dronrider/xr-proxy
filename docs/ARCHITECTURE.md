@@ -536,7 +536,11 @@ GeoIP (за feature-flag).
 правила редактируются на экране «Правила» (вкладка «Серверы») и хранятся
 глобальным упорядоченным списком в `filesDir/user_rules.json`. При Connect
 `VpnViewModel.buildConfigJson` кладёт их в конфиг движка массивом `user_rules`
-(`[{action, pattern}]` плюс `default_action`), JNI-слой конвертирует его в
+(`[{action, pattern}]` плюс `default_action`); на каждом последующем поднятии
+туннеля из кэша сессии (resume из паузы, «включить здесь», рестарт после
+ошибки) `XrVpnService.withFreshUserRules` подменяет массив свежим содержимым
+`user_rules.json`, поэтому правка правил доезжает и без полного реконнекта
+(XR-118). JNI-слой конвертирует массив в
 `RoutingConfig` через `xr_proto::user_rule::to_routing_config`. Валидация
 паттернов (домен / `*.wildcard` / CIDR) одна на всех:
 `xr_proto::user_rule::classify_pattern`, из Kotlin она дёргается через
