@@ -2,7 +2,7 @@
 //! xr-server, при --with-hub рядом встаёт xr-hub, и установка заканчивается
 //! одноразовым инвайтом - швом с онбордингом LLD-04.
 
-use crate::actions::{InstallBinary, SigningKey, Sysctl, SystemdUnit, WriteConfig};
+use crate::actions::{InstallBinary, Restart, SigningKey, Sysctl, SystemdUnit, WriteConfig};
 use crate::arch::Arch;
 use crate::fetch::BinSource;
 use crate::hub_api::HubClient;
@@ -186,7 +186,7 @@ pub fn plan(r: &Resolved) -> Vec<Box<dyn Step>> {
             file: format!("xr-server-{}", r.arch.dist_suffix()),
             dest: PathBuf::from(SERVER_BIN),
             source: r.source.clone(),
-            restart_unit: Some(SERVER_UNIT_NAME.into()),
+            restart: Some(Restart::Unit(SERVER_UNIT_NAME.into())),
         }),
         Box::new(WriteConfig {
             label: "server".into(),
@@ -194,7 +194,7 @@ pub fn plan(r: &Resolved) -> Vec<Box<dyn Step>> {
             content: render_server_toml(&r.server),
             mode: 0o600,
             overwrite: r.force,
-            restart_unit: Some(SERVER_UNIT_NAME.into()),
+            restart: Some(Restart::Unit(SERVER_UNIT_NAME.into())),
             extra: None,
         }),
         Box::new(Sysctl {
@@ -212,7 +212,7 @@ pub fn plan(r: &Resolved) -> Vec<Box<dyn Step>> {
             file: format!("xr-hub-{}", r.arch.dist_suffix()),
             dest: PathBuf::from(HUB_BIN),
             source: r.source.clone(),
-            restart_unit: Some(HUB_UNIT_NAME.into()),
+            restart: Some(Restart::Unit(HUB_UNIT_NAME.into())),
         }));
         steps.push(Box::new(SigningKey {
             path: PathBuf::from(SIGNING_KEY_FILE),
@@ -224,7 +224,7 @@ pub fn plan(r: &Resolved) -> Vec<Box<dyn Step>> {
                 content: content.clone(),
                 mode: 0o600,
                 overwrite: r.force,
-                restart_unit: Some(HUB_UNIT_NAME.into()),
+                restart: Some(Restart::Unit(HUB_UNIT_NAME.into())),
                 extra: hub
                     .admin_pass
                     .as_ref()

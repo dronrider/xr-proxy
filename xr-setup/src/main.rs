@@ -1,12 +1,15 @@
 //! xr-setup: идемпотентный установщик xr-proxy (LLD-13, этап 1).
 //! Цель `server` поднимает xr-server (и опционально xr-hub) на чистом VPS
-//! и заканчивается одноразовым инвайтом; цель `router` появится в XR-177.
+//! и заканчивается одноразовым инвайтом; цель `router` приводит OpenWRT
+//! к раздающему обход роутеру.
 
 mod actions;
 mod arch;
 mod fetch;
 mod hub_api;
+mod openwrt;
 mod render;
+mod router_profile;
 mod secrets;
 mod server_profile;
 mod steps;
@@ -27,7 +30,7 @@ struct Cli {
 enum Cmd {
     /// Поднять xr-server на этом VPS, при --with-hub вместе с xr-hub
     Server(ServerArgs),
-    /// Настроить OpenWRT-роутер (реализация в XR-177)
+    /// Настроить этот OpenWRT-роутер на готовый xr-server
     Router(RouterArgs),
 }
 
@@ -64,28 +67,89 @@ struct ServerArgs {
 
 #[derive(Args)]
 struct RouterArgs {
-    /// Адрес xr-server (addr:port)
+    /// Сервер пула addr:port; можно повторять, порядок задаёт приоритет
+    /// (первый = primary). Печатает установка server-цели.
+    #[arg(long, required = true)]
+    server: Vec<String>,
+    /// Ключ обфускации base64 (тот же, что на сервере)
+    #[arg(long, required = true)]
+    key: String,
+    /// Salt обфускации, 0xHEX или число (печатает установка server-цели)
+    #[arg(long, required = true, value_parser = parse_salt)]
+    salt: u32,
+    /// URL хаба: пресет маршрутизации и enroll
     #[arg(long)]
-    server: Option<String>,
-    /// Ключ обфускации base64
-    #[arg(long)]
-    key: Option<String>,
+    hub_url: Option<String>,
     /// Пресет маршрутизации с хаба
+    #[arg(long, default_value = "russia", requires = "hub_url")]
+    preset: String,
+    /// Одноразовый enrollment-токен реестра хаба (LLD-17)
+    #[arg(long, requires = "hub_url")]
+    enroll_token: Option<String>,
+    /// Имя роутера в реестре (без флага возьмётся hostname)
+    #[arg(long, requires = "enroll_token")]
+    name: Option<String>,
+    /// Имя раздаваемой Wi-Fi-сети; применяется отложенно последним шагом
     #[arg(long)]
-    preset: Option<String>,
+    ssid: Option<String>,
+    /// Пароль Wi-Fi (psk2); без флага шифрование не трогается
+    #[arg(long, requires = "ssid")]
+    wifi_pass: Option<String>,
     /// База раздачи бинарей (как у server)
     #[arg(long, conflicts_with = "from_dir")]
     dist_url: Option<String>,
     /// Локальная директория с бинарями
     #[arg(long)]
     from_dir: Option<PathBuf>,
+    /// Перезаписать существующий конфиг заново
+    #[arg(long)]
+    force: bool,
 }
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Server(args) => run_server(args),
-        Cmd::Router(_) => bail!("router-профиль ещё не реализован, он едет в XR-177"),
+        Cmd::Router(args) => run_router(args),
     }
+}
+
+fn run_router(args: RouterArgs) -> Result<()> {
+    ensure_linux_root()?;
+
+    let source = match (args.from_dir, args.dist_url) {
+        (Some(dir), _) => Some(fetch::BinSource::Dir(dir)),
+        (None, Some(url)) => Some(fetch::BinSource::Url(url)),
+        (None, None) => None,
+    };
+    let opts = router_profile::RouterOpts {
+        servers: args.server,
+        key: args.key,
+        salt: args.salt,
+        hub_url: args.hub_url,
+        preset: args.preset,
+        enroll_token: args.enroll_token,
+        name: args.name,
+        ssid: args.ssid,
+        wifi_pass: args.wifi_pass,
+        source,
+        force: args.force,
+    };
+
+    let resolved = router_profile::resolve(opts)?;
+    println!("xr-setup router: приводим роутер к целевому состоянию");
+    let report = steps::run(&router_profile::plan(&resolved))?;
+    print_report(&report);
+    router_profile::finish(&resolved)
+}
+
+/// Salt в том виде, в каком его печатает установка сервера (0xHEX),
+/// десятичная запись тоже принимается.
+fn parse_salt(s: &str) -> Result<u32, String> {
+    let parsed = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16),
+        None => s.parse(),
+    };
+    parsed.map_err(|_| format!("'{s}' не salt: ожидается 0xHEX или число"))
 }
 
 fn run_server(args: ServerArgs) -> Result<()> {
@@ -110,6 +174,11 @@ fn run_server(args: ServerArgs) -> Result<()> {
     let resolved = server_profile::resolve(opts)?;
     println!("xr-setup server: приводим VPS к целевому состоянию");
     let report = steps::run(&server_profile::plan(&resolved))?;
+    print_report(&report);
+    server_profile::finish(&resolved)
+}
+
+fn print_report(report: &[(String, steps::StepOutcome)]) {
     let applied = report
         .iter()
         .filter(|(_, o)| *o == steps::StepOutcome::Applied)
@@ -119,7 +188,6 @@ fn run_server(args: ServerArgs) -> Result<()> {
         report.len(),
         report.len() - applied
     );
-    server_profile::finish(&resolved)
 }
 
 fn ensure_linux_root() -> Result<()> {

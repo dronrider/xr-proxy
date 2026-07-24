@@ -25,20 +25,49 @@ pub fn run_cmd(argv: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn systemctl_quiet(args: &[&str]) -> bool {
-    Command::new("systemctl")
-        .args(args)
+/// Тихий запуск: важен только код возврата (is-active, running и т.п.).
+pub fn cmd_ok(argv: &[&str]) -> bool {
+    Command::new(argv[0])
+        .args(&argv[1..])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
 pub fn unit_active(unit: &str) -> bool {
-    systemctl_quiet(&["is-active", "--quiet", unit])
+    cmd_ok(&["systemctl", "is-active", "--quiet", unit])
 }
 
 fn unit_enabled(unit: &str) -> bool {
-    systemctl_quiet(&["is-enabled", "--quiet", unit])
+    cmd_ok(&["systemctl", "is-enabled", "--quiet", unit])
+}
+
+/// Чей сервис перезапускать после замены бинаря или конфига: юнит systemd
+/// на VPS либо procd-скрипт init.d на OpenWRT. Неработающий сервис не
+/// трогается, его поднимет свой шаг плана.
+#[derive(Clone)]
+pub enum Restart {
+    Unit(String),
+    Initd(PathBuf),
+}
+
+impl Restart {
+    pub fn kick(&self) -> Result<()> {
+        match self {
+            Restart::Unit(unit) => {
+                if unit_active(unit) {
+                    run_cmd(&["systemctl", "restart", unit])?;
+                }
+            }
+            Restart::Initd(init) => {
+                let init = init.to_string_lossy().into_owned();
+                if cmd_ok(&[&init, "running"]) {
+                    run_cmd(&[&init, "restart"])?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Атомарная запись: файл появляется целиком или не появляется вовсе,
@@ -67,11 +96,9 @@ fn write_atomic(path: &PathBuf, bytes: &[u8], mode: u32) -> Result<()> {
     Ok(())
 }
 
-fn restart_if_active(unit: Option<&str>) -> Result<()> {
-    if let Some(unit) = unit {
-        if unit_active(unit) {
-            run_cmd(&["systemctl", "restart", unit])?;
-        }
+fn restart_if_active(restart: Option<&Restart>) -> Result<()> {
+    if let Some(restart) = restart {
+        restart.kick()?;
     }
     Ok(())
 }
@@ -83,8 +110,8 @@ pub struct InstallBinary {
     pub file: String,
     pub dest: PathBuf,
     pub source: Option<Arc<BinSource>>,
-    /// Какой сервис перезапустить, если бинарь заменён под работающим юнитом.
-    pub restart_unit: Option<String>,
+    /// Какой сервис перезапустить, если бинарь заменён под работающим.
+    pub restart: Option<Restart>,
 }
 
 impl InstallBinary {
@@ -130,7 +157,7 @@ impl Step for InstallBinary {
         })?;
         let bytes = src.fetch(&self.file)?;
         write_atomic(&self.dest, &bytes, 0o755)?;
-        restart_if_active(self.restart_unit.as_deref())
+        restart_if_active(self.restart.as_ref())
     }
 }
 
@@ -143,7 +170,7 @@ pub struct WriteConfig {
     pub content: String,
     pub mode: u32,
     pub overwrite: bool,
-    pub restart_unit: Option<String>,
+    pub restart: Option<Restart>,
     /// Файл-спутник, живущий только вместе со свежим конфигом
     /// (пароль админа хаба рядом с его хешем).
     pub extra: Option<(PathBuf, String, u32)>,
@@ -171,13 +198,38 @@ impl Step for WriteConfig {
             write_atomic(path, content.as_bytes(), *mode)?;
         }
         write_atomic(&self.path, self.content.as_bytes(), self.mode)?;
-        restart_if_active(self.restart_unit.as_deref())
+        restart_if_active(self.restart.as_ref())
+    }
+}
+
+/// Исполняемый скрипт установки (watchdog, nftables-обвязка). В отличие от
+/// конфига это код: содержимое всегда приводится к вшитому в установщик,
+/// правки на месте перетираются.
+pub struct InstallScript {
+    pub label: String,
+    pub path: PathBuf,
+    pub content: String,
+}
+
+impl Step for InstallScript {
+    fn name(&self) -> String {
+        format!("script:{}", self.label)
+    }
+
+    fn check(&self) -> Result<bool> {
+        Ok(std::fs::read_to_string(&self.path)
+            .map(|cur| cur == self.content)
+            .unwrap_or(false))
+    }
+
+    fn apply(&self) -> Result<()> {
+        write_atomic(&self.path, self.content.as_bytes(), 0o755)
     }
 }
 
 /// Закрепить sysctl в sysctl.d и попробовать применить сразу. Отказ
-/// `sysctl --system` (ядро без bbr и т.п.) не валит установку: файл на
-/// месте и применится на подходящем ядре при загрузке.
+/// применения (ядро без bbr и т.п.) не валит установку: файл на месте и
+/// применится при загрузке.
 pub struct Sysctl {
     pub path: PathBuf,
     pub content: String,
@@ -196,8 +248,12 @@ impl Step for Sysctl {
 
     fn apply(&self) -> Result<()> {
         write_atomic(&self.path, self.content.as_bytes(), 0o644)?;
-        if let Err(e) = run_cmd(&["sysctl", "--system"]) {
-            println!("      предупреждение: sysctl применится после перезагрузки ({e})");
+        // busybox-sysctl на OpenWRT не знает --system, ему нужен -p <файл>.
+        let path = self.path.to_string_lossy().into_owned();
+        if run_cmd(&["sysctl", "--system"]).is_err() {
+            if let Err(e) = run_cmd(&["sysctl", "-p", &path]) {
+                println!("      предупреждение: sysctl применится после перезагрузки ({e})");
+            }
         }
         Ok(())
     }
@@ -283,7 +339,7 @@ mod tests {
             content: "новое".into(),
             mode: 0o600,
             overwrite: false,
-            restart_unit: None,
+            restart: None,
             extra: None,
         };
         assert!(!step.check().unwrap());
@@ -314,7 +370,7 @@ mod tests {
             content: "conf".into(),
             mode: 0o600,
             overwrite: false,
-            restart_unit: None,
+            restart: None,
             extra: Some((dir.join("admin.pass"), "pass\n".into(), 0o600)),
         };
         step.apply().unwrap();
@@ -334,7 +390,7 @@ mod tests {
             file: "xr-server-linux-x86_64".into(),
             dest: dest.clone(),
             source: None,
-            restart_unit: None,
+            restart: None,
         };
         assert!(!no_source.check().unwrap());
         assert!(
@@ -364,7 +420,7 @@ mod tests {
             file: "xr-server-linux-x86_64".into(),
             dest,
             source: None,
-            restart_unit: None,
+            restart: None,
         };
         assert!(offline.check().unwrap());
         std::fs::remove_dir_all(&dir).ok();

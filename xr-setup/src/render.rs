@@ -6,6 +6,16 @@
 pub const SERVER_UNIT: &str = include_str!("../../deploy/xr-proxy-server.service");
 pub const HUB_UNIT: &str = include_str!("../../deploy/xr-hub.service");
 
+/// Обвязка роутера, те же файлы, что раскладываются вручную по хэндоффу:
+/// procd init (в нём же fd-limit через procd limits), watchdog-cron и
+/// nftables-скрипты, на которые init ссылается.
+pub const ROUTER_INIT: &str = include_str!("../../deploy/xr-proxy.init");
+pub const ROUTER_WATCHDOG: &str = include_str!("../../deploy/xr-watchdog.sh");
+pub const KILLSWITCH_SETUP: &str = include_str!("../../scripts/killswitch-setup.sh");
+pub const KILLSWITCH_CLEANUP: &str = include_str!("../../scripts/killswitch-cleanup.sh");
+pub const UDP_TPROXY_SETUP: &str = include_str!("../../scripts/udp-tproxy-setup.sh");
+pub const UDP_TPROXY_CLEANUP: &str = include_str!("../../scripts/udp-tproxy-cleanup.sh");
+
 /// BBR с fq и буферы 8М: без них mux упирается в BDP задолго до ширины
 /// канала (LLD-09). То же, что закреплено на живом флоте в sysctl.d.
 pub const SYSCTL_CONF: &str = "\
@@ -51,6 +61,71 @@ level = "info"
         port = p.port,
         key = p.key,
         salt = p.salt,
+    )
+}
+
+/// Буферы TCP под дальний RTT, как закреплено на живых роутерах
+/// (bbr на OpenWRT-ядре не включаем, его там обычно нет).
+pub const ROUTER_SYSCTL_CONF: &str = "\
+# xr-proxy: TCP-буферы под mux к дальнему VPS (ставит xr-setup)
+net.core.rmem_max=8388608
+net.core.wmem_max=8388608
+net.ipv4.tcp_rmem=4096 131072 8388608
+net.ipv4.tcp_wmem=4096 65536 8388608
+";
+
+/// Один сервер пула роутера; приоритет по порядку в списке (0 = primary).
+pub struct RouterServer {
+    pub address: String,
+    pub port: u16,
+}
+
+pub struct RouterTomlParams {
+    pub servers: Vec<RouterServer>,
+    pub key: String,
+    pub salt: u32,
+    /// Хаб с пресетом маршрутизации; без него правил нет и всё идёт Direct.
+    pub hub: Option<(String, String)>,
+}
+
+pub fn render_router_toml(p: &RouterTomlParams) -> String {
+    let mut out = String::from(
+        "# xr-proxy client config (сгенерирован xr-setup, XR-177)\n\
+         # Ключ и salt обязаны совпадать с сервером.\n\n",
+    );
+    for (priority, s) in p.servers.iter().enumerate() {
+        out.push_str(&format!(
+            "[[servers]]\naddress = \"{}\"\nport = {}\npriority = {}\n\n",
+            s.address, s.port, priority
+        ));
+    }
+    out.push_str(&format!(
+        "[obfuscation]\nkey = \"{}\"\nmodifier = \"positional_xor_rotate\"\nsalt = 0x{:08X}\n\n",
+        p.key, p.salt
+    ));
+    // Без локальных правил: их раздаёт пресет хаба, локальный список стал бы
+    // вторым источником правды.
+    out.push_str("[routing]\ndefault_action = \"direct\"\n\n");
+    out.push_str(
+        "[client]\nlisten_port = 1080\nauto_redirect = true\non_server_down = \"block\"\nlog_level = \"info\"\n",
+    );
+    if let Some((url, preset)) = &p.hub {
+        out.push_str(&format!("\n[hub]\nurl = \"{url}\"\npreset = \"{preset}\"\n"));
+    }
+    out
+}
+
+/// Секция `[control]` после enroll (шов с LLD-17): per-router идентичность
+/// для poll-канала. Клиент начнёт читать её с реализацией реестра (XR-025),
+/// до тех пор секция безвредна.
+pub fn render_control_section(
+    hub_url: &str,
+    router_id: &str,
+    secret: &str,
+    command_pubkey: &str,
+) -> String {
+    format!(
+        "\n[control]\nhub_url = \"{hub_url}\"\nrouter_id = \"{router_id}\"\nsecret = \"{secret}\"\ncommand_pubkey = \"{command_pubkey}\"\n"
     )
 }
 
