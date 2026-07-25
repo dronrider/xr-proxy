@@ -91,6 +91,10 @@ class XrVpnService : VpnService() {
         // XR-021/XR-022); any reachable host still clears the flag at once.
         private const val RESTRICT_CONFIRM_PROBES = 2
         private const val RESTRICT_CONFIRM_DELAY_MS = 8_000L
+        // Окно ожидания доверенного Wi-Fi после авиарежима, прежде чем резюмить
+        // на подвернувшуюся сотовую (XR-095). Переассоциация Wi-Fi после выхода
+        // из авиарежима укладывается в несколько секунд.
+        private const val NO_NETWORK_RESUME_GRACE_MS = 5_000L
     }
 
     enum class Phase { Idle, Preparing, Connecting, Finalizing, Connected, Paused, Stopping, Error }
@@ -190,6 +194,16 @@ class XrVpnService : VpnService() {
     // only if the new network turns out NOT to be trusted (a trusted network
     // pauses instead of re-binding; we must not do both — see maybeEvaluate).
     @Volatile private var pendingSwitch = false
+    // Выставляется на выходе из «сети нет» (выключили авиарежим). Сотовая часто
+    // цепляется дефолтной раньше, чем Wi-Fi переассоциируется, и мгновенный
+    // resume в паузе поднимал туннель на пару секунд, после чего вернувшийся
+    // доверенный Wi-Fi снова ронял его в паузу: мелькание Connected со
+    // смайликом-ошибкой холодного старта (XR-095, шаг 3). Пока флаг взведён,
+    // resume на недоверенную сеть откладывается на окно ожидания Wi-Fi.
+    @Volatile private var justLeftNoNetwork = false
+    // Отложенный resume из паузы после авиарежима: ждёт, не станет ли доверенный
+    // Wi-Fi дефолтным за окно, и только потом поднимает туннель на недоверенной.
+    @Volatile private var graceResumeJob: Job? = null
     // Normalized SSID of the trusted network the user chose to keep the tunnel
     // running on ("Включить здесь"). While the uplink still matches it, every
     // auto-pause decision is skipped. Keyed by SSID, not by Network identity:
@@ -615,6 +629,7 @@ class XrVpnService : VpnService() {
     /** Full stop: tear the tunnel down and unregister network callbacks. */
     private fun stopInternal() {
         tearTunnelDown()
+        cancelGraceResume()
         unregisterUnderlyingNetworkCallback()
     }
 
@@ -625,6 +640,7 @@ class XrVpnService : VpnService() {
      *  no-op when nothing is running). */
     private fun doPause(rawSsid: String?) {
         tearTunnelDown()
+        cancelGraceResume()
         pausedNetwork = currentDefaultNetwork
         val display = rawSsid?.let { NativeBridge.nativeNormalizeSsid(it) }
         NativeBridge.nativeJournalLog(
@@ -751,6 +767,32 @@ class XrVpnService : VpnService() {
             updateNotification()
             bringTunnelUp()
         }
+    }
+
+    /** Отложить resume из паузы после авиарежима: сотовая стала дефолтной, но
+     *  доверенному Wi-Fi даём окно вернуться. Если за окно он не стал дефолтным
+     *  (доверенная ветка [maybeEvaluate] сняла бы задачу), сеть действительно
+     *  сменилась на недоверенную и туннель поднимаем (XR-095). */
+    private fun scheduleGraceResume() {
+        if (graceResumeJob?.isActive == true) return
+        graceResumeJob = scope.launch {
+            delay(NO_NETWORK_RESUME_GRACE_MS)
+            justLeftNoNetwork = false
+            if (_stateFlow.value.phase == Phase.Paused &&
+                !_stateFlow.value.noNetwork &&
+                !isTrusted(currentRawSsid)
+            ) {
+                requestResume("после авиарежима вернулась недоверенная сеть")
+            }
+        }
+    }
+
+    /** Доверенный Wi-Fi вернулся (или сеть снова пропала) быстрее окна: снять
+     *  отложенный resume и погасить флаг, чтобы туннель не поднялся зря. */
+    private fun cancelGraceResume() {
+        graceResumeJob?.cancel()
+        graceResumeJob = null
+        justLeftNoNetwork = false
     }
 
     // ── Network watching: SSID auto-pause + LTE↔Wi-Fi re-bind ─────────
@@ -883,6 +925,7 @@ class XrVpnService : VpnService() {
                         // the spurious-resume fix. Refresh the SSID label if it
                         // resolved/changed while staying trusted.
                         if (trusted) {
+                            cancelGraceResume()
                             val display = raw?.let { NativeBridge.nativeNormalizeSsid(it) }
                             if (display != null && display != _stateFlow.value.pausedSsid) {
                                 publish(Phase.Paused, snapshot = null, pausedSsid = display)
@@ -892,7 +935,9 @@ class XrVpnService : VpnService() {
                     }
                     trusted -> {
                         // Moved to a different but still trusted network — stay
-                        // paused, retarget and re-probe restrictions.
+                        // paused, retarget and re-probe restrictions. Доверенный
+                        // Wi-Fi стал дефолтным: отложенный resume отменяем.
+                        cancelGraceResume()
                         pausedNetwork = network
                         val display = raw?.let { NativeBridge.nativeNormalizeSsid(it) }
                         publish(Phase.Paused, snapshot = null, pausedSsid = display)
@@ -902,7 +947,16 @@ class XrVpnService : VpnService() {
                     caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) && raw == null -> {
                         // New Wi-Fi but its SSID hasn't resolved yet — wait for
                         // the next caps update instead of resuming prematurely
-                        // (avoids churn on a Wi-Fi reconnect).
+                        // (avoids churn on a Wi-Fi reconnect). Wi-Fi уже
+                        // приходит, отложенный resume на сотовую тоже снимаем.
+                        cancelGraceResume()
+                    }
+                    justLeftNoNetwork -> {
+                        // Выход из авиарежима: сотовая стала дефолтной раньше,
+                        // чем Wi-Fi переассоциировался. Не поднимаем туннель
+                        // сразу, а даём доверенному Wi-Fi окно вернуться; если
+                        // не вернётся, resume добьёт отложенная задача (XR-095).
+                        scheduleGraceResume()
                     }
                     else -> {
                         // Left to a non-trusted network (cellular / other Wi-Fi).
@@ -1023,6 +1077,7 @@ class XrVpnService : VpnService() {
         val cameFromNoNetwork = _stateFlow.value.noNetwork
         if (cameFromNoNetwork) {
             _stateFlow.update { it.copy(noNetwork = false) }
+            justLeftNoNetwork = true
             updateNotification()
         }
         // A real switch — owe a re-bind (deferred until onCapabilities tells us
@@ -1058,6 +1113,8 @@ class XrVpnService : VpnService() {
         currentDefaultIsWifi = false
         probeJob?.cancel()
         probeJob = null
+        // Сеть снова пропала: отложенный resume после авиарежима больше не нужен.
+        cancelGraceResume()
         _stateFlow.update { it.copy(noNetwork = true, restrictedNetwork = false) }
         updateNotification()
     }
