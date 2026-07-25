@@ -346,6 +346,9 @@ class XrVpnService : VpnService() {
      *  Those states restart from the kept session config instead. */
     private fun resumeOverride() {
         armOverride()
+        // Пользователь сам поднимает туннель здесь: отложенный после авиарежима
+        // resume больше не нужен, снимаем, чтобы он не сработал вторым заходом.
+        cancelGraceResume()
         when (_stateFlow.value.phase) {
             Phase.Paused ->
                 scope.launch { requestResume("«включить здесь», остаёмся на доверенной сети") }
