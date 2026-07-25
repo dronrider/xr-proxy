@@ -109,4 +109,22 @@ class HealthTracker {
         currentLevel = HealthLevel.Healthy
         lastWorseTime = 0L
     }
+
+    /**
+     * Сеть пропала (авиарежим): без аплинка движок сыплет relay-ошибками, но
+     * это не деградация прокси, а отсутствие связи, и деградировать здоровье
+     * по ним нельзя (XR-183). Подтягиваем базовую линию к текущим счётчикам и
+     * чистим окно, оставаясь Healthy: пока сети нет, здоровье не портится, а
+     * когда она вернётся, дельта считается от этой точки, без ложного всплеска
+     * от накопленных за офлайн ошибок.
+     */
+    fun freezeAt(relayErrors: Long, relayWarnings: Long): HealthLevel {
+        lastSeenErrors = relayErrors
+        lastSeenWarns = relayWarnings
+        errorTimestamps.clear()
+        warnTimestamps.clear()
+        currentLevel = HealthLevel.Healthy
+        lastWorseTime = 0L
+        return currentLevel
+    }
 }

@@ -598,8 +598,14 @@ class XrVpnService : VpnService() {
             prevBytesDown = snap.bytesDown
             prevTickMs = now
 
-            // Health tracking
-            val health = healthTracker.update(snap.relayErrors, snap.relayWarnings)
+            // Health tracking. Без сети relay-ошибки идут от отсутствия аплинка,
+            // а не от прокси: здоровье не деградируем, замораживаем на Healthy
+            // (XR-183). UI при noNetwork смайлик всё равно прячет, но заморозка
+            // ещё и не даёт ложного всплеска в момент возврата сети.
+            val health = if (_stateFlow.value.noNetwork)
+                healthTracker.freezeAt(snap.relayErrors, snap.relayWarnings)
+            else
+                healthTracker.update(snap.relayErrors, snap.relayWarnings)
 
             _stateFlow.value = _stateFlow.value.copy(
                 phase = phase,

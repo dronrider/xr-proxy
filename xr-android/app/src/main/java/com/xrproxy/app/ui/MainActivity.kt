@@ -611,8 +611,11 @@ fun ConnectionSection(
     ShieldArrowIcon(phase = state.phase, modifier = Modifier.size(128.dp))
     Spacer(Modifier.height(16.dp))
 
-    // Status text with inline health emoji (LLD-08 §2.4)
-    val healthEmoji = if (state.connected) {
+    // Status text with inline health emoji (LLD-08). Без сети смайлик прячем:
+    // движок в авиарежиме сыплет ошибками от отсутствия аплинка, и «плохое»
+    // лицо при живом туннеле вводит в заблуждение (XR-183). Строка «Нет сети»
+    // под статусом сама объясняет состояние.
+    val healthEmoji = if (state.connected && !state.noNetwork) {
         when (state.health) {
             HealthLevel.Healthy -> " \uD83D\uDE0A"
             HealthLevel.Good -> " \uD83D\uDE42"
@@ -651,9 +654,10 @@ fun ConnectionSection(
             color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 
-    // Активен резервный сервер пула (LLD-10 §2.6): primary упал, движок
-    // увёл трафик на backup. Строка исчезает после failback.
-    if (state.connected && state.backupActive && state.activeServer.isNotBlank()) {
+    // Активен резервный сервер пула (LLD-10): primary упал, движок увёл трафик
+    // на backup. Строка исчезает после failback. При noNetwork прячем: без сети
+    // «активен резерв» так же врёт, трафика нет вовсе (XR-183).
+    if (state.connected && !state.noNetwork && state.backupActive && state.activeServer.isNotBlank()) {
         Spacer(Modifier.height(4.dp))
         Text(
             "через ${state.activeServer} (резерв)",
