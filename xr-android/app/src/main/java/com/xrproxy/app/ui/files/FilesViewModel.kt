@@ -367,6 +367,16 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Отмена удаления из undo-снекбара: вернуть придержанный конфиг как был.
+     *  Локальные файлы удаление не трогает, так что восстановление полное,
+     *  вместе с выбором и тумблером синка. */
+    fun restoreShare(cfg: ShareConfig) {
+        viewModelScope.launch {
+            store().upsert(cfg)
+            rescheduleIfNeeded()
+        }
+    }
+
     fun removeShare(shareId: String) {
         viewModelScope.launch {
             store().remove(shareId)

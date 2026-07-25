@@ -9,10 +9,12 @@ import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -24,27 +26,40 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddLink
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Replay
+import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -55,8 +70,10 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
@@ -149,10 +166,33 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
     val openConfig = configs.firstOrNull { it.shareId == ui.openShareId }
     BackHandler(enabled = openConfig != null) { vm.navigateUp() }
 
-    if (openConfig != null) {
-        ExplorerView(vm, ui, openConfig, context, modifier)
-    } else {
-        ShareListView(vm, ui, configs, hubUrl, inviteToken, modifier)
+    // Удаление шары подтверждается не диалогом, а undo-снекбаром (макет 1d):
+    // конфиг придерживаем до истечения снекбара, «Отменить» кладёт его назад
+    // как был. Локальные файлы удаление не трогает, восстановление полное.
+    val snackbarHost = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+    val deleteWithUndo: (ShareConfig) -> Unit = { cfg ->
+        vm.removeShare(cfg.shareId)
+        scope.launch {
+            val result = snackbarHost.showSnackbar(
+                message = "Шара «${cfg.name}» удалена",
+                actionLabel = "Отменить",
+                duration = SnackbarDuration.Long,
+            )
+            if (result == SnackbarResult.ActionPerformed) vm.restoreShare(cfg)
+        }
+    }
+
+    Box(modifier = modifier) {
+        if (openConfig != null) {
+            ExplorerView(vm, ui, openConfig, context, Modifier)
+        } else {
+            ShareListView(vm, ui, configs, hubUrl, inviteToken, deleteWithUndo, Modifier)
+        }
+        SnackbarHost(
+            snackbarHost,
+            modifier = Modifier.align(Alignment.BottomCenter),
+        )
     }
 
     val storageCfg = configs.firstOrNull { it.shareId == ui.storageDialogFor }
@@ -222,10 +262,15 @@ private fun ShareListView(
     configs: List<ShareConfig>,
     hubUrl: String?,
     inviteToken: String?,
+    onDeleteShare: (ShareConfig) -> Unit,
     modifier: Modifier,
 ) {
     val knownIds = configs.map { it.shareId }.toSet()
     val addable = ui.hubShares.filter { it.shareId !in knownIds }
+    // Какой шаре открыт лист действий (кнопка с тремя точками). Держим id, а
+    // не конфиг: тумблер синка в листе должен видеть живое состояние из store,
+    // не снимок.
+    var menuShareId by remember { mutableStateOf<String?>(null) }
 
     LazyColumn(
         modifier = modifier.padding(horizontal = 16.dp),
@@ -284,39 +329,189 @@ private fun ShareListView(
                 )
             }
         }
+        // Карточка по макету 2a: имя одной строкой во всю ширину (эллипсис в
+        // середине держит начало и хвост различимыми), под ним строка статуса
+        // с точкой. Тумблер, папка и удаление переехали в лист действий по
+        // кнопке с тремя точками (макет 1d), единственное касание карточки
+        // открывает шару (XR-055).
         items(configs, key = { it.shareId }) { cfg ->
             Card(modifier = Modifier.fillMaxWidth().clickable { vm.openShare(cfg) }) {
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(12.dp),
+                    modifier = Modifier.fillMaxWidth().padding(start = 12.dp, top = 12.dp, bottom = 12.dp, end = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(28.dp))
+                    ShareIconTile(cfg.syncEnabled)
                     Spacer(Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Text(cfg.name, style = MaterialTheme.typography.titleMedium, maxLines = 1,
-                            modifier = Modifier.basicMarquee())
-                        Text(
-                            if (cfg.selection.isEmpty()) "ничего не выбрано" else "выбрано: ${cfg.selection.size}",
-                            fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        // Tapping the line itself changes the folder: a third
-                        // trailing icon squeezed the name column (XR-055).
-                        Text(
-                            "Папка: ${StorageAccess.label(cfg.storagePath)}",
-                            fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1, overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.fillMaxWidth()
-                                .clickable { vm.openStorageDialog(cfg.shareId) },
-                        )
+                            overflow = TextOverflow.MiddleEllipsis)
+                        Spacer(Modifier.height(4.dp))
+                        ShareStatusLine(cfg)
                     }
-                    Switch(checked = cfg.syncEnabled, onCheckedChange = { vm.setSyncEnabled(cfg.shareId, it) })
-                    IconButton(onClick = { vm.removeShare(cfg.shareId) }) {
-                        Icon(Icons.Default.Delete, contentDescription = "Удалить")
+                    IconButton(onClick = { menuShareId = cfg.shareId }) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "Действия с шарой")
                     }
                 }
             }
         }
         item { Spacer(Modifier.height(24.dp)) }
+    }
+
+    val menuCfg = configs.firstOrNull { it.shareId == menuShareId }
+    if (menuCfg != null) {
+        ShareActionsSheet(
+            cfg = menuCfg,
+            vm = vm,
+            onDelete = onDeleteShare,
+            onDismiss = { menuShareId = null },
+        )
+    }
+}
+
+/** Ведущая плитка карточки: папка в скруглённом тонированном квадрате, тон
+ *  следует за состоянием синка, как и точка статуса. */
+@Composable
+private fun ShareIconTile(syncEnabled: Boolean) {
+    val tint = if (syncEnabled) MaterialTheme.colorScheme.primary
+    else MaterialTheme.colorScheme.onSurfaceVariant
+    Box(
+        modifier = Modifier.size(40.dp)
+            .background(tint.copy(alpha = 0.14f), RoundedCornerShape(12.dp)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(Icons.Default.Folder, contentDescription = null, tint = tint,
+            modifier = Modifier.size(20.dp))
+    }
+}
+
+/** Строка статуса из макета 2a: точка-индикатор плюс текст. Счётчик держим
+ *  прежний («выбрано: N»): в выборе бывают и папки, «N файлов» приврал бы. */
+@Composable
+private fun ShareStatusLine(cfg: ShareConfig) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            modifier = Modifier.size(8.dp).background(
+                if (cfg.syncEnabled) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.outline,
+                CircleShape,
+            ),
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            shareStatusText(cfg),
+            fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+private fun shareStatusText(cfg: ShareConfig): String {
+    val selection = if (cfg.selection.isEmpty()) "ничего не выбрано" else "выбрано: ${cfg.selection.size}"
+    return if (cfg.syncEnabled) "Синхронизируется \u00B7 $selection"
+    else "Синхронизация выключена \u00B7 $selection"
+}
+
+// -- Лист действий шары (макет 1d) ----------------------------------
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ShareActionsSheet(
+    cfg: ShareConfig,
+    vm: FilesViewModel,
+    onDelete: (ShareConfig) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            ShareIconTile(cfg.syncEnabled)
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(cfg.name, style = MaterialTheme.typography.titleMedium, maxLines = 1,
+                    overflow = TextOverflow.MiddleEllipsis)
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    shareStatusText(cfg),
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+        SheetActionRow(
+            icon = { Icon(Icons.Default.FolderOpen, contentDescription = null) },
+            title = "Открыть шару",
+            chevron = true,
+            onClick = { onDismiss(); vm.openShare(cfg) },
+        )
+        SheetActionRow(
+            icon = { Icon(Icons.Default.Sync, contentDescription = null) },
+            title = "Синхронизация",
+            trailing = {
+                Switch(
+                    checked = cfg.syncEnabled,
+                    onCheckedChange = { vm.setSyncEnabled(cfg.shareId, it) },
+                )
+            },
+        )
+        SheetActionRow(
+            icon = { Icon(Icons.Default.SaveAlt, contentDescription = null) },
+            title = "Папка на устройстве",
+            subtitle = StorageAccess.label(cfg.storagePath),
+            chevron = true,
+            onClick = { onDismiss(); vm.openStorageDialog(cfg.shareId) },
+        )
+        HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+        SheetActionRow(
+            icon = {
+                Icon(Icons.Default.Delete, contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error)
+            },
+            title = "Удалить шару",
+            titleColor = MaterialTheme.colorScheme.error,
+            onClick = { onDismiss(); onDelete(cfg) },
+        )
+        Spacer(Modifier.height(16.dp))
+    }
+}
+
+@Composable
+private fun SheetActionRow(
+    icon: @Composable () -> Unit,
+    title: String,
+    subtitle: String? = null,
+    titleColor: Color = Color.Unspecified,
+    chevron: Boolean = false,
+    trailing: (@Composable () -> Unit)? = null,
+    onClick: (() -> Unit)? = null,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth()
+            .let { if (onClick != null) it.clickable(onClick = onClick) else it }
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        icon()
+        Spacer(Modifier.width(16.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, color = titleColor, style = MaterialTheme.typography.bodyLarge)
+            if (subtitle != null) {
+                Text(
+                    subtitle,
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        if (trailing != null) trailing()
+        else if (chevron) {
+            Icon(
+                Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 
