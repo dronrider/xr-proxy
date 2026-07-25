@@ -629,14 +629,20 @@ fun ConnectionSection(
         ConnectPhase.Preparing -> "Подготовка…"
         ConnectPhase.Connecting -> "Подключение…"
         ConnectPhase.Finalizing -> "Проверка маршрутов…"
-        ConnectPhase.Connected -> "Подключено$healthEmoji"
+        // Туннель поднят, но аплинка нет: «Подключено» тут противоречит «Нет
+        // сети» под ним, поэтому сам заголовок честно говорит про ожидание
+        // сети (XR-183). Движок держит туннель и оживает сам с возвратом связи.
+        ConnectPhase.Connected -> if (state.noNetwork) "Ожидание сети" else "Подключено$healthEmoji"
         ConnectPhase.Paused -> "На паузе"
         ConnectPhase.Stopping -> "Отключение…"
     }
-    val statusColor = when (state.phase) {
-        ConnectPhase.Connected -> MaterialTheme.colorScheme.primary
-        ConnectPhase.Preparing, ConnectPhase.Connecting, ConnectPhase.Finalizing ->
-            MaterialTheme.colorScheme.tertiary
+    val statusColor = when {
+        // Ожидание сети это не «подключено», зелёным не красим.
+        state.phase == ConnectPhase.Connected && state.noNetwork ->
+            MaterialTheme.colorScheme.onSurfaceVariant
+        state.phase == ConnectPhase.Connected -> MaterialTheme.colorScheme.primary
+        state.phase == ConnectPhase.Preparing || state.phase == ConnectPhase.Connecting ||
+            state.phase == ConnectPhase.Finalizing -> MaterialTheme.colorScheme.tertiary
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
     Text(statusText, style = MaterialTheme.typography.headlineMedium, color = statusColor)
@@ -709,15 +715,10 @@ fun ConnectionSection(
             )
         }
     }
-    // Тот же честный кейс при поднятом туннеле: связи нет, движок ждёт её
-    // возвращения, статус Connected сам по себе об этом не говорит.
+    // При поднятом туннеле без сети сам заголовок уже говорит «Ожидание сети»,
+    // поэтому дублирующую строку не рисуем, только поясняющую подпись.
     if (state.connected && state.noNetwork) {
         Spacer(Modifier.height(4.dp))
-        Text(
-            "Нет сети",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
         Text(
             "VPN восстановится сам, когда связь вернётся",
             style = MaterialTheme.typography.bodySmall,
