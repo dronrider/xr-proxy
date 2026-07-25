@@ -671,7 +671,7 @@ fun ConnectionSection(
     if (state.paused && state.noNetwork) {
         Spacer(Modifier.height(4.dp))
         Text(
-            "Сети нет",
+            "Нет сети",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -710,7 +710,7 @@ fun ConnectionSection(
     if (state.connected && state.noNetwork) {
         Spacer(Modifier.height(4.dp))
         Text(
-            "Сети нет",
+            "Нет сети",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

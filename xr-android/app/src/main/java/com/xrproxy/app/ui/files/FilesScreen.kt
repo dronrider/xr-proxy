@@ -336,7 +336,7 @@ private fun ShareListView(
         if (configs.isEmpty() && ui.storeReady) {
             item {
                 Text(
-                    if (ui.hubOffline) "Сети нет, а сохранённых шар пока нет"
+                    if (ui.hubOffline) "Нет сети, а сохранённых шар пока нет"
                     else "Пока нет шар. Обнови список и добавь нужные.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(8.dp),
@@ -628,7 +628,7 @@ private fun ExplorerView(
                 when {
                     ui.manifest.isEmpty() && ui.offlineLocal -> item {
                         Text(
-                            "Сети нет, а скачанных файлов пока нет", modifier = Modifier.padding(16.dp),
+                            "Нет сети, а скачанных файлов пока нет", modifier = Modifier.padding(16.dp),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }

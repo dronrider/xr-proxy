@@ -1360,11 +1360,11 @@ class XrVpnService : VpnService() {
             Phase.Idle, Phase.Preparing -> "Запуск…"
             Phase.Connecting -> "Подключение…"
             Phase.Finalizing -> "Проверка маршрутов…"
-            Phase.Connected -> if (state.noNetwork) "Сети нет, VPN восстановится сам"
+            Phase.Connected -> if (state.noNetwork) "Нет сети, VPN восстановится сам"
             else state.snapshot?.let { s ->
                 "↑${formatBytes(s.bytesUp)} ↓${formatBytes(s.bytesDown)} • ${formatUptime(s.uptime)}"
             } ?: "Подключено"
-            Phase.Paused -> if (state.noNetwork) "На паузе, сети нет" else {
+            Phase.Paused -> if (state.noNetwork) "На паузе, нет сети" else {
                 val base = state.pausedSsid?.let { "На паузе · доверенная сеть «$it»" }
                     ?: "На паузе · доверенная сеть"
                 if (state.restrictedNetwork) "$base · ⚠ в сети ограничения" else base
