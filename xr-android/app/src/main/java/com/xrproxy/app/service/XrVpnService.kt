@@ -172,6 +172,12 @@ class XrVpnService : VpnService() {
     // tunnel for direct-mode DNS lookups. Registered at VPN start, torn
     // down on stop. See NativeBridge.resolveDomain for the consumer side.
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    // Все живые физические аплинки (NET_CAPABILITY_NOT_VPN). Пустое множество
+    // это «сети нет». Считаем именно по нему, а не по дефолтному колбэку:
+    // при поднятом туннеле дефолт видит наш VPN, а не физику, и пропажу сотовой
+    // в авиарежиме дефолтный onLost не ловит (XR-183). Мутируется только с
+    // потока колбэков ConnectivityManager, поэтому обычный HashSet безопасен.
+    private val underlyingNetworks = HashSet<Network>()
 
     // Separate callback that watches only the DEFAULT (active) uplink so we
     // can (a) re-bind the tunnel when it switches (LTE↔Wi-Fi, task 3b-1) and
@@ -1009,18 +1015,26 @@ class XrVpnService : VpnService() {
 
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                underlyingNetworks.add(network)
                 NativeBridge.underlyingNetwork = network
                 // Inform the framework that traffic is metered/unmetered
-                // through this uplink — it's also what SystemUI uses to
+                // through this uplink, it's also what SystemUI uses to
                 // decide the signal-strength indicator above the VPN key.
                 setUnderlyingNetworks(arrayOf(network))
+                // Физика вернулась: снять «сети нет» (при живом туннеле только
+                // этот колбэк её и увидит, XR-183).
+                exitNoNetwork()
             }
             override fun onLost(network: Network) {
+                underlyingNetworks.remove(network)
                 // Only clear if the lost one is what we were pointing at;
                 // another network may already be Available.
                 if (NativeBridge.underlyingNetwork == network) {
-                    NativeBridge.underlyingNetwork = null
+                    NativeBridge.underlyingNetwork = underlyingNetworks.firstOrNull()
                 }
+                // Ушёл последний физический аплинк это и есть «сети нет»,
+                // независимо от того, поднят туннель или нет.
+                if (underlyingNetworks.isEmpty()) enterNoNetwork()
             }
         }
         try {
@@ -1080,25 +1094,13 @@ class XrVpnService : VpnService() {
     private fun onDefaultAvailable(network: Network) {
         val previous = currentDefaultNetwork
         currentDefaultNetwork = network
-        // Через update, не присваиванием: сюда пишет поток ConnectivityManager,
-        // а pollLoop параллельно копирует состояние с Dispatchers.Default, и
-        // проигранная гонка теряла бы один из апдейтов.
-        val cameFromNoNetwork = _stateFlow.value.noNetwork
-        if (cameFromNoNetwork) {
-            _stateFlow.update { it.copy(noNetwork = false) }
-            justLeftNoNetwork = true
-            updateNotification()
-        }
-        // A real switch — owe a re-bind (deferred until onCapabilities tells us
+        // A real switch, owe a re-bind (deferred until onCapabilities tells us
         // the new network isn't trusted; see maybeEvaluate). The user override
         // deliberately survives this point: a Wi-Fi reconnect changes the netId
         // without leaving the network, so the SSID-keyed override is only
-        // re-checked once capabilities arrive (maybeDisarmOverride).
-        // После полной пропажи сети previous обнулён, но переживший её туннель
-        // сидит на мёртвых сокетах так же, как при смене сетей: re-bind нужен
-        // и на выходе из «сети нет», иначе Connected оживал бы только медленным
-        // нативным детектором таймаутов.
-        if ((previous != null && previous != network) || cameFromNoNetwork) {
+        // re-checked once capabilities arrive (maybeDisarmOverride). Re-bind на
+        // выходе из «сети нет» ставит exitNoNetwork (его зовёт NOT_VPN-колбэк).
+        if (previous != null && previous != network) {
             pendingSwitch = true
         }
     }
@@ -1109,22 +1111,48 @@ class XrVpnService : VpnService() {
         maybeEvaluate(network, caps)
     }
 
-    /** Последняя дефолтная сеть ушла, замены нет: авиарежим или пропавший
-     *  Wi-Fi. При обычной смене сетей onAvailable новой приходит раньше
-     *  onLost старой, и guard по currentDefaultNetwork этот случай отсекает.
-     *  Проба ограничений на мёртвом аплинке фейлит все хосты подряд и
-     *  рисовала бы «в сети ограничения» там, где сети нет вовсе (XR-095):
-     *  цикл гасим, вердикт сбрасываем, UI показывает честное «сети нет». */
+    /** Дефолтная сеть ушла: чистим её трекинг (SSID, флаг Wi-Fi). Саму «сети
+     *  нет» ставит не здесь, а `enterNoNetwork` по NOT_VPN-колбэку: при живом
+     *  туннеле дефолт видит VPN, а не физику, и до сюда пропажа аплинка не
+     *  доходит (XR-183). Пустой аплинк-сет из NOT_VPN честнее в обоих режимах. */
     private fun onDefaultLost(network: Network) {
         if (network != currentDefaultNetwork) return
         currentDefaultNetwork = null
         currentRawSsid = null
         currentDefaultIsWifi = false
+    }
+
+    /** Физического аплинка не осталось (авиарежим, пропавший Wi-Fi). Проба
+     *  ограничений на мёртвом аплинке фейлит все хосты и рисовала бы «в сети
+     *  ограничения» там, где сети нет вовсе (XR-095): цикл гасим, вердикт и
+     *  отложенный resume сбрасываем, UI показывает честное «сети нет».
+     *  Идемпотентно: заход из обоих колбэков (дефолтного и NOT_VPN) безвреден. */
+    private fun enterNoNetwork() {
+        if (_stateFlow.value.noNetwork) return
         probeJob?.cancel()
         probeJob = null
-        // Сеть снова пропала: отложенный resume после авиарежима больше не нужен.
-        cancelGraceResume()
+        // Флаг окна ожидания Wi-Fi (XR-095) взводим при ВХОДЕ в «сети нет», а не
+        // при выходе: «сети нет» и возврат приходят из разных колбэков (дефолт и
+        // NOT_VPN), их порядок не гарантирован, а к моменту, когда maybeEvaluate
+        // на вернувшейся сотовой решает про grace, флаг уже должен стоять. doPause
+        // и cancelGraceResume его гасят раньше любого ложного чтения.
+        justLeftNoNetwork = true
+        graceResumeJob?.cancel()
+        graceResumeJob = null
+        // Через update, не присваиванием: сюда пишет поток ConnectivityManager,
+        // а pollLoop параллельно копирует состояние с Dispatchers.Default, и
+        // проигранная гонка теряла бы один из апдейтов.
         _stateFlow.update { it.copy(noNetwork = true, restrictedNetwork = false) }
+        updateNotification()
+    }
+
+    /** Физический аплинк вернулся. Снимаем «сети нет» и ставим долг на re-bind
+     *  туннеля к новому аплинку (иначе Connected оживал бы только медленным
+     *  нативным детектором). Окно ожидания Wi-Fi уже взведено на входе. */
+    private fun exitNoNetwork() {
+        if (!_stateFlow.value.noNetwork) return
+        _stateFlow.update { it.copy(noNetwork = false) }
+        pendingSwitch = true
         updateNotification()
     }
 
@@ -1224,6 +1252,7 @@ class XrVpnService : VpnService() {
         val cb = networkCallback ?: return
         networkCallback = null
         NativeBridge.underlyingNetwork = null
+        underlyingNetworks.clear()
         if (cm == null) return
         try {
             cm.unregisterNetworkCallback(cb)
