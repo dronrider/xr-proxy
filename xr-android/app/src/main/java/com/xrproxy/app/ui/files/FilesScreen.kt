@@ -47,6 +47,7 @@ import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -626,6 +627,11 @@ private fun ExplorerView(
                             "Сети нет, а скачанных файлов пока нет", modifier = Modifier.padding(16.dp),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                    }
+                    // Первое открытие шары без локального кэша: список ещё пуст,
+                    // маленького индикатора жеста мало, показываем явный спиннер.
+                    level.isEmpty() && ui.manifestLoading -> item {
+                        CircularProgressIndicator(modifier = Modifier.padding(16.dp))
                     }
                     level.isEmpty() && !ui.manifestLoading -> item {
                         Text(
