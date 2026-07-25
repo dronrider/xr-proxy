@@ -47,6 +47,7 @@ import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -348,7 +349,10 @@ private fun ShareListView(
         // кнопке с тремя точками (макет 1d), единственное касание карточки
         // открывает шару (XR-055).
         items(configs, key = { it.shareId }) { cfg ->
-            Card(modifier = Modifier.fillMaxWidth().clickable { vm.openShare(cfg) }) {
+            Card(
+                modifier = Modifier.fillMaxWidth().clickable { vm.openShare(cfg) },
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+            ) {
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(start = 12.dp, top = 12.dp, bottom = 12.dp, end = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
