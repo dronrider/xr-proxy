@@ -367,13 +367,17 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Отмена удаления из undo-снекбара: вернуть придержанный конфиг как был.
-     *  Локальные файлы удаление не трогает, так что восстановление полное,
-     *  вместе с выбором и тумблером синка. */
+    /** Отмена удаления из undo-снекбара: вернуть придержанный конфиг как был,
+     *  вместе с выбором и тумблером синка (локальные файлы удаление не трогает).
+     *  removeShare успел отменить живую закачку, поэтому включённый синк
+     *  продолжает сразу, не дожидаясь периодического слота WorkManager. */
     fun restoreShare(cfg: ShareConfig) {
         viewModelScope.launch {
             store().upsert(cfg)
             rescheduleIfNeeded()
+            if (cfg.syncEnabled) {
+                withContext(Dispatchers.IO) { ShareSyncScheduler.syncNow(getApplication()) }
+            }
         }
     }
 

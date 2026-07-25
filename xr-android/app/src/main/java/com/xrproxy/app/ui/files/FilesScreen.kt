@@ -64,6 +64,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TriStateCheckbox
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -73,7 +74,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
@@ -90,6 +90,7 @@ import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
 import com.xrproxy.app.model.TreeNode
 import com.xrproxy.app.model.explorerLevel
+import kotlinx.coroutines.launch
 import java.io.File
 
 /**
@@ -174,6 +175,9 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
     val deleteWithUndo: (ShareConfig) -> Unit = { cfg ->
         vm.removeShare(cfg.shareId)
         scope.launch {
+            // Второе удаление подряд вытесняет висящий снекбар: очередь
+            // showSnackbar задержала бы отклик на десять секунд.
+            snackbarHost.currentSnackbarData?.dismiss()
             val result = snackbarHost.showSnackbar(
                 message = "Шара «${cfg.name}» удалена",
                 actionLabel = "Отменить",
@@ -421,7 +425,17 @@ private fun ShareActionsSheet(
     onDelete: (ShareConfig) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    ModalBottomSheet(onDismissRequest = onDismiss) {
+    val sheetState = rememberModalBottomSheetState()
+    val scope = rememberCoroutineScope()
+    // Кнопки закрывают лист той же анимацией, что свайп и тап по скриму:
+    // сначала hide, действие после, иначе лист исчезает рывком.
+    fun dismissThen(action: () -> Unit) {
+        scope.launch { sheetState.hide() }.invokeOnCompletion {
+            onDismiss()
+            action()
+        }
+    }
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -444,7 +458,7 @@ private fun ShareActionsSheet(
             icon = { Icon(Icons.Default.FolderOpen, contentDescription = null) },
             title = "Открыть шару",
             chevron = true,
-            onClick = { onDismiss(); vm.openShare(cfg) },
+            onClick = { dismissThen { vm.openShare(cfg) } },
         )
         SheetActionRow(
             icon = { Icon(Icons.Default.Sync, contentDescription = null) },
@@ -461,7 +475,7 @@ private fun ShareActionsSheet(
             title = "Папка на устройстве",
             subtitle = StorageAccess.label(cfg.storagePath),
             chevron = true,
-            onClick = { onDismiss(); vm.openStorageDialog(cfg.shareId) },
+            onClick = { dismissThen { vm.openStorageDialog(cfg.shareId) } },
         )
         HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
         SheetActionRow(
@@ -471,7 +485,7 @@ private fun ShareActionsSheet(
             },
             title = "Удалить шару",
             titleColor = MaterialTheme.colorScheme.error,
-            onClick = { onDismiss(); onDelete(cfg) },
+            onClick = { dismissThen { onDelete(cfg) } },
         )
         Spacer(Modifier.height(16.dp))
     }
