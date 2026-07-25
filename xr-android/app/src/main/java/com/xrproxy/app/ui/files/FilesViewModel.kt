@@ -264,6 +264,9 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         e.startsWith("agent_offline") -> e.substringAfter(": ", "агент шары не на связи")
         e.startsWith("access_expired") -> e.substringAfter(": ", "доступ к шаре истёк")
         e.startsWith("stale_token") -> "токен шары устарел, обновите список по инвайту"
+        // Транспортный сбой (нет сети, агент недоступен): с офлайн-полным
+        // списком качать нечего, файл ждёт сеть. Категорию наружу не тащим.
+        e.startsWith("network") -> "нет сети, попробуйте позже"
         else -> e
     }
 
@@ -527,17 +530,21 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     },
                     onFailure = { e ->
                         // Сетевой провал явного refresh переводит шару в офлайн.
-                        // Держим уже показанный полный список (кэш манифеста),
-                        // если он есть, и только при его отсутствии падаем на
-                        // локальные файлы. Ретрай (XR-099) молча вернёт свежий
-                        // список, когда связь появится.
+                        // Держим полный список, если он уже на экране: либо это
+                        // кэш (offlineFullListing), либо свежий серверный список
+                        // с онлайн-открытия (!offlineLocal). st.manifest в любой
+                        // ветке не беднее localManifest, поэтому падать на него
+                        // надо только когда полного списка не было вовсе, иначе
+                        // жест-refresh офлайн ронял бы шару до «только скачанные»
+                        // (XR-099). Ретрай молча вернёт свежий список с сетью.
                         val offline = e.isOffline() || e.isAgentOffline()
-                        val fallback = if (st.offlineFullListing) st.manifest else localManifest
+                        val hadFull = st.offlineFullListing || !st.offlineLocal
+                        val fallback = if (hadFull) st.manifest else localManifest
                         st.copy(
                             manifestLoading = false,
                             manifest = if (offline) fallback else st.manifest,
                             offlineLocal = st.offlineLocal || offline,
-                            offlineFullListing = st.offlineFullListing,
+                            offlineFullListing = if (offline) hadFull else st.offlineFullListing,
                             // No network (also the offline outcome of a stale-token
                             // heal, XR-167): a clean line, not the raw reqwest text.
                             message = if (e.isOffline()) "Список: хаб недоступен, попробуйте позже"
