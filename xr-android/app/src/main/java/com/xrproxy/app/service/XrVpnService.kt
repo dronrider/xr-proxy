@@ -175,8 +175,9 @@ class XrVpnService : VpnService() {
     // Все живые физические аплинки (NET_CAPABILITY_NOT_VPN). Пустое множество
     // это «сети нет». Считаем именно по нему, а не по дефолтному колбэку:
     // при поднятом туннеле дефолт видит наш VPN, а не физику, и пропажу сотовой
-    // в авиарежиме дефолтный onLost не ловит (XR-183). Мутируется только с
-    // потока колбэков ConnectivityManager, поэтому обычный HashSet безопасен.
+    // в авиарежиме дефолтный onLost не ловит (XR-183). Читается/пишется с потока
+    // колбэков ConnectivityManager; единственное исключение это clear() на
+    // тир-дауне, и он идёт уже после unregister, когда колбэки не приходят.
     private val underlyingNetworks = HashSet<Network>()
 
     // Separate callback that watches only the DEFAULT (active) uplink so we
@@ -613,13 +614,19 @@ class XrVpnService : VpnService() {
             else
                 healthTracker.update(snap.relayErrors, snap.relayWarnings)
 
-            _stateFlow.value = _stateFlow.value.copy(
-                phase = phase,
-                snapshot = snap,
-                speedUp = speedUp,
-                speedDown = speedDown,
-                health = health,
-            )
+            // Через update, не присваиванием: колбэк сети параллельно правит
+            // noNetwork атомарным update, а copy-assign с прочитанного снапшота
+            // затёр бы его обратно (Connected + «сети нет» это теперь штатное
+            // состояние, XR-183). Тот же резон у прочих писателей ниже.
+            _stateFlow.update {
+                it.copy(
+                    phase = phase,
+                    snapshot = snap,
+                    speedUp = speedUp,
+                    speedDown = speedDown,
+                    health = health,
+                )
+            }
             updateNotification()
             delay(1000)
         }
@@ -708,7 +715,7 @@ class XrVpnService : VpnService() {
                 restrictedStreak = if (result.restricted) restrictedStreak + 1 else 0
                 val confirmed = restrictedStreak >= RESTRICT_CONFIRM_PROBES
                 if (_stateFlow.value.restrictedNetwork != confirmed) {
-                    _stateFlow.value = _stateFlow.value.copy(restrictedNetwork = confirmed)
+                    _stateFlow.update { it.copy(restrictedNetwork = confirmed) }
                     updateNotification()
                 }
                 if (result.restricted && !confirmed) {
@@ -841,7 +848,7 @@ class XrVpnService : VpnService() {
     private fun setOverrideSsid(ssid: String?) {
         if (overrideSsid == ssid) return
         overrideSsid = ssid
-        _stateFlow.value = _stateFlow.value.copy(overrideSsid = ssid)
+        _stateFlow.update { it.copy(overrideSsid = ssid) }
     }
 
     /** Remember the current network as user-overridden ("включить здесь").
@@ -1103,6 +1110,11 @@ class XrVpnService : VpnService() {
         if (previous != null && previous != network) {
             pendingSwitch = true
         }
+        // Фолбэк для OEM, где NOT_VPN-колбэк не поднялся (SecurityException в
+        // registerUnderlyingNetworkCallback): там «сети нет» некому снять по
+        // физике, берём на себя дефолтный колбэк, как было до XR-183. В паузе
+        // дефолт видит физику, так что кейс XR-095 не регрессирует.
+        if (networkCallback == null) exitNoNetwork()
     }
 
     private fun onDefaultCaps(network: Network, caps: NetworkCapabilities) {
@@ -1120,6 +1132,9 @@ class XrVpnService : VpnService() {
         currentDefaultNetwork = null
         currentRawSsid = null
         currentDefaultIsWifi = false
+        // Фолбэк на OEM без NOT_VPN-колбэка (см. onDefaultAvailable): в паузе
+        // дефолт это физика, её пропажу отрабатываем здесь, как до XR-183.
+        if (networkCallback == null) enterNoNetwork()
     }
 
     /** Физического аплинка не осталось (авиарежим, пропавший Wi-Fi). Проба
@@ -1252,13 +1267,18 @@ class XrVpnService : VpnService() {
         val cb = networkCallback ?: return
         networkCallback = null
         NativeBridge.underlyingNetwork = null
-        underlyingNetworks.clear()
-        if (cm == null) return
+        if (cm == null) {
+            underlyingNetworks.clear()
+            return
+        }
         try {
             cm.unregisterNetworkCallback(cb)
         } catch (_: IllegalArgumentException) {
-            // Already unregistered — benign race with Android-side cleanup.
+            // Already unregistered, benign race with Android-side cleanup.
         }
+        // Чистим сет после unregister: новые onAvailable/onLost уже не придут,
+        // гонки с потоком колбэков нет.
+        underlyingNetworks.clear()
     }
 
     // ── State publishing helpers ──────────────────────────────────────
@@ -1272,13 +1292,15 @@ class XrVpnService : VpnService() {
         // probe re-sets it on the next pause.
         restrictedNetwork: Boolean = if (phase == Phase.Paused) _stateFlow.value.restrictedNetwork else false,
     ) {
-        _stateFlow.value = _stateFlow.value.copy(
-            phase = phase,
-            snapshot = snapshot,
-            errorMessage = errorMessage,
-            pausedSsid = pausedSsid,
-            restrictedNetwork = restrictedNetwork,
-        )
+        _stateFlow.update {
+            it.copy(
+                phase = phase,
+                snapshot = snapshot,
+                errorMessage = errorMessage,
+                pausedSsid = pausedSsid,
+                restrictedNetwork = restrictedNetwork,
+            )
+        }
     }
 
     private fun readSnapshot(): StatsSnapshot {
