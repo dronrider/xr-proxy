@@ -600,7 +600,10 @@ private fun ExplorerView(
         Breadcrumbs(cfg.name, ui.currentPath) { vm.navigateTo(it) }
         if (ui.offlineLocal && ui.manifest.isNotEmpty()) {
             Text(
-                "Офлайн: показаны только скачанные файлы",
+                // Полный кэшированный манифест показывает и не скачанные файлы,
+                // так что «только скачанные» тут врало бы (XR-099).
+                if (ui.offlineFullListing) "Офлайн: показан последний известный список, файлы могли измениться"
+                else "Офлайн: показаны только скачанные файлы",
                 fontSize = 11.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(vertical = 2.dp),

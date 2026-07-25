@@ -138,6 +138,41 @@ class ShareRepository(private val context: Context) {
         }
     }
 
+    // -- Кэш манифеста (XR-099) --------------------------------------
+    // Последний удачно полученный от агента манифест кладём на диск, чтобы
+    // повторный заход в шару офлайн показывал полный список файлов (в том
+    // числе не скачанных), а не только то, что лежит на телефоне. Ключ по
+    // shareId, живёт отдельно от самих файлов шары.
+
+    private fun manifestCacheFile(shareId: String): File =
+        File(context.filesDir, "manifest-cache").apply { mkdirs() }
+            .let { File(it, "$shareId.json") }
+
+    /** Сохранить полный серверный манифест шары. Тихо глотает ошибки записи:
+     *  кэш это ускорение офлайна, а не источник правды. */
+    fun saveManifestCache(config: ShareConfig, manifest: List<ManifestEntry>) {
+        runCatching {
+            val arr = JSONArray()
+            manifest.forEach { arr.put(JSONObject(it.toJson())) }
+            manifestCacheFile(config.shareId).writeText(arr.toString())
+        }
+    }
+
+    /** Прочитать сохранённый манифест, либо null (нет кэша или битый). */
+    fun loadManifestCache(config: ShareConfig): List<ManifestEntry>? {
+        val file = manifestCacheFile(config.shareId)
+        if (!file.exists()) return null
+        return runCatching {
+            val arr = JSONArray(file.readText())
+            (0 until arr.length()).map { ManifestEntry.fromJson(arr.getJSONObject(it)) }
+        }.getOrNull()
+    }
+
+    /** Убрать кэш при удалении шары, чтобы не копился мусор. */
+    fun clearManifestCache(shareId: String) {
+        runCatching { manifestCacheFile(shareId).delete() }
+    }
+
     /** A manifest built from the locally-downloaded files, for offline browsing:
      *  when the agent is unreachable the already-downloaded files must stay
      *  viewable and openable. Hash is empty (unknown offline); size/mtime local. */

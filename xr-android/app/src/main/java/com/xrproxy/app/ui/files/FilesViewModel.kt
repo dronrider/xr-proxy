@@ -104,6 +104,11 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
          *  lands) and after an offline fetch failure. Combined with an empty
          *  [manifest] it renders the "no network, nothing downloaded" state. */
         val offlineLocal: Boolean = false,
+        /** True when the offline listing is the persisted server manifest (full
+         *  file list, XR-099), not just the downloaded files: the banner then
+         *  says the listing is the last known one, and non-downloaded files stay
+         *  visible. False means only local files are shown. */
+        val offlineFullListing: Boolean = false,
         val localPaths: Set<String> = emptySet(),
         /** FIFO of files queued with the per-row plus (XR-044); the head is the
          *  one being downloaded (or waiting out the background mirror's lock). */
@@ -384,6 +389,9 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     fun removeShare(shareId: String) {
         viewModelScope.launch {
             store().remove(shareId)
+            // Кэш манифеста шары больше не нужен. Undo (XR-055) вернёт запись,
+            // а полный список подтянется при следующем онлайн-заходе.
+            withContext(Dispatchers.IO) { repo.clearManifestCache(shareId) }
             rescheduleIfNeeded()
             _ui.update { st ->
                 st.copy(
@@ -410,24 +418,38 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update {
             it.copy(
                 openShareId = config.shareId, currentPath = "",
-                manifest = emptyList(), manifestLoading = true, offlineLocal = false,
+                manifest = emptyList(), manifestLoading = true,
+                offlineLocal = false, offlineFullListing = false,
             )
         }
         ensureTransferPolling()
         viewModelScope.launch {
-            // Cache-first (XR-059): the already-downloaded files show up right
-            // away, the fresh manifest replaces them when the fetch lands. The
-            // old fetch-then-fallback order kept a spinner up for the whole
-            // manifest timeout when the VPN is up but the server unreachable:
-            // the local smoltcp stack accepts the connect (SYN-ACK before the
-            // upstream), so the connect-timeout never fires.
+            // Cache-first (XR-059): показать что-то мгновенно, а свежий манифест
+            // заменит это, когда фетч дойдёт. Раньше кэшем служил только список
+            // скачанных файлов, и повторный заход офлайн ронял шару до «видно
+            // только то, что на телефоне» (XR-099). Теперь предпочитаем полный
+            // сохранённый манифест: офлайн видно всё содержимое шары, а пометка
+            // говорит, что список последний известный. Fallback на локальные
+            // файлы остаётся, когда кэша манифеста ещё нет.
             val localManifest = withContext(Dispatchers.IO) { repo.localManifest(config) }
             val local = localManifest.map { it.path }.toSet()
             adoptLocalIntoSelection(config.shareId, local)
-            if (localManifest.isNotEmpty()) {
-                _ui.update { st ->
+            val cached = withContext(Dispatchers.IO) { repo.loadManifestCache(config) }
+            val cachedListing = cached?.takeIf { it.isNotEmpty() }?.let { withLocalOnly(it, localManifest) }
+            when {
+                cachedListing != null -> _ui.update { st ->
                     if (st.openShareId != config.shareId) return@update st
-                    st.copy(manifest = localManifest, manifestLoading = false, localPaths = local, offlineLocal = true)
+                    st.copy(
+                        manifest = cachedListing, manifestLoading = false,
+                        localPaths = local, offlineLocal = true, offlineFullListing = true,
+                    )
+                }
+                localManifest.isNotEmpty() -> _ui.update { st ->
+                    if (st.openShareId != config.shareId) return@update st
+                    st.copy(
+                        manifest = localManifest, manifestLoading = false,
+                        localPaths = local, offlineLocal = true, offlineFullListing = false,
+                    )
                 }
             }
             val result = fetchManifestHealing(config)
@@ -437,14 +459,16 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     onSuccess = {
                         st.copy(
                             manifest = withLocalOnly(it, localManifest),
-                            manifestLoading = false, localPaths = local, offlineLocal = false,
+                            manifestLoading = false, localPaths = local,
+                            offlineLocal = false, offlineFullListing = false,
                         )
                     },
                     onFailure = { e ->
                         when {
                             // The agent is gone from the relay: mark the share
                             // offline and say so, instead of the raw network
-                            // error against the loopback address (XR-134).
+                            // error against the loopback address (XR-134). Кэш
+                            // манифеста (если был) остаётся на экране.
                             e.isAgentOffline() ->
                                 st.copy(
                                     manifestLoading = false, offlineLocal = true,
@@ -463,9 +487,9 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                             // error the user should see, unlike a mere no-network.
                             !e.isOffline() ->
                                 st.copy(manifestLoading = false, message = "Манифест: ${e.message}")
-                            // Offline with the local list already on screen: the
-                            // "Офлайн" mark says it all, no toast on top.
-                            localManifest.isNotEmpty() -> st
+                            // Offline, а cache-first уже показал кэш или локальные
+                            // файлы: пометка «Офлайн» всё говорит, тост не нужен.
+                            st.manifest.isNotEmpty() -> st.copy(manifestLoading = false)
                             // Offline and nothing downloaded: an honest empty
                             // state instead of a raw error (rendered in-place).
                             else -> st.copy(manifestLoading = false, offlineLocal = true)
@@ -473,8 +497,14 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     },
                 )
             }
-            if (result.isSuccess) enqueueMissingSelected(config.shareId)
-            else maybeStartOfflineRetry(result.exceptionOrNull())
+            if (result.isSuccess) {
+                result.getOrNull()?.let { fresh ->
+                    withContext(Dispatchers.IO) { repo.saveManifestCache(config, fresh) }
+                }
+                enqueueMissingSelected(config.shareId)
+            } else {
+                maybeStartOfflineRetry(result.exceptionOrNull())
+            }
         }
     }
 
@@ -492,20 +522,22 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     onSuccess = {
                         st.copy(
                             manifest = withLocalOnly(it, localManifest),
-                            manifestLoading = false, offlineLocal = false,
+                            manifestLoading = false, offlineLocal = false, offlineFullListing = false,
                         )
                     },
                     onFailure = { e ->
-                        // Сетевой провал явного refresh переводит шару в тот же
-                        // офлайн, что и открытие без сети: в списке локальные
-                        // файлы (плашка «показаны только скачанные» обязана им
-                        // соответствовать), а ретрай (XR-099) молча вернёт полный
+                        // Сетевой провал явного refresh переводит шару в офлайн.
+                        // Держим уже показанный полный список (кэш манифеста),
+                        // если он есть, и только при его отсутствии падаем на
+                        // локальные файлы. Ретрай (XR-099) молча вернёт свежий
                         // список, когда связь появится.
                         val offline = e.isOffline() || e.isAgentOffline()
+                        val fallback = if (st.offlineFullListing) st.manifest else localManifest
                         st.copy(
                             manifestLoading = false,
-                            manifest = if (offline) localManifest else st.manifest,
+                            manifest = if (offline) fallback else st.manifest,
                             offlineLocal = st.offlineLocal || offline,
+                            offlineFullListing = st.offlineFullListing,
                             // No network (also the offline outcome of a stale-token
                             // heal, XR-167): a clean line, not the raw reqwest text.
                             message = if (e.isOffline()) "Список: хаб недоступен, попробуйте позже"
@@ -514,8 +546,14 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     },
                 )
             }
-            if (result.isSuccess) enqueueMissingSelected(config.shareId)
-            else maybeStartOfflineRetry(result.exceptionOrNull())
+            if (result.isSuccess) {
+                result.getOrNull()?.let { fresh ->
+                    withContext(Dispatchers.IO) { repo.saveManifestCache(config, fresh) }
+                }
+                enqueueMissingSelected(config.shareId)
+            } else {
+                maybeStartOfflineRetry(result.exceptionOrNull())
+            }
         }
     }
 
@@ -564,11 +602,12 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
      *  папка живёт в currentPath и подмену переживает. */
     private suspend fun applyFreshManifest(config: ShareConfig, fresh: List<ManifestEntry>) {
         val localManifest = withContext(Dispatchers.IO) { repo.localManifest(config) }
+        withContext(Dispatchers.IO) { repo.saveManifestCache(config, fresh) }
         _ui.update { st ->
             if (st.openShareId != config.shareId) return@update st
             st.copy(
                 manifest = withLocalOnly(fresh, localManifest),
-                manifestLoading = false, offlineLocal = false,
+                manifestLoading = false, offlineLocal = false, offlineFullListing = false,
             )
         }
         enqueueMissingSelected(config.shareId)
