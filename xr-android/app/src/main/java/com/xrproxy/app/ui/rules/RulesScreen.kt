@@ -55,6 +55,7 @@ import com.xrproxy.app.data.UserRule
 import com.xrproxy.app.data.UserRulesStore
 import com.xrproxy.app.ui.PresetRefresh
 import com.xrproxy.app.ui.VpnViewModel
+import com.xrproxy.app.ui.components.XrPullToRefresh
 import com.xrproxy.app.ui.components.XrSnackbarHost
 import com.xrproxy.app.ui.UiSeverity
 import kotlinx.coroutines.Dispatchers
@@ -136,10 +137,31 @@ fun RulesScreen(
             )
         },
     ) { padding ->
+        // Обновление пресета хаба тем же жестом, что и кнопка «Обновить сейчас»
+        // на карточке (стандарт XR-181): свайп-вниз перечитывает пресет с хаба.
+        val refreshPreset: () -> Unit = {
+            refreshing = true
+            scope.launch {
+                when (val r = viewModel.refreshPresetNow()) {
+                    is PresetRefresh.Updated ->
+                        snack("Пресет обновлён до v${r.version}")
+                    is PresetRefresh.UpToDate ->
+                        snack("Пресет v${r.version} актуален")
+                    is PresetRefresh.Failed ->
+                        snack(r.message, UiSeverity.Error)
+                }
+                presetEpoch++
+                refreshing = false
+            }
+        }
+        XrPullToRefresh(
+            refreshing = refreshing,
+            onRefresh = refreshPreset,
+            modifier = Modifier.padding(padding),
+        ) {
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding)
                 .padding(horizontal = 16.dp),
         ) {
             item {
@@ -147,21 +169,7 @@ fun RulesScreen(
                     presetName = presetName,
                     preset = preset,
                     refreshing = refreshing,
-                    onRefresh = {
-                        refreshing = true
-                        scope.launch {
-                            when (val r = viewModel.refreshPresetNow()) {
-                                is PresetRefresh.Updated ->
-                                    snack("Пресет обновлён до v${r.version}")
-                                is PresetRefresh.UpToDate ->
-                                    snack("Пресет v${r.version} актуален")
-                                is PresetRefresh.Failed ->
-                                    snack(r.message, UiSeverity.Error)
-                            }
-                            presetEpoch++
-                            refreshing = false
-                        }
-                    },
+                    onRefresh = refreshPreset,
                     onDetails = { detailsOpen = true },
                 )
             }
@@ -214,6 +222,7 @@ fun RulesScreen(
                 }
                 Spacer(Modifier.height(24.dp))
             }
+        }
         }
     }
 

@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -46,7 +47,6 @@ import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -86,6 +86,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xrproxy.app.data.StorageAccess
+import com.xrproxy.app.ui.components.XrPullToRefresh
 import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
 import com.xrproxy.app.model.TreeNode
@@ -276,8 +277,16 @@ private fun ShareListView(
     // не снимок.
     var menuShareId by remember { mutableStateOf<String?>(null) }
 
+    // Свайп-вниз обновляет список по инвайту (XR-125, стандарт XR-181): тот же
+    // refreshHub, что и кнопка в шапке, и общий флаг loadingHub гасит оба
+    // индикатора, поэтому отдельный инлайн-спиннер убран.
+    XrPullToRefresh(
+        refreshing = ui.loadingHub,
+        onRefresh = { vm.refreshHub(hubUrl, inviteToken) },
+        modifier = modifier,
+    ) {
     LazyColumn(
-        modifier = modifier.padding(horizontal = 16.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         item {
@@ -302,7 +311,6 @@ private fun ShareListView(
             }
         }
         if (ui.migratingShareId != null) item { ProgressBar(ui.transfer) { vm.cancelTransfer() } }
-        if (ui.loadingHub) item { CircularProgressIndicator(modifier = Modifier.padding(8.dp)) }
 
         if (addable.isNotEmpty()) {
             item { SectionLabel("Доступно по инвайту") }
@@ -359,6 +367,7 @@ private fun ShareListView(
             }
         }
         item { Spacer(Modifier.height(24.dp)) }
+    }
     }
 
     val menuCfg = configs.firstOrNull { it.shareId == menuShareId }
@@ -555,7 +564,7 @@ private fun ExplorerView(
         folderPresence(ui.manifest, ui.currentPath, ui.localPaths, queuedPaths)
     }
 
-    Column(modifier = modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
+    Column(modifier = modifier.fillMaxSize().padding(horizontal = 12.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -601,30 +610,45 @@ private fun ExplorerView(
         }
         HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
 
-        when {
-            ui.manifestLoading -> CircularProgressIndicator(modifier = Modifier.padding(16.dp))
-            ui.manifest.isEmpty() && ui.offlineLocal -> Text(
-                "Сети нет, а скачанных файлов пока нет", modifier = Modifier.padding(16.dp),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            level.isEmpty() -> Text(
-                "Папка пуста", modifier = Modifier.padding(16.dp),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            else -> LazyColumn {
-                items(level, key = { it.path }) { node ->
-                    when (node) {
-                        is TreeNode.Folder -> FolderRow(node, folderPresence[node.path], cfg, vm)
-                        is TreeNode.FileNode -> FileRow(
-                            node, cfg, ui, vm,
-                            isHead = node.entry.path == headPath,
-                            queued = node.entry.path != headPath && node.entry.path in queuedPaths,
-                            failed = failedByPath[node.entry.path],
-                        ) { detailsFor = it }
+        // Свайп-вниз перезапрашивает манифест у агента (стандарт XR-181): тот же
+        // refreshManifest, что и кнопка в шапке. Контент всегда LazyColumn, даже
+        // пустой, иначе жесту не за что зацепиться; индикатор manifestLoading
+        // рисует сам жест, отдельный спиннер убран.
+        XrPullToRefresh(
+            refreshing = ui.manifestLoading,
+            onRefresh = { vm.refreshManifest(cfg) },
+            modifier = Modifier.weight(1f),
+        ) {
+            LazyColumn(modifier = Modifier.fillMaxSize()) {
+                when {
+                    ui.manifest.isEmpty() && ui.offlineLocal -> item {
+                        Text(
+                            "Сети нет, а скачанных файлов пока нет", modifier = Modifier.padding(16.dp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
-                    HorizontalDivider()
+                    level.isEmpty() && !ui.manifestLoading -> item {
+                        Text(
+                            "Папка пуста", modifier = Modifier.padding(16.dp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    else -> {
+                        items(level, key = { it.path }) { node ->
+                            when (node) {
+                                is TreeNode.Folder -> FolderRow(node, folderPresence[node.path], cfg, vm)
+                                is TreeNode.FileNode -> FileRow(
+                                    node, cfg, ui, vm,
+                                    isHead = node.entry.path == headPath,
+                                    queued = node.entry.path != headPath && node.entry.path in queuedPaths,
+                                    failed = failedByPath[node.entry.path],
+                                ) { detailsFor = it }
+                            }
+                            HorizontalDivider()
+                        }
+                        item { Spacer(Modifier.height(24.dp)) }
+                    }
                 }
-                item { Spacer(Modifier.height(24.dp)) }
             }
         }
     }
