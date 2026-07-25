@@ -613,8 +613,8 @@ fun ConnectionSection(
 
     // Status text with inline health emoji (LLD-08). Без сети смайлик прячем:
     // движок в авиарежиме сыплет ошибками от отсутствия аплинка, и «плохое»
-    // лицо при живом туннеле вводит в заблуждение (XR-183). Строка «Нет сети»
-    // под статусом сама объясняет состояние.
+    // лицо при живом туннеле вводит в заблуждение (XR-183). Заголовок
+    // «Ожидание сети» сам объясняет состояние.
     val healthEmoji = if (state.connected && !state.noNetwork) {
         when (state.health) {
             HealthLevel.Healthy -> " \uD83D\uDE0A"
