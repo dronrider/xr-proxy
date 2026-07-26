@@ -99,7 +99,8 @@
   - низ — острая точка по центру с закруглением кончика (радиус 4%).
   - Пропорции: высота щита 100%, ширина в самой широкой части (верх) 80%.
   - Stroke-free, **сплошная заливка** `primary` (#22D3EE).
-  - Щит занимает safe-zone целиком (66dp в adaptive icon foreground).
+  - Силуэт вписан в safe zone adaptive-иконки (круг диаметром 66),
+    а не растянут на неё целиком: иначе верхние углы срезает круглая маска.
 
 - **Стрела-молния.** Пересекает щит по диагонали сверху-справа вниз-влево:
   - Углы излома — зигзаг из трёх сегментов (как знак молнии ⚡), но
@@ -556,7 +557,7 @@ Material Symbols (они имеют лицензию Apache-2.0) — это са
 
 | Файл | Что меняется |
 |---|---|
-| `xr-android/app/src/main/res/values/colors.xml` | Палитра из §3.1 (12 цветов + `gradient_top/bottom` для icon background). |
+| `xr-android/app/src/main/res/values/colors.xml` | Палитра из раздела 3.1. |
 | `xr-android/app/src/main/java/com/xrproxy/app/ui/theme/XrTheme.kt` (новый) | `darkColorScheme(...)` на основе ресурсов. `@Composable fun XrTheme(content: @Composable () -> Unit)`. |
 | [MainActivity.kt](../../xr-android/app/src/main/java/com/xrproxy/app/ui/MainActivity.kt) | `setContent { XrTheme { ... } }`. Edge-to-edge: `WindowCompat.setDecorFitsSystemWindows(window, false)`, стиль status bar — light icons. Переработать `ConnectionSection`: центральная `ShieldArrowIcon` вместо Lock/LockOpen, строка статуса + подстрока шагов, pill-кнопка, карточки статистики через `StatsCard`, `DebugSection` вместо плоской колонки метрик. |
 | `xr-android/app/src/main/java/com/xrproxy/app/ui/components/ShieldArrowIcon.kt` (новый) | Canvas-композит щита и стрелы, анимация по `ConnectPhase` (§3.5). |
@@ -569,8 +570,6 @@ Material Symbols (они имеют лицензию Apache-2.0) — это са
 | [XrVpnService.kt](../../xr-android/app/src/main/java/com/xrproxy/app/service/XrVpnService.kt) | В polling-цикле хранить prev snapshot, вычислять delta → `speedUp/speedDown` в `ServiceState`. Публиковать Preparing/Connecting/Finalizing переходы в правильных точках (см. таблицу §3.6). Добавить `HealthTracker`, обновлять на каждом тике, публиковать `ServiceState.health` (§3.5a). Notification — добавить `setColor` из `R.color.primary` и моно-иконку `ic_notification`. |
 | `res/mipmap-anydpi-v26/ic_launcher.xml` | Adaptive icon с foreground+background, §3.2. |
 | `res/drawable/ic_launcher_foreground.xml` | Vector со щитом и стрелой, §3.2. |
-| `res/drawable/ic_launcher_background.xml` | Vector с градиентом, §3.2. |
-| `res/mipmap-*/ic_launcher.png` (legacy) | PNG-рендеры через Image Asset Studio, 48/72/96/144/192 dp. |
 | `res/drawable/ic_notification.xml` (новый) | §3.3. Можно будет использовать для LLD-02 (там она тоже указана). |
 | `res/drawable/ic_upload.xml`, `ic_download.xml`, `ic_speed_up.xml`, `ic_speed_down.xml`, `ic_uptime.xml`, `ic_connections.xml`, `ic_debug.xml`, `ic_expand.xml`, `ic_notification_stop.xml`, `ic_info.xml`, `ic_warning_round.xml`, `ic_error.xml` | Новые моно-vector'ы, §3.9 и §3.9a. |
 | [AndroidManifest.xml](../../xr-android/app/src/main/AndroidManifest.xml) | `android:theme` — убрать `Theme.Material.Light.NoActionBar`, заменить на `@style/Theme.XrProxy` (наш, parent — `Theme.Material3.DynamicDark.NoActionBar` либо `Theme.Material3.DarkNoActionBar`). |
@@ -584,10 +583,9 @@ Material Symbols (они имеют лицензию Apache-2.0) — это са
 
 ## 5. Риски и edge-кейсы
 
-1. **Canvas vs векторный ассет.** Мы рисуем `ShieldArrowIcon` на Canvas, а
-   иконку приложения — через vector drawable. Если формы разойдутся, два
-   «щита» будут выглядеть по-разному. Митигация: тестовый экран (dev-flag),
-   который показывает оба рядом, — визуальная проверка при каждом изменении.
+1. **Canvas vs векторный ассет.** Снято в XR-187: у экранной иконки и у
+   вектора лаунчера теперь одна геометрия, вектор пересчитан из тех же
+   координат. Расходиться нечему, отдельный сравнительный экран не нужен.
    После стабилизации экран удалить.
 2. **Минимальное время показа фаз 300 ms.** На слабом устройстве реальный
    переход может быть медленнее, и «обёртка» не добавит ничего — это ок.
@@ -599,12 +597,9 @@ Material Symbols (они имеют лицензию Apache-2.0) — это са
    invalidation перерисовывает экран каждый кадр. На фазе Connecting это
    максимум 2-3 секунды — пренебрежимо. На фазе Connected включена только
    тонкая пульсация раз в 2 сек, между тиками Compose ничего не перерисовывает.
-4. **Adaptive icon на старых прошивках.** Android < 8 использует legacy PNG.
-   Android 8+ — adaptive. Важно, чтобы PNG-рендер в `mipmap-*` визуально
-   совпадал с adaptive icon (щит должен занимать те же пропорции, которые
-   после обрезки safe zone получаются одинаковыми). Практически — это
-   значит PNG рисуется на той же канве, что foreground adaptive, без
-   background gradient, с явным margin под обрезку.
+4. **Adaptive icon на старых прошивках.** Снято в XR-187: minSdk 29, ниже
+   Android 10 приложение не ставится, поэтому adaptive-иконка применяется
+   всегда, а legacy-растры удалены как недостижимые.
 5. **Цветовая слепота.** `primary` (cyan) и `error` (red) различимы при
    обоих типах цветовой слепоты (deuteranopia/protanopia), но для
    перестраховки в статусных сообщениях рядом с цветом всегда есть текст
@@ -630,9 +625,9 @@ Material Symbols (они имеют лицензию Apache-2.0) — это са
 Ручная (согласно правилу из LLD-02 §6 — автотестов в Android-слое не
 заводим):
 
-1. **Собрать и установить APK.** Иконка в лаунчере — щит со стрелой,
-   узнаваемая издалека. На Android 8+ — adaptive, на 7- — legacy PNG,
-   оба варианта проверить в эмуляторе.
+1. **Собрать и установить APK.** Иконка в лаунчере это щит с молнией в
+   брендовом cyan, узнаваемая издалека. Проверить на круглой маске: углы
+   щита не срезаны.
 2. **Тёмная тема.** После установки открыть приложение — экран полностью
    тёмный (#0B1220), нет белых flash'ей при старте, статус-бар в цвет фона.
 3. **Idle state.** Центральная иконка `ShieldArrowIcon` нарисована

@@ -13,10 +13,6 @@
     <color name="on_error">#FF0B1220</color>
     <color name="outline">#FF334155</color>
 
-    <!-- Adaptive icon background gradient endpoints -->
-    <color name="gradient_top">#FF0F172A</color>
-    <color name="gradient_bottom">#FF0B1220</color>
-
     <!-- Legacy alias for notification (backward compat) -->
     <color name="brand_primary">#FF22D3EE</color>
 </resources>
