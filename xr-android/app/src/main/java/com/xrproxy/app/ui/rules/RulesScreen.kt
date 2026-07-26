@@ -21,6 +21,7 @@ import androidx.compose.material.icons.automirrored.filled.Rule
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -164,7 +165,11 @@ fun RulesScreen(
                 .fillMaxSize()
                 .padding(horizontal = 16.dp),
         ) {
+            if (state.paused) {
+                item { RulesPausedNote() }
+            }
             item {
+                SectionHeader("Серверные правила", "Раздаёт хаб, только для чтения")
                 PresetCard(
                     presetName = presetName,
                     preset = preset,
@@ -174,15 +179,9 @@ fun RulesScreen(
                 )
             }
             item {
-                Text(
+                SectionHeader(
                     "Мои правила",
-                    style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.padding(top = 16.dp, bottom = 4.dp),
-                )
-                Text(
-                    "Срабатывают раньше пресета, выше в списке — раньше.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    "Переопределяют серверные, выше в списке применяется раньше.",
                 )
                 Spacer(Modifier.height(8.dp))
             }
@@ -267,6 +266,46 @@ private fun moveRule(rules: List<UserRule>, id: String, delta: Int): List<UserRu
     return mutable
 }
 
+/** Заголовок секции экрана правил: название плюс поясняющая строка. */
+@Composable
+private fun SectionHeader(title: String, subtitle: String) {
+    Text(
+        title,
+        style = MaterialTheme.typography.titleMedium,
+        modifier = Modifier.padding(top = 16.dp, bottom = 4.dp),
+    )
+    Text(
+        subtitle,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+/** Подпись при паузе в доверенной сети (XR-120): трафик идёт напрямую, правила
+ *  не действуют, поэтому список ниже нерелевантен. */
+@Composable
+private fun RulesPausedNote() {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.12f),
+        modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+    ) {
+        Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.Top) {
+            Icon(
+                Icons.Default.Pause,
+                null,
+                tint = MaterialTheme.colorScheme.tertiary,
+                modifier = Modifier.size(20.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                "В доверенной сети VPN на паузе. Трафик идёт напрямую, правила не действуют.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+}
+
 // ── Карточка пресета ────────────────────────────────────────────────
 
 @Composable
@@ -277,7 +316,7 @@ private fun PresetCard(
     onRefresh: () -> Unit,
     onDetails: () -> Unit,
 ) {
-    OutlinedCard(modifier = Modifier.fillMaxWidth().padding(top = 16.dp)) {
+    OutlinedCard(modifier = Modifier.fillMaxWidth().padding(top = 4.dp)) {
         Column(modifier = Modifier.padding(16.dp)) {
             if (presetName.isBlank()) {
                 Text("Пресет не подключён", style = MaterialTheme.typography.titleMedium)
