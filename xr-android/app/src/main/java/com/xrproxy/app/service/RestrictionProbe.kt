@@ -55,10 +55,8 @@ object RestrictionProbe {
      * network was flagged restricted (the app Log tab). Blocking, call off the
      * main thread.
      *
-     * Строки уходят в общий журнал приложения и держат его стиль (xr-core
-     * journal.rs): одно событие в строку, тема и детали через запятую, своей
-     * разметки нет. Прежние рамки, отступы и галочки выделяли пробу из ленты и
-     * ломали поиск по ней (XR-089).
+     * Lines go to the app-wide journal and follow its record style (see
+     * xr-core journal.rs): one event per line, no own markup.
      *
      * The network is flagged restricted only if **every** probed host is
      * unreachable (after retries). On a network that proxies for us at least one
@@ -84,7 +82,7 @@ object RestrictionProbe {
             }
             failed++
         }
-        log("итог пробы: сеть ограничена, ни один из $failed хостов не доступен напрямую")
+        log("итог пробы: сеть ограничена, ни один из ${hosts.size} хостов не доступен напрямую")
         return Result(restricted = hosts.isNotEmpty(), checked = hosts.size, failed = failed)
     }
 
@@ -113,7 +111,8 @@ object RestrictionProbe {
             answers.firstOrNull { it is java.net.Inet4Address }
                 ?: return Attempt(true, "только IPv6, A-записи нет, не сужу")
         } catch (e: Exception) {
-            return Attempt(false, "DNS-ошибка: ${e.javaClass.simpleName} ${e.message ?: ""}".trim())
+            val detail = e.message?.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""
+            return Attempt(false, "DNS-ошибка, ${e.javaClass.simpleName}$detail")
         }
 
         // 2) TCP + TLS handshake with SNI = host. DPI SNI-blocking resets or

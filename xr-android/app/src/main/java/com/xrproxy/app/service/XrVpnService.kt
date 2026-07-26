@@ -454,7 +454,7 @@ class XrVpnService : VpnService() {
             .establish()
 
         if (iface == null) {
-            NativeBridge.nativeJournalLog("ERROR", "vpn", "не удалось поднять TUN")
+            NativeBridge.nativeJournalLog("ERROR", "vpn", "Не удалось поднять TUN")
             publish(Phase.Error, errorMessage = "Не удалось поднять TUN")
             updateNotification()
             stopInternal()
