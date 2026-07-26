@@ -301,10 +301,13 @@ impl ServerPool {
         self.slots.get(idx).map(|s| s.state.lock().unwrap().health)
     }
 
-    fn emit(&self, msg: &str) {
-        tracing::info!("{}", msg);
+    /// Событие пула уходит в два адреса, и текст у них разный: в tracing по-английски,
+    /// его читает разработчик в логах роутера и сервера, а `on_event` ведёт в журнал
+    /// приложения, где запись видит пользователь и стиль там русский (XR-089).
+    fn emit(&self, dev: &str, user: &str) {
+        tracing::info!("{}", dev);
         if let Some(cb) = &self.on_event {
-            cb(msg);
+            cb(user);
         }
     }
 
@@ -320,12 +323,12 @@ impl ServerPool {
             .is_ok();
         if switched {
             self.slots[to].note_became_active();
-            self.emit(&format!(
-                "server {}: {} -> {}",
-                reason,
-                self.slots[from].label(),
-                self.slots[to].label(),
-            ));
+            let from_label = self.slots[from].label();
+            let to_label = self.slots[to].label();
+            self.emit(
+                &format!("server {}: {} -> {}", reason, from_label, to_label),
+                &format!("сервер сменён ({}): {} -> {}", reason, from_label, to_label),
+            );
         }
         switched
     }
@@ -476,10 +479,14 @@ impl ServerPool {
         }
         let cur = self.active.swap(0, Ordering::Relaxed);
         if cur != 0 {
-            self.emit(&format!(
-                "server pool recycled, active reset to {}",
-                self.slots[0].label()
-            ));
+            let label = self.slots[0].label();
+            self.emit(
+                &format!("server pool recycled, active reset to {}", label),
+                &format!(
+                    "пул серверов пересобран после смены сети, снова работаю через {}",
+                    label,
+                ),
+            );
         }
     }
 
@@ -963,8 +970,13 @@ mod tests {
 
         let _ = pool.open_stream(&target()).await.expect("backup serves");
         let log = events.lock().unwrap();
+        // Формулировка проверяется вместе с фактом события: `on_event` ведёт в
+        // журнал приложения, и запись там русская, как у остальных источников
+        // (XR-089). Английское `server failover: ...` осталось только в tracing.
         assert!(
-            log.iter().any(|m| m.contains("failover") && m.contains("timeweb")),
+            log.iter().any(|m| {
+                m.starts_with("сервер сменён") && m.contains("failover") && m.contains("timeweb")
+            }),
             "failover must be reported to the host log, got: {:?}",
             *log
         );
