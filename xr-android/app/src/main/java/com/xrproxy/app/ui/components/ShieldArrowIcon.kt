@@ -131,7 +131,7 @@ fun ShieldArrowIcon(phase: ConnectPhase, modifier: Modifier = Modifier) {
  *  успевало погаснуть, не дойдя до строки статуса под иконкой: Canvas не
  *  обрезает рисование по своим границам. */
 private const val RING_NEAR = 0.9f
-private const val RING_FAR = 1.3f
+private const val RING_FAR = 1.22f
 
 /** Расходящееся кольцо: растёт от щита наружу и гаснет к 70% пути. */
 private fun radarRing(p: Float): Pair<Float, Float> {
