@@ -453,7 +453,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
 
     let config_str: String = match env.get_string(&config_json) {
         Ok(s) => s.into(),
-        Err(_) => return err(&mut env, "Failed to read config string"),
+        Err(_) => return err(&mut env, "Не удалось прочитать конфигурацию"),
     };
 
     let mut config = match parse_config(&config_str) {
@@ -481,7 +481,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
         .build()
     {
         Ok(rt) => rt,
-        Err(e) => return err(&mut env, &format!("Tokio runtime error: {}", e)),
+        Err(e) => return err(&mut env, &format!("Не удалось запустить runtime: {}", e)),
     };
 
     let _guard = runtime.enter();
