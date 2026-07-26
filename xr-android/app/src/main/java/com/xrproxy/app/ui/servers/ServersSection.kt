@@ -29,6 +29,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.xrproxy.app.data.ServerProfile
 import com.xrproxy.app.data.ServerSource
@@ -125,17 +126,26 @@ private fun ServerCard(
             Spacer(Modifier.width(8.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(server.name, style = MaterialTheme.typography.bodyLarge)
+                // Вес на адресе, а не на пресете: Row меряет невзвешенные
+                // элементы первыми, поэтому пресет забирает свою ширину целиком,
+                // а длинный адрес с пулом резервов ужимается с эллипсисом.
+                // Без этого пресету оставалась пара букв и он переносился
+                // посимвольно в столбик (XR-184).
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
                         server.displaySubtitle,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
                     )
                     if (server.presetLabel.isNotBlank()) {
                         Text(
                             server.presetLabel,
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.primary,
+                            maxLines = 1,
                         )
                     }
                 }
