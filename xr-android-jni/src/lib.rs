@@ -12,6 +12,7 @@ use std::time::Duration;
 use xr_core::engine::{VpnConfig, VpnEngine};
 use xr_core::ip_stack::PacketQueue;
 use xr_core::onboarding;
+use xr_core::presets;
 use xr_core::session::{ProtectSocketFn, SystemResolverFn};
 use xr_core::sync;
 use xr_core::update;
@@ -1147,6 +1148,28 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeListShares(
 
     let json = match with_onboarding_runtime(sync::list_shares(&hub_url, timeout)) {
         Ok(Ok(shares)) => serde_json::json!({ "shares": shares }).to_string(),
+        Ok(Err(e)) | Err(e) => json_error(&e),
+    };
+    jstring_into_raw(&mut env, json)
+}
+
+/// GET the hub's public preset list (summaries, XR-119). Returns
+/// `{"presets":[{name,version,updated_at,rules_count}...]}` or `{"error":".."}`.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeListPresets(
+    mut env: JNIEnv,
+    _class: JClass,
+    hub_url: JString,
+    timeout_ms: jlong,
+) -> jstring {
+    let hub_url = match read_jstring(&mut env, &hub_url) {
+        Ok(s) => s,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+
+    let json = match with_onboarding_runtime(presets::list_presets(&hub_url, timeout)) {
+        Ok(Ok(list)) => serde_json::json!({ "presets": list }).to_string(),
         Ok(Err(e)) | Err(e) => json_error(&e),
     };
     jstring_into_raw(&mut env, json)
