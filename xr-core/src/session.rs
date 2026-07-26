@@ -376,8 +376,9 @@ async fn relay_direct(
 
     // Симметрично записи про прокси: без неё пользователь не отличит по журналу,
     // какой путь выбран для соединения.
-    ctx.stats.add_log(&format!("напрямую: {}", journal_target(domain, real_dst)));
-    tracing::debug!("direct connect for {:?} {}", domain, real_dst);
+    let label = journal_target(domain, real_dst);
+    ctx.stats.add_log(&format!("напрямую: {}", label));
+    tracing::debug!("direct connect for {}", label);
 
     let (mut tr, mut tw) = target.into_split();
 
@@ -721,22 +722,19 @@ mod tests {
         assert!(err.to_string().contains("no answers"));
     }
 
-    /// XR-089: обе ветки маршрута описывают цель одинаково и без своей
-    /// разметки. Раньше прокси-строка печатала отладочный `Domain("x", 443)`,
-    /// а direct повторяла его вручную, и в ленте это читалось как события
-    /// разной природы.
+    /// XR-089: метка цели в журнале это `хост:порт`, одна и та же у прокси-ветки
+    /// и у direct. Раньше прокси печатала отладочный `Domain("x", 443)`, а
+    /// direct повторяла этот формат вручную, и в ленте события выглядели как
+    /// записи разной природы.
     #[test]
     fn journal_target_is_flat_host_port() {
         let addr: SocketAddr = "142.250.1.1:443".parse().unwrap();
         assert_eq!(journal_target(Some("www.youtube.com"), addr), "www.youtube.com:443");
         assert_eq!(journal_target(None, addr), "142.250.1.1:443");
-        for label in [journal_target(Some("x.example"), addr), journal_target(None, addr)] {
-            assert!(
-                !label.contains(|c: char| matches!(c, '"' | '(' | ')')),
-                "метка цели не должна нести своей разметки, получили {}",
-                label,
-            );
-        }
+        // Порт берётся из адреса, а не из хвоста домена: домен с портом внутри
+        // не должен давать `x:8443:443`.
+        assert_eq!(journal_target(Some("x.example"), "1.2.3.4:8443".parse().unwrap()),
+            "x.example:8443");
     }
 
     #[tokio::test]

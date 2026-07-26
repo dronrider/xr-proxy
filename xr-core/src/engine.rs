@@ -625,9 +625,13 @@ async fn run_event_loop(
                 let real_dst = session.real_dst;
                 let cached_domain = session.domain.clone();
                 let key_clone = *key;
-                // "ip-only" = сессия без восстановленного домена (IP-литерал или
-                // просроченный fake DNS-кэш). "NO_DOMAIN" было слишком техническим.
-                let domain_tag = cached_domain.as_deref().unwrap_or("ip-only").to_string();
+                // Метка цели для записи в журнал: домен вместе с реальным адресом,
+                // а без восстановленного домена (IP-литерал или просроченный fake
+                // DNS-кэш) только адрес.
+                let target_label = match cached_domain.as_deref() {
+                    Some(d) => format!("{} ({})", d, real_dst),
+                    None => real_dst.to_string(),
+                };
                 let relay_waker = waker.clone();
                 tokio::spawn(async move {
                     let relay_key = TcpSessionKey {
@@ -637,7 +641,7 @@ async fn run_event_loop(
                     match relay_session_with_domain(ctx_clone.clone(), relay_key, cached_domain, to_relay_rx, from_relay_tx, relay_waker).await {
                         Ok(()) => {}
                         Err(e) => {
-                            let msg = format!("[{}] {}: {}", domain_tag, real_dst, e);
+                            let msg = format!("сбой соединения {}: {}", target_label, e);
                             let err_text = e.to_string();
 
                             // Специальный случай: DoT-блок. Он работает по контракту
