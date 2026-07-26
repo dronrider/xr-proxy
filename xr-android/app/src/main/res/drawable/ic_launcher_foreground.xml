@@ -1,58 +1,46 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Shield pierced by lightning arrow (LLD-06 §3.2) -->
+<!--
+  Передний слой иконки лаунчера: щит с вырезанной молнией.
+
+  Геометрия та же, что рисует ShieldArrowIcon на главном экране, только
+  пересчитанная из системы 100x120 в 108x108. Иначе иконка приложения и
+  иконка в лаунчере разъезжаются формой, о чём LLD-06 и предупреждает в
+  разделе 5.
+
+  Размер выбран так, чтобы силуэт целиком лёг в safe zone adaptive-иконки:
+  круг диаметром 66 в центре холста. Самая дальняя точка контура это 32.15
+  от центра при допустимых 33, поэтому круглая маска ничего не срежет.
+  Прежний вектор был крупнее (верхние углы уходили на 43) и терял их на
+  круглых масках, а молния торчала за пределы щита.
+-->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- Shield: heater-shield silhouette, primary cyan fill -->
+    <!-- Щит: сплошная заливка primary -->
     <path
         android:fillColor="#22D3EE"
         android:pathData="
-            M54,21
-            Q54,21 54,21
-            L77,21
-            Q79.5,21 79.5,23
-            Q82,35 82,45
-            Q82,62 68,76
-            Q58,85.5 54,87
-            Q50,85.5 40,76
-            Q26,62 26,45
-            Q26,35 28.5,23
-            Q28.5,21 31,21
+            M33.4,30.94
+            Q33.4,28.0 36.34,28.0
+            L71.66,28.0
+            Q74.6,28.0 74.6,30.94
+            L74.6,50.57
+            Q74.6,67.25 54.0,80.0
+            Q33.4,67.25 33.4,50.57
             Z" />
 
-    <!-- Lightning bolt "hole" through shield — background color = cut-out effect -->
+    <!-- Молния: вырезана цветом фона, тем же, что у background-слоя -->
     <path
         android:fillColor="#0B1220"
         android:pathData="
-            M68,26
-            L58,46
-            L66,46
-            L48,72
-            L54,52
-            L46,52
-            L56,26
-            Z" />
-
-    <!-- Lightning bolt extension above shield — visible primary -->
-    <path
-        android:fillColor="#22D3EE"
-        android:pathData="
-            M72,17
-            L68,26
-            L56,26
-            L62,17
-            Z" />
-
-    <!-- Lightning bolt extension below shield — visible primary -->
-    <path
-        android:fillColor="#22D3EE"
-        android:pathData="
-            M48,72
-            L44,82
-            L52,82
-            L54,72
+            M57.92,36.83
+            L45.66,57.43
+            L52.53,57.43
+            L49.58,72.15
+            L62.83,50.57
+            L55.47,50.57
             Z" />
 </vector>
