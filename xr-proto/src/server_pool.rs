@@ -223,6 +223,41 @@ impl ServerSlot {
     }
 }
 
+/// Почему сменился активный сервер. Причина едет в две ленты сразу, поэтому
+/// хранится типом, а не строкой: в tracing уходит привычное разработчику
+/// `failover`, в журнал приложения русская формулировка.
+#[derive(Copy, Clone)]
+enum SwitchReason {
+    /// Активный не отдал стрим (или не ответил в срок), ушли на резерв.
+    Failover,
+    /// Активный туннелирует, но живой трафик через него сыплется (XR-094).
+    RelayDegraded,
+    /// Более приоритетный сервер выздоровел и отстоял hold-down.
+    Failback,
+    /// Первый прогрев: активным становится самый приоритетный из живых.
+    Warmup,
+}
+
+impl SwitchReason {
+    fn dev(self) -> &'static str {
+        match self {
+            Self::Failover => "failover",
+            Self::RelayDegraded => "failover (relay degraded)",
+            Self::Failback => "failback",
+            Self::Warmup => "warmup",
+        }
+    }
+
+    fn user(self) -> &'static str {
+        match self {
+            Self::Failover => "сервер не ответил, перешёл на резерв",
+            Self::RelayDegraded => "через сервер не идёт трафик, перешёл на резерв",
+            Self::Failback => "основной сервер снова живой, вернулся на него",
+            Self::Warmup => "выбран сервер",
+        }
+    }
+}
+
 /// Клиентский пул серверов: primary/backup по приоритету, sticky-to-primary.
 pub struct ServerPool {
     /// Отсортированы по приоритету, индекс 0 это primary.
@@ -313,7 +348,7 @@ impl ServerPool {
 
     /// Атомарно переключает активный сервер. CAS защищает от дублей при
     /// конкурентных failover'ах: лог и событие получает только победитель.
-    fn switch_active(&self, from: usize, to: usize, reason: &str) -> bool {
+    fn switch_active(&self, from: usize, to: usize, reason: SwitchReason) -> bool {
         if from == to {
             return false;
         }
@@ -326,8 +361,8 @@ impl ServerPool {
             let from_label = self.slots[from].label();
             let to_label = self.slots[to].label();
             self.emit(
-                &format!("server {}: {} -> {}", reason, from_label, to_label),
-                &format!("сервер сменён ({}): {} -> {}", reason, from_label, to_label),
+                &format!("server {}: {} -> {}", reason.dev(), from_label, to_label),
+                &format!("{}: {} -> {}", reason.user(), from_label, to_label),
             );
         }
         switched
@@ -371,7 +406,7 @@ impl ServerPool {
                         if self.slots[start].active_for().is_some_and(|d| d < FAILBACK_FLAP_WINDOW) {
                             self.slots[start].penalize_flap(self.profile.failback_hold);
                         }
-                        self.switch_active(start, idx, "failover");
+                        self.switch_active(start, idx, SwitchReason::Failover);
                     } else if self.slots[start].active_for().is_some_and(|d| d >= FAILBACK_FLAP_WINDOW) {
                         // Активный устойчиво отдаёт реальный трафик дольше окна
                         // мигания: снимаем накопленный штраф, будущий failback
@@ -439,7 +474,7 @@ impl ServerPool {
                     // На старте/после re-bind липкость не действует: активным
                     // сразу становится самый приоритетный из живых.
                     let cur = self.active.load(Ordering::Relaxed);
-                    self.switch_active(cur, idx, "warmup");
+                    self.switch_active(cur, idx, SwitchReason::Warmup);
                     Ok(())
                 }
                 None => Err(last_err.unwrap_or_else(|| {
@@ -454,7 +489,7 @@ impl ServerPool {
                     Ok(()) => {
                         self.slots[idx].mark_up();
                         if idx != start {
-                            self.switch_active(start, idx, "failover");
+                            self.switch_active(start, idx, SwitchReason::Failover);
                         }
                         return Ok(());
                     }
@@ -542,7 +577,7 @@ impl ServerPool {
             }
             if let Some(up) = self.slots[idx].up_for() {
                 if up >= self.profile.failback_hold {
-                    self.switch_active(active, idx, "failback");
+                    self.switch_active(active, idx, SwitchReason::Failback);
                     break;
                 }
             }
@@ -575,7 +610,7 @@ impl ServerPool {
         // Окно счётчиков чистим: после failback деградацию должен подтвердить
         // свежий трафик, а не хвост старых сбоев.
         self.slots[active].pool.relay_health().reset();
-        self.switch_active(active, to, "failover (relay degraded)");
+        self.switch_active(active, to, SwitchReason::RelayDegraded);
     }
 }
 
@@ -975,7 +1010,7 @@ mod tests {
         // (XR-089). Английское `server failover: ...` осталось только в tracing.
         assert!(
             log.iter().any(|m| {
-                m.starts_with("сервер сменён") && m.contains("failover") && m.contains("timeweb")
+                m.starts_with("сервер не ответил, перешёл на резерв") && m.contains("timeweb")
             }),
             "failover must be reported to the host log, got: {:?}",
             *log
@@ -1034,7 +1069,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|m| m.contains("relay degraded") && m.contains("backup")),
+                .any(|m| m.contains("не идёт трафик") && m.contains("backup")),
             "failover по деградации должен уйти событием в журнал"
         );
     }
@@ -1159,7 +1194,7 @@ mod tests {
         );
 
         // Уводим активность на backup и штрафуем primary (как будто мигнул).
-        pool.switch_active(0, 1, "failover");
+        pool.switch_active(0, 1, SwitchReason::Failover);
         assert_eq!(pool.active_index(), 1);
         pool.slots[0].penalize_flap(Duration::from_secs(3600));
 
