@@ -1,25 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--
-  Передний слой иконки лаунчера: щит с вырезанной молнией.
-
-  Геометрия та же, что рисует ShieldArrowIcon на главном экране, только
-  пересчитанная из системы 100x120 в 108x108. Иначе иконка приложения и
-  иконка в лаунчере разъезжаются формой, о чём LLD-06 и предупреждает в
-  разделе 5.
-
-  Размер выбран так, чтобы силуэт целиком лёг в safe zone adaptive-иконки:
-  круг диаметром 66 в центре холста. Самая дальняя точка контура это 32.15
-  от центра при допустимых 33, поэтому круглая маска ничего не срежет.
-  Прежний вектор был крупнее (верхние углы уходили на 43) и терял их на
-  круглых масках, а молния торчала за пределы щита.
--->
+<!-- Launcher foreground: shield with a cut-out bolt, geometry shared with ShieldArrowIcon, inscribed in the 66dp safe zone (LLD-06 3.2) -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- Щит: сплошная заливка primary -->
+    <!-- Shield: solid primary fill -->
     <path
         android:fillColor="#22D3EE"
         android:pathData="
@@ -32,7 +19,7 @@
             Q33.4,67.25 33.4,50.57
             Z" />
 
-    <!-- Молния: вырезана цветом фона, тем же, что у background-слоя -->
+    <!-- Bolt: cut out with the same colour the background layer uses -->
     <path
         android:fillColor="#0B1220"
         android:pathData="
