@@ -200,6 +200,9 @@ object NativeBridge {
      *  `{"shares":[{share_id,name,addr,port,agent_pubkey}...]}` or `{"error":..}`. */
     external fun nativeListShares(hubUrl: String, timeoutMs: Long): String
 
+    /** Публичный список пресетов хаба (сводки, XR-119). */
+    external fun nativeListPresets(hubUrl: String, timeoutMs: Long): String
+
     /** GET the shares attached to an invite (the access anchor, §9.5). Returns
      *  `{"shares":[{share_id,name,addr,port,agent_pubkey,token,exp}...]}` where
      *  `token` is the decoded ShareToken JSON ready for the manifest/download

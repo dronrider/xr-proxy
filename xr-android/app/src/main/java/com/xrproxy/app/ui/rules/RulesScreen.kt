@@ -62,6 +62,13 @@ import com.xrproxy.app.ui.UiSeverity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import androidx.compose.foundation.layout.Box
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.runtime.LaunchedEffect
+import com.xrproxy.app.ui.PresetList
 
 /**
  * Полноэкранный редактор правил маршрутизации (LLD-05, XR-047): карточка
@@ -103,6 +110,9 @@ fun RulesScreen(
     var tomlOpen by remember { mutableStateOf(false) }
     var detailsOpen by remember { mutableStateOf(false) }
     var refreshing by remember { mutableStateOf(false) }
+    var pickerOpen by remember { mutableStateOf(false) }
+    // Пресет выбираем только когда у активного сервера есть хаб (XR-119).
+    val canPick = activeServer?.hubUrl?.isNotBlank() == true
 
     // Единая точка сохранения: подсказка «применятся при следующем
     // подключении» показывается только при живом туннеле, когда она несёт
@@ -176,6 +186,7 @@ fun RulesScreen(
                     refreshing = refreshing,
                     onRefresh = refreshPreset,
                     onDetails = { detailsOpen = true },
+                    onPick = if (canPick) ({ pickerOpen = true }) else null,
                 )
             }
             item {
@@ -252,6 +263,21 @@ fun RulesScreen(
             onCopied = { snack("Скопировано") },
         )
     }
+    if (pickerOpen) {
+        PresetPickerSheet(
+            current = presetName,
+            loadPresets = { viewModel.listHubPresets() },
+            onPick = { name ->
+                pickerOpen = false
+                viewModel.setActivePreset(name)
+                presetEpoch++
+                if (state.connected) {
+                    snack("Пресет сменён. Применится при следующем подключении")
+                }
+            },
+            onDismiss = { pickerOpen = false },
+        )
+    }
 }
 
 /** Перестановка правила: [delta] +-1 на позицию, Int.MIN_VALUE/MAX_VALUE в край. */
@@ -315,11 +341,12 @@ private fun PresetCard(
     refreshing: Boolean,
     onRefresh: () -> Unit,
     onDetails: () -> Unit,
+    onPick: (() -> Unit)?,
 ) {
     OutlinedCard(modifier = Modifier.fillMaxWidth().padding(top = 4.dp)) {
         Column(modifier = Modifier.padding(16.dp)) {
             if (presetName.isBlank()) {
-                Text("Пресет не подключён", style = MaterialTheme.typography.titleMedium)
+                PresetTitleRow("Пресет не подключён", onPick)
                 Spacer(Modifier.height(4.dp))
                 Text(
                     "Правила сервера раздаёт хаб. Примените приглашение или " +
@@ -329,10 +356,10 @@ private fun PresetCard(
                 )
                 return@Column
             }
-            Text(
-                if (preset != null) "Пресет $presetName · v${preset.version}"
+            PresetTitleRow(
+                if (preset != null) "Пресет $presetName \u00B7 v${preset.version}"
                 else "Пресет $presetName",
-                style = MaterialTheme.typography.titleMedium,
+                onPick,
             )
             Spacer(Modifier.height(4.dp))
             Text(
@@ -357,6 +384,96 @@ private fun PresetCard(
                 }
                 OutlinedButton(onClick = onDetails, enabled = preset != null) {
                     Text("Подробнее")
+                }
+            }
+        }
+    }
+}
+
+/** Заголовок карточки пресета. Когда доступен выбор (onPick != null), строка
+ *  становится дропдауном с шевроном (XR-119). */
+@Composable
+private fun PresetTitleRow(text: String, onPick: (() -> Unit)?) {
+    if (onPick == null) {
+        Text(text, style = MaterialTheme.typography.titleMedium)
+        return
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onPick),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(text, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+        Icon(
+            Icons.Default.ArrowDropDown,
+            "Сменить пресет",
+            tint = MaterialTheme.colorScheme.primary,
+        )
+    }
+}
+
+/** Bottom sheet выбора пресета из списка хаба (XR-119). Список грузится один
+ *  раз при открытии; выбор пишется в профиль и применяется на следующем
+ *  подключении. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PresetPickerSheet(
+    current: String,
+    loadPresets: suspend () -> PresetList,
+    onPick: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val sheetState = rememberModalBottomSheetState()
+    var result by remember { mutableStateOf<PresetList?>(null) }
+    LaunchedEffect(Unit) { result = loadPresets() }
+
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
+        Column(modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp)) {
+            Text(
+                "Выбрать пресет",
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.padding(start = 24.dp, end = 24.dp, bottom = 8.dp),
+            )
+            when (val r = result) {
+                null -> Box(
+                    modifier = Modifier.fillMaxWidth().padding(32.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator(Modifier.size(28.dp), strokeWidth = 3.dp)
+                }
+                is PresetList.Failed -> Text(
+                    r.message,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp),
+                )
+                is PresetList.Ok -> if (r.presets.isEmpty()) {
+                    Text(
+                        "На хабе нет пресетов",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp),
+                    )
+                } else {
+                    r.presets.forEach { p ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onPick(p.name) }
+                                .padding(horizontal = 20.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            RadioButton(selected = p.name == current, onClick = { onPick(p.name) })
+                            Spacer(Modifier.width(8.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(p.name, style = MaterialTheme.typography.bodyLarge)
+                                Text(
+                                    "${p.rulesCount} правил \u00B7 v${p.version}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }

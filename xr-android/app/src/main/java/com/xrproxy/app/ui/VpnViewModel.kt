@@ -106,6 +106,15 @@ sealed interface PresetRefresh {
     data class Failed(val message: String) : PresetRefresh
 }
 
+/** Сводка пресета из листинга хаба для пикера выбора (XR-119). */
+data class HubPreset(val name: String, val version: Long, val rulesCount: Int)
+
+/** Исход загрузки списка пресетов для пикера. */
+sealed interface PresetList {
+    data class Ok(val presets: List<HubPreset>) : PresetList
+    data class Failed(val message: String) : PresetList
+}
+
 data class VpnUiState(
     val phase: ConnectPhase = ConnectPhase.Idle,
     val state: String = "Disconnected",
@@ -711,6 +720,41 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         code.startsWith("network") -> "Хаб недоступен. Проверьте интернет"
         code.startsWith("http_") -> "Ошибка хаба: ${code.removePrefix("http_")}"
         else -> "Не удалось обновить пресет: $code"
+    }
+
+    /** Список пресетов активного хаба для пикера выбора (XR-119). */
+    suspend fun listHubPresets(): PresetList {
+        val hubUrl = activeHubUrl() ?: return PresetList.Failed("У активного сервера не настроен хаб")
+        val json = withContext(Dispatchers.IO) {
+            NativeBridge.nativeListPresets(hubUrl, 5_000L)
+        }
+        val obj = runCatching { JSONObject(json) }.getOrNull()
+            ?: return PresetList.Failed("Ошибка ответа хаба")
+        obj.optString("error").takeIf { it.isNotBlank() }?.let { code ->
+            return PresetList.Failed(friendlyHubError(code))
+        }
+        val arr = obj.optJSONArray("presets") ?: return PresetList.Failed("Ошибка ответа хаба")
+        val out = buildList {
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                add(HubPreset(o.optString("name"), o.optLong("version"), o.optInt("rules_count")))
+            }
+        }
+        return PresetList.Ok(out)
+    }
+
+    /** Записать выбранный пресет в активный профиль. Применится на следующем
+     *  подключении: buildConfigJson читает hubPreset при старте. */
+    fun setActivePreset(name: String) {
+        val server = repo.activeServer() ?: return
+        if (server.hubPreset == name) return
+        repo.upsert(server.copy(hubPreset = name))
+    }
+
+    private fun friendlyHubError(code: String): String = when {
+        code.startsWith("network") -> "Хаб недоступен. Проверьте интернет"
+        code.startsWith("http_") -> "Ошибка хаба: ${code.removePrefix("http_")}"
+        else -> "Не удалось получить список пресетов: $code"
     }
 
     // ── APK self-update (LLD-12) ────────────────────────────────────
