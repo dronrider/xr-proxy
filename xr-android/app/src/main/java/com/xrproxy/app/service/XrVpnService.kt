@@ -454,8 +454,8 @@ class XrVpnService : VpnService() {
             .establish()
 
         if (iface == null) {
-            NativeBridge.nativeJournalLog("ERROR", "vpn", "TUN establish failed")
-            publish(Phase.Error, errorMessage = "TUN establish failed")
+            NativeBridge.nativeJournalLog("ERROR", "vpn", "не удалось поднять TUN")
+            publish(Phase.Error, errorMessage = "Не удалось поднять TUN")
             updateNotification()
             stopInternal()
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -703,7 +703,7 @@ class XrVpnService : VpnService() {
                 val seed = probeSeed++
                 val net = NativeBridge.underlyingNetwork
                 val ssid = _stateFlow.value.pausedSsid
-                logProbe("── Доверенная сеть «${ssid ?: "?"}» — проверка доступности ресурсов")
+                logProbe("проба доверенной сети «${ssid ?: "?"}»: туннель на паузе, проверяю доступность заблокированных ресурсов")
                 val result = withContext(Dispatchers.IO) { RestrictionProbe.probe(net, seed, ::logProbe) }
                 // Network may have changed during the probe: only apply if still paused.
                 if (_stateFlow.value.phase != Phase.Paused) break
@@ -719,7 +719,7 @@ class XrVpnService : VpnService() {
                     updateNotification()
                 }
                 if (result.restricted && !confirmed) {
-                    logProbe("  одиночный сбой, баннер не показываю — перепроверю через ${RESTRICT_CONFIRM_DELAY_MS / 1000}с")
+                    logProbe("проба: одиночный сбой, баннер не показываю, перепроверю через ${RESTRICT_CONFIRM_DELAY_MS / 1000}с")
                 }
                 // Recheck soon while a lone restricted result is unconfirmed (cold
                 // uplink self-heals); otherwise settle to the normal interval.
