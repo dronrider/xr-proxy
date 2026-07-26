@@ -188,7 +188,12 @@ Cargo-workspace + Android-модуль:
   Connected, Disconnecting, Error(String) }` + `StateHandle` на базе
   `tokio::sync::watch`. Реактивная доставка смены состояния.
 - [stats.rs](../xr-core/src/stats.rs) — `Stats` (atomic-счётчики без блокировок)
-  + `recent_errors` (Mutex<Vec>). `snapshot()` → `StatsSnapshot`.
+  + `add_log`/`add_warn`/`add_error`, они же пишут запись в журнал.
+  `snapshot()` -> `StatsSnapshot`.
+- [journal.rs](../xr-core/src/journal.rs): единый журнал приложения (XR-042),
+  общий буфер на все источники, хвост в памяти для вкладки Log и персист с
+  ротацией. Формат строки и общий стиль сообщения описаны в шапке модуля,
+  подробности в разделе 8.
 - [onboarding.rs](../xr-core/src/onboarding.rs) — one-shot HTTP-вызовы
   xr-hub для Android onboarding (LLD-04): `fetch_invite_info` (GET,
   без consume) и `apply_invite` (POST `/claim` → `InvitePayload` + TOFU
@@ -196,15 +201,15 @@ Cargo-workspace + Android-модуль:
   Живёт рядом с `presets.rs`, чтобы переиспользовать тот же reqwest-клиент
   и формат кэша; JNI-обёртки в `xr-android-jni` лишь прокидывают вызовы.
 
-**Важно:** `relay_errors` (счётчик) и `recent_errors` (журнал строк) — два
+**Важно:** `relay_errors` (счётчик) и `recent_errors` (хвост журнала) это два
 независимых источника. В Android UI бадж и заголовок вкладки Log считают
-WARN-строки прямо из `recent_errors` (см. §4.6), так что срез `entries.drain`
-в Rust автоматически уменьшает и бадж; `relay_errors` остался только как
-debug-метрика. Чтобы инвариант «бадж = число WARN в журнале» выполнялся,
-в `session.rs` строго разделены уровни: отказы mux-стрима идут через
-`add_relay_error` (WARN + счётчик), а шумный `mux relay for` — только через
-`tracing::debug!`, не засоряя `recent_errors` и не вытесняя WARN'ы через
-`drain(0..50)`.
+WARN-строки прямо по хвосту журнала (см. раздел 4.6), так что ротация в Rust
+автоматически уменьшает и бадж; `relay_errors` остался только как
+debug-метрика. Чтобы инвариант «бадж = число WARN в журнале» выполнялся, уровни
+строго разделены: отказы relay-задач классифицируются в `engine.rs` на
+`add_warn`/`add_error` (счётчик плюс WARN или ERROR в журнале), а выбранный путь
+соединения (`через прокси: ...`, `напрямую: ...`) идёт через `add_log` на INFO и
+бадж не задевает.
 
 ### 4.3 xr-client — OpenWRT-клиент
 
@@ -638,13 +643,17 @@ GeoIP (за feature-flag).
 - **Stats.** Все счётчики — atomics без блокировок, читаются по snapshot.
   Снимок сериализуется в JSON для Kotlin. В UI отображаются bytes up/down,
   connections, uptime, а также debug-метрики (DNS, SYNs, smol, relay_errors).
-- **Logs.** Два источника:
-  - `recent_errors: Mutex<Vec<String>>` — последние ~200 записей, старые
-    обрезаются пачками по 50. Читаются через `StatsSnapshot` (поле `errors`
-    в JSON), т.е. теми же вызовами `nativeGetStats()`, что и метрики.
-    Android UI показывает журнал и бадж Log из этого списка.
-    `nativeGetErrorLog()` оставлен как JNI-экспорт для совместимости, но
-    актуальная Android-реализация его не использует.
+- **Logs.** Единый журнал ([journal.rs](../xr-core/src/journal.rs), XR-042): все
+  источники (движок, пробы доверенной сети, смены сети и режима, файловые
+  операции) пишут в один буфер. Последние 400 строк держатся в памяти и
+  читаются через `StatsSnapshot` (поле `errors` в JSON), то есть теми же
+  вызовами `nativeGetStats()`, что и метрики; на диске лежит `journal.log` с
+  ротацией по размеру и числу файлов (настройка в приложении).
+  - Стиль записи общий для всех источников и описан в шапке `journal.rs`: одно
+    событие в строку, текст русский со строчной буквы, тема и детали через
+    двоеточие и запятые, своей разметки сообщение не несёт. Уровень и `[source]`
+    ставит журнал, по ним UI красит строки и считает бадж, поэтому рамки и
+    значки внутри сообщения только ломают поиск по ленте.
   - `relay_errors: AtomicU64` — счётчик ошибок relay-задач. На Android
     остался только как debug-метрика в статистике; UI-бадж вкладки Log его
     не читает.
