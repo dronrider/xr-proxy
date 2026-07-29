@@ -6,28 +6,50 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- Shield: solid primary fill -->
+    <!-- Shield: vertical gradient, light on top -->
+    <path android:pathData="
+            M54.0,23.58
+            C63.06,28.76 72.12,31.35 78.59,32.0
+            L78.59,50.76
+            C78.59,67.59 68.89,79.24 54.0,84.42
+            C39.11,79.24 29.41,67.59 29.41,50.76
+            L29.41,32.0
+            C35.88,31.35 44.94,28.76 54.0,23.58
+            Z">
+        <aapt:attr xmlns:aapt="http://schemas.android.com/aapt" name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="54" android:startY="23.58"
+                android:endX="54" android:endY="84.42">
+                <item android:offset="0" android:color="#53E6F8" />
+                <item android:offset="0.55" android:color="#22D3EE" />
+                <item android:offset="1" android:color="#0E9FBF" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Gloss along the shoulders -->
     <path
-        android:fillColor="#22D3EE"
+        android:fillColor="#38FFFFFF"
         android:pathData="
-            M33.4,30.94
-            Q33.4,28.0 36.34,28.0
-            L71.66,28.0
-            Q74.6,28.0 74.6,30.94
-            L74.6,50.57
-            Q74.6,67.25 54.0,80.0
-            Q33.4,67.25 33.4,50.57
+            M54.0,26.82
+            C61.77,31.35 69.53,33.61 75.36,34.39
+            L75.36,41.7
+            C68.24,40.41 60.47,37.82 54.0,33.94
+            C47.53,37.82 39.76,40.41 32.64,41.7
+            L32.64,34.39
+            C38.47,33.61 46.23,31.35 54.0,26.82
             Z" />
 
     <!-- Bolt: cut out with the same colour the background layer uses -->
     <path
         android:fillColor="#0B1220"
         android:pathData="
-            M57.92,36.83
-            L45.66,57.43
-            L52.53,57.43
-            L49.58,72.15
-            L62.83,50.57
-            L55.47,50.57
+            M58.53,33.94
+            L42.35,57.24
+            L50.76,57.24
+            L48.18,72.77
+            L65.65,48.18
+            L55.94,48.18
             Z" />
 </vector>

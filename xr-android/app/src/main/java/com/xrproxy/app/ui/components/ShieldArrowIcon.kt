@@ -16,6 +16,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
@@ -123,7 +124,7 @@ fun ShieldArrowIcon(phase: ConnectPhase, modifier: Modifier = Modifier) {
                 }
             }
         }
-        drawShield(primary = primary, cutout = cutout)
+        drawShield(cutout = cutout)
     }
 }
 
@@ -148,39 +149,74 @@ private fun convergeRing(p: Float): Pair<Float, Float> {
     return scale to alpha
 }
 
+/** Оттенки щита: свет сверху, тень снизу. Держим рядом с геометрией, потому
+ *  что это материал самой иконки, а не роль палитры; те же значения зашиты в
+ *  `ic_launcher_foreground.xml`. Канон в LLD-06, раздел 3.2. */
+private val ShieldLight = Color(0xFF53E6F8)
+private val ShieldMid = Color(0xFF22D3EE)
+private val ShieldDeep = Color(0xFF0E9FBF)
+private val ShieldGloss = Color(0x38FFFFFF)
+
 /**
- * Щит с молнией по пропорциям из раздела 3.2: верх ровный со скруглёнными
- * углами, боковины выпуклые, низ сходится в точку. Молния вырезана цветом
- * фона. Геометрия задана в системе 100 на 120 и вписывается в иконку с
- * одинаковым масштабом по осям, иначе на квадратном холсте щит расплывался бы
- * в ширину и терял заданную разделом 3.2 пропорцию.
+ * Щит с молнией по пропорциям из раздела 3.2: верх мягко скруглён, боковины
+ * выпуклые, низ круглый, а не остриём. Круглое дно повторяет кривизну колец
+ * вокруг иконки, поэтому «остриё против круга» больше не спорит.
+ *
+ * Геометрия задана в квадратной системе 120 на 120 и вписывается с одинаковым
+ * масштабом по осям. Фигура в этой системе стоит по оптическому центру, а не
+ * по геометрическому: центр масс щита ниже середины бокса, и без поправки
+ * иконка казалась бы съехавшей вверх.
+ *
+ * Объём даёт вертикальный градиент со светом сверху плюс блик по плечам,
+ * никакого глянца и растровых теней (XR-233).
  */
-private fun DrawScope.drawShield(primary: Color, cutout: Color) {
-    val scale = minOf(size.width / 100f, size.height / 120f)
-    val originX = (size.width - 100f * scale) / 2f
+private fun DrawScope.drawShield(cutout: Color) {
+    val scale = minOf(size.width, size.height) / 120f
+    val originX = (size.width - 120f * scale) / 2f
     val originY = (size.height - 120f * scale) / 2f
     fun px(v: Float) = originX + v * scale
     fun py(v: Float) = originY + v * scale
 
     val shield = Path().apply {
-        moveTo(px(8f), py(14f))
-        quadraticTo(px(8f), py(8f), px(14f), py(8f))
-        lineTo(px(86f), py(8f))
-        quadraticTo(px(92f), py(8f), px(92f), py(14f))
-        lineTo(px(92f), py(54f))
-        quadraticTo(px(92f), py(88f), px(50f), py(114f))
-        quadraticTo(px(8f), py(88f), px(8f), py(54f))
+        moveTo(px(60f), py(14f))
+        cubicTo(px(74f), py(22f), px(88f), py(26f), px(98f), py(27f))
+        lineTo(px(98f), py(56f))
+        cubicTo(px(98f), py(82f), px(83f), py(100f), px(60f), py(108f))
+        cubicTo(px(37f), py(100f), px(22f), py(82f), px(22f), py(56f))
+        lineTo(px(22f), py(27f))
+        cubicTo(px(32f), py(26f), px(46f), py(22f), px(60f), py(14f))
+        close()
+    }
+    // Блик по плечам: та же дуга, что у верхнего края, отведённая вниз.
+    val gloss = Path().apply {
+        moveTo(px(60f), py(19f))
+        cubicTo(px(72f), py(26f), px(84f), py(29.5f), px(93f), py(30.7f))
+        lineTo(px(93f), py(42f))
+        cubicTo(px(82f), py(40f), px(70f), py(36f), px(60f), py(30f))
+        cubicTo(px(50f), py(36f), px(38f), py(40f), px(27f), py(42f))
+        lineTo(px(27f), py(30.7f))
+        cubicTo(px(36f), py(29.5f), px(48f), py(26f), px(60f), py(19f))
         close()
     }
     val bolt = Path().apply {
-        moveTo(px(58f), py(26f))
-        lineTo(px(33f), py(68f))
-        lineTo(px(47f), py(68f))
-        lineTo(px(41f), py(98f))
-        lineTo(px(68f), py(54f))
-        lineTo(px(53f), py(54f))
+        moveTo(px(67f), py(30f))
+        lineTo(px(42f), py(66f))
+        lineTo(px(55f), py(66f))
+        lineTo(px(51f), py(90f))
+        lineTo(px(78f), py(52f))
+        lineTo(px(63f), py(52f))
         close()
     }
-    drawPath(shield, color = primary)
+    drawPath(
+        shield,
+        brush = Brush.verticalGradient(
+            0f to ShieldLight,
+            0.55f to ShieldMid,
+            1f to ShieldDeep,
+            startY = py(14f),
+            endY = py(108f),
+        ),
+    )
+    drawPath(gloss, color = ShieldGloss)
     drawPath(bolt, color = cutout)
 }
