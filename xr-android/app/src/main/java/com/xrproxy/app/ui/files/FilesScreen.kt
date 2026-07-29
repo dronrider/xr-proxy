@@ -280,11 +280,16 @@ private fun ShareListView(
     var menuShareId by remember { mutableStateOf<String?>(null) }
 
     // Свайп-вниз обновляет список по инвайту (XR-125, стандарт XR-181): тот же
-    // refreshHub, что и кнопка в шапке, и общий флаг loadingHub гасит оба
-    // индикатора, поэтому отдельный инлайн-спиннер убран.
+    // refreshHub, что и кнопка в шапке. Вход на вкладку тоже дёргает refreshHub,
+    // поэтому индикатор жеста вешаем не на общий loadingHub, а на локальный
+    // флаг, который взводят только жест и кнопка (XR-232): выезжающий сам по
+    // себе спиннер выглядел поломкой.
+    var manualRefresh by remember { mutableStateOf(false) }
+    LaunchedEffect(ui.loadingHub) { if (!ui.loadingHub) manualRefresh = false }
+    val refreshByHand = { manualRefresh = true; vm.refreshHub(hubUrl, inviteToken) }
     XrPullToRefresh(
-        refreshing = ui.loadingHub,
-        onRefresh = { vm.refreshHub(hubUrl, inviteToken) },
+        refreshing = manualRefresh && ui.loadingHub,
+        onRefresh = refreshByHand,
         modifier = modifier,
     ) {
     LazyColumn(
@@ -298,7 +303,7 @@ private fun ShareListView(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text("Файлы", style = MaterialTheme.typography.titleLarge)
-                IconButton(onClick = { vm.refreshHub(hubUrl, inviteToken) }) {
+                IconButton(onClick = refreshByHand) {
                     Icon(Icons.Default.Refresh, contentDescription = "Обновить по инвайту")
                 }
             }
@@ -554,6 +559,11 @@ private fun ExplorerView(
     modifier: Modifier,
 ) {
     var detailsFor by remember { mutableStateOf<ManifestEntry?>(null) }
+    // Открытие шары поднимает manifestLoading само, индикатор жеста поэтому
+    // держим на локальном флаге ручных обновлений, как в списке шар (XR-232).
+    var manualRefresh by remember { mutableStateOf(false) }
+    LaunchedEffect(ui.manifestLoading) { if (!ui.manifestLoading) manualRefresh = false }
+    val refreshByHand = { manualRefresh = true; vm.refreshManifest(cfg) }
     // Derived once per state change, not per recomposition: a big manifest
     // with a long queue would otherwise be rescanned for every visible row on
     // every 500ms progress tick.
@@ -589,7 +599,7 @@ private fun ExplorerView(
             // Refresh the listing from the agent. Deliberately not the sync
             // action: the old circular-arrows button confused both meanings
             // (XR-044), downloads now go through the per-row controls.
-            IconButton(onClick = { vm.refreshManifest(cfg) }) {
+            IconButton(onClick = refreshByHand) {
                 Icon(Icons.Default.Refresh, contentDescription = "Обновить список")
             }
             Spacer(Modifier.width(6.dp))
@@ -620,11 +630,11 @@ private fun ExplorerView(
 
         // Свайп-вниз перезапрашивает манифест у агента (стандарт XR-181): тот же
         // refreshManifest, что и кнопка в шапке. Контент всегда LazyColumn, даже
-        // пустой, иначе жесту не за что зацепиться; индикатор manifestLoading
-        // рисует сам жест, отдельный спиннер убран.
+        // пустой, иначе жесту не за что зацепиться; индикатор рисует сам жест,
+        // отдельный спиннер убран.
         XrPullToRefresh(
-            refreshing = ui.manifestLoading,
-            onRefresh = { vm.refreshManifest(cfg) },
+            refreshing = manualRefresh && ui.manifestLoading,
+            onRefresh = refreshByHand,
             modifier = Modifier.weight(1f),
         ) {
             LazyColumn(modifier = Modifier.fillMaxSize()) {
