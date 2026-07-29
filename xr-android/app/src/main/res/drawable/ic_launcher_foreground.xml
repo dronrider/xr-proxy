@@ -8,19 +8,19 @@
 
     <!-- Shield: vertical gradient, light on top -->
     <path android:pathData="
-            M54.0,23.58
-            C63.06,28.76 72.12,31.35 78.59,32.0
-            L78.59,50.76
-            C78.59,67.59 68.89,79.24 54.0,84.42
-            C39.11,79.24 29.41,67.59 29.41,50.76
-            L29.41,32.0
-            C35.88,31.35 44.94,28.76 54.0,23.58
+            M54.0,24.14
+            C62.9,29.22 71.79,31.76 78.15,32.4
+            L78.15,50.82
+            C78.15,67.34 68.61,78.78 54.0,83.86
+            C39.39,78.78 29.85,67.34 29.85,50.82
+            L29.85,32.4
+            C36.21,31.76 45.1,29.22 54.0,24.14
             Z">
         <aapt:attr xmlns:aapt="http://schemas.android.com/aapt" name="android:fillColor">
             <gradient
                 android:type="linear"
-                android:startX="54" android:startY="23.58"
-                android:endX="54" android:endY="84.42">
+                android:startX="54" android:startY="24.14"
+                android:endX="54" android:endY="83.86">
                 <item android:offset="0" android:color="#53E6F8" />
                 <item android:offset="0.55" android:color="#22D3EE" />
                 <item android:offset="1" android:color="#0E9FBF" />
@@ -32,24 +32,24 @@
     <path
         android:fillColor="#38FFFFFF"
         android:pathData="
-            M54.0,26.82
-            C61.77,31.35 69.53,33.61 75.36,34.39
-            L75.36,41.7
-            C68.24,40.41 60.47,37.82 54.0,33.94
-            C47.53,37.82 39.76,40.41 32.64,41.7
-            L32.64,34.39
-            C38.47,33.61 46.23,31.35 54.0,26.82
+            M54.0,27.31
+            C61.62,31.76 69.25,33.98 74.97,34.75
+            L74.97,41.93
+            C67.98,40.66 60.35,38.11 54.0,34.3
+            C47.65,38.11 40.02,40.66 33.03,41.93
+            L33.03,34.75
+            C38.75,33.98 46.38,31.76 54.0,27.31
             Z" />
 
     <!-- Bolt: cut out with the same colour the background layer uses -->
     <path
         android:fillColor="#0B1220"
         android:pathData="
-            M58.53,33.94
-            L42.35,57.24
-            L50.76,57.24
-            L48.18,72.77
-            L65.65,48.18
-            L55.94,48.18
+            M58.45,34.3
+            L42.56,57.18
+            L50.82,57.18
+            L48.28,72.43
+            L65.44,48.28
+            L55.91,48.28
             Z" />
 </vector>
