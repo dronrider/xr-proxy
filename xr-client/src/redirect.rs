@@ -472,6 +472,18 @@ mod tests {
     }
 
     #[test]
+    fn ipt_same_entry_twice_gives_one_exclusion() {
+        let servers = vec![
+            ServerEndpoint { address: "203.0.113.10".into(), port: 8443 },
+            ServerEndpoint { address: "203.0.113.10".into(), port: 8443 },
+        ];
+        let rules = joined(build_ipt_rules(1080, &servers, &[], false));
+
+        let exclusion = format!("-t nat -A {IPT_CHAIN} -d 203.0.113.10 -p tcp --dport 8443 -j RETURN");
+        assert_eq!(rules.iter().filter(|r| *r == &exclusion).count(), 1);
+    }
+
+    #[test]
     fn ipt_keeps_bypass_private_nets_and_quic_block() {
         let bypass = vec!["192.168.1.50".to_string()];
         let rules = joined(build_ipt_rules(1080, &pool(), &bypass, true));
