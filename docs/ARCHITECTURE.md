@@ -341,7 +341,8 @@ Kotlin + Jetpack Compose, Material3, MVVM без DI-фреймворка.
   `colorizeLog`). `relayErrors: Long` осталась только как debug-метрика в
   статистике, UI-бадж её не читает. Старое поле `errorLog: String` и метод
   `refreshLog()` удалены.
-- `OnboardingState { ShowingWelcome, Loading, ConfirmInvite(...), Completed }`
+- `OnboardingState { ShowingWelcome, Loading(hubUrl), ConfirmInvite(...),
+  InviteError(...), Completed }`
   — параллельный StateFlow (LLD-04). Рендер MainActivity до `Completed`
   подменяет главный Scaffold onboarding-экранами; переход в `Completed`
   происходит после успешного `applyInvite` или при ручной настройке.
