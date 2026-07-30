@@ -286,7 +286,9 @@ fn compile_rule(rule: &RoutingRule) -> CompiledRule {
             Ok(RuleKind::CidrV4) | Ok(RuleKind::CidrV6) => {
                 tracing::warn!("IP range in domains list, use ip_ranges instead: {}", domain)
             }
-            Err(e) => tracing::warn!("Invalid domain in config: {} ({})", domain, e),
+            // Текст ошибки от classify_pattern написан для экрана «Правила» на
+            // Android, в лог клиента его не тащим: соседние записи английские.
+            Err(_) => tracing::warn!("Invalid domain in config: {}", domain),
         }
     }
 
@@ -428,6 +430,26 @@ mod tests {
     }
 
     #[test]
+    fn test_bare_star_rule_matches_any_sni() {
+        // Правило `domains = ["*"]` это proxy_all по SNI: компиляция даёт
+        // пустой суффикс, соединение без SNI под него не подпадает.
+        let config = RoutingConfig {
+            default_action: "direct".into(),
+            rules: vec![RoutingRule {
+                action: "proxy".into(),
+                domains: vec!["*".into()],
+                ip_ranges: vec![],
+                geoip: vec![],
+            }],
+        };
+        let router = Router::new(&config, None);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        assert_eq!(router.resolve(Some("example.com"), ip), Action::Proxy);
+        assert_eq!(router.resolve(Some("почта.яндекс.рф"), ip), Action::Proxy);
+        assert_eq!(router.resolve(None, ip), Action::Direct);
+    }
+
+    #[test]
     fn test_broken_preset_domain_does_not_kill_the_rest() {
         // Опечатка в пресете хаба или в TOML отбраковывается с WARN, соседние
         // правила продолжают работать, процесс живёт.
@@ -450,6 +472,25 @@ mod tests {
         assert_eq!(router.resolve(Some("mail.google.com"), ip), Action::Proxy);
         assert_eq!(router.resolve(Some("яндекс.рф"), ip), Action::Direct);
         assert_eq!(router.resolve(Some("ffff"), ip), Action::Direct);
+    }
+
+    #[test]
+    fn test_ip_range_in_domains_is_skipped() {
+        // Диапазону место в ip_ranges: точным доменом он не станет, но и
+        // остальные домены правила из-за него не пропадут.
+        let config = RoutingConfig {
+            default_action: "direct".into(),
+            rules: vec![RoutingRule {
+                action: "proxy".into(),
+                domains: vec!["10.0.0.0/8".into(), "1.2.3.4".into(), "youtube.com".into()],
+                ip_ranges: vec![],
+                geoip: vec![],
+            }],
+        };
+        let router = Router::new(&config, None);
+        assert_eq!(router.resolve(None, "10.1.2.3".parse().unwrap()), Action::Direct);
+        assert_eq!(router.resolve(Some("10.0.0.0/8"), "8.8.8.8".parse().unwrap()), Action::Direct);
+        assert_eq!(router.resolve(Some("youtube.com"), "8.8.8.8".parse().unwrap()), Action::Proxy);
     }
 
     #[test]
