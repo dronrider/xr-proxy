@@ -45,6 +45,12 @@ padding_max = 128                     # Max random padding per packet (bytes)
 [routing]
 default_action = "direct"
 
+# Домен пишется либо точным именем (github.com), либо с подстановкой в начале
+# (*.github.com, она матчит и сам github.com); одиночная "*" матчит любой SNI.
+# Имя только ASCII и минимум из двух меток, кириллические домены вводятся в
+# punycode (xn--...). Что не разобралось, клиент пропускает с WARN в лог, так
+# что опечатка молча выключает одно правило, а не роняет маршрутизацию целиком.
+
 # Rule 1: Proxy these domains through the server
 [[routing.rules]]
 action = "proxy"
