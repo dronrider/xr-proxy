@@ -1,6 +1,7 @@
 /// Routing engine: domain matching, IP range (CIDR) matching, GeoIP lookup.
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::config::{RoutingConfig, RoutingRule};
+use crate::user_rule::{classify_pattern, normalize_pattern, RuleKind};
 
 /// Routing decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,9 +203,18 @@ impl Router {
             }
 
             for suffix in &rule.wildcard_suffixes {
-                if hostname_lower.ends_with(suffix.as_str()) || hostname_lower == suffix[1..] {
-                    // "*.google.com" matches "mail.google.com" and "google.com"
+                // "*.google.com" хранится как ".google.com" и матчит как
+                // "mail.google.com", так и сам "google.com"; одиночная "*" это
+                // пустой суффикс, он матчит любой SNI. Срез по байтам здесь
+                // недопустим: домен приходит из чужого конфига, и на
+                // многобайтовом символе он роняет процесс.
+                if hostname_lower.ends_with(suffix.as_str()) {
                     return true;
+                }
+                if let Some(base) = suffix.strip_prefix('.') {
+                    if hostname_lower == base {
+                        return true;
+                    }
                 }
             }
         }
@@ -261,13 +271,22 @@ fn compile_rule(rule: &RoutingRule) -> CompiledRule {
     let mut exact_domains = Vec::new();
     let mut wildcard_suffixes = Vec::new();
 
+    // Домены из пресета хаба и из TOML проходят ту же проверку, что и
+    // пользовательские правила (`user_rule::classify_pattern`): битое
+    // отбраковывается с WARN, как невалидный CIDR ниже. Fail-soft, потому что
+    // одна опечатка в общем пресете не должна лишать весь парк маршрутизации.
     for domain in &rule.domains {
-        let d = domain.to_lowercase();
-        if let Some(suffix) = d.strip_prefix('*') {
-            // "*.google.com" → ".google.com"
-            wildcard_suffixes.push(suffix.to_string());
-        } else {
-            exact_domains.push(d);
+        let d = normalize_pattern(domain);
+        match classify_pattern(&d) {
+            Ok(RuleKind::Wildcard) => {
+                // "*.google.com" -> ".google.com", одиночная "*" -> ""
+                wildcard_suffixes.push(d.strip_prefix('*').unwrap_or_default().to_string());
+            }
+            Ok(RuleKind::Domain) => exact_domains.push(d),
+            Ok(RuleKind::CidrV4) | Ok(RuleKind::CidrV6) => {
+                tracing::warn!("IP range in domains list, use ip_ranges instead: {}", domain)
+            }
+            Err(e) => tracing::warn!("Invalid domain in config: {} ({})", domain, e),
         }
     }
 
@@ -311,7 +330,7 @@ mod tests {
                 },
                 RoutingRule {
                     action: "direct".into(),
-                    domains: vec!["*.local".into()],
+                    domains: vec!["*.corp.local".into()],
                     ip_ranges: vec![],
                     geoip: vec![],
                 },
@@ -363,6 +382,92 @@ mod tests {
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         // "*.google.com" should also match "google.com"
         assert_eq!(router.resolve(Some("google.com"), ip), Action::Proxy);
+    }
+
+    #[test]
+    fn test_wildcard_suffix_matching_survives_multibyte() {
+        // Регресс XR-206: матчинг резал суффикс по байтам (`suffix[1..]`) в
+        // расчёте на ведущую точку, и на кириллице срез попадал внутрь
+        // символа, роняя процесс на первом же SNI. Матчинг не должен
+        // полагаться на то, что домены уже отфильтрованы компиляцией.
+        let router = Router::new(
+            &RoutingConfig { default_action: "direct".into(), rules: vec![] },
+            None,
+        );
+        let rule = CompiledRule {
+            action: Action::Proxy,
+            exact_domains: vec![],
+            wildcard_suffixes: vec!["яндекс.рф".into()],
+            ip_ranges: vec![],
+            geoip_codes: vec![],
+        };
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        assert!(router.matches_rule(&rule, Some("почта.яндекс.рф"), ip));
+        assert!(!router.matches_rule(&rule, Some("google.com"), ip));
+        assert!(!router.matches_rule(&rule, None, ip));
+    }
+
+    #[test]
+    fn test_empty_wildcard_suffix_matches_any_sni() {
+        // Одиночная "*" компилируется в пустой суффикс: любой SNI её матчит,
+        // а соединение без SNI нет.
+        let router = Router::new(
+            &RoutingConfig { default_action: "direct".into(), rules: vec![] },
+            None,
+        );
+        let rule = CompiledRule {
+            action: Action::Proxy,
+            exact_domains: vec![],
+            wildcard_suffixes: vec!["".into()],
+            ip_ranges: vec![],
+            geoip_codes: vec![],
+        };
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        assert!(router.matches_rule(&rule, Some("example.com"), ip));
+        assert!(!router.matches_rule(&rule, None, ip));
+    }
+
+    #[test]
+    fn test_broken_preset_domain_does_not_kill_the_rest() {
+        // Опечатка в пресете хаба или в TOML отбраковывается с WARN, соседние
+        // правила продолжают работать, процесс живёт.
+        let config = RoutingConfig {
+            default_action: "direct".into(),
+            rules: vec![RoutingRule {
+                action: "proxy".into(),
+                domains: vec![
+                    "*яндекс.рф".into(),
+                    "ffff".into(),
+                    "https://youtube.com".into(),
+                    "*.google.com".into(),
+                ],
+                ip_ranges: vec![],
+                geoip: vec![],
+            }],
+        };
+        let router = Router::new(&config, None);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        assert_eq!(router.resolve(Some("mail.google.com"), ip), Action::Proxy);
+        assert_eq!(router.resolve(Some("яндекс.рф"), ip), Action::Direct);
+        assert_eq!(router.resolve(Some("ffff"), ip), Action::Direct);
+    }
+
+    #[test]
+    fn test_domain_is_normalized_before_compile() {
+        let config = RoutingConfig {
+            default_action: "direct".into(),
+            rules: vec![RoutingRule {
+                action: "proxy".into(),
+                domains: vec![" *.GitHub.com ".into(), "  YouTube.com".into()],
+                ip_ranges: vec![],
+                geoip: vec![],
+            }],
+        };
+        let router = Router::new(&config, None);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        assert_eq!(router.resolve(Some("api.github.com"), ip), Action::Proxy);
+        assert_eq!(router.resolve(Some("github.com"), ip), Action::Proxy);
+        assert_eq!(router.resolve(Some("youtube.com"), ip), Action::Proxy);
     }
 
     #[test]
