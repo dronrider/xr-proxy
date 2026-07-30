@@ -82,9 +82,10 @@ fn web_port_tunnels(servers: &[ServerEndpoint]) -> Vec<&ServerEndpoint> {
         .collect()
 }
 
-/// Set up redirect rules. Из перехвата выводится не сервер пула (LLD-10)
-/// целиком, а его туннельный порт и всё, кроме 80 и 443: туннель не должен
-/// зациклиться, а сайты на том же VPS обязаны уходить через прокси.
+/// Set up redirect rules. Сервер пула (LLD-10) выводится из перехвата не
+/// целиком: мимо прокси уходит всё, кроме 80 и 443, плюс отдельно туннельный
+/// порт на случай, когда туннель сидит на web-порту. Сайты на том же VPS
+/// обязаны уходить через прокси, иначе их SNI видит провайдер.
 /// `bypass_ips` are source IPs that should not be redirected (game consoles, etc.)
 pub fn setup_redirect(
     backend: FirewallBackend,
@@ -95,9 +96,7 @@ pub fn setup_redirect(
 ) -> Result<(), Box<dyn std::error::Error>> {
     for server in web_port_tunnels(servers) {
         tracing::warn!(
-            "tunnel port {} on {} is a web port: {}:{} stays outside the tunnel",
-            server.port,
-            server.address,
+            "tunnel {}:{} sits on a web port, it and the sites served from that VPS stay outside the tunnel",
             server.address,
             server.port
         );
@@ -304,15 +303,19 @@ fn build_ipt_rules(
     }
 
     // Пул серверов (LLD-10): выпускаем только туннельный порт, см. разбор
-    // в build_nft_ruleset. Второе правило («всё, кроме web-портов») здесь не
-    // нужно: redirect ниже и так ловит только 80 и 443.
+    // в build_nft_ruleset. Правило «всё, кроме web-портов» здесь не нужно:
+    // redirect ниже и так ловит только 80 и 443. Полностью совпавшие записи
+    // пула схлопываем, как и в nft-ветке.
     for server in servers {
         let port = server.port.to_string();
-        rules.push(rule(&[
+        let exclusion = rule(&[
             "-t", "nat", "-A", IPT_CHAIN,
             "-d", &server.address, "-p", "tcp", "--dport", &port,
             "-j", "RETURN",
-        ]));
+        ]);
+        if !rules.contains(&exclusion) {
+            rules.push(exclusion);
+        }
     }
 
     // Private destination ranges
@@ -414,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn nft_same_address_twice_gives_no_duplicate_rules() {
+    fn nft_same_address_twice_keeps_one_web_rule() {
         // Один VPS двумя записями пула: обычный туннель и запасной под
         // камуфляж на 443.
         let servers = vec![
@@ -425,6 +428,9 @@ mod tests {
 
         assert_eq!(ruleset.matches("tcp dport != { 80, 443 } return").count(), 1);
         assert!(ruleset.contains("ip daddr 203.0.113.10 tcp dport 8443 return"));
+        // Осознанная плата: туннель на 443 нельзя перехватывать, поэтому 443
+        // к этому VPS выпадает из перехвата и сайты на нём остаются голыми.
+        // Про такую запись клиент ругается в лог, см. web_port_tunnels.
         assert!(ruleset.contains("ip daddr 203.0.113.10 tcp dport 443 return"));
     }
 
