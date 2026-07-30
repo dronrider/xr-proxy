@@ -65,19 +65,26 @@ pub fn detect_backend() -> Option<FirewallBackend> {
     }
 }
 
-/// Set up redirect rules. `server_ips` (все серверы пула LLD-10) are excluded
+/// Адрес сервера пула вместе с портом его туннеля.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerEndpoint {
+    pub address: String,
+    pub port: u16,
+}
+
+/// Set up redirect rules. `servers` (все серверы пула LLD-10) are excluded
 /// to avoid redirect loops.
 /// `bypass_ips` are source IPs that should not be redirected (game consoles, etc.)
 pub fn setup_redirect(
     backend: FirewallBackend,
     listen_port: u16,
-    server_ips: &[String],
+    servers: &[ServerEndpoint],
     bypass_ips: &[String],
     block_quic: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match backend {
-        FirewallBackend::Nftables => setup_nftables(listen_port, server_ips, bypass_ips, block_quic),
-        FirewallBackend::Iptables => setup_iptables(listen_port, server_ips, bypass_ips, block_quic),
+        FirewallBackend::Nftables => setup_nftables(listen_port, servers, bypass_ips, block_quic),
+        FirewallBackend::Iptables => setup_iptables(listen_port, servers, bypass_ips, block_quic),
     }
 }
 
@@ -93,7 +100,7 @@ pub fn cleanup_redirect(backend: FirewallBackend) -> Result<(), Box<dyn std::err
 
 fn setup_nftables(
     listen_port: u16,
-    server_ips: &[String],
+    servers: &[ServerEndpoint],
     bypass_ips: &[String],
     block_quic: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -102,6 +109,32 @@ fn setup_nftables(
     // Clean up any existing rules first
     let _ = cleanup_nftables();
 
+    let ruleset = build_nft_ruleset(listen_port, servers, bypass_ips, block_quic);
+
+    // Use sh -c with pipe to feed ruleset via stdin
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "echo '{}' | {} -f -",
+            ruleset.replace('\'', "'\\''"),
+            nft
+        ))
+        .status()?;
+
+    if !status.success() {
+        return Err(format!("nft command failed (binary: {})", nft).into());
+    }
+
+    tracing::info!("nftables redirect rules installed (table: {}, nft: {})", NFT_TABLE, nft);
+    Ok(())
+}
+
+fn build_nft_ruleset(
+    listen_port: u16,
+    servers: &[ServerEndpoint],
+    bypass_ips: &[String],
+    block_quic: bool,
+) -> String {
     // Build bypass rules for excluded source IPs
     let bypass_rules: String = bypass_ips
         .iter()
@@ -130,15 +163,18 @@ fn setup_nftables(
         ""
     };
 
-    // Пул серверов (LLD-10): исключаем из перехвата каждый VPS, иначе
-    // туннель к резерву сам попал бы под redirect.
-    let server_returns: String = server_ips
+    // Пул серверов (LLD-10): выпускаем мимо перехвата туннельный порт каждого
+    // VPS, иначе телефон с персональным клиентом в той же LAN получил бы
+    // туннель в туннеле. Исключение сужено до порта, а не до всего адреса:
+    // на том же VPS живут обычные сайты, и по всему адресу их 443 уходил из
+    // LAN голым, светя SNI провайдерскому фильтру.
+    let server_returns: String = servers
         .iter()
-        .map(|ip| format!("        ip daddr {} return", ip))
+        .map(|s| format!("        ip daddr {} tcp dport {} return", s.address, s.port))
         .collect::<Vec<_>>()
         .join("\n");
 
-    let ruleset = format!(
+    format!(
         r#"
 table ip {table} {{
     chain prerouting {{
@@ -173,24 +209,7 @@ table ip {table} {{
         listen_port = listen_port,
         bypass_section = bypass_section,
         quic_section = quic_section,
-    );
-
-    // Use sh -c with pipe to feed ruleset via stdin
-    let status = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(format!(
-            "echo '{}' | {} -f -",
-            ruleset.replace('\'', "'\\''"),
-            nft
-        ))
-        .status()?;
-
-    if !status.success() {
-        return Err(format!("nft command failed (binary: {})", nft).into());
-    }
-
-    tracing::info!("nftables redirect rules installed (table: {}, nft: {})", NFT_TABLE, nft);
-    Ok(())
+    )
 }
 
 fn cleanup_nftables() -> Result<(), Box<dyn std::error::Error>> {
@@ -218,52 +237,76 @@ fn cleanup_nftables() -> Result<(), Box<dyn std::error::Error>> {
 
 fn setup_iptables(
     listen_port: u16,
-    server_ips: &[String],
+    servers: &[ServerEndpoint],
     bypass_ips: &[String],
     block_quic: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = cleanup_iptables();
 
-    // Create custom chain
-    run_ipt(&["-t", "nat", "-N", IPT_CHAIN])?;
-
-    // Bypass devices (game consoles, etc.)
-    for ip in bypass_ips {
-        run_ipt(&["-t", "nat", "-A", IPT_CHAIN, "-s", ip, "-j", "RETURN"])?;
-    }
-
-    // Skip server IPs (весь пул LLD-10), private destination ranges
-    for ip in server_ips {
-        run_ipt(&["-t", "nat", "-A", IPT_CHAIN, "-d", ip, "-j", "RETURN"])?;
-    }
-    run_ipt(&["-t", "nat", "-A", IPT_CHAIN, "-d", "10.0.0.0/8", "-j", "RETURN"])?;
-    run_ipt(&["-t", "nat", "-A", IPT_CHAIN, "-d", "172.16.0.0/12", "-j", "RETURN"])?;
-    run_ipt(&["-t", "nat", "-A", IPT_CHAIN, "-d", "192.168.0.0/16", "-j", "RETURN"])?;
-    run_ipt(&["-t", "nat", "-A", IPT_CHAIN, "-d", "127.0.0.0/8", "-j", "RETURN"])?;
-
-    // Redirect HTTP/HTTPS
-    let port_str = listen_port.to_string();
-    run_ipt(&[
-        "-t", "nat", "-A", IPT_CHAIN,
-        "-p", "tcp", "-m", "multiport", "--dports", "80,443",
-        "-j", "REDIRECT", "--to-ports", &port_str,
-    ])?;
-
-    // Hook into PREROUTING
-    run_ipt(&["-t", "nat", "-A", "PREROUTING", "-j", IPT_CHAIN])?;
-
-    // Drop QUIC so browsers fall back to interceptable TCP/443
-    // (см. комментарий в setup_nftables).
-    if block_quic {
-        run_ipt(&[
-            "-t", "mangle", "-A", "PREROUTING",
-            "-i", "br-lan", "-p", "udp", "--dport", "443", "-j", "DROP",
-        ])?;
+    for rule in build_ipt_rules(listen_port, servers, bypass_ips, block_quic) {
+        let args: Vec<&str> = rule.iter().map(String::as_str).collect();
+        run_ipt(&args)?;
     }
 
     let ipt = find_iptables().unwrap_or_else(|| "iptables".to_string());
     tracing::info!("iptables redirect rules installed (chain: {}, binary: {})", IPT_CHAIN, ipt);
     Ok(())
+}
+
+/// Аргументы вызовов iptables в порядке применения.
+fn build_ipt_rules(
+    listen_port: u16,
+    servers: &[ServerEndpoint],
+    bypass_ips: &[String],
+    block_quic: bool,
+) -> Vec<Vec<String>> {
+    let rule = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<String>>();
+
+    // Create custom chain
+    let mut rules = vec![rule(&["-t", "nat", "-N", IPT_CHAIN])];
+
+    // Bypass devices (game consoles, etc.)
+    for ip in bypass_ips {
+        rules.push(rule(&["-t", "nat", "-A", IPT_CHAIN, "-s", ip, "-j", "RETURN"]));
+    }
+
+    // Пул серверов (LLD-10): выпускаем только туннельный порт, см. разбор
+    // в build_nft_ruleset.
+    for server in servers {
+        let port = server.port.to_string();
+        rules.push(rule(&[
+            "-t", "nat", "-A", IPT_CHAIN,
+            "-d", &server.address, "-p", "tcp", "--dport", &port,
+            "-j", "RETURN",
+        ]));
+    }
+
+    // Private destination ranges
+    for net in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"] {
+        rules.push(rule(&["-t", "nat", "-A", IPT_CHAIN, "-d", net, "-j", "RETURN"]));
+    }
+
+    // Redirect HTTP/HTTPS
+    let port_str = listen_port.to_string();
+    rules.push(rule(&[
+        "-t", "nat", "-A", IPT_CHAIN,
+        "-p", "tcp", "-m", "multiport", "--dports", "80,443",
+        "-j", "REDIRECT", "--to-ports", &port_str,
+    ]));
+
+    // Hook into PREROUTING
+    rules.push(rule(&["-t", "nat", "-A", "PREROUTING", "-j", IPT_CHAIN]));
+
+    // Drop QUIC so browsers fall back to interceptable TCP/443
+    // (см. комментарий в build_nft_ruleset).
+    if block_quic {
+        rules.push(rule(&[
+            "-t", "mangle", "-A", "PREROUTING",
+            "-i", "br-lan", "-p", "udp", "--dport", "443", "-j", "DROP",
+        ]));
+    }
+
+    rules
 }
 
 fn cleanup_iptables() -> Result<(), Box<dyn std::error::Error>> {
@@ -287,4 +330,74 @@ fn run_ipt(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("{} {:?} failed", ipt, args).into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pool() -> Vec<ServerEndpoint> {
+        vec![
+            ServerEndpoint { address: "203.0.113.10".into(), port: 8443 },
+            ServerEndpoint { address: "198.51.100.7".into(), port: 9443 },
+        ]
+    }
+
+    #[test]
+    fn nft_server_exclusion_covers_tunnel_port_only() {
+        let ruleset = build_nft_ruleset(1080, &pool(), &[], true);
+
+        assert!(ruleset.contains("ip daddr 203.0.113.10 tcp dport 8443 return"));
+        assert!(ruleset.contains("ip daddr 198.51.100.7 tcp dport 9443 return"));
+        // Целиком адрес VPS выводить из перехвата нельзя: сайты, живущие на
+        // той же машине, уходили бы из LAN мимо туннеля с открытым SNI.
+        assert!(!ruleset.contains("ip daddr 203.0.113.10 return"));
+        assert!(!ruleset.contains("ip daddr 198.51.100.7 return"));
+    }
+
+    #[test]
+    fn nft_keeps_bypass_private_nets_and_quic_block() {
+        let bypass = vec!["192.168.1.50".to_string()];
+        let ruleset = build_nft_ruleset(1080, &pool(), &bypass, true);
+
+        assert!(ruleset.contains("ip saddr 192.168.1.50 return"));
+        assert!(ruleset.contains("ip daddr 192.168.0.0/16 return"));
+        assert!(ruleset.contains("redirect to :1080"));
+        assert!(ruleset.contains("udp dport 443 drop"));
+
+        assert!(!build_nft_ruleset(1080, &pool(), &bypass, false).contains("udp dport 443 drop"));
+    }
+
+    #[test]
+    fn ipt_server_exclusion_covers_tunnel_port_only() {
+        let rules: Vec<String> = build_ipt_rules(1080, &pool(), &[], true)
+            .iter()
+            .map(|r| r.join(" "))
+            .collect();
+
+        assert!(rules.contains(&format!(
+            "-t nat -A {IPT_CHAIN} -d 203.0.113.10 -p tcp --dport 8443 -j RETURN"
+        )));
+        assert!(!rules.contains(&format!("-t nat -A {IPT_CHAIN} -d 203.0.113.10 -j RETURN")));
+        assert!(!rules.contains(&format!("-t nat -A {IPT_CHAIN} -d 198.51.100.7 -j RETURN")));
+    }
+
+    #[test]
+    fn ipt_rules_keep_order_of_chain_setup() {
+        let rules: Vec<String> = build_ipt_rules(1080, &pool(), &["192.168.1.50".to_string()], false)
+            .iter()
+            .map(|r| r.join(" "))
+            .collect();
+
+        // Цепочка сначала создаётся, исключения идут до redirect, а хук в
+        // PREROUTING ставится последним, иначе часть трафика проскочит мимо
+        // ещё не дописанных правил.
+        assert_eq!(rules.first().unwrap(), &format!("-t nat -N {IPT_CHAIN}"));
+        assert_eq!(rules.last().unwrap(), &format!("-t nat -A PREROUTING -j {IPT_CHAIN}"));
+
+        let bypass = rules.iter().position(|r| r.contains("-s 192.168.1.50")).unwrap();
+        let exclusion = rules.iter().position(|r| r.contains("-d 203.0.113.10")).unwrap();
+        let redirect = rules.iter().position(|r| r.contains("REDIRECT")).unwrap();
+        assert!(bypass < exclusion && exclusion < redirect);
+    }
 }

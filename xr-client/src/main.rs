@@ -157,14 +157,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Setup firewall redirect
-    let server_ips: Vec<String> = server_entries.iter().map(|e| e.address.clone()).collect();
+    let server_endpoints: Vec<redirect::ServerEndpoint> = server_entries
+        .iter()
+        .map(|e| redirect::ServerEndpoint {
+            address: e.address.clone(),
+            port: e.port,
+        })
+        .collect();
     let fw_backend = if config.client.auto_redirect {
         match redirect::detect_backend() {
             Some(backend) => {
                 redirect::setup_redirect(
                     backend,
                     config.client.listen_port,
-                    &server_ips,
+                    &server_endpoints,
                     &config.client.bypass_ips,
                     config.client.block_quic,
                 )?;
