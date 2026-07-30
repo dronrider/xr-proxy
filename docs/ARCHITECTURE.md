@@ -221,6 +221,11 @@ Cargo-workspace + Android-модуль:
   `routing`), своих обёрток у клиента нет.
 - [redirect.rs](../xr-client/src/redirect.rs) — управление nftables/iptables
   (auto-setup, cleanup). Использует семейство `ip` (не `inet`, см. CLAUDE.md).
+  Каждый VPS пула выводится из перехвата не целиком, а парой «адрес плюс порт
+  туннеля»: телефону с персональным клиентом в LAN нельзя получить туннель в
+  туннеле, но обычные сайты на том же VPS должны уходить через прокси, иначе их
+  SNI видит провайдер. Генерация правил вынесена в чистые `build_nft_ruleset` и
+  `build_ipt_rules`, они и покрыты тестами.
 - [udp_relay.rs](../xr-client/src/udp_relay.rs) — UDP TPROXY: `recvmsg` +
   `IP_ORIGDSTADDR`, relay на VPS, spoofed-responses через `IP_TRANSPARENT`.
 
