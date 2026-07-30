@@ -72,6 +72,16 @@ pub struct ServerEndpoint {
     pub port: u16,
 }
 
+/// Серверы пула, чей туннель сидит на web-порту: перехватывать этот порт
+/// нельзя (иначе туннель зациклится), значит и сайты на том же VPS с него в
+/// туннель не уйдут. Повод предупредить владельца конфига.
+fn web_port_tunnels(servers: &[ServerEndpoint]) -> Vec<&ServerEndpoint> {
+    servers
+        .iter()
+        .filter(|s| matches!(s.port, 80 | 443))
+        .collect()
+}
+
 /// Set up redirect rules. Из перехвата выводится не сервер пула (LLD-10)
 /// целиком, а его туннельный порт и всё, кроме 80 и 443: туннель не должен
 /// зациклиться, а сайты на том же VPS обязаны уходить через прокси.
@@ -83,14 +93,14 @@ pub fn setup_redirect(
     bypass_ips: &[String],
     block_quic: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for server in servers {
-        if matches!(server.port, 80 | 443) {
-            tracing::warn!(
-                "tunnel port {} on {} is a web port: sites hosted on that VPS stay outside the tunnel",
-                server.port,
-                server.address
-            );
-        }
+    for server in web_port_tunnels(servers) {
+        tracing::warn!(
+            "tunnel port {} on {} is a web port: {}:{} stays outside the tunnel",
+            server.port,
+            server.address,
+            server.address,
+            server.port
+        );
     }
 
     match backend {
@@ -174,23 +184,28 @@ fn build_nft_ruleset(
         ""
     };
 
-    // Пул серверов (LLD-10): туннельный порт каждого VPS выпускаем мимо
-    // перехвата, иначе телефон с персональным клиентом в той же LAN получил бы
-    // туннель в туннеле. Второе правило выпускает всё, кроме 80 и 443: на VPS
-    // висят ssh и служебные ручки, а catch-all redirect ниже утащил бы их в
-    // прокси, где первым говорит сервер и соединение висело бы до таймаута.
-    // Web-порты остаются под перехватом сознательно: сайты на том же VPS
-    // уходили из LAN голыми, светя SNI провайдерскому фильтру.
-    let server_returns: String = servers
-        .iter()
-        .flat_map(|s| {
-            [
-                format!("        ip daddr {} tcp dport {} return", s.address, s.port),
-                format!("        ip daddr {} tcp dport != {{ 80, 443 }} return", s.address),
-            ]
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Пул серверов (LLD-10). Правило про всё, кроме 80 и 443, и есть рабочий
+    // выпуск: на VPS висят ssh и служебные ручки, а catch-all redirect ниже
+    // утащил бы их в прокси, где первым говорит сервер и соединение висело бы
+    // до таймаута. Заодно оно выпускает и туннельный порт при обычном его
+    // значении. Web-порты остаются под перехватом сознательно: сайты на том же
+    // VPS уходили из LAN голыми, светя SNI провайдерскому фильтру. Правило про
+    // туннельный порт стреляет только когда туннель сидит на 80 или 443: там
+    // без него телефон с персональным клиентом в той же LAN получил бы туннель
+    // в туннеле. Держим его для всех, чтобы loop-guard не зависел от списка
+    // web-портов.
+    let mut server_rules: Vec<String> = Vec::with_capacity(servers.len() * 2);
+    for server in servers {
+        for rule in [
+            format!("        ip daddr {} tcp dport {} return", server.address, server.port),
+            format!("        ip daddr {} tcp dport != {{ 80, 443 }} return", server.address),
+        ] {
+            if !server_rules.contains(&rule) {
+                server_rules.push(rule);
+            }
+        }
+    }
+    let server_returns = server_rules.join("\n");
 
     format!(
         r#"
@@ -392,9 +407,38 @@ mod tests {
     fn nft_ruleset_survives_empty_pool() {
         let ruleset = build_nft_ruleset(1080, &[], &[], false);
 
-        assert!(!ruleset.contains("ip daddr  "));
+        // Без серверов остаются только приватные сети, серверных строк нет.
+        assert!(!ruleset.contains("tcp dport != { 80, 443 }"));
+        assert_eq!(ruleset.matches("ip daddr").count(), 4);
         assert!(ruleset.contains("redirect to :1080"));
-        assert!(ruleset.contains("ip daddr 127.0.0.0/8 return"));
+    }
+
+    #[test]
+    fn nft_same_address_twice_gives_no_duplicate_rules() {
+        // Один VPS двумя записями пула: обычный туннель и запасной под
+        // камуфляж на 443.
+        let servers = vec![
+            ServerEndpoint { address: "203.0.113.10".into(), port: 8443 },
+            ServerEndpoint { address: "203.0.113.10".into(), port: 443 },
+        ];
+        let ruleset = build_nft_ruleset(1080, &servers, &[], false);
+
+        assert_eq!(ruleset.matches("tcp dport != { 80, 443 } return").count(), 1);
+        assert!(ruleset.contains("ip daddr 203.0.113.10 tcp dport 8443 return"));
+        assert!(ruleset.contains("ip daddr 203.0.113.10 tcp dport 443 return"));
+    }
+
+    #[test]
+    fn web_port_tunnel_is_reported() {
+        assert!(web_port_tunnels(&pool()).is_empty());
+
+        let camouflaged = vec![
+            ServerEndpoint { address: "203.0.113.10".into(), port: 8443 },
+            ServerEndpoint { address: "198.51.100.7".into(), port: 443 },
+        ];
+        let clashing = web_port_tunnels(&camouflaged);
+        assert_eq!(clashing.len(), 1);
+        assert_eq!(clashing[0].address, "198.51.100.7");
     }
 
     #[test]
