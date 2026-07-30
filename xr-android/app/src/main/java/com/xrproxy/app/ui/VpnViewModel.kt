@@ -65,7 +65,23 @@ data class UiMessage(val text: String, val severity: UiSeverity = UiSeverity.Inf
 
 sealed interface OnboardingState {
     object ShowingWelcome : OnboardingState
-    object Loading : OnboardingState
+
+    /** Ожидание. [hubUrl] пуст на старте приложения и на миг локального
+     *  разбора ссылки; как только адрес известен, экран говорит, к какому
+     *  хабу идёт запрос (XR-234). */
+    data class Loading(val hubUrl: String = "") : OnboardingState
+
+    /** Отказ проверки инвайта. Живёт экраном, а не снекбаром: причина
+     *  остаётся перед глазами, а [rawLink] даёт «Повторить» без повторной
+     *  вставки ссылки. [retryable] ложен, когда дело в самом приглашении
+     *  и повтор бессмыслен (XR-234). */
+    data class InviteError(
+        val hubUrl: String,
+        val title: String,
+        val detail: String,
+        val retryable: Boolean,
+        val rawLink: String,
+    ) : OnboardingState
     data class ConfirmInvite(
         val hubUrl: String,
         val token: String,
@@ -186,7 +202,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(VpnUiState())
     val uiState: StateFlow<VpnUiState> = _uiState
 
-    private val _onboardingState = MutableStateFlow<OnboardingState>(OnboardingState.Loading)
+    private val _onboardingState = MutableStateFlow<OnboardingState>(OnboardingState.Loading())
     val onboardingState: StateFlow<OnboardingState> = _onboardingState
 
     private val _permissionRequest = MutableSharedFlow<Intent>(extraBufferCapacity = 1)
@@ -952,7 +968,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     // ── Onboarding (LLD-04 + LLD-08) ───────────────────────────────
 
     fun onInviteLinkReceived(raw: String) {
-        _onboardingState.value = OnboardingState.Loading
+        _onboardingState.value = OnboardingState.Loading()
         viewModelScope.launch {
             val parsedJson = withContext(Dispatchers.IO) {
                 NativeBridge.nativeParseInviteLink(raw)
@@ -960,31 +976,32 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             val parsed = runCatching { JSONObject(parsedJson) }.getOrNull()
             if (parsed == null || parsed.has("error")) {
                 val err = parsed?.optString("error") ?: "parse failed"
-                emitMessage("Неправильный формат приглашения", UiSeverity.Error)
                 Log.w("xr-onboarding", "parseInviteLink: $err")
-                _onboardingState.value = initialOnboardingState()
+                _onboardingState.value = badInviteError(hubUrl = "", raw = raw,
+                    detail = "Неправильный формат приглашения")
                 return@launch
             }
             val hubUrl = parsed.optString("hub_url")
             val token = parsed.optString("token")
             if (hubUrl.isBlank() || token.isBlank()) {
-                emitMessage("Неправильный формат приглашения", UiSeverity.Error)
-                _onboardingState.value = initialOnboardingState()
+                _onboardingState.value = badInviteError(hubUrl = hubUrl, raw = raw,
+                    detail = "Неправильный формат приглашения")
                 return@launch
             }
 
+            // Адрес хаба известен ещё до сети: разбор ссылки локальный.
+            // Дальше экран ожидания говорит, к кому именно идёт запрос.
+            _onboardingState.value = OnboardingState.Loading(hubUrl)
             val infoJson = withContext(Dispatchers.IO) {
                 NativeBridge.nativeFetchInviteInfo(hubUrl, token, 5_000L)
             }
             val info = runCatching { JSONObject(infoJson) }.getOrNull()
             if (info == null) {
-                emitMessage("Ошибка ответа хаба", UiSeverity.Error)
-                _onboardingState.value = initialOnboardingState()
+                _onboardingState.value = hubInviteError(hubUrl, raw, "Ошибка ответа хаба")
                 return@launch
             }
             if (info.has("error")) {
-                emitMessage(friendlyInviteInfoError(info.optString("error")), UiSeverity.Error)
-                _onboardingState.value = initialOnboardingState()
+                _onboardingState.value = inviteErrorFor(info.optString("error"), hubUrl, raw)
                 return@launch
             }
 
@@ -1001,6 +1018,40 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onInviteCancelled() {
         _onboardingState.value = initialOnboardingState()
+    }
+
+    /** «Повторить» с экрана отказа: тот же путь, что и первый заход, ссылка
+     *  сохранена в состоянии, вставлять её заново не нужно. */
+    fun onInviteRetry() {
+        val err = _onboardingState.value as? OnboardingState.InviteError ?: return
+        onInviteLinkReceived(err.rawLink)
+    }
+
+    /** Дело в самом приглашении: повторять нечего, только назад. */
+    private fun badInviteError(hubUrl: String, raw: String, detail: String) =
+        OnboardingState.InviteError(
+            hubUrl = hubUrl,
+            title = "Приглашение не подходит",
+            detail = detail,
+            retryable = false,
+            rawLink = raw,
+        )
+
+    /** Дело в связи или хабе: повтор осмыслен. */
+    private fun hubInviteError(hubUrl: String, raw: String, detail: String) =
+        OnboardingState.InviteError(
+            hubUrl = hubUrl,
+            title = "Хаб не ответил",
+            detail = detail,
+            retryable = true,
+            rawLink = raw,
+        )
+
+    /** Код ошибки хаба раскладывается на два класса: not_found и gone это
+     *  судьба самого приглашения, остальное это проблемы доставки. */
+    private fun inviteErrorFor(code: String, hubUrl: String, raw: String) = when (code) {
+        "not_found", "gone" -> badInviteError(hubUrl, raw, friendlyInviteInfoError(code))
+        else -> hubInviteError(hubUrl, raw, friendlyInviteInfoError(code))
     }
 
     fun onManualSetupChosen() {
@@ -1095,7 +1146,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         "not_found" -> "Приглашение не найдено"
         "gone" -> "Приглашение уже использовано или истекло"
         else -> when {
-            code.startsWith("network") -> "Хаб недоступен. Проверьте интернет"
+            code.startsWith("network") -> "Проверьте интернет и попробуйте снова"
             code.contains("certificate") -> "Небезопасное соединение с хабом"
             code.startsWith("http_") -> "Ошибка хаба: ${code.removePrefix("http_")}"
             else -> "Ошибка: $code"

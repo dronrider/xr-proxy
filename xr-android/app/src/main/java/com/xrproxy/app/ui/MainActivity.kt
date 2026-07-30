@@ -52,6 +52,8 @@ import com.xrproxy.app.ui.components.formatBytes
 import com.xrproxy.app.ui.components.formatUptime
 import com.xrproxy.app.ui.files.FilesScreen
 import com.xrproxy.app.ui.onboarding.InviteConfirmScreen
+import com.xrproxy.app.ui.onboarding.InviteErrorScreen
+import com.xrproxy.app.ui.onboarding.InviteLoadingScreen
 import com.xrproxy.app.ui.onboarding.PasteLinkDialog
 import com.xrproxy.app.ui.onboarding.WelcomeScreen
 import com.xrproxy.app.ui.onboarding.scanInviteQr
@@ -302,9 +304,17 @@ fun MainScreen(
                     }
                 }
                 is OnboardingState.Loading -> {
-                    Box(Modifier.fillMaxSize(), Alignment.Center) {
-                        CircularProgressIndicator()
-                    }
+                    InviteLoadingScreen(hubUrl = ob.hubUrl)
+                }
+                is OnboardingState.InviteError -> {
+                    InviteErrorScreen(
+                        title = ob.title,
+                        detail = ob.detail,
+                        hubUrl = ob.hubUrl,
+                        retryable = ob.retryable,
+                        onRetry = { viewModel.onInviteRetry() },
+                        onBack = { viewModel.onInviteCancelled() },
+                    )
                 }
                 is OnboardingState.ConfirmInvite -> {
                     InviteConfirmScreen(
