@@ -72,8 +72,9 @@ pub struct ServerEndpoint {
     pub port: u16,
 }
 
-/// Set up redirect rules. `servers` (все серверы пула LLD-10) are excluded
-/// to avoid redirect loops.
+/// Set up redirect rules. Из перехвата выводится не сервер пула (LLD-10)
+/// целиком, а его туннельный порт и всё, кроме 80 и 443: туннель не должен
+/// зациклиться, а сайты на том же VPS обязаны уходить через прокси.
 /// `bypass_ips` are source IPs that should not be redirected (game consoles, etc.)
 pub fn setup_redirect(
     backend: FirewallBackend,
@@ -82,6 +83,16 @@ pub fn setup_redirect(
     bypass_ips: &[String],
     block_quic: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    for server in servers {
+        if matches!(server.port, 80 | 443) {
+            tracing::warn!(
+                "tunnel port {} on {} is a web port: sites hosted on that VPS stay outside the tunnel",
+                server.port,
+                server.address
+            );
+        }
+    }
+
     match backend {
         FirewallBackend::Nftables => setup_nftables(listen_port, servers, bypass_ips, block_quic),
         FirewallBackend::Iptables => setup_iptables(listen_port, servers, bypass_ips, block_quic),
@@ -163,14 +174,21 @@ fn build_nft_ruleset(
         ""
     };
 
-    // Пул серверов (LLD-10): выпускаем мимо перехвата туннельный порт каждого
-    // VPS, иначе телефон с персональным клиентом в той же LAN получил бы
-    // туннель в туннеле. Исключение сужено до порта, а не до всего адреса:
-    // на том же VPS живут обычные сайты, и по всему адресу их 443 уходил из
-    // LAN голым, светя SNI провайдерскому фильтру.
+    // Пул серверов (LLD-10): туннельный порт каждого VPS выпускаем мимо
+    // перехвата, иначе телефон с персональным клиентом в той же LAN получил бы
+    // туннель в туннеле. Второе правило выпускает всё, кроме 80 и 443: на VPS
+    // висят ssh и служебные ручки, а catch-all redirect ниже утащил бы их в
+    // прокси, где первым говорит сервер и соединение висело бы до таймаута.
+    // Web-порты остаются под перехватом сознательно: сайты на том же VPS
+    // уходили из LAN голыми, светя SNI провайдерскому фильтру.
     let server_returns: String = servers
         .iter()
-        .map(|s| format!("        ip daddr {} tcp dport {} return", s.address, s.port))
+        .flat_map(|s| {
+            [
+                format!("        ip daddr {} tcp dport {} return", s.address, s.port),
+                format!("        ip daddr {} tcp dport != {{ 80, 443 }} return", s.address),
+            ]
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -271,7 +289,8 @@ fn build_ipt_rules(
     }
 
     // Пул серверов (LLD-10): выпускаем только туннельный порт, см. разбор
-    // в build_nft_ruleset.
+    // в build_nft_ruleset. Второе правило («всё, кроме web-портов») здесь не
+    // нужно: redirect ниже и так ловит только 80 и 443.
     for server in servers {
         let port = server.port.to_string();
         rules.push(rule(&[
@@ -343,6 +362,10 @@ mod tests {
         ]
     }
 
+    fn joined(rules: Vec<Vec<String>>) -> Vec<String> {
+        rules.iter().map(|r| r.join(" ")).collect()
+    }
+
     #[test]
     fn nft_server_exclusion_covers_tunnel_port_only() {
         let ruleset = build_nft_ruleset(1080, &pool(), &[], true);
@@ -353,6 +376,25 @@ mod tests {
         // той же машине, уходили бы из LAN мимо туннеля с открытым SNI.
         assert!(!ruleset.contains("ip daddr 203.0.113.10 return"));
         assert!(!ruleset.contains("ip daddr 198.51.100.7 return"));
+    }
+
+    #[test]
+    fn nft_server_keeps_everything_but_web_ports_direct() {
+        let ruleset = build_nft_ruleset(1080, &pool(), &[], true);
+
+        // Под перехват у адреса сервера попадают только 80 и 443, всё
+        // остальное (ssh, служебные ручки) идёт мимо прокси, как и раньше.
+        assert!(ruleset.contains("ip daddr 203.0.113.10 tcp dport != { 80, 443 } return"));
+        assert!(ruleset.contains("ip daddr 198.51.100.7 tcp dport != { 80, 443 } return"));
+    }
+
+    #[test]
+    fn nft_ruleset_survives_empty_pool() {
+        let ruleset = build_nft_ruleset(1080, &[], &[], false);
+
+        assert!(!ruleset.contains("ip daddr  "));
+        assert!(ruleset.contains("redirect to :1080"));
+        assert!(ruleset.contains("ip daddr 127.0.0.0/8 return"));
     }
 
     #[test]
@@ -370,10 +412,7 @@ mod tests {
 
     #[test]
     fn ipt_server_exclusion_covers_tunnel_port_only() {
-        let rules: Vec<String> = build_ipt_rules(1080, &pool(), &[], true)
-            .iter()
-            .map(|r| r.join(" "))
-            .collect();
+        let rules = joined(build_ipt_rules(1080, &pool(), &[], true));
 
         assert!(rules.contains(&format!(
             "-t nat -A {IPT_CHAIN} -d 203.0.113.10 -p tcp --dport 8443 -j RETURN"
@@ -383,17 +422,36 @@ mod tests {
     }
 
     #[test]
+    fn ipt_keeps_bypass_private_nets_and_quic_block() {
+        let bypass = vec!["192.168.1.50".to_string()];
+        let rules = joined(build_ipt_rules(1080, &pool(), &bypass, true));
+
+        assert!(rules.contains(&format!("-t nat -A {IPT_CHAIN} -s 192.168.1.50 -j RETURN")));
+        assert!(rules.contains(&format!("-t nat -A {IPT_CHAIN} -d 192.168.0.0/16 -j RETURN")));
+        assert!(rules.iter().any(|r| r.contains("REDIRECT --to-ports 1080")));
+
+        let quic = "-t mangle -A PREROUTING -i br-lan -p udp --dport 443 -j DROP".to_string();
+        assert!(rules.contains(&quic));
+        assert!(!joined(build_ipt_rules(1080, &pool(), &bypass, false)).contains(&quic));
+    }
+
+    #[test]
     fn ipt_rules_keep_order_of_chain_setup() {
-        let rules: Vec<String> = build_ipt_rules(1080, &pool(), &["192.168.1.50".to_string()], false)
-            .iter()
-            .map(|r| r.join(" "))
-            .collect();
+        let rules = joined(build_ipt_rules(1080, &pool(), &["192.168.1.50".to_string()], true));
 
         // Цепочка сначала создаётся, исключения идут до redirect, а хук в
-        // PREROUTING ставится последним, иначе часть трафика проскочит мимо
-        // ещё не дописанных правил.
+        // PREROUTING ставится после всех правил цепочки, иначе часть трафика
+        // проскочит мимо ещё не дописанных.
         assert_eq!(rules.first().unwrap(), &format!("-t nat -N {IPT_CHAIN}"));
-        assert_eq!(rules.last().unwrap(), &format!("-t nat -A PREROUTING -j {IPT_CHAIN}"));
+        let hook = rules
+            .iter()
+            .position(|r| r == &format!("-t nat -A PREROUTING -j {IPT_CHAIN}"))
+            .unwrap();
+        let last_chain_rule = rules
+            .iter()
+            .rposition(|r| r.contains(&format!("-A {IPT_CHAIN}")))
+            .unwrap();
+        assert!(last_chain_rule < hook);
 
         let bypass = rules.iter().position(|r| r.contains("-s 192.168.1.50")).unwrap();
         let exclusion = rules.iter().position(|r| r.contains("-d 203.0.113.10")).unwrap();

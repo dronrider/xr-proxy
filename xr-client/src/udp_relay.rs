@@ -21,6 +21,13 @@ const SOL_IP: libc::c_int = 0;
 const IP_TRANSPARENT: libc::c_int = 19;
 const IP_RECVORIGDSTADDR: libc::c_int = 20;
 const IP_ORIGDSTADDR: libc::c_int = 20;
+
+// На боевых целях значение берём у libc: оно разное по архитектурам
+// (на mips свой набор флагов). Заглушка нужна только для сборки на маке,
+// где крейт собирают ради юнит-тестов, а не для запуска.
+#[cfg(target_os = "linux")]
+use libc::SOCK_NONBLOCK;
+#[cfg(not(target_os = "linux"))]
 const SOCK_NONBLOCK: libc::c_int = 0o4000;
 
 // ── Flow tracking ──────────────────────────────────────────────────
