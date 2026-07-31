@@ -183,7 +183,7 @@ fn run_backup(config_path: &str, out: &str, keep: usize) -> Result<()> {
     let target = out_dir.join(backup::archive_name(
         &now.format("%Y%m%dT%H%M%SZ").to_string(),
     ));
-    backup::write_archive(&target, &bytes)?;
+    backup::write_secret(&target, &bytes)?;
     let removed = backup::prune(out_dir, keep)?;
 
     println!("Бэкап хаба: {}", target.display());
