@@ -164,7 +164,7 @@ async fn test_full_tunnel_roundtrip() {
 
     // Send Connect frame pointing to echo server
     let target = TargetAddr::Ip(echo_addr);
-    let connect_payload = target.encode();
+    let connect_payload = target.encode().unwrap();
     let connect_frame = codec.encode_frame(Command::Connect, &connect_payload).unwrap();
     server_conn.write_all(&connect_frame).await.unwrap();
 
@@ -246,7 +246,7 @@ async fn test_domain_connect() {
 
     // Connect using "127.0.0.1" as domain (server will resolve it)
     let target = TargetAddr::Domain("127.0.0.1".to_string(), echo_addr.port());
-    let frame = codec.encode_frame(Command::Connect, &target.encode()).unwrap();
+    let frame = codec.encode_frame(Command::Connect, &target.encode().unwrap()).unwrap();
     conn.write_all(&frame).await.unwrap();
 
     // Read ack
@@ -304,7 +304,7 @@ async fn test_wrong_key_rejected() {
         .unwrap();
 
     let target = TargetAddr::Ip("127.0.0.1:9999".parse().unwrap());
-    let frame = wrong_codec.encode_frame(Command::Connect, &target.encode()).unwrap();
+    let frame = wrong_codec.encode_frame(Command::Connect, &target.encode().unwrap()).unwrap();
     conn.write_all(&frame).await.unwrap();
 
     // Should NOT receive a valid ConnectAck

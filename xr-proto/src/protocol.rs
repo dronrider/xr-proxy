@@ -22,6 +22,9 @@ pub(crate) const MAX_PAYLOAD_LEN: usize = u16::MAX as usize;
 /// Верхняя граница padding кадра (padding_len это u8). Нужна вне модуля, чтобы
 /// приёмный буфер mux вмещал максимальный легальный кадр целиком.
 pub const MAX_PADDING_LEN: usize = u8::MAX as usize;
+/// Домен в Connect кодируется префиксом длины в один байт. Нужна вне модуля,
+/// чтобы сниффер SNI отсекал слишком длинные имена ещё до кодирования.
+pub const MAX_DOMAIN_LEN: usize = u8::MAX as usize;
 /// Fixed magic embedded in header for basic validation (bits 5-7 of command byte).
 const HEADER_MAGIC_MASK: u8 = 0xE0;
 const HEADER_MAGIC: u8 = 0xA0;
@@ -126,7 +129,11 @@ pub enum TargetAddr {
 }
 
 impl TargetAddr {
-    pub fn encode(&self) -> Vec<u8> {
+    /// Длина домена на проводе это один байт, поэтому слишком длинное имя не
+    /// кодируется. Раньше тут стоял assert, и домен, пришедший из SNI чужого
+    /// ClientHello, ронял весь процесс: прокси на роутере и VPN-сервис на
+    /// телефоне (XR-205).
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
         let mut buf = Vec::new();
         match self {
             TargetAddr::Ip(SocketAddr::V4(addr)) => {
@@ -140,15 +147,20 @@ impl TargetAddr {
                 buf.extend_from_slice(&addr.port().to_be_bytes());
             }
             TargetAddr::Domain(domain, port) => {
-                buf.push(0x03); // Domain
                 let domain_bytes = domain.as_bytes();
-                assert!(domain_bytes.len() <= 255);
+                if domain_bytes.len() > MAX_DOMAIN_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "domain too long for wire format",
+                    ));
+                }
+                buf.push(0x03); // Domain
                 buf.push(domain_bytes.len() as u8);
                 buf.extend_from_slice(domain_bytes);
                 buf.extend_from_slice(&port.to_be_bytes());
             }
         }
-        buf
+        Ok(buf)
     }
 
     pub fn decode(data: &[u8]) -> io::Result<(Self, usize)> {
@@ -342,7 +354,7 @@ mod tests {
     #[test]
     fn test_connect_addr_roundtrip() {
         let addr = TargetAddr::Domain("www.google.com".to_string(), 443);
-        let encoded = addr.encode();
+        let encoded = addr.encode().unwrap();
         let (decoded, len) = TargetAddr::decode(&encoded).unwrap();
         assert_eq!(len, encoded.len());
         match decoded {
@@ -350,6 +362,25 @@ mod tests {
                 assert_eq!(d, "www.google.com");
                 assert_eq!(p, 443);
             }
+            _ => panic!("wrong type"),
+        }
+    }
+
+    /// Домен, не влезающий в байтовый префикс длины, отдаёт ошибку, а не
+    /// роняет процесс: до XR-205 тут стоял assert, и SNI из чужого
+    /// ClientHello абортил прокси на роутере.
+    #[test]
+    fn test_connect_addr_too_long_domain_errs() {
+        let addr = TargetAddr::Domain("a".repeat(MAX_DOMAIN_LEN + 1), 443);
+        let err = addr.encode().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Ровно на границе кодируется и читается обратно.
+        let addr = TargetAddr::Domain("a".repeat(MAX_DOMAIN_LEN), 443);
+        let encoded = addr.encode().unwrap();
+        let (decoded, _) = TargetAddr::decode(&encoded).unwrap();
+        match decoded {
+            TargetAddr::Domain(d, _) => assert_eq!(d.len(), MAX_DOMAIN_LEN),
             _ => panic!("wrong type"),
         }
     }

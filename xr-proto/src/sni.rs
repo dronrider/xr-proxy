@@ -1,3 +1,5 @@
+use crate::protocol::MAX_DOMAIN_LEN;
+
 /// Extract SNI (Server Name Indication) from TLS ClientHello.
 ///
 /// This is a lightweight parser that looks for the SNI extension in the
@@ -37,7 +39,9 @@ pub fn extract_sni(buf: &[u8]) -> Option<String> {
 
     // Handshake header (inside the record)
     let hs = &buf[5..record_end];
-    if hs.is_empty() || hs[0] != 0x01 {
+    // Заголовок handshake это 4 байта. Обрезанный рекорд (длина в заголовке
+    // меньше самого заголовка) раньше уводил чтение за границу среза (XR-205).
+    if hs.len() < 4 || hs[0] != 0x01 {
         // Not ClientHello
         return None;
     }
@@ -109,7 +113,12 @@ fn parse_sni_extension(data: &[u8]) -> Option<String> {
         pos += 3;
 
         if name_type == 0x00 {
-            // Host name
+            // Host name. Имя длиннее байтового префикса Connect на провод не
+            // лезет, а настоящих таких доменов не бывает (DNS даёт максимум
+            // 253 символа): такое соединение уходит маршрутом по IP.
+            if name_len > MAX_DOMAIN_LEN {
+                return None;
+            }
             if pos + name_len <= data.len() {
                 return String::from_utf8(data[pos..pos + name_len].to_vec()).ok();
             }
@@ -142,6 +151,32 @@ mod tests {
     #[test]
     fn test_short_buffer() {
         assert_eq!(extract_sni(&[0x16, 0x03, 0x01]), None);
+    }
+
+    /// Рекорд объявляет длину меньше заголовка handshake: чтение заголовка
+    /// уходило за границу среза и роняло процесс (XR-205). Буфер при этом
+    /// длиннее минимальных 44 байт, иначе разбор отсекается раньше.
+    #[test]
+    fn test_truncated_record_len() {
+        for record_len in 0u16..=4 {
+            let mut buf = vec![0x16, 0x03, 0x01];
+            buf.extend_from_slice(&record_len.to_be_bytes());
+            buf.push(0x01); // ClientHello, но рекорд обрывается на нём
+            buf.resize(64, 0);
+            assert_eq!(extract_sni(&buf), None, "record_len={}", record_len);
+        }
+    }
+
+    /// SNI длиннее байтового префикса Connect не поедет на провод, поэтому
+    /// сниффер отдаёт None и соединение уходит маршрутом по IP.
+    #[test]
+    fn test_overlong_sni_ignored() {
+        let long = "a".repeat(MAX_DOMAIN_LEN + 1);
+        assert_eq!(extract_sni(&build_test_client_hello(&long)), None);
+
+        // Ровно на границе имя ещё принимается.
+        let edge = "a".repeat(MAX_DOMAIN_LEN);
+        assert_eq!(extract_sni(&build_test_client_hello(&edge)), Some(edge));
     }
 
     /// Build a minimal TLS ClientHello with a given SNI for testing.

@@ -42,7 +42,7 @@ pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     target_addr: &TargetAddr,
     codec: &Codec,
 ) -> io::Result<()> {
-    let connect_payload = target_addr.encode();
+    let connect_payload = target_addr.encode()?;
     let connect_frame = codec.encode_frame(Command::Connect, &connect_payload)?;
     server.write_all(&connect_frame).await?;
 

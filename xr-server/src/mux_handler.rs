@@ -342,7 +342,7 @@ mod tests {
         };
         let target = TargetAddr::Ip(format!("127.0.0.1:{}", dead_port).parse().unwrap());
         let wire = codec
-            .encode_frame(Command::Connect, &encode_mux_payload(1, &target.encode()))
+            .encode_frame(Command::Connect, &encode_mux_payload(1, &target.encode().unwrap()))
             .unwrap();
         tokio::io::AsyncWriteExt::write_all(&mut client, &wire).await.unwrap();
 
@@ -368,7 +368,7 @@ mod tests {
 
         let target = TargetAddr::Domain("xr094-canary.invalid".to_string(), 443);
         let wire = codec
-            .encode_frame(Command::Connect, &encode_mux_payload(1, &target.encode()))
+            .encode_frame(Command::Connect, &encode_mux_payload(1, &target.encode().unwrap()))
             .unwrap();
         tokio::io::AsyncWriteExt::write_all(&mut client, &wire).await.unwrap();
 
