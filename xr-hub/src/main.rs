@@ -1,4 +1,5 @@
 mod api;
+mod backup;
 mod config;
 mod embed;
 mod password_reset;
@@ -8,7 +9,7 @@ mod state;
 mod storage;
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -40,6 +41,32 @@ enum Commands {
         user: String,
         /// New password. If omitted, you will be prompted (input hidden).
         password: Option<String>,
+    },
+    /// Собрать бэкап состояния хаба (XR-224): конфиг, ключ подписи, пресеты,
+    /// инвайты и шары одним tar.gz. Раздача дистрибутивов в архив не едет.
+    Backup {
+        /// Куда положить архив.
+        #[arg(long, default_value = "/var/backups/xr-hub")]
+        out: String,
+        /// Сколько архивов оставить в каталоге (0 отключает ротацию).
+        #[arg(long, default_value_t = 14)]
+        keep: usize,
+    },
+    /// Развернуть бэкап состояния хаба (XR-224). Сервис на время
+    /// восстановления остановить, после запустить заново.
+    Restore {
+        /// Архив, собранный `xr-hub backup`.
+        #[arg(long)]
+        from: String,
+        /// Каталог состояния; без флага берётся из конфига в архиве.
+        #[arg(long = "data-dir")]
+        data_dir: Option<String>,
+        /// Куда положить ключ подписи; без флага рядом с состоянием.
+        #[arg(long = "signing-key")]
+        signing_key: Option<String>,
+        /// Заменить ключ подписи с другим отпечатком.
+        #[arg(long)]
+        force: bool,
     },
     /// Generate a fresh ed25519 release keypair for APK self-update (LLD-12).
     /// Keep the private key OFFLINE; the public key goes into the app build.
@@ -127,6 +154,118 @@ fn reset_password(config_path: &str, user: &str, password: Option<&str>) -> Resu
     Ok(())
 }
 
+/// `xr-hub backup`: собрать архив состояния и подчистить старые. Печатает
+/// путь, размер, отпечаток ключа и счётчики: по выводу видно, что уехало
+/// непустое, а молчание не спутать с работой.
+fn run_backup(config_path: &str, out: &str, keep: usize) -> Result<()> {
+    let text = std::fs::read_to_string(config_path)
+        .with_context(|| format!("чтение конфига {config_path}"))?;
+    let hub_config: config::HubConfig = toml::from_str(&text).context("разбор конфига")?;
+
+    let src = backup::Sources {
+        config: PathBuf::from(config_path),
+        data_dir: PathBuf::from(&hub_config.server.data_dir),
+        signing_key: hub_config
+            .signing
+            .as_ref()
+            .map(|s| PathBuf::from(&s.private_key)),
+    };
+
+    let now = chrono::Utc::now();
+    let (bytes, manifest) = backup::build_archive(
+        &src,
+        &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        &hostname(),
+        now.timestamp().max(0) as u64,
+    )?;
+
+    let out_dir = Path::new(out);
+    let target = out_dir.join(backup::archive_name(
+        &now.format("%Y%m%dT%H%M%SZ").to_string(),
+    ));
+    backup::write_archive(&target, &bytes)?;
+    let removed = backup::prune(out_dir, keep)?;
+
+    println!("Бэкап хаба: {}", target.display());
+    println!("  размер: {} байт", bytes.len());
+    match (&manifest.signing_fingerprint, &manifest.signing_public_key) {
+        (Some(fp), Some(pubkey)) => {
+            println!("  ключ подписи: {fp}");
+            println!("  публичная половина: {pubkey}");
+        }
+        _ => println!("  ключ подписи: в конфиге нет секции [signing], в архиве его нет"),
+    }
+    println!(
+        "  пресетов: {}, инвайтов: {}, шар: {}",
+        manifest.presets, manifest.invites, manifest.shares
+    );
+    if manifest.presets == 0 && manifest.invites == 0 && manifest.shares == 0 {
+        println!("  внимание: состояние пустое, проверь data_dir в конфиге");
+    }
+    if !removed.is_empty() {
+        println!("  ротация: удалено старых архивов {}", removed.len());
+    }
+    Ok(())
+}
+
+/// `xr-hub restore`: разложить архив по путям хаба.
+fn run_restore(
+    config_path: &str,
+    from: &str,
+    data_dir: Option<&str>,
+    signing_key: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    let archive = std::fs::read(from).with_context(|| format!("чтение архива {from}"))?;
+    let targets = backup::Targets {
+        config: PathBuf::from(config_path),
+        data_dir: data_dir.map(PathBuf::from),
+        signing_key: signing_key.map(PathBuf::from),
+    };
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let report = backup::restore(&archive, &targets, force, &stamp)?;
+
+    let m = &report.manifest;
+    println!(
+        "Восстановлен бэкап от {} (хост {}, xr-hub {}).",
+        m.created_at, m.host, m.hub_version
+    );
+    println!("  конфиг: {}", report.config.display());
+    if let Some(key) = &report.signing_key {
+        let state = match report.key_state {
+            backup::KeyState::Fresh => "положен на чистое место",
+            backup::KeyState::Same => "тот же ключ, что лежал",
+            backup::KeyState::Replaced => "заменил ключ с другим отпечатком",
+        };
+        println!("  ключ подписи: {} ({state})", key.display());
+        if let Some(fp) = &m.signing_fingerprint {
+            println!("    отпечаток: {fp}");
+        }
+    }
+    println!(
+        "  состояние: {} (файлов {}, пресетов {}, инвайтов {}, шар {})",
+        report.data_dir.display(),
+        report.data_files,
+        m.presets,
+        m.invites,
+        m.shares
+    );
+    println!();
+    println!("Восстановленное состояние хаб читает при старте:");
+    println!("  systemctl restart xr-hub");
+    Ok(())
+}
+
+fn hostname() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -141,6 +280,28 @@ async fn main() -> Result<()> {
 
     if let Some(Commands::ResetPassword { user, password }) = &cli.command {
         reset_password(&cli.config, user, password.as_deref())?;
+        return Ok(());
+    }
+
+    if let Some(Commands::Backup { out, keep }) = &cli.command {
+        run_backup(&cli.config, out, *keep)?;
+        return Ok(());
+    }
+
+    if let Some(Commands::Restore {
+        from,
+        data_dir,
+        signing_key,
+        force,
+    }) = &cli.command
+    {
+        run_restore(
+            &cli.config,
+            from,
+            data_dir.as_deref(),
+            signing_key.as_deref(),
+            *force,
+        )?;
         return Ok(());
     }
 
