@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use xr_proto::protocol::MAX_DOMAIN_LEN;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -221,7 +222,16 @@ fn parse_dns_question(data: &[u8]) -> Option<(String, u16, u16, usize)> {
     let qclass = u16::from_be_bytes([data[pos + 2], data[pos + 3]]);
     pos += 4;
 
+    // Отдельная метка не длиннее 255 байт, но их количество ничем не ограничено,
+    // а собранное имя уезжает в Connect, где длина домена это один байт. Так что
+    // предел тот же, что у сниффера SNI: приложение на телефоне запросом с сотней
+    // меток не должно валить движок (XR-205). Настоящих имён это не задевает,
+    // DNS даёт максимум 253 символа.
     let domain = parts.join(".");
+    if domain.len() > MAX_DOMAIN_LEN {
+        tracing::debug!("fake DNS: имя вопроса {} байт, больше предела домена", domain.len());
+        return None;
+    }
     Some((domain, qtype, qclass, pos))
 }
 
@@ -337,6 +347,24 @@ mod tests {
         query[name_end + 1] = 28;
 
         assert!(dns.handle_query(&query).is_none());
+    }
+
+    /// Меток в вопросе может быть сколько угодно, а собранное имя уезжает в
+    /// Connect с однобайтовой длиной. Слишком длинное имя fake DNS не берёт,
+    /// иначе приложение таким запросом роняло движок (XR-205).
+    #[test]
+    fn test_overlong_query_name_ignored() {
+        let dns = FakeDns::new();
+
+        // Сотня меток по три символа даёт имя далеко за пределом домена.
+        let long = vec!["abc"; 100].join(".");
+        assert!(long.len() > MAX_DOMAIN_LEN);
+        assert!(dns.handle_query(&build_test_dns_query(&long)).is_none());
+
+        // Имя ровно на границе ещё обслуживается.
+        let edge = vec!["abc"; 64].join(".")[..MAX_DOMAIN_LEN].to_string();
+        let (_, fake_ip) = dns.handle_query(&build_test_dns_query(&edge)).unwrap();
+        assert_eq!(dns.lookup(fake_ip), Some(edge));
     }
 
     /// Build a DNS query packet for testing.
