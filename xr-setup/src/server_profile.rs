@@ -277,17 +277,14 @@ pub fn finish(r: &Resolved) -> Result<()> {
 }
 
 /// Незаполненный backup.env: бэкап хаба собирается по cron, но никуда не
-/// уезжает, а тишину в этом случае не отличить от рабочей отправки.
+/// уезжает, а тишину в этом случае не отличить от рабочей отправки. Отправка
+/// требует обе переменные, поэтому одного адреса мало: иначе установщик
+/// молчит, а cron каждый день шлёт алерт.
 pub fn backup_env_finding(env: Option<&str>) -> Option<String> {
     let filled = env.is_some_and(|text| {
-        text.lines().any(|line| {
-            let line = line.trim_start();
-            !line.starts_with('#')
-                && line
-                    .strip_prefix("BACKUP_HOST")
-                    .and_then(|rest| rest.trim_start().strip_prefix('='))
-                    .is_some_and(|value| !value.trim().is_empty())
-        })
+        ["BACKUP_HOST", "BACKUP_KEY"]
+            .iter()
+            .all(|key| env_value_set(text, key))
     });
     if filled {
         return None;
@@ -297,6 +294,19 @@ pub fn backup_env_finding(env: Option<&str>) -> Option<String> {
          Заполни {HUB_BACKUP_ENV_FILE} (BACKUP_HOST и BACKUP_KEY) и проверь отправку:\n  \
          {HUB_BACKUP_BIN}"
     ))
+}
+
+/// Переменная env-файла задана непустым значением. Закомментированная
+/// строка не в счёт: болванка установщика состоит как раз из них.
+fn env_value_set(text: &str, key: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        !line.starts_with('#')
+            && line
+                .strip_prefix(key)
+                .and_then(|rest| rest.trim_start().strip_prefix('='))
+                .is_some_and(|value| !value.trim().is_empty())
+    })
 }
 
 fn finish_hub(hub: &HubPlan) -> Result<()> {
@@ -474,8 +484,13 @@ mod tests {
         for empty in [
             None,
             Some(HUB_BACKUP_ENV),
-            Some("#BACKUP_HOST=203.0.113.7\n"),
+            Some("#BACKUP_HOST=203.0.113.7\n#BACKUP_KEY=/root/.ssh/xr-hub-backup\n"),
             Some("BACKUP_HOST=\nBACKUP_KEY=/root/.ssh/xr-hub-backup\n"),
+            // Отправка требует обе переменные: с одним адресом установщик
+            // молчал бы, а cron слал алерт про незаполненный env.
+            Some("BACKUP_HOST=203.0.113.7\n"),
+            Some("BACKUP_HOST=203.0.113.7\nBACKUP_KEY=\n"),
+            Some("BACKUP_HOST=203.0.113.7\n#BACKUP_KEY=/root/.ssh/xr-hub-backup\n"),
         ] {
             let finding = backup_env_finding(empty).unwrap_or_else(|| {
                 panic!("незаполненный env обязан стать находкой: {empty:?}")
@@ -484,7 +499,10 @@ mod tests {
             assert!(finding.contains(HUB_BACKUP_BIN), "в находке нужна точная команда");
         }
         assert!(
-            backup_env_finding(Some("BACKUP_HOST = 203.0.113.7\n")).is_none(),
+            backup_env_finding(Some(
+                "# приёмник\nBACKUP_HOST = 203.0.113.7\nBACKUP_KEY=/root/.ssh/xr-hub-backup\n"
+            ))
+            .is_none(),
             "заполненный env находкой не считается"
         );
     }
