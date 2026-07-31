@@ -2,13 +2,15 @@
 //! xr-server, при --with-hub рядом встаёт xr-hub, и установка заканчивается
 //! одноразовым инвайтом - швом с онбордингом LLD-04.
 
-use crate::actions::{InstallBinary, Restart, SigningKey, Sysctl, SystemdUnit, WriteConfig};
+use crate::actions::{
+    HubBackup, InstallBinary, Restart, SigningKey, Sysctl, SystemdUnit, WriteConfig,
+};
 use crate::arch::Arch;
 use crate::fetch::BinSource;
 use crate::hub_api::HubClient;
 use crate::render::{
-    render_hub_toml, render_server_toml, HubTomlParams, ServerTomlParams, HUB_UNIT, SERVER_UNIT,
-    SYSCTL_CONF,
+    render_hub_toml, render_server_toml, HubTomlParams, ServerTomlParams, HUB_BACKUP,
+    HUB_BACKUP_CRON, HUB_BACKUP_ENV, HUB_UNIT, SERVER_UNIT, SYSCTL_CONF,
 };
 use crate::secrets;
 use crate::steps::Step;
@@ -24,6 +26,9 @@ const SERVER_CONF: &str = "/etc/xr-proxy/server.toml";
 const HUB_CONF: &str = "/etc/xr-hub/config.toml";
 const ADMIN_PASS_FILE: &str = "/etc/xr-hub/admin.pass";
 const SIGNING_KEY_FILE: &str = "/var/lib/xr-hub/signing.key";
+const HUB_BACKUP_BIN: &str = "/usr/local/bin/xr-hub-backup.sh";
+const HUB_BACKUP_CRON_FILE: &str = "/etc/cron.d/xr-hub-backup";
+const HUB_BACKUP_ENV_FILE: &str = "/etc/xr-hub/backup.env";
 const SYSCTL_FILE: &str = "/etc/sysctl.d/99-xr-proxy.conf";
 const SERVER_UNIT_NAME: &str = "xr-proxy-server";
 const HUB_UNIT_NAME: &str = "xr-hub";
@@ -235,6 +240,14 @@ pub fn plan(r: &Resolved) -> Vec<Box<dyn Step>> {
             unit: HUB_UNIT_NAME.into(),
             content: HUB_UNIT.into(),
         }));
+        steps.push(Box::new(HubBackup {
+            script: PathBuf::from(HUB_BACKUP_BIN),
+            script_content: HUB_BACKUP.into(),
+            cron: PathBuf::from(HUB_BACKUP_CRON_FILE),
+            cron_content: HUB_BACKUP_CRON.into(),
+            env: PathBuf::from(HUB_BACKUP_ENV_FILE),
+            env_template: HUB_BACKUP_ENV.into(),
+        }));
     }
 
     steps
@@ -253,6 +266,40 @@ pub fn finish(r: &Resolved) -> Result<()> {
         return Ok(());
     };
 
+    let outcome = finish_hub(hub);
+    if let Some(finding) =
+        backup_env_finding(std::fs::read_to_string(HUB_BACKUP_ENV_FILE).ok().as_deref())
+    {
+        println!();
+        println!("{finding}");
+    }
+    outcome
+}
+
+/// Незаполненный backup.env: бэкап хаба собирается по cron, но никуда не
+/// уезжает, а тишину в этом случае не отличить от рабочей отправки.
+pub fn backup_env_finding(env: Option<&str>) -> Option<String> {
+    let filled = env.is_some_and(|text| {
+        text.lines().any(|line| {
+            let line = line.trim_start();
+            !line.starts_with('#')
+                && line
+                    .strip_prefix("BACKUP_HOST")
+                    .and_then(|rest| rest.trim_start().strip_prefix('='))
+                    .is_some_and(|value| !value.trim().is_empty())
+        })
+    });
+    if filled {
+        return None;
+    }
+    Some(format!(
+        "Находка: бэкап состояния хаба собирается по cron, но приёмник не задан.\n  \
+         Заполни {HUB_BACKUP_ENV_FILE} (BACKUP_HOST и BACKUP_KEY) и проверь отправку:\n  \
+         {HUB_BACKUP_BIN}"
+    ))
+}
+
+fn finish_hub(hub: &HubPlan) -> Result<()> {
     if hub.native_tls {
         println!("В конфиге хаба включён TLS: минт инвайта по локальному HTTP не пройдёт.");
         println!("Создай инвайт в админке хаба ({}).", hub.public_hub_url);
@@ -416,8 +463,29 @@ mod tests {
                 "binary:xr-hub",
                 "hub:signing-key",
                 "config:hub",
-                "service:xr-hub"
+                "service:xr-hub",
+                "hub:backup"
             ]
+        );
+    }
+
+    #[test]
+    fn backup_finding_fires_until_the_receiver_is_set() {
+        for empty in [
+            None,
+            Some(HUB_BACKUP_ENV),
+            Some("#BACKUP_HOST=203.0.113.7\n"),
+            Some("BACKUP_HOST=\nBACKUP_KEY=/root/.ssh/xr-hub-backup\n"),
+        ] {
+            let finding = backup_env_finding(empty).unwrap_or_else(|| {
+                panic!("незаполненный env обязан стать находкой: {empty:?}")
+            });
+            assert!(finding.contains(HUB_BACKUP_ENV_FILE));
+            assert!(finding.contains(HUB_BACKUP_BIN), "в находке нужна точная команда");
+        }
+        assert!(
+            backup_env_finding(Some("BACKUP_HOST = 203.0.113.7\n")).is_none(),
+            "заполненный env находкой не считается"
         );
     }
 
