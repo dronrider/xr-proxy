@@ -80,6 +80,13 @@ pub fn write_atomic(path: &PathBuf, bytes: &[u8], mode: u32) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("создание {}", parent.display()))?;
+        // Каталог секрета сужается до 0700 и когда он уже был: create_dir_all
+        // идёт по umask, и /etc/xr-hub с /var/lib/xr-hub оставались 0755, то
+        // есть имена ключей и инвайтов читал любой локальный пользователь.
+        // Файлы под 0644 и 0755 (юниты, cron, бинари) читаемы по замыслу.
+        if mode == 0o600 {
+            narrow_dir(parent)?;
+        }
     }
     let tmp = path.with_extension("xr-setup.new");
     std::fs::remove_file(&tmp).ok();
@@ -93,6 +100,22 @@ pub fn write_atomic(path: &PathBuf, bytes: &[u8], mode: u32) -> Result<()> {
         .with_context(|| format!("запись {}", tmp.display()))?;
     drop(f);
     std::fs::rename(&tmp, path).with_context(|| format!("замена {}", path.display()))?;
+    Ok(())
+}
+
+/// Сузить права каталога до 0700. Правится только сам каталог: выше по
+/// цепочке лежат /etc и /var, они не наши.
+fn narrow_dir(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let current = std::fs::metadata(dir)
+        .with_context(|| format!("права {}", dir.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if current != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("сужение прав {}", dir.display()))?;
+    }
     Ok(())
 }
 
@@ -457,6 +480,63 @@ mod tests {
             restart: None,
         };
         assert!(offline.check().unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Каталог секретов на живой машине обычно уже есть (повторный запуск,
+    /// доустановка хаба рядом с сервером), и create_dir_all оставлял его с
+    /// 0755: имена ключа подписи и инвайтов читались кем угодно.
+    #[test]
+    fn secret_dirs_are_narrowed_even_when_they_exist() {
+        let dir = tmpdir("dirmode");
+        let secrets = dir.join("etc/xr-hub");
+        let public = dir.join("etc/systemd/system");
+        for old in [&secrets, &public] {
+            std::fs::create_dir_all(old).unwrap();
+            std::fs::set_permissions(old, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let conf = WriteConfig {
+            label: "hub".into(),
+            path: secrets.join("config.toml"),
+            content: "conf".into(),
+            mode: 0o600,
+            overwrite: false,
+            restart: None,
+            extra: None,
+        };
+        conf.apply().unwrap();
+        assert_eq!(
+            std::fs::metadata(&secrets).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "каталог с хешем пароля и ключом не должен листаться посторонними"
+        );
+
+        let key = SigningKey {
+            path: dir.join("var/lib/xr-hub/signing.key"),
+        };
+        key.apply().unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.join("var/lib/xr-hub"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        // Юниты и прочее под 0644 читаемы по замыслу: их каталог не трогаем.
+        write_atomic(&public.join("xr-hub.service"), b"[Unit]\n", 0o644).unwrap();
+        assert_eq!(
+            std::fs::metadata(&public).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "systemd читает свой каталог, сужать его нечего"
+        );
+        assert_eq!(
+            std::fs::metadata(dir.join("etc")).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "правится сам каталог секретов, а не /etc над ним"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
