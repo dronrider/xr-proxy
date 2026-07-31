@@ -96,6 +96,13 @@ pub fn write_atomic(path: &PathBuf, bytes: &[u8], mode: u32) -> Result<()> {
     Ok(())
 }
 
+/// Файл на месте и совпадает с тем, что кладёт установщик.
+fn file_is(path: &PathBuf, content: &str) -> bool {
+    std::fs::read_to_string(path)
+        .map(|cur| cur == content)
+        .unwrap_or(false)
+}
+
 fn restart_if_active(restart: Option<&Restart>) -> Result<()> {
     if let Some(restart) = restart {
         restart.kick()?;
@@ -217,9 +224,7 @@ impl Step for InstallScript {
     }
 
     fn check(&self) -> Result<bool> {
-        Ok(std::fs::read_to_string(&self.path)
-            .map(|cur| cur == self.content)
-            .unwrap_or(false))
+        Ok(file_is(&self.path, &self.content))
     }
 
     fn apply(&self) -> Result<()> {
@@ -241,9 +246,7 @@ impl Step for Sysctl {
     }
 
     fn check(&self) -> Result<bool> {
-        Ok(std::fs::read_to_string(&self.path)
-            .map(|cur| cur == self.content)
-            .unwrap_or(false))
+        Ok(file_is(&self.path, &self.content))
     }
 
     fn apply(&self) -> Result<()> {
@@ -277,9 +280,7 @@ impl Step for SystemdUnit {
     }
 
     fn check(&self) -> Result<bool> {
-        let same = std::fs::read_to_string(self.unit_path())
-            .map(|cur| cur == self.content)
-            .unwrap_or(false);
+        let same = file_is(&self.unit_path(), &self.content);
         Ok(same && unit_enabled(&self.unit) && unit_active(&self.unit))
     }
 
@@ -313,6 +314,39 @@ impl Step for SigningKey {
             crate::secrets::gen_signing_key().as_bytes(),
             0o600,
         )
+    }
+}
+
+/// Обвязка бэкапа хаба (XR-224): скрипт, строка cron и болванка env.
+/// Скрипт и cron это код установщика и приводятся к вшитому, а env хранит
+/// адрес приёмника и путь к ключу, поэтому заполненный не перетирается.
+pub struct HubBackup {
+    pub script: PathBuf,
+    pub script_content: String,
+    pub cron: PathBuf,
+    pub cron_content: String,
+    pub env: PathBuf,
+    pub env_template: String,
+}
+
+impl Step for HubBackup {
+    fn name(&self) -> String {
+        "hub:backup".into()
+    }
+
+    fn check(&self) -> Result<bool> {
+        Ok(file_is(&self.script, &self.script_content)
+            && file_is(&self.cron, &self.cron_content)
+            && self.env.exists())
+    }
+
+    fn apply(&self) -> Result<()> {
+        write_atomic(&self.script, self.script_content.as_bytes(), 0o755)?;
+        write_atomic(&self.cron, self.cron_content.as_bytes(), 0o644)?;
+        if !self.env.exists() {
+            write_atomic(&self.env, self.env_template.as_bytes(), 0o600)?;
+        }
+        Ok(())
     }
 }
 
@@ -448,6 +482,51 @@ mod tests {
         assert!(!step.check().unwrap());
         step.apply().unwrap();
         assert_eq!(std::fs::read_to_string(&step.path).unwrap(), step.content);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hub_backup_updates_code_but_keeps_filled_env() {
+        let dir = tmpdir("backup");
+        let step = HubBackup {
+            script: dir.join("usr/local/bin/xr-hub-backup.sh"),
+            script_content: "#!/bin/sh\necho v1\n".into(),
+            cron: dir.join("etc/cron.d/xr-hub-backup"),
+            cron_content: "17 4 * * * root /usr/local/bin/xr-hub-backup.sh\n".into(),
+            env: dir.join("etc/xr-hub/backup.env"),
+            env_template: "#BACKUP_HOST=\n".into(),
+        };
+        assert!(!step.check().unwrap());
+        step.apply().unwrap();
+        assert!(step.check().unwrap());
+        assert_eq!(
+            std::fs::metadata(&step.script).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(&step.env).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "в env едет путь к ключу отправки, ему не место под чужими глазами"
+        );
+
+        // Заполненный оператором env переживает и обновление скрипта.
+        std::fs::write(&step.env, "BACKUP_HOST=203.0.113.7\n").unwrap();
+        let next = HubBackup {
+            script_content: "#!/bin/sh\necho v2\n".into(),
+            ..step
+        };
+        assert!(!next.check().unwrap());
+        next.apply().unwrap();
+        assert_eq!(std::fs::read_to_string(&next.script).unwrap(), next.script_content);
+        assert_eq!(
+            std::fs::read_to_string(&next.env).unwrap(),
+            "BACKUP_HOST=203.0.113.7\n",
+            "адрес приёмника вводят руками, установщик его не трогает"
+        );
+
+        // Пропавший cron-файл возвращает шаг в работу.
+        std::fs::remove_file(&next.cron).unwrap();
+        assert!(!next.check().unwrap());
         std::fs::remove_dir_all(&dir).ok();
     }
 

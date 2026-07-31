@@ -16,6 +16,26 @@ pub const KILLSWITCH_CLEANUP: &str = include_str!("../../scripts/killswitch-clea
 pub const UDP_TPROXY_SETUP: &str = include_str!("../../scripts/udp-tproxy-setup.sh");
 pub const UDP_TPROXY_CLEANUP: &str = include_str!("../../scripts/udp-tproxy-cleanup.sh");
 
+/// Бэкап состояния хаба (XR-224): тот же скрипт, что кладут руками.
+pub const HUB_BACKUP: &str = include_str!("../../deploy/xr-hub-backup.sh");
+
+/// Раз в сутки ночью; cron.d на этих VPS уже носит cert-alert.
+pub const HUB_BACKUP_CRON: &str = "\
+# xr-hub: ежедневный бэкап состояния на второй VPS (ставит xr-setup, XR-224)
+17 4 * * * root /usr/local/bin/xr-hub-backup.sh
+";
+
+/// Болванка backup.env: адрес приёмника и ключ заполняет оператор, в
+/// репозитории их нет.
+pub const HUB_BACKUP_ENV: &str = "\
+# Куда xr-hub-backup.sh отправляет архив состояния хаба (XR-224).
+# Приёмник это второй VPS, где ключ ниже зажат forced command на
+# xr-hub-backup-receive.sh. Раскомментировать и заполнить обе строки,
+# иначе бэкап собирается, но никуда не уезжает.
+#BACKUP_HOST=
+#BACKUP_KEY=/root/.ssh/xr-hub-backup
+";
+
 /// BBR с fq и буферы 8М: без них mux упирается в BDP задолго до ширины
 /// канала (LLD-09). То же, что закреплено на живом флоте в sysctl.d.
 pub const SYSCTL_CONF: &str = "\
