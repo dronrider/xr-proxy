@@ -12,3 +12,6 @@ CLAUDE.local.md
 # Локальная обвязка выката, живёт только на машине.
 .devkit/*.local
 release-staging/
+
+# Побочный продукт питоньей оснастки в tools/
+__pycache__/
