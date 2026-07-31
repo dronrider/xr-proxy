@@ -214,6 +214,10 @@ pub fn restore(archive: &[u8], targets: &Targets, force: bool, stamp: &str) -> R
         config_text
     };
 
+    // Каталог состояния бывает уже создан установщиком, и тогда права ему
+    // правит только этот вызов: write_secret ниже видит лишь подкаталоги.
+    create_dir_secure(&data_dir)?;
+
     backup_existing(&targets.config, stamp)?;
     write_secret(&targets.config, config_text.as_bytes())?;
     if let (Some(target), Some(bytes)) = (&signing_key, archived_key) {
@@ -458,13 +462,28 @@ fn decode_key(bytes: &[u8]) -> Result<String> {
 /// xr-hub его не задаёт) вышло бы 0755, и листинг бэкапов читал бы любой
 /// локальный пользователь, хотя файлы внутри и лежат с 600. Приёмник
 /// xr-hub-backup-receive.sh ставит для того же umask 077.
+///
+/// Права сужаются и у каталога, который уже был: на живой машине
+/// /var/lib/xr-hub создал установщик, а /var/backups/xr-hub мог остаться от
+/// бэкапов до этой правки, и оба приехали бы с 0755. Правится только сам
+/// каталог, не вся цепочка: /var и /var/lib чужие.
 fn create_dir_secure(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)
-        .with_context(|| format!("создание {}", dir.display()))
+        .with_context(|| format!("создание {}", dir.display()))?;
+    let current = std::fs::metadata(dir)
+        .with_context(|| format!("права {}", dir.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if current != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("сужение прав {}", dir.display()))?;
+    }
+    Ok(())
 }
 
 /// Копия затираемого секрета рядом: если архив оказался не тем, откатиться
@@ -795,6 +814,52 @@ mod tests {
         let err = restore(&bytes, &targets, false, "1").unwrap_err().to_string();
         assert!(err.contains("MANIFEST.json"), "невнятный отказ: {err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Каталоги на живой машине создаёт не бэкап: data_dir приезжает от
+    /// установщика, каталог архивов мог остаться от версии без этой заботы,
+    /// и оба лежат с 0755. Права обязаны сузиться и им, иначе листинг
+    /// состояния и бэкапов читает любой локальный пользователь.
+    #[test]
+    fn existing_dirs_are_narrowed_to_700() {
+        let dir = tmpdir("existing-perms");
+        let key = gen_key();
+        let src = hub_layout(&dir, &key);
+        let (bytes, _) = build_archive(&src, "2026-07-31T04:17:00Z", "hub-test", 0).unwrap();
+
+        let dest = tmpdir("existing-perms-dest");
+        let data_dir = dest.join("var/lib/xr-hub");
+        let etc = dest.join("etc/xr-hub");
+        let out = dest.join("var/backups/xr-hub");
+        for old in [&data_dir, &etc, &out] {
+            std::fs::create_dir_all(old).unwrap();
+            std::fs::set_permissions(old, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        write_secret(&out.join(archive_name("20260731T041700Z")), &bytes).unwrap();
+        let targets = Targets {
+            config: etc.join("config.toml"),
+            data_dir: Some(data_dir.clone()),
+            signing_key: None,
+        };
+        restore(&bytes, &targets, false, "1").unwrap();
+
+        for narrowed in [&data_dir, &etc, &out, &data_dir.join("presets")] {
+            assert_eq!(
+                std::fs::metadata(narrowed).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "существовавший каталог обязан сузиться до 700: {}",
+                narrowed.display()
+            );
+        }
+        // Правится сам каталог, а не вся цепочка вверх: /var и /var/lib чужие.
+        assert_eq!(
+            std::fs::metadata(dest.join("var/lib")).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "родительские каталоги не наши, их права не трогаем"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dest).ok();
     }
 
     #[test]
