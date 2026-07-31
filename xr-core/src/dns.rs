@@ -8,9 +8,10 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use xr_proto::protocol::MAX_DOMAIN_LEN;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use xr_proto::protocol::MAX_DOMAIN_LEN;
 
 /// Reserved CIDR for fake IPs: 198.18.0.0/15 (198.18.0.0 - 198.19.255.255).
 /// This range is designated for benchmarking (RFC 2544) and safe for local use.
@@ -229,7 +230,10 @@ fn parse_dns_question(data: &[u8]) -> Option<(String, u16, u16, usize)> {
     // DNS даёт максимум 253 символа.
     let domain = parts.join(".");
     if domain.len() > MAX_DOMAIN_LEN {
-        tracing::debug!("fake DNS: имя вопроса {} байт, больше предела домена", domain.len());
+        tracing::debug!(
+            "fake DNS: имя вопроса {} байт, больше предела домена",
+            domain.len()
+        );
         return None;
     }
     Some((domain, qtype, qclass, pos))
@@ -361,8 +365,10 @@ mod tests {
         assert!(long.len() > MAX_DOMAIN_LEN);
         assert!(dns.handle_query(&build_test_dns_query(&long)).is_none());
 
-        // Имя ровно на границе ещё обслуживается.
-        let edge = vec!["abc"; 64].join(".")[..MAX_DOMAIN_LEN].to_string();
+        // Имя ровно на границе (64 метки по три символа это ровно 255 байт)
+        // ещё обслуживается.
+        let edge = vec!["abc"; 64].join(".");
+        assert_eq!(edge.len(), MAX_DOMAIN_LEN);
         let (_, fake_ip) = dns.handle_query(&build_test_dns_query(&edge)).unwrap();
         assert_eq!(dns.lookup(fake_ip), Some(edge));
     }
