@@ -415,6 +415,14 @@ impl ServerPool {
                     }
                     return Ok(stream);
                 }
+                Ok(Err(e)) if e.kind() == io::ErrorKind::InvalidInput => {
+                    // Ошибка самого запроса, а не транспорта (некодируемый
+                    // адрес, XR-205). Обходить пул бессмысленно, все ответят
+                    // тем же, а здоровье серверов от этого страдать не должно:
+                    // иначе одно кривое имя из LAN гасит весь пул разом.
+                    tracing::debug!("open_stream rejected the target ({}), no failover", e);
+                    return Err(e);
+                }
                 Ok(Err(e)) => {
                     self.slots[idx].mark_down();
                     tracing::debug!(
@@ -620,7 +628,7 @@ mod tests {
     use crate::mux::{mux_handshake_server, Multiplexer};
     use crate::mux_pool::ConnectFn;
     use crate::obfuscation::{ModifierStrategy, Obfuscator};
-    use crate::protocol::{Codec, Command};
+    use crate::protocol::{Codec, Command, MAX_DOMAIN_LEN};
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, AtomicU32};
     use tokio::io::AsyncReadExt;
@@ -829,6 +837,35 @@ mod tests {
         assert!(stream.is_alive());
         assert_eq!(pool.active_index(), 1, "active must move to the backup");
         assert!(pool.is_backup_active());
+    }
+
+    /// Некодируемый адрес это ошибка ввода, а не отказ сервера. Пул обязан
+    /// вернуть её сразу и оставить серверы здоровыми, иначе одно длинное имя
+    /// из LAN гасит весь пул разом (XR-205).
+    #[tokio::test]
+    async fn test_bad_target_keeps_servers_healthy() {
+        let primary_addr = spawn_test_server().await;
+        let backup_addr = spawn_test_server().await;
+
+        let pool = ServerPool::new(
+            vec![
+                slot("primary", connect_to(primary_addr, Arc::new(AtomicU32::new(0)))),
+                slot("backup", connect_to(backup_addr, Arc::new(AtomicU32::new(0)))),
+            ],
+            PoolProfile::mobile(),
+            None,
+        );
+
+        let bad = TargetAddr::Domain("a".repeat(MAX_DOMAIN_LEN + 1), 443);
+        let err = pool.open_stream(&bad).await.expect_err("bad target must not open");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!pool.slots[0].is_down(), "primary must stay healthy");
+        assert!(!pool.slots[1].is_down(), "backup must stay healthy");
+        assert_eq!(pool.active_index(), 0, "active must not move");
+
+        // Нормальный адрес после этого обслуживается как ни в чём не бывало.
+        let stream = pool.open_stream(&target()).await.expect("pool still serves");
+        assert!(stream.is_alive());
     }
 
     #[tokio::test]

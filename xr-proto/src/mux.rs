@@ -1536,8 +1536,8 @@ pub async fn mux_open_stream(
         return Err(io::Error::new(io::ErrorKind::BrokenPipe, "mux connection dead"));
     }
 
-    // Адрес кодируем до регистрации стрима: некодируемый target это ошибка
-    // вызывающего, и она не должна оставлять за собой запись в streams.
+    // Адрес кодируем до всего остального: некодируемый target это ошибка
+    // вызывающего, и на ней незачем ни жечь stream_id, ни брать лок streams.
     let connect_payload = target.encode()?;
 
     let stream_id = mux.next_stream_id.fetch_add(2, Ordering::Relaxed);

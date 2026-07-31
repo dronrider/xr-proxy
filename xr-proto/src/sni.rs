@@ -41,7 +41,11 @@ pub fn extract_sni(buf: &[u8]) -> Option<String> {
     let hs = &buf[5..record_end];
     // Заголовок handshake это 4 байта. Обрезанный рекорд (длина в заголовке
     // меньше самого заголовка) раньше уводил чтение за границу среза (XR-205).
-    if hs.len() < 4 || hs[0] != 0x01 {
+    if hs.len() < 4 {
+        tracing::debug!("SNI: рекорд короче заголовка handshake ({} байт), пропускаем", hs.len());
+        return None;
+    }
+    if hs[0] != 0x01 {
         // Not ClientHello
         return None;
     }
@@ -117,6 +121,7 @@ fn parse_sni_extension(data: &[u8]) -> Option<String> {
             // лезет, а настоящих таких доменов не бывает (DNS даёт максимум
             // 253 символа): такое соединение уходит маршрутом по IP.
             if name_len > MAX_DOMAIN_LEN {
+                tracing::debug!("SNI: имя {} байт, больше предела домена, пропускаем", name_len);
                 return None;
             }
             if pos + name_len <= data.len() {
@@ -179,32 +184,95 @@ mod tests {
         assert_eq!(extract_sni(&build_test_client_hello(&edge)), Some(edge));
     }
 
+    /// Настоящий браузерный ClientHello непохож на минимальную фикстуру: в нём
+    /// возобновляемый session_id, десятки шифров и SNI где-то посреди чужих
+    /// расширений. Ровно эти поля разбор пропускает арифметикой, поэтому
+    /// проверяем её на таком образце (замечание ревью).
+    #[test]
+    fn test_extract_sni_from_rich_client_hello() {
+        let hello = build_rich_client_hello("news.example.org");
+        assert_eq!(extract_sni(&hello), Some("news.example.org".to_string()));
+    }
+
+    /// ClientHello, разорванный на TCP-сегменты: в буфере лежит начало, а
+    /// заголовок рекорда обещает больше. Разбор обязан выжить на любом обрыве.
+    #[test]
+    fn test_record_longer_than_buffer() {
+        let hello = build_rich_client_hello("news.example.org");
+        for cut in 1..hello.len() {
+            let part = &hello[..cut];
+            match extract_sni(part) {
+                None => {}
+                Some(name) => assert_eq!(name, "news.example.org", "обрыв на {}", cut),
+            }
+        }
+    }
+
     /// Build a minimal TLS ClientHello with a given SNI for testing.
     fn build_test_client_hello(hostname: &str) -> Vec<u8> {
+        build_client_hello(hostname, 0, 1, false)
+    }
+
+    /// То же, но с полями, которые есть у живого клиента.
+    fn build_rich_client_hello(hostname: &str) -> Vec<u8> {
+        build_client_hello(hostname, 32, 30, true)
+    }
+
+    /// `session_id_len` и `cipher_count` набивают поля, которые разбор
+    /// перепрыгивает по длине. При `padded` вокруг SNI встают чужие расширения,
+    /// а в ServerNameList первой идёт запись не-host_name.
+    fn build_client_hello(
+        hostname: &str,
+        session_id_len: usize,
+        cipher_count: usize,
+        padded: bool,
+    ) -> Vec<u8> {
         let host_bytes = hostname.as_bytes();
 
         // SNI extension
-        let sni_entry_len = 3 + host_bytes.len(); // name_type(1) + len(2) + name
-        let sni_list_len = sni_entry_len;
+        let mut entries = Vec::new();
+        if padded {
+            // name_type 0x02 (историческая host_name_srv), разбор её пропускает
+            entries.push(0x02);
+            entries.extend_from_slice(&4u16.to_be_bytes());
+            entries.extend_from_slice(b"skip");
+        }
+        entries.push(0x00); // host name type
+        entries.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
+        entries.extend_from_slice(host_bytes);
+
         let mut sni_ext = Vec::new();
-        sni_ext.extend_from_slice(&(sni_list_len as u16).to_be_bytes()); // list len
-        sni_ext.push(0x00); // host name type
-        sni_ext.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
-        sni_ext.extend_from_slice(host_bytes);
+        sni_ext.extend_from_slice(&(entries.len() as u16).to_be_bytes()); // list len
+        sni_ext.extend_from_slice(&entries);
 
         // Extensions block
         let mut extensions = Vec::new();
+        if padded {
+            // supported_versions до SNI
+            extensions.extend_from_slice(&0x002bu16.to_be_bytes());
+            extensions.extend_from_slice(&3u16.to_be_bytes());
+            extensions.extend_from_slice(&[0x02, 0x03, 0x04]);
+        }
         extensions.extend_from_slice(&0u16.to_be_bytes()); // ext type = SNI
         extensions.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
         extensions.extend_from_slice(&sni_ext);
+        if padded {
+            // padding после SNI
+            extensions.extend_from_slice(&0x0015u16.to_be_bytes());
+            extensions.extend_from_slice(&64u16.to_be_bytes());
+            extensions.extend_from_slice(&[0u8; 64]);
+        }
 
         // ClientHello body
         let mut ch_body = Vec::new();
         ch_body.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
         ch_body.extend_from_slice(&[0u8; 32]); // random
-        ch_body.push(0); // session id length = 0
-        ch_body.extend_from_slice(&2u16.to_be_bytes()); // cipher suites length
-        ch_body.extend_from_slice(&[0x00, 0xff]); // one cipher suite
+        ch_body.push(session_id_len as u8);
+        ch_body.extend(std::iter::repeat(0x5a).take(session_id_len));
+        ch_body.extend_from_slice(&((cipher_count * 2) as u16).to_be_bytes());
+        for i in 0..cipher_count {
+            ch_body.extend_from_slice(&(0x1300u16 + i as u16).to_be_bytes());
+        }
         ch_body.push(1); // compression methods length
         ch_body.push(0); // null compression
         ch_body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
