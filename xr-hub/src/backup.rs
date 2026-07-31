@@ -1,9 +1,12 @@
 //! `xr-hub backup` и `xr-hub restore` (XR-224): состояние хаба уезжает архивом
 //! на второй VPS, оттуда же разворачивается на чистой машине.
 //!
-//! В архив едут конфиг, ключ подписи и содержимое data_dir, кроме раздачи
-//! дистрибутивов (`releases/`, `setup-dist/`): её воспроизводит машина сборки,
-//! ежедневно гонять её десятки мегабайт незачем. Первым файлом лежит
+//! В архив едут конфиг, ключ подписи и содержимое data_dir, кроме раздач
+//! дистрибутивов (`releases/`, `setup-dist/`, `share-dist/` и их `.bak`-копии):
+//! их воспроизводит машина сборки, ежедневно гонять сотни мегабайт незачем.
+//! Список раздач ведётся руками, поэтому следующая новая раздача в него не
+//! попадёт, и на этот случай сборка ругается на всякий тяжёлый каталог,
+//! который всё-таки поехал в архив. Первым файлом лежит
 //! `MANIFEST.json` с отпечатком публичной половины ключа подписи и
 //! счётчиками пресетов, инвайтов и шар; приватной половины в манифесте нет.
 
@@ -23,8 +26,14 @@ pub const MANIFEST_NAME: &str = "MANIFEST.json";
 pub const CONFIG_NAME: &str = "config.toml";
 pub const KEY_NAME: &str = "signing.key";
 
-/// Каталоги data_dir, которые в архив не едут.
-const SKIP_DIRS: [&str; 2] = ["releases", "setup-dist"];
+/// Раздачи дистрибутивов: в бэкапе не нужны, восстанавливаются с машины
+/// сборки. Рядом с ними живут исторические копии вида `<имя>.bak.<метка>`
+/// от прошлых выкатов, их отсекаем тем же именем.
+const DIST_DIRS: [&str; 3] = ["releases", "setup-dist", "share-dist"];
+
+/// Каталог состояния тяжелее этого порога в архиве подозрителен: столько
+/// весят раздачи, а не пресеты с инвайтами.
+const HEAVY_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Что лежит в архиве помимо файлов состояния.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +48,34 @@ pub struct Manifest {
     pub presets: usize,
     pub invites: usize,
     pub shares: usize,
+}
+
+/// Собранный архив вместе с тем, что стоит сказать оператору вслух.
+pub struct Archive {
+    pub bytes: Vec<u8>,
+    pub manifest: Manifest,
+    /// Каталоги и файлы тяжелее порога, которые всё же поехали в архив:
+    /// имя плюс размер до сжатия.
+    pub heavy: Vec<(String, u64)>,
+    /// Раздачи, отсечённые по имени.
+    pub skipped: Vec<String>,
+}
+
+/// Итог обхода data_dir: что поехало, что отсеклось по имени и что поехало,
+/// хотя весит подозрительно много.
+#[derive(Default)]
+struct Collected {
+    data: BTreeMap<String, Vec<u8>>,
+    heavy: Vec<(String, u64)>,
+    skipped: Vec<String>,
+}
+
+impl Collected {
+    fn note_weight(&mut self, name: &str, bytes: u64) {
+        if bytes >= HEAVY_BYTES {
+            self.heavy.push((name.to_string(), bytes));
+        }
+    }
 }
 
 /// Откуда собирается архив.
@@ -109,7 +146,7 @@ pub fn build_archive(
     created_at: &str,
     host: &str,
     mtime: u64,
-) -> Result<(Vec<u8>, Manifest)> {
+) -> Result<Archive> {
     let config = std::fs::read(&src.config)
         .with_context(|| format!("чтение конфига {}", src.config.display()))?;
 
@@ -133,7 +170,8 @@ pub fn build_archive(
         .flatten()
         .filter_map(|p| p.canonicalize().ok())
         .collect();
-    let data = collect_data(&src.data_dir, &skip)?;
+    let collected = collect_data(&src.data_dir, &skip)?;
+    let data = &collected.data;
 
     let manifest = Manifest {
         created_at: created_at.to_string(),
@@ -141,9 +179,9 @@ pub fn build_archive(
         hub_version: env!("CARGO_PKG_VERSION").to_string(),
         signing_public_key: public_key,
         signing_fingerprint: key_fingerprint,
-        presets: count_records(&data, "presets"),
-        invites: count_records(&data, "invites"),
-        shares: count_records(&data, "shares"),
+        presets: count_records(data, "presets"),
+        invites: count_records(data, "invites"),
+        shares: count_records(data, "shares"),
     };
     let manifest_json = serde_json::to_vec_pretty(&manifest).context("сериализация манифеста")?;
 
@@ -154,7 +192,7 @@ pub fn build_archive(
     if let Some(bytes) = &key_bytes {
         append(&mut tar, KEY_NAME, bytes, mtime)?;
     }
-    for (name, bytes) in &data {
+    for (name, bytes) in data {
         append(&mut tar, name, bytes, mtime)?;
     }
     let bytes = tar
@@ -163,7 +201,12 @@ pub fn build_archive(
         .finish()
         .context("сжатие архива")?;
 
-    Ok((bytes, manifest))
+    Ok(Archive {
+        bytes,
+        manifest,
+        heavy: collected.heavy,
+        skipped: collected.skipped,
+    })
 }
 
 /// Разложить архив по целевым путям. Существующий ключ подписи с другим
@@ -285,13 +328,61 @@ fn append<W: Write>(tar: &mut tar::Builder<W>, name: &str, bytes: &[u8], mtime: 
 /// Содержимое data_dir относительными путями, без раздачи дистрибутивов и
 /// без файлов, которые уже уехали в архив отдельно (ключ лежит внутри
 /// data_dir на живом хабе).
-fn collect_data(data_dir: &Path, skip: &[PathBuf]) -> Result<BTreeMap<String, Vec<u8>>> {
-    let mut out = BTreeMap::new();
+fn collect_data(data_dir: &Path, skip: &[PathBuf]) -> Result<Collected> {
+    let mut out = Collected::default();
     if !data_dir.exists() {
         return Ok(out);
     }
-    walk(data_dir, data_dir, skip, &mut out)?;
+    let mut top: Vec<PathBuf> = std::fs::read_dir(data_dir)
+        .with_context(|| format!("чтение {}", data_dir.display()))?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<_>>()?;
+    top.sort();
+
+    for path in top {
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if path.is_dir() {
+            if is_dist_dir(&name) {
+                out.skipped.push(name);
+                continue;
+            }
+            let mut sub = BTreeMap::new();
+            walk(data_dir, &path, skip, &mut sub)?;
+            out.note_weight(&name, sub.values().map(|b| b.len() as u64).sum());
+            out.data.extend(sub);
+            continue;
+        }
+        if path.canonicalize().is_ok_and(|c| skip.contains(&c)) {
+            continue;
+        }
+        let bytes = std::fs::read(&path).with_context(|| format!("чтение {}", path.display()))?;
+        out.note_weight(&name, bytes.len() as u64);
+        out.data.insert(name, bytes);
+    }
     Ok(out)
+}
+
+/// Раздача дистрибутивов или её историческая копия `<имя>.bak.<метка>`.
+fn is_dist_dir(name: &str) -> bool {
+    let base = name.split(".bak").next().unwrap_or(name);
+    DIST_DIRS.contains(&base)
+}
+
+/// Размер человеку: бэкап читают глазами в выводе cron.
+pub fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    match bytes {
+        b if b >= GB => format!("{:.1} ГБ", b as f64 / GB as f64),
+        b if b >= MB => format!("{:.1} МБ", b as f64 / MB as f64),
+        b if b >= KB => format!("{} КБ", b / KB),
+        b => format!("{b} Б"),
+    }
 }
 
 fn walk(
@@ -308,9 +399,6 @@ fn walk(
             .to_string_lossy()
             .into_owned();
         if path.is_dir() {
-            if SKIP_DIRS.contains(&rel.as_str()) {
-                continue;
-            }
             walk(root, &path, skip, out)?;
             continue;
         }
@@ -550,7 +638,18 @@ mod tests {
     /// записи состояния и раздача дистрибутивов.
     fn hub_layout(dir: &Path, key_b64: &str) -> Sources {
         let data_dir = dir.join("var/lib/xr-hub");
-        for sub in ["presets", "invites", "shares", "releases", "setup-dist"] {
+        // Раздачи и их исторические копии от прошлых выкатов: ровно та
+        // раскладка, что нашлась на живом хабе (XR-224, провал проверки).
+        for sub in [
+            "presets",
+            "invites",
+            "shares",
+            "releases",
+            "setup-dist",
+            "share-dist",
+            "share-dist.bak.1753000000",
+            "releases.bak",
+        ] {
             std::fs::create_dir_all(data_dir.join(sub)).unwrap();
         }
         std::fs::write(data_dir.join("presets/russia.json"), r#"{"name":"russia"}"#).unwrap();
@@ -560,6 +659,13 @@ mod tests {
         std::fs::write(data_dir.join("shares/sh2.json"), r#"{"share_id":"sh2"}"#).unwrap();
         std::fs::write(data_dir.join("releases/0.9.0.apk"), vec![0u8; 4096]).unwrap();
         std::fs::write(data_dir.join("setup-dist/xr-server-linux-x86_64"), b"bin").unwrap();
+        std::fs::write(data_dir.join("share-dist/xr-share-linux-x86_64"), vec![0u8; 4096]).unwrap();
+        std::fs::write(
+            data_dir.join("share-dist.bak.1753000000/xr-share-linux-x86_64"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+        std::fs::write(data_dir.join("releases.bak/0.8.0.apk"), vec![0u8; 4096]).unwrap();
 
         let key_path = data_dir.join("signing.key");
         std::fs::write(&key_path, key_b64).unwrap();
@@ -594,8 +700,9 @@ mod tests {
         let dir = tmpdir("build");
         let key = gen_key();
         let src = hub_layout(&dir, &key);
-        let (bytes, manifest) =
+        let archive =
             build_archive(&src, "2026-07-31T04:17:00Z", "hub-test", 1_753_000_000).unwrap();
+        let (bytes, manifest) = (&archive.bytes, &archive.manifest);
 
         let names = names(&bytes);
         for expected in [
@@ -608,10 +715,30 @@ mod tests {
         ] {
             assert!(names.contains(&expected.to_string()), "нет {expected} в {names:?}");
         }
-        assert!(
-            !names.iter().any(|n| n.starts_with("releases/") || n.starts_with("setup-dist/")),
-            "раздача дистрибутивов в бэкап не едет: {names:?}"
+        for dist in [
+            "releases/",
+            "setup-dist/",
+            "share-dist/",
+            "share-dist.bak.1753000000/",
+            "releases.bak/",
+        ] {
+            assert!(
+                !names.iter().any(|n| n.starts_with(dist)),
+                "раздача {dist} в бэкап не едет: {names:?}"
+            );
+        }
+        assert_eq!(
+            archive.skipped,
+            [
+                "releases",
+                "releases.bak",
+                "setup-dist",
+                "share-dist",
+                "share-dist.bak.1753000000"
+            ],
+            "отсечённые раздачи называются в отчёте, а не пропадают молча"
         );
+        assert!(archive.heavy.is_empty(), "лёгкое состояние тревоги не поднимает");
         // Ключ лежит внутри data_dir, но в архиве он ровно один раз.
         assert_eq!(names.iter().filter(|n| n.ends_with("signing.key")).count(), 1);
 
@@ -635,7 +762,7 @@ mod tests {
         let dir = tmpdir("roundtrip");
         let key = gen_key();
         let src = hub_layout(&dir, &key);
-        let (bytes, _) = build_archive(&src, "2026-07-31T04:17:00Z", "hub-test", 0).unwrap();
+        let bytes = build_archive(&src, "2026-07-31T04:17:00Z", "hub-test", 0).unwrap().bytes;
 
         let fresh = tmpdir("roundtrip-dest");
         let targets = Targets {
@@ -694,7 +821,7 @@ mod tests {
         let dir = tmpdir("as-is");
         let key = gen_key();
         let src = hub_layout(&dir, &key);
-        let (bytes, _) = build_archive(&src, "2026-07-31T04:17:00Z", "hub-test", 0).unwrap();
+        let bytes = build_archive(&src, "2026-07-31T04:17:00Z", "hub-test", 0).unwrap().bytes;
         let archived_config = read_archive(&bytes).unwrap()[CONFIG_NAME].clone();
 
         std::fs::remove_dir_all(&src.data_dir).unwrap();
@@ -721,7 +848,7 @@ mod tests {
         let dir = tmpdir("collision");
         let key = gen_key();
         let src = hub_layout(&dir, &key);
-        let (bytes, _) = build_archive(&src, "2026-07-31T04:17:00Z", "hub-test", 0).unwrap();
+        let bytes = build_archive(&src, "2026-07-31T04:17:00Z", "hub-test", 0).unwrap().bytes;
 
         let dest = tmpdir("collision-dest");
         let data_dir = dest.join("data");
@@ -759,7 +886,7 @@ mod tests {
         let dir = tmpdir("same-key");
         let key = gen_key();
         let src = hub_layout(&dir, &key);
-        let (bytes, _) = build_archive(&src, "2026-07-31T04:17:00Z", "hub-test", 0).unwrap();
+        let bytes = build_archive(&src, "2026-07-31T04:17:00Z", "hub-test", 0).unwrap().bytes;
 
         let dest = tmpdir("same-key-dest");
         let data_dir = dest.join("data");
@@ -825,7 +952,7 @@ mod tests {
         let dir = tmpdir("existing-perms");
         let key = gen_key();
         let src = hub_layout(&dir, &key);
-        let (bytes, _) = build_archive(&src, "2026-07-31T04:17:00Z", "hub-test", 0).unwrap();
+        let bytes = build_archive(&src, "2026-07-31T04:17:00Z", "hub-test", 0).unwrap().bytes;
 
         let dest = tmpdir("existing-perms-dest");
         let data_dir = dest.join("var/lib/xr-hub");
@@ -862,12 +989,58 @@ mod tests {
         std::fs::remove_dir_all(&dest).ok();
     }
 
+    /// Список раздач ведётся руками, и следующая новая в него сама не
+    /// попадёт (так в архив уехала share-dist на 281 МБ). Молчаливого
+    /// раздувания быть не должно: тяжёлый каталог, поехавший в архив,
+    /// называется вслух с именем и размером.
+    #[test]
+    fn heavy_dir_in_the_archive_is_named_out_loud() {
+        let dir = tmpdir("heavy");
+        let key = gen_key();
+        let src = hub_layout(&dir, &key);
+        // Раздача, которой ещё нет в списке исключений.
+        std::fs::create_dir_all(src.data_dir.join("plugin-dist")).unwrap();
+        std::fs::write(
+            src.data_dir.join("plugin-dist/bundle.bin"),
+            vec![7u8; HEAVY_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let archive = build_archive(&src, "2026-08-01T04:17:00Z", "hub-test", 0).unwrap();
+        assert_eq!(archive.heavy.len(), 1, "тревога ровно об одном каталоге");
+        let (name, size) = &archive.heavy[0];
+        assert_eq!(name, "plugin-dist");
+        assert!(*size > HEAVY_BYTES, "в тревоге настоящий размер, {size}");
+        assert!(
+            names(&archive.bytes).iter().any(|n| n.starts_with("plugin-dist/")),
+            "неизвестный каталог всё же едет в архив: молча терять состояние хуже"
+        );
+
+        // Лёгкие каталоги состояния молчат, иначе тревога обесценится.
+        assert!(
+            !archive.heavy.iter().any(|(n, _)| n == "presets" || n == "shares"),
+            "пресеты и шары столько не весят: {:?}",
+            archive.heavy
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn size_reads_like_a_human_wrote_it() {
+        assert_eq!(human_size(0), "0 Б");
+        assert_eq!(human_size(999), "999 Б");
+        assert_eq!(human_size(2048), "2 КБ");
+        assert_eq!(human_size(10 * 1024 * 1024), "10.0 МБ");
+        assert_eq!(human_size(281 * 1024 * 1024 + 512 * 1024), "281.5 МБ");
+        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0 ГБ");
+    }
+
     #[test]
     fn broken_archive_is_rejected_and_nothing_is_laid_out() {
         let dir = tmpdir("broken");
         let key = gen_key();
         let src = hub_layout(&dir, &key);
-        let (bytes, _) = build_archive(&src, "2026-07-31T04:17:00Z", "hub-test", 0).unwrap();
+        let bytes = build_archive(&src, "2026-07-31T04:17:00Z", "hub-test", 0).unwrap().bytes;
 
         let dest = tmpdir("broken-dest");
         let targets = Targets {

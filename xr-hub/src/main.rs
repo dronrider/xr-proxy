@@ -172,7 +172,7 @@ fn run_backup(config_path: &str, out: &str, keep: usize) -> Result<()> {
     };
 
     let now = chrono::Utc::now();
-    let (bytes, manifest) = backup::build_archive(
+    let archive = backup::build_archive(
         &src,
         &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         &hostname(),
@@ -183,11 +183,12 @@ fn run_backup(config_path: &str, out: &str, keep: usize) -> Result<()> {
     let target = out_dir.join(backup::archive_name(
         &now.format("%Y%m%dT%H%M%SZ").to_string(),
     ));
-    backup::write_secret(&target, &bytes)?;
+    backup::write_secret(&target, &archive.bytes)?;
     let removed = backup::prune(out_dir, keep)?;
 
+    let manifest = &archive.manifest;
     println!("Бэкап хаба: {}", target.display());
-    println!("  размер: {} байт", bytes.len());
+    println!("  размер: {}", backup::human_size(archive.bytes.len() as u64));
     match (&manifest.signing_fingerprint, &manifest.signing_public_key) {
         (Some(fp), Some(pubkey)) => {
             println!("  ключ подписи: {fp}");
@@ -202,8 +203,20 @@ fn run_backup(config_path: &str, out: &str, keep: usize) -> Result<()> {
     if manifest.presets == 0 && manifest.invites == 0 && manifest.shares == 0 {
         println!("  внимание: состояние пустое, проверь data_dir в конфиге");
     }
+    if !archive.skipped.is_empty() {
+        println!("  раздачи не поехали: {}", archive.skipped.join(", "));
+    }
     if !removed.is_empty() {
         println!("  ротация: удалено старых архивов {}", removed.len());
+    }
+    // Раздачи отсекаются по имени, и новая в список сама не попадёт. Пусть
+    // хотя бы не проезжает молча: состояние хаба столько не весит.
+    for (name, size) in &archive.heavy {
+        eprintln!(
+            "  внимание: в архив поехал тяжёлый каталог {name} ({}). Раздачам \
+             дистрибутивов в бэкапе не место, их место в списке исключений.",
+            backup::human_size(*size)
+        );
     }
     Ok(())
 }
