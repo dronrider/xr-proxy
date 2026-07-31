@@ -230,7 +230,7 @@ fn parse_dns_question(data: &[u8]) -> Option<(String, u16, u16, usize)> {
     // DNS даёт максимум 253 символа.
     let domain = parts.join(".");
     if domain.len() > MAX_DOMAIN_LEN {
-        tracing::debug!(
+        tracing::warn!(
             "fake DNS: имя вопроса {} байт, больше предела домена",
             domain.len()
         );
