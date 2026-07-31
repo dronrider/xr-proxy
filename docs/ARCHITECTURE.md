@@ -98,7 +98,10 @@ Cargo-workspace + Android-модуль:
   `Codec` — верхнеуровневая оболочка поверх обфускатора.
 - [routing.rs](../xr-proto/src/routing.rs) — `Router`, `Action::{Proxy,Direct}`,
   скомпилированные правила (exact / wildcard / CIDR / GeoIP).
-- [sni.rs](../xr-proto/src/sni.rs) достаёт SNI из TLS ClientHello.
+- [sni.rs](../xr-proto/src/sni.rs) достаёт SNI из TLS ClientHello. Разбор идёт по
+  байтам чужого сокета, поэтому всё сомнительное отбрасывается молча: обрезанный
+  рекорд и имя длиннее 255 байт (предел длины домена в Connect) дают `None`, и
+  соединение маршрутизируется по IP, как любое не-TLS.
 - [udp_relay.rs](../xr-proto/src/udp_relay.rs) — wire-формат UDP relay:
   `[Nonce:4B][Obfuscated: type + dst + src_port + payload]`.
 - mux — поверх TCP создаётся мультиплексированный поток (см. `MuxPool`,
