@@ -267,16 +267,6 @@ pub fn prune(dir: &Path, keep: usize) -> Result<Vec<PathBuf>> {
     Ok(removed)
 }
 
-/// Атомарная запись архива: сначала temp рядом, потом rename. Права 600
-/// выставляются при создании, файл ни мгновения не лежит по umask.
-pub fn write_archive(target: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("создание {}", parent.display()))?;
-    }
-    write_secret(target, bytes)
-}
-
 fn append<W: Write>(tar: &mut tar::Builder<W>, name: &str, bytes: &[u8], mtime: u64) -> Result<()> {
     let mut header = tar::Header::new_gnu();
     header.set_size(bytes.len() as u64);
@@ -464,6 +454,19 @@ fn decode_key(bytes: &[u8]) -> Result<String> {
     Ok(fingerprint(public.as_bytes()))
 }
 
+/// Каталог под архивы и состояние: 0700. На умолчательном umask (юнит
+/// xr-hub его не задаёт) вышло бы 0755, и листинг бэкапов читал бы любой
+/// локальный пользователь, хотя файлы внутри и лежат с 600. Приёмник
+/// xr-hub-backup-receive.sh ставит для того же umask 077.
+fn create_dir_secure(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("создание {}", dir.display()))
+}
+
 /// Копия затираемого секрета рядом: если архив оказался не тем, откатиться
 /// есть куда (так же страхуется cert-receive.sh).
 fn backup_existing(path: &Path, stamp: &str) -> Result<()> {
@@ -478,11 +481,12 @@ fn backup_existing(path: &Path, stamp: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_secret(path: &Path, bytes: &[u8]) -> Result<()> {
+/// Атомарная запись секрета: сначала temp рядом, потом rename. Права 600
+/// выставляются при создании, файл ни мгновения не лежит по umask.
+pub fn write_secret(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("создание {}", parent.display()))?;
+        create_dir_secure(parent)?;
     }
     let tmp = path.with_extension("xr-backup.new");
     std::fs::remove_file(&tmp).ok();
@@ -641,6 +645,14 @@ mod tests {
                 path.display()
             );
         }
+        for dir in [fresh.join("data"), fresh.join("data/presets"), fresh.join("etc")] {
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "каталог состояния не должен листаться посторонними: {}",
+                dir.display()
+            );
+        }
 
         // Конфиг перенацелен: хаб с ним поднимется из нового каталога.
         let restored = std::fs::read_to_string(fresh.join("etc/config.toml")).unwrap();
@@ -783,6 +795,54 @@ mod tests {
         let err = restore(&bytes, &targets, false, "1").unwrap_err().to_string();
         assert!(err.contains("MANIFEST.json"), "невнятный отказ: {err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn broken_archive_is_rejected_and_nothing_is_laid_out() {
+        let dir = tmpdir("broken");
+        let key = gen_key();
+        let src = hub_layout(&dir, &key);
+        let (bytes, _) = build_archive(&src, "2026-07-31T04:17:00Z", "hub-test", 0).unwrap();
+
+        let dest = tmpdir("broken-dest");
+        let targets = Targets {
+            config: dest.join("config.toml"),
+            data_dir: Some(dest.join("data")),
+            signing_key: None,
+        };
+
+        // Оборванная передача: половина gzip-потока.
+        let cut = &bytes[..bytes.len() / 2];
+        assert!(read_archive(cut).is_err(), "усечённый архив не архив");
+        assert!(restore(cut, &targets, false, "1").is_err());
+        assert!(
+            !targets.config.exists() && !dest.join("data").exists(),
+            "разбор падает до записи, полусостояния на диске не остаётся"
+        );
+
+        // Мусор вместо архива и пустой поток.
+        assert!(read_archive(b"not an archive at all").is_err());
+        assert!(read_archive(&[]).is_err(), "пустой поток не архив");
+
+        // Целый gzip, но внутри не tar.
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all("просто текст, а не блоки tar".as_bytes()).unwrap();
+        assert!(read_archive(&gz.finish().unwrap()).is_err());
+
+        // Битый MANIFEST.json: архив читается, а разбор манифеста нет.
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut gz);
+            append(&mut tar, MANIFEST_NAME, "{ не json".as_bytes(), 0).unwrap();
+            append(&mut tar, CONFIG_NAME, b"[server]\n", 0).unwrap();
+            tar.finish().unwrap();
+        }
+        let err = restore(&gz.finish().unwrap(), &targets, false, "1")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MANIFEST.json"), "невнятный отказ: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dest).ok();
     }
 
     #[test]
