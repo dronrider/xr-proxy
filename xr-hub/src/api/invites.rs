@@ -49,11 +49,21 @@ pub async fn get_invite_info(
     }))
 }
 
+/// Инвайт потреблён, но помнит, кто его забрал, и ещё не истёк: кому-то повтор
+/// возможен. Кому именно, знает только владелец ключа, поэтому страница
+/// приглашения дальше этого не заглядывает. Отзыв ключ стирает, и отозванный
+/// инвайт сюда не попадает.
+fn has_live_claim(invite: &Invite, now: &str) -> bool {
+    invite.consumed_at.is_some()
+        && invite.claim_id.is_some()
+        && invite.expires_at.as_str() > now
+}
+
 /// Может ли спрашивающий забрать payload повторно: инвайт потреблён этим же
 /// ключом и ещё не истёк. Одна проверка на ручку сведений и на claim, чтобы
 /// экран подтверждения не расходился с тем, что ответит сам claim.
 fn can_reclaim(invite: &Invite, claim_id: &Option<String>, now: &str) -> bool {
-    if invite.consumed_at.is_none() || invite.expires_at.as_str() <= now {
+    if !has_live_claim(invite, now) {
         return false;
     }
     match (invite.claim_id.as_deref(), claim_id.as_deref()) {
@@ -139,10 +149,11 @@ pub async fn view_invite(
     // Потреблённый инвайт кнопку не гасит (XR-216): применял его, возможно, тот
     // же человек, у которого сорвалось применение, и на его устройстве инвайт
     // откроется снова. Браузер ключа установки не держит и решить это за
-    // приложение не может, поэтому кнопка живая, а под ней объяснение. Истёкший
-    // инвайт не оживить ничем, там кнопка гаснет как раньше.
-    let openable = active || status == "consumed";
-    let open_class = if openable { "btn primary" } else { "btn primary disabled" };
+    // приложение не может, поэтому кнопка живая, а под ней объяснение. Обещаем
+    // это только там, где повтор вправду возможен: у истёкшего и отозванного
+    // (отзыв стирает ключ) кнопка гаснет как раньше, а обещание было бы враньём.
+    let reclaimable = has_live_claim(invite, &now);
+    let open_class = if active || reclaimable { "btn primary" } else { "btn primary disabled" };
 
     // «Открыть в приложении» только на Android (см. is_android выше).
     let open_in_app = if is_android {
@@ -150,7 +161,7 @@ pub async fn view_invite(
     } else {
         String::new()
     };
-    let consumed_note = if status == "consumed" {
+    let consumed_note = if reclaimable {
         r#"<p class="note">Инвайт уже использован. Если применяли его вы, откройте в приложении: на том же устройстве он применится снова.</p>"#
     } else {
         ""
@@ -1017,9 +1028,8 @@ mod tests {
     // живой, а рядом объяснение, кому она поможет. Бейдж при этом не врёт.
     #[tokio::test]
     async fn view_keeps_open_button_for_consumed_invite() {
-        let state = state_with_invite("https://hub.example.com", "");
-        state.invites.write().await.get_mut(TOKEN).unwrap().consumed_at =
-            Some("2026-01-02T00:00:00+00:00".into());
+        let (state, _dir) = claim_state();
+        claim(&state, Some("client-key-1")).await.expect("первый claim");
 
         let html = view_html(state).await;
         assert!(
@@ -1030,15 +1040,46 @@ mod tests {
         assert!(html.contains("Уже использовано"), "бейдж должен остаться честным");
     }
 
-    // Истёкший инвайт не оживить ничем, и объяснять про повтор нечего.
+    // Живому инвайту обещать нечего: он и так применяется первый раз, а фраза
+    // про «уже применяли» сбивала бы с толку.
+    #[tokio::test]
+    async fn view_says_nothing_about_reclaim_for_active_invite() {
+        let html = view_html(state_with_invite("https://hub.example.com", "")).await;
+        assert!(!html.contains("Если применяли его вы"), "живому инвайту обещан повтор");
+    }
+
+    // Отзыв стирает ключ, повторить нечем (XR-216, замечание ревью). Обещание
+    // повтора тут враньё: страница зовёт в приложение, а там отказ без причины.
+    #[tokio::test]
+    async fn view_promises_nothing_for_revoked_invite() {
+        let (state, _dir) = claim_state();
+        claim(&state, Some("client-key-1")).await.expect("первый claim");
+        revoke_invite(State(state.clone()), extract::Path(TOKEN.to_string()))
+            .await
+            .expect("revoke failed");
+
+        let html = view_html(state).await;
+        assert!(!html.contains("Если применяли его вы"), "отозванному инвайту обещан повтор");
+        assert!(
+            html.contains(&format!(r#"class="btn primary disabled" href="xr://invite/{TOKEN}"#)),
+            "у отозванного инвайта кнопка открытия должна быть погашена: {html}"
+        );
+    }
+
+    // Истёкший инвайт не оживить ничем, даже с запомненным ключом.
     #[tokio::test]
     async fn view_says_nothing_about_reclaim_for_expired_invite() {
-        let state = state_with_invite("https://hub.example.com", "");
+        let (state, _dir) = claim_state();
+        claim(&state, Some("client-key-1")).await.expect("первый claim");
         state.invites.write().await.get_mut(TOKEN).unwrap().expires_at =
             "2000-01-01T00:00:00+00:00".into();
 
         let html = view_html(state).await;
         assert!(!html.contains("Если применяли его вы"), "истёкшему инвайту обещан повтор");
+        assert!(
+            html.contains(&format!(r#"class="btn primary disabled" href="xr://invite/{TOKEN}"#)),
+            "у истёкшего инвайта кнопка открытия должна быть погашена: {html}"
+        );
     }
 
     // «Открыть в приложении» только на Android: приложение есть лишь под него,
