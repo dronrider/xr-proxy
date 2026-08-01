@@ -27,6 +27,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
+use xr_proto::accept::accept_loop;
 use xr_proto::mux::{mux_handshake_server, mux_open_stream, Multiplexer};
 use xr_proto::protocol::{
     Codec, Command, Frame, TargetAddr, CLOSE_REASON_AGENT_OFFLINE, CLOSE_REASON_CONNECT_FAIL,
@@ -85,37 +86,35 @@ fn now_unix() -> u64 {
 }
 
 /// Accept loop: one spawned handler per connection, bounded by a connection
-/// semaphore (backpressure, not reject). Runs until the listener errors.
+/// semaphore (backpressure, not reject). Runs until the listener dies for good.
 pub async fn serve(
     listener: TcpListener,
     codec: Codec,
     state: Arc<RelayState>,
     max_connections: usize,
-) {
+) -> io::Result<()> {
     let conn_sem = Arc::new(Semaphore::new(max_connections));
-    loop {
-        let (tcp, peer) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                // A persistent accept error (EMFILE and friends) would spin this
-                // loop hot and flood the log; a short breather lets descriptors
-                // free up while the agent tunnels stay alive.
-                tracing::warn!("relay accept failed: {e}");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
+    let listener = &listener;
+    accept_loop(
+        "relay",
+        move || async move { listener.accept().await.map(Some) },
+        |tcp: TcpStream, peer| {
+            let permit = conn_sem.clone().acquire_owned();
+            let codec = codec.clone();
+            let state = state.clone();
+            async move {
+                let permit = permit.await.expect("sem open");
+                tcp.set_nodelay(true).ok();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(tcp, peer, codec, state).await {
+                        tracing::debug!("relay conn {peer} ended: {e}");
+                    }
+                    drop(permit);
+                });
             }
-        };
-        let permit = conn_sem.clone().acquire_owned().await.expect("sem open");
-        tcp.set_nodelay(true).ok();
-        let codec = codec.clone();
-        let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(tcp, peer, codec, state).await {
-                tracing::debug!("relay conn {peer} ended: {e}");
-            }
-            drop(permit);
-        });
-    }
+        },
+    )
+    .await
 }
 
 /// Periodically log the per-share byte totals (LLD-23 §2.6).

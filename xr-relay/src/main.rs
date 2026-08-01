@@ -50,7 +50,11 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::select! {
-        _ = serve(listener, codec, state, config.max_connections) => {}
+        r = serve(listener, codec, state, config.max_connections) => {
+            if let Err(e) = r {
+                tracing::error!("xr-relay listener is dead: {e}");
+            }
+        }
         _ = shutdown => tracing::info!("xr-relay shutting down"),
     }
     Ok(())
