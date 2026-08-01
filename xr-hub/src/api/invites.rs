@@ -668,20 +668,36 @@ mod tests {
         assert_eq!(claim(&state, None).await.unwrap_err(), StatusCode::GONE);
     }
 
-    // Пустой и непомерно длинный ключ не сохраняем: пустой совпал бы у всех, а
-    // длинный это уже не ключ клиента, а попытка раздуть файл инвайта.
+    // Пустой ключ не сохраняем: он совпал бы у всех, и одноразовый инвайт
+    // открылся бы любому, кто пришлёт тот же пустой заголовок.
     #[tokio::test]
-    async fn blank_and_oversized_keys_are_not_remembered() {
+    async fn blank_key_is_not_remembered() {
         let (state, dir) = claim_state();
         claim(&state, Some("   ")).await.expect("первый claim");
         assert!(stored_invite(&dir).claim_id.is_none());
         assert_eq!(claim(&state, Some("   ")).await.unwrap_err(), StatusCode::GONE);
+    }
+
+    // Граница длины ключа: 128 символов ещё ключ клиента, 129 это уже попытка
+    // раздуть файл инвайта. Проверяем оба края, иначе сдвиг условия на символ
+    // прошёл бы незамеченным.
+    #[tokio::test]
+    async fn key_of_128_is_remembered_and_129_is_not() {
+        let (state, dir) = claim_state();
+        let limit = "k".repeat(128);
+        claim(&state, Some(&limit)).await.expect("первый claim");
+        assert_eq!(
+            stored_invite(&dir).claim_id.as_deref(),
+            Some(limit.as_str()),
+            "ключ ровно в 128 символов должен запоминаться"
+        );
+        claim(&state, Some(&limit)).await.expect("повтор с ключом в 128 символов");
 
         let (state, dir) = claim_state();
-        let long = "k".repeat(129);
-        claim(&state, Some(&long)).await.expect("первый claim");
-        assert!(stored_invite(&dir).claim_id.is_none());
-        assert_eq!(claim(&state, Some(&long)).await.unwrap_err(), StatusCode::GONE);
+        let over = "k".repeat(129);
+        claim(&state, Some(&over)).await.expect("первый claim");
+        assert!(stored_invite(&dir).claim_id.is_none(), "ключ в 129 символов запомнили");
+        assert_eq!(claim(&state, Some(&over)).await.unwrap_err(), StatusCode::GONE);
     }
 
     // Отзыв инвайта закрывает его и для того, кто уже забирал: иначе «отозвать»
