@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::time::Duration;
+use xr_proto::accept::accept_loop;
 use xr_proto::config::{decode_key, load_server_config};
 use xr_proto::obfuscation::{ModifierStrategy, Obfuscator};
 use xr_proto::protocol::Codec;
@@ -92,36 +93,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Accept loop
-    loop {
-        tokio::select! {
-            result = listener.accept() => {
-                let (stream, addr) = result?;
-                let codec = codec.clone();
-                let fallback = fallback_response.clone();
-                let sem = semaphore.clone();
+    let listener = &listener;
+    let outcome = accept_loop(
+        "server",
+        move || async move {
+            tokio::select! {
+                result = listener.accept() => result.map(Some),
+                _ = shutdown_signal() => {
+                    tracing::info!("Shutdown signal received");
+                    Ok(None)
+                }
+            }
+        },
+        |stream, addr| {
+            let codec = codec.clone();
+            let fallback = fallback_response.clone();
+            let sem = semaphore.clone();
 
-                tokio::spawn(async move {
-                    let _permit = match sem.try_acquire() {
-                        Ok(p) => p,
-                        Err(_) => {
-                            tracing::warn!("Connection limit reached, rejecting {}", addr);
-                            return;
-                        }
-                    };
-
-                    if let Err(e) = handler::handle_client(stream, addr, codec, timeout, fallback).await {
-                        tracing::warn!("Client {} error: {}", addr, e);
+            tokio::spawn(async move {
+                let _permit = match sem.try_acquire() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        tracing::warn!("Connection limit reached, rejecting {}", addr);
+                        return;
                     }
-                });
-            }
-            _ = shutdown_signal() => {
-                tracing::info!("Shutdown signal received");
-                break;
-            }
-        }
-    }
+                };
+
+                if let Err(e) = handler::handle_client(stream, addr, codec, timeout, fallback).await {
+                    tracing::warn!("Client {} error: {}", addr, e);
+                }
+            });
+            std::future::ready(())
+        },
+    )
+    .await;
 
     tracing::info!("XR Proxy Server stopped");
+    outcome?;
     Ok(())
 }
 
