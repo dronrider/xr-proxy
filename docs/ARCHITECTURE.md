@@ -524,6 +524,7 @@ xr-client) держит `MuxPool`, который переиспользует �
 - `GET /api/v1/presets` — список `PresetSummary` (имя, версия, дата, кол-во правил). Поддержка `ETag`.
 - `GET /api/v1/presets/:name` — полный `Preset` с правилами. `304 Not Modified` по `If-None-Match`.
 - `GET /api/v1/invite/:token` — `InvitePayload` (полный конфиг подключения). Одноразовый → `410 Gone` при повторе.
+- `GET /api/v1/invite/:token/view` - HTML-страница приглашения для получателя (QR, deep link на Android, кнопка APK). Голые пути `/invite/:token` и `/invite/:token/view` редиректят сюда.
 - `GET /api/v1/public-key` — публичный ключ ed25519 для проверки подписей пресетов.
 - `GET /api/v1/app/latest` — подписанный манифест последнего APK: `{manifest, signature}` с диска (LLD-12). `404` если релиз не выложен.
 - `GET /api/v1/app/download/:ver` — APK стримом (`application/vnd.android.package-archive`) из `releases/<ver>.apk`.
@@ -533,6 +534,16 @@ xr-client) держит `MuxPool`, который переиспользует �
 - `GET/POST/DELETE /api/v1/admin/invites` — управление инвайтами.
 
 Admin SPA встроена в бинарь через `rust-embed`. Подробности — [lld/01-control-plane.md](lld/01-control-plane.md).
+
+**Страница приглашения (XR-192).** `/invite/:token/view` это единственный HTML,
+который хаб собирает из данных, и открывает его посторонний человек по ссылке
+из мессенджера, а в самой ссылке лежит одноразовый токен. Поэтому страница
+замкнута на себя: QR рисуется инлайновым SVG прямо в ответе (крейт `qrcode`),
+внешних картинок, шрифтов и скриптов на ней нет, и утекать токену наружу
+нечем. Всё, что подставляется в разметку (комментарий инвайта, deep link из
+`hub_url`, срок), проходит через экранирование, а ответ несёт
+`Content-Security-Policy` с `default-src 'none'`; инлайновые стили пускает
+одноразовый nonce, а не `unsafe-inline`.
 
 **Состояние и его резерв (XR-224).** Хаб держит состояние файлами на диске:
 `config.toml` (хеш пароля админки, ключ обфускации и salt пула), ключ подписи
