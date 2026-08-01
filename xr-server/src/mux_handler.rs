@@ -68,7 +68,7 @@ async fn handle_mux_client_lt(
                 Err(e) => {
                     tracing::debug!("{} sid={} bad Connect payload: {}", client_addr, stream_id, e);
                     // Send Close for this stream.
-                    let _ = mux.send_frame(stream_id, Command::Close, Vec::new()).await;
+                    let _ = mux.send_stream_close(stream_id, Vec::new()).await;
                     continue;
                 }
             };
@@ -84,24 +84,15 @@ async fn handle_mux_client_lt(
             // Register the stream on the multiplexer so Data frames are routed to it.
             let mux_stream = mux.register_stream(stream_id).await;
 
-            // Spawn independent relay task for this stream.
-            let mux_clone = mux.clone();
+            // Spawn independent relay task for this stream. Close стрима шлёт сам
+            // relay_stream своей же половиной записи, чтобы кадр встал в общий
+            // FIFO с Data и не обогнал их (XR-241).
             let addr_str = addr_display(&target_addr);
             let client_addr_clone = client_addr;
             tokio::spawn(async move {
-                let reason = match relay_stream(mux_stream, target_addr).await {
-                    Ok(()) => None,
-                    Err(e) => {
-                        tracing::debug!("{} sid={} {} relay error: {}", client_addr_clone, stream_id, addr_str, e);
-                        e.close_reason()
-                    }
-                };
-                // Send Close to notify the client. Сбой установки relay (resolve
-                // или connect до апстрима) уезжает причиной в payload: по ней
-                // клиентский пул считает деградацию сервера (XR-094). Старые
-                // клиенты лишний байт игнорируют.
-                let payload = reason.map_or_else(Vec::new, |r| vec![r]);
-                let _ = mux_clone.send_frame(stream_id, Command::Close, payload).await;
+                if let Err(e) = relay_stream(mux_stream, target_addr).await {
+                    tracing::debug!("{} sid={} {} relay error: {}", client_addr_clone, stream_id, addr_str, e);
+                }
             });
         }
         Ok::<(), io::Error>(())
@@ -171,6 +162,23 @@ async fn relay_stream(
     mux_stream: xr_proto::mux::MuxStream,
     target_addr: TargetAddr,
 ) -> Result<(), RelayError> {
+    let (mut mux_r, mut mux_w) = mux_stream.split();
+    let result = relay_pump(&mut mux_r, &mut mux_w, target_addr).await;
+    // Close клиенту шлём сами и той же половиной записи, что и Data: иначе кадр
+    // обгонит недописанный хвост ответа апстрима (XR-241). Сбой установки relay
+    // (resolve или connect до апстрима) уезжает причиной в payload, по ней
+    // клиентский пул считает деградацию сервера (XR-094); старые клиенты лишний
+    // байт игнорируют.
+    let reason = result.as_ref().err().and_then(RelayError::close_reason);
+    let _ = mux_w.close_with(reason.map_or_else(Vec::new, |r| vec![r])).await;
+    result
+}
+
+async fn relay_pump(
+    mux_r: &mut xr_proto::mux::MuxReadHalf,
+    mux_w: &mut xr_proto::mux::MuxWriteHalf,
+    target_addr: TargetAddr,
+) -> Result<(), RelayError> {
     // Resolve and connect to target.
     let target_sockaddr = resolve_target(&target_addr)
         .await
@@ -194,7 +202,6 @@ async fn relay_stream(
     configure_target(&target);
 
     let (mut tr, mut tw) = target.split();
-    let (mut mux_r, mux_w) = mux_stream.split();
 
     // MuxStream → Target (downstream from server's POV: data going to origin).
     let to_target = async {
@@ -355,6 +362,90 @@ mod tests {
             "connect-сбой должен прийти причиной {} в Close",
             CLOSE_REASON_CONNECT_FAIL
         );
+    }
+
+    /// XR-241: апстрим отдаёт ответ и сразу закрывает соединение, а клиент в этот
+    /// момент вычитывает туннель медленнее, чем сервер его наполняет. Close стрима
+    /// обязан прийти последним, после всех Data: уйди он контрольным планом, он
+    /// обгонит очередь, клиент снимет стрим и выбросит хвост (у Signal так не
+    /// доезжали CCS и Finished, TLS-хендшейк не завершался). Объём взят меньше
+    /// окна стрима (сырой клиент теста WindowUpdate не шлёт) и заведомо больше
+    /// буферов сокета, поэтому к моменту Close очередь сервера непуста.
+    #[tokio::test]
+    async fn relay_close_arrives_after_all_data() {
+        const TOTAL: usize = 768 * 1024;
+        let codec = test_codec();
+        let mut client = start_mux_server(codec.clone()).await;
+        // Маленький приёмный буфер: сервер упирается в него на первых килобайтах,
+        // и весь остальной ответ ждёт своей очереди в mux, а не оседает в ядре.
+        socket2::SockRef::from(&client).set_recv_buffer_size(16 * 1024).unwrap();
+
+        // Апстрим: отдаёт TOTAL байт и закрывает соединение, сообщая об этом.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.unwrap();
+            let chunk = vec![0x5au8; 4096];
+            for _ in 0..(TOTAL / chunk.len()) {
+                sock.write_all(&chunk).await.unwrap();
+            }
+            sock.shutdown().await.unwrap();
+            let _ = done_tx.send(());
+        });
+
+        let target = TargetAddr::Ip(upstream_addr);
+        let wire = codec
+            .encode_frame(Command::Connect, &encode_mux_payload(1, &target.encode().unwrap()))
+            .unwrap();
+        client.write_all(&wire).await.unwrap();
+
+        // Не читаем туннель, пока апстрим не отдал всё: очередь сервера к моменту
+        // Close должна быть непустой, иначе обгонять было бы нечего.
+        done_rx.await.unwrap();
+
+        // Читаем до Close, а после него ещё дослушиваем: дубль Close (его слал бы
+        // дроп половины записи, если бы close_with не помечал стрим закрытым) и
+        // догоняющие Data пришли бы сразу за ним.
+        let mut got = 0usize;
+        let mut closes = 0usize;
+        let mut data_after_close = 0usize;
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut filled = 0;
+        loop {
+            while let Some((frame, consumed)) = codec.decode_frame(&buf[..filled]).unwrap() {
+                let (sid, payload) = decode_mux_payload(&frame.payload).unwrap();
+                assert_eq!(sid, 1);
+                match frame.command {
+                    Command::Data if closes == 0 => got += payload.len(),
+                    Command::Data => data_after_close += payload.len(),
+                    Command::Close => closes += 1,
+                    _ => {}
+                }
+                buf.copy_within(consumed..filled, 0);
+                filled -= consumed;
+            }
+            if filled == buf.len() {
+                buf.resize(buf.len() * 2, 0);
+            }
+            // После Close ждём недолго: всё лишнее сервер отправил бы тут же.
+            let wait = if closes == 0 { Duration::from_secs(15) } else { Duration::from_millis(500) };
+            let n = match tokio::time::timeout(wait, client.read(&mut buf[filled..])).await {
+                Ok(r) => r.unwrap(),
+                Err(_) => {
+                    assert!(closes > 0, "сервер обязан прислать Close");
+                    break;
+                }
+            };
+            if n == 0 {
+                assert!(closes > 0, "сервер закрыл сокет без Close");
+                break;
+            }
+            filled += n;
+        }
+        assert_eq!(got, TOTAL, "Close обогнал хвост Data, ответ апстрима обрезан");
+        assert_eq!(data_after_close, 0, "Data после Close: пир их уже выбросит");
+        assert_eq!(closes, 1, "стрим закрывается ровно одним Close");
     }
 
     /// XR-094 (инцидент 2026-07-10): resolve-сбой (мёртвый DNS на VPS) уезжает
