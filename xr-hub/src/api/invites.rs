@@ -313,7 +313,24 @@ fn urlencoding(s: &str) -> String {
         .collect()
 }
 
-/// POST /invite/:token/claim — return full payload and consume one-time invites.
+/// Ключ клиента из заголовка `X-Claim-Id` (XR-216). Пустой и слишком длинный
+/// отбрасываем: первый не отличает клиентов, второй некуда писать в файл инвайта.
+fn claim_id_header(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers.get("x-claim-id")?.to_str().ok()?.trim();
+    if raw.is_empty() || raw.len() > 128 {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// Ключ сверяем в постоянное время: подбирать его на потреблённом инвайте
+/// пришлось бы вслепую, и по времени ответа подсказки быть не должно.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+/// POST /invite/:token/claim: return full payload and consume one-time invites.
 pub async fn claim_invite(
     State(state): State<Arc<AppState>>,
     extract::Path(token): extract::Path<String>,
@@ -324,12 +341,24 @@ pub async fn claim_invite(
         .get_mut(&token)
         .ok_or((StatusCode::NOT_FOUND, "invite not found".into()))?;
 
+    let claim_id = claim_id_header(&headers);
+
     let now = chrono::Utc::now().to_rfc3339();
     if invite.expires_at <= now {
         return Err((StatusCode::GONE, "invite expired".into()));
     }
     if invite.consumed_at.is_some() {
-        return Err((StatusCode::GONE, "invite already used".into()));
+        // Повтор того же клиента (XR-216): инвайт уже потреблён, но получатель
+        // остался без payload'а, потому что ответ до него не доехал целым.
+        // Отдаём тот же payload, пока инвайт не истёк; чужой повтор и отозванный
+        // инвайт (там ключа нет) уходят в 410 как раньше.
+        return match (invite.claim_id.as_deref(), claim_id.as_deref()) {
+            (Some(stored), Some(given)) if constant_time_eq(stored, given) => {
+                tracing::info!("invite re-claimed by the same client, serving payload again");
+                Ok(Json(invite.payload.clone()))
+            }
+            _ => Err((StatusCode::GONE, "invite already used".into())),
+        };
     }
 
     // Extract client IP (X-Real-IP from nginx, or direct connection).
@@ -352,6 +381,7 @@ pub async fn claim_invite(
     if invite.one_time && !state.config.invites.dev_mode {
         invite.consumed_at = Some(now);
         invite.claimed_by_ip = client_ip;
+        invite.claim_id = claim_id;
         let data_dir = Path::new(&state.config.server.data_dir);
         let _ = storage::save_invite(data_dir, invite);
     }
@@ -498,6 +528,8 @@ pub async fn revoke_invite(
 
     let now = chrono::Utc::now().to_rfc3339();
     invite.consumed_at = Some(now);
+    // Ключ клиента снимаем: с ним повтор проходил бы и после отзыва (XR-216).
+    invite.claim_id = None;
 
     let data_dir = Path::new(&state.config.server.data_dir);
     storage::save_invite(data_dir, invite)
@@ -517,9 +549,18 @@ mod tests {
     const TOKEN: &str = "abcdefghij0123456789AB";
 
     fn state_with_invite(payload_hub_url: &str, default_hub_url: &str) -> Arc<AppState> {
+        state_with_invite_in(payload_hub_url, default_hub_url, "/nonexistent")
+    }
+
+    fn state_with_invite_in(
+        payload_hub_url: &str,
+        default_hub_url: &str,
+        data_dir: &str,
+    ) -> Arc<AppState> {
         let mut config: crate::config::HubConfig =
             toml::from_str("[server]\n[admin]\nusers = []").unwrap();
         config.invites.defaults.hub_url = default_hub_url.into();
+        config.server.data_dir = data_dir.into();
 
         let invite = Invite {
             token: TOKEN.into(),
@@ -561,6 +602,123 @@ mod tests {
     /// проверяем сравнением с QR ожидаемой ссылки, а ссылку в тесте пишем руками.
     fn html_carries_qr_for(html: &str, data: &str) -> bool {
         html.contains(&render_qr_svg(data))
+    }
+
+    /// Инвайт живёт на диске, и claim его туда переписывает; тесты про ключ
+    /// смотрят в файл, поэтому data_dir у них свой временный.
+    fn claim_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_invite_in(
+            "https://hub.example.com",
+            "",
+            dir.path().to_str().unwrap(),
+        );
+        (state, dir)
+    }
+
+    async fn claim(
+        state: &Arc<AppState>,
+        claim_id: Option<&str>,
+    ) -> Result<InvitePayload, StatusCode> {
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some(id) = claim_id {
+            headers.insert("x-claim-id", id.parse().unwrap());
+        }
+        claim_invite(State(state.clone()), extract::Path(TOKEN.to_string()), headers)
+            .await
+            .map(|Json(payload)| payload)
+            .map_err(|(status, _)| status)
+    }
+
+    fn stored_invite(dir: &tempfile::TempDir) -> Invite {
+        let path = dir.path().join("invites").join(format!("{TOKEN}.json"));
+        let data = std::fs::read_to_string(&path).expect("инвайт не сохранён на диск");
+        serde_json::from_str(&data).unwrap()
+    }
+
+    // XR-216: одноразовый инвайт потребляется на выдаче payload'а, и получатель,
+    // у которого ответ не доехал целым (не разобралось тело, оборвалась сеть),
+    // оставался ни с чем до нового инвайта от админа. Повтор с тем же ключом
+    // должен отдать тот же payload.
+    #[tokio::test]
+    async fn repeat_claim_with_same_key_returns_payload() {
+        let (state, dir) = claim_state();
+
+        let first = claim(&state, Some("client-key-1")).await.expect("первый claim");
+        let second = claim(&state, Some("client-key-1")).await.expect("повтор того же клиента");
+
+        assert_eq!(first.server_address, "203.0.113.10");
+        assert_eq!(second.server_address, first.server_address);
+        assert_eq!(second.server_port, first.server_port);
+
+        // Инвайт при этом остаётся потреблённым, и ключ переживает рестарт хаба.
+        let stored = stored_invite(&dir);
+        assert!(stored.consumed_at.is_some(), "повтор не должен снимать пометку");
+        assert_eq!(stored.claim_id.as_deref(), Some("client-key-1"));
+    }
+
+    // Ключ и есть весь пропуск к повтору: без него и с чужим одноразовый инвайт
+    // закрыт, иначе пересланная в мессенджере ссылка сработала бы дважды.
+    #[tokio::test]
+    async fn repeat_claim_with_foreign_key_is_gone() {
+        let (state, _dir) = claim_state();
+        claim(&state, Some("client-key-1")).await.expect("первый claim");
+
+        assert_eq!(claim(&state, Some("client-key-2")).await.unwrap_err(), StatusCode::GONE);
+        assert_eq!(claim(&state, None).await.unwrap_err(), StatusCode::GONE);
+    }
+
+    // Пустой и непомерно длинный ключ не сохраняем: пустой совпал бы у всех, а
+    // длинный это уже не ключ клиента, а попытка раздуть файл инвайта.
+    #[tokio::test]
+    async fn blank_and_oversized_keys_are_not_remembered() {
+        let (state, dir) = claim_state();
+        claim(&state, Some("   ")).await.expect("первый claim");
+        assert!(stored_invite(&dir).claim_id.is_none());
+        assert_eq!(claim(&state, Some("   ")).await.unwrap_err(), StatusCode::GONE);
+
+        let (state, dir) = claim_state();
+        let long = "k".repeat(129);
+        claim(&state, Some(&long)).await.expect("первый claim");
+        assert!(stored_invite(&dir).claim_id.is_none());
+        assert_eq!(claim(&state, Some(&long)).await.unwrap_err(), StatusCode::GONE);
+    }
+
+    // Отзыв инвайта закрывает его и для того, кто уже забирал: иначе «отозвать»
+    // не отменяло бы ничего, пока у клиента на руках ключ.
+    #[tokio::test]
+    async fn revoked_invite_is_gone_for_its_claimer() {
+        let (state, _dir) = claim_state();
+        claim(&state, Some("client-key-1")).await.expect("первый claim");
+
+        revoke_invite(State(state.clone()), extract::Path(TOKEN.to_string()))
+            .await
+            .expect("revoke failed");
+
+        assert_eq!(claim(&state, Some("client-key-1")).await.unwrap_err(), StatusCode::GONE);
+    }
+
+    // Срок инвайта важнее ключа: после истечения повтор такой же мёртвый, как
+    // и первая попытка.
+    #[tokio::test]
+    async fn expired_invite_is_gone_for_its_claimer() {
+        let (state, _dir) = claim_state();
+        claim(&state, Some("client-key-1")).await.expect("первый claim");
+        state.invites.write().await.get_mut(TOKEN).unwrap().expires_at =
+            "2000-01-01T00:00:00+00:00".into();
+
+        assert_eq!(claim(&state, Some("client-key-1")).await.unwrap_err(), StatusCode::GONE);
+    }
+
+    // Многоразовый инвайт ключом не ограничен: он не потребляется вовсе.
+    #[tokio::test]
+    async fn reusable_invite_serves_every_client() {
+        let (state, _dir) = claim_state();
+        state.invites.write().await.get_mut(TOKEN).unwrap().one_time = false;
+
+        claim(&state, Some("client-key-1")).await.expect("первый claim");
+        claim(&state, Some("client-key-2")).await.expect("другой клиент");
+        claim(&state, None).await.expect("клиент без ключа");
     }
 
     async fn view_ua(state: Arc<AppState>, ua: &str) -> (String, String) {
