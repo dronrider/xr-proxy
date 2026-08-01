@@ -16,10 +16,11 @@ use crate::storage;
 
 // ── Public ──────────────────────────────────────────────────────────
 
-/// GET /invite/:token — return metadata without secrets. Does NOT consume.
+/// GET /invite/:token: return metadata without secrets. Does NOT consume.
 pub async fn get_invite_info(
     State(state): State<Arc<AppState>>,
     extract::Path(token): extract::Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<InviteInfo>, (StatusCode, String)> {
     let invites = state.invites.read().await;
     let invite = invites
@@ -41,8 +42,24 @@ pub async fn get_invite_info(
         comment: invite.comment.clone(),
         status: status.into(),
         expires_at: invite.expires_at.clone(),
-        reclaimable: false,
+        // Приложение спрашивает сведения до применения и гасит кнопку по
+        // статусу, поэтому владельцу ключа мало идемпотентного claim: без
+        // этого поля он до claim просто не доходит (XR-216).
+        reclaimable: can_reclaim(invite, &claim_id_header(&headers), &now),
     }))
+}
+
+/// Может ли спрашивающий забрать payload повторно: инвайт потреблён этим же
+/// ключом и ещё не истёк. Одна проверка на ручку сведений и на claim, чтобы
+/// экран подтверждения не расходился с тем, что ответит сам claim.
+fn can_reclaim(invite: &Invite, claim_id: &Option<String>, now: &str) -> bool {
+    if invite.consumed_at.is_none() || invite.expires_at.as_str() <= now {
+        return false;
+    }
+    match (invite.claim_id.as_deref(), claim_id.as_deref()) {
+        (Some(stored), Some(given)) => constant_time_eq(stored, given),
+        _ => false,
+    }
 }
 
 /// GET /invite/:token и /invite/:token/view на верхнем уровне -> HTML-view.
@@ -119,13 +136,24 @@ pub async fn view_invite(
     // Абсолютный от корня путь: страница живёт под /api/v1/..., а раздача APK по
     // /api/v1/app/download (LLD-12), латест-алиас всегда тянет свежий релиз.
     let apk_url = "/api/v1/app/download/latest";
-    let open_class = if active { "btn primary" } else { "btn primary disabled" };
+    // Потреблённый инвайт кнопку не гасит (XR-216): применял его, возможно, тот
+    // же человек, у которого сорвалось применение, и на его устройстве инвайт
+    // откроется снова. Браузер ключа установки не держит и решить это за
+    // приложение не может, поэтому кнопка живая, а под ней объяснение. Истёкший
+    // инвайт не оживить ничем, там кнопка гаснет как раньше.
+    let openable = active || status == "consumed";
+    let open_class = if openable { "btn primary" } else { "btn primary disabled" };
 
     // «Открыть в приложении» только на Android (см. is_android выше).
     let open_in_app = if is_android {
         format!(r#"<a class="{open_class}" href="{deep_link}">Открыть в приложении</a>"#)
     } else {
         String::new()
+    };
+    let consumed_note = if status == "consumed" {
+        r#"<p class="note">Инвайт уже использован. Если применяли его вы, откройте в приложении: на том же устройстве он применится снова.</p>"#
+    } else {
+        ""
     };
     // На не-Android нет ни deep link, ни смысла в APK: подсказываем QR.
     let platform_note = if is_android {
@@ -210,6 +238,7 @@ pub async fn view_invite(
           <span class="store-tx"><small>Скачать</small><b>APK для Android</b></span>
         </a>
       </div>
+      {consumed_note}
       {platform_note}
     </div>
     <div class="col-qr">
@@ -228,6 +257,7 @@ pub async fn view_invite(
             format!(r#"<div class="field"><div class="field-label">Комментарий</div><div class="field-value">{comment}</div></div>"#)
         },
         open_in_app = open_in_app,
+        consumed_note = consumed_note,
         platform_note = platform_note,
         apk_url = apk_url,
         qr_svg = qr_svg,
@@ -353,13 +383,11 @@ pub async fn claim_invite(
         // остался без payload'а, потому что ответ до него не доехал целым.
         // Отдаём тот же payload, пока инвайт не истёк; чужой повтор и отозванный
         // инвайт (там ключа нет) уходят в 410 как раньше.
-        return match (invite.claim_id.as_deref(), claim_id.as_deref()) {
-            (Some(stored), Some(given)) if constant_time_eq(stored, given) => {
-                tracing::info!("invite re-claimed by the same client, serving payload again");
-                Ok(Json(invite.payload.clone()))
-            }
-            _ => Err((StatusCode::GONE, "invite already used".into())),
-        };
+        if can_reclaim(invite, &claim_id, &now) {
+            tracing::info!("invite re-claimed by the same client, serving payload again");
+            return Ok(Json(invite.payload.clone()));
+        }
+        return Err((StatusCode::GONE, "invite already used".into()));
     }
 
     // Extract client IP (X-Real-IP from nginx, or direct connection).
@@ -631,6 +659,18 @@ mod tests {
             .map_err(|(status, _)| status)
     }
 
+    async fn invite_info(state: &Arc<AppState>, claim_id: Option<&str>) -> InviteInfo {
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some(id) = claim_id {
+            headers.insert("x-claim-id", id.parse().unwrap());
+        }
+        let Json(info) =
+            get_invite_info(State(state.clone()), extract::Path(TOKEN.to_string()), headers)
+                .await
+                .expect("get_invite_info failed");
+        info
+    }
+
     fn stored_invite(dir: &tempfile::TempDir) -> Invite {
         let path = dir.path().join("invites").join(format!("{TOKEN}.json"));
         let data = std::fs::read_to_string(&path).expect("инвайт не сохранён на диск");
@@ -656,6 +696,69 @@ mod tests {
         let stored = stored_invite(&dir);
         assert!(stored.consumed_at.is_some(), "повтор не должен снимать пометку");
         assert_eq!(stored.claim_id.as_deref(), Some("client-key-1"));
+    }
+
+    // XR-216, провал проверки на проде: приложение спрашивает сведения об
+    // инвайте до применения и гасит кнопку по статусу, поэтому владелец ключа
+    // до повторного claim просто не доходил. Сведения обязаны признать инвайт
+    // своим, не выдавая его при этом за активный.
+    #[tokio::test]
+    async fn invite_info_marks_reclaimable_for_the_key_owner() {
+        let (state, _dir) = claim_state();
+
+        let before = invite_info(&state, Some("client-key-1")).await;
+        assert_eq!(before.status, "active");
+        assert!(!before.reclaimable, "живой инвайт незачем помечать повторным");
+
+        claim(&state, Some("client-key-1")).await.expect("первый claim");
+
+        let mine = invite_info(&state, Some("client-key-1")).await;
+        assert_eq!(mine.status, "consumed", "статус остаётся честным");
+        assert!(mine.reclaimable, "владелец ключа не увидит кнопку применения");
+
+        // Сведения не расходятся с тем, что ответит сам claim.
+        claim(&state, Some("client-key-1")).await.expect("повтор владельца ключа");
+    }
+
+    // Постороннему потреблённый инвайт по-прежнему закрыт, и сведения об этом
+    // не должны намекать на обратное.
+    #[tokio::test]
+    async fn invite_info_hides_reclaimable_from_others() {
+        let (state, _dir) = claim_state();
+        claim(&state, Some("client-key-1")).await.expect("первый claim");
+
+        for key in [Some("client-key-2"), None] {
+            let info = invite_info(&state, key).await;
+            assert_eq!(info.status, "consumed");
+            assert!(!info.reclaimable, "чужой ключ {key:?} получил право на повтор");
+        }
+    }
+
+    // Истёкший инвайт мёртв и для владельца ключа: повтор ему всё равно
+    // ответит 410, и обещать применение на экране нельзя.
+    #[tokio::test]
+    async fn invite_info_hides_reclaimable_after_expiry() {
+        let (state, _dir) = claim_state();
+        claim(&state, Some("client-key-1")).await.expect("первый claim");
+        state.invites.write().await.get_mut(TOKEN).unwrap().expires_at =
+            "2000-01-01T00:00:00+00:00".into();
+
+        let info = invite_info(&state, Some("client-key-1")).await;
+        assert!(!info.reclaimable, "истёкший инвайт обещает повтор");
+        assert_eq!(claim(&state, Some("client-key-1")).await.unwrap_err(), StatusCode::GONE);
+    }
+
+    // Отзыв закрывает инвайт и для владельца ключа, сведения обязаны это
+    // показать: иначе кнопка живая, а claim отвечает отказом.
+    #[tokio::test]
+    async fn invite_info_hides_reclaimable_after_revoke() {
+        let (state, _dir) = claim_state();
+        claim(&state, Some("client-key-1")).await.expect("первый claim");
+        revoke_invite(State(state.clone()), extract::Path(TOKEN.to_string()))
+            .await
+            .expect("revoke failed");
+
+        assert!(!invite_info(&state, Some("client-key-1")).await.reclaimable);
     }
 
     // Ключ и есть весь пропуск к повтору: без него и с чужим одноразовый инвайт
@@ -907,6 +1010,35 @@ mod tests {
             html.contains(&format!(r#"class="btn primary disabled" href="xr://invite/{TOKEN}"#)),
             "у просроченного инвайта кнопка открытия должна быть погашена"
         );
+    }
+
+    // XR-216: со страницы получатель и возвращается в приложение после
+    // сорванного применения, поэтому у потреблённого инвайта кнопка остаётся
+    // живой, а рядом объяснение, кому она поможет. Бейдж при этом не врёт.
+    #[tokio::test]
+    async fn view_keeps_open_button_for_consumed_invite() {
+        let state = state_with_invite("https://hub.example.com", "");
+        state.invites.write().await.get_mut(TOKEN).unwrap().consumed_at =
+            Some("2026-01-02T00:00:00+00:00".into());
+
+        let html = view_html(state).await;
+        assert!(
+            html.contains(&format!(r#"class="btn primary" href="xr://invite/{TOKEN}"#)),
+            "у потреблённого инвайта кнопка открытия погашена: {html}"
+        );
+        assert!(html.contains("Если применяли его вы"), "нет объяснения про повтор");
+        assert!(html.contains("Уже использовано"), "бейдж должен остаться честным");
+    }
+
+    // Истёкший инвайт не оживить ничем, и объяснять про повтор нечего.
+    #[tokio::test]
+    async fn view_says_nothing_about_reclaim_for_expired_invite() {
+        let state = state_with_invite("https://hub.example.com", "");
+        state.invites.write().await.get_mut(TOKEN).unwrap().expires_at =
+            "2000-01-01T00:00:00+00:00".into();
+
+        let html = view_html(state).await;
+        assert!(!html.contains("Если применяли его вы"), "истёкшему инвайту обещан повтор");
     }
 
     // «Открыть в приложении» только на Android: приложение есть лишь под него,
