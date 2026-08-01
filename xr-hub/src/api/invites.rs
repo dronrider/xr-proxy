@@ -58,12 +58,15 @@ pub async fn redirect_to_view(
     axum::response::Redirect::temporary(&format!("/api/v1/invite/{}/view", urlencoding(&token)))
 }
 
+/// Ответ страницы /view: тело плюс заголовок Content-Security-Policy.
+pub type ViewResponse = ([(axum::http::HeaderName, String); 1], Html<String>);
+
 /// GET /invite/:token/view - HTML page with invite info and QR code.
 pub async fn view_invite(
     State(state): State<Arc<AppState>>,
     extract::Path(token): extract::Path<String>,
     headers: axum::http::HeaderMap,
-) -> Result<Html<String>, (StatusCode, String)> {
+) -> Result<ViewResponse, (StatusCode, String)> {
     // Приложение есть только под Android, поэтому «Открыть в приложении»
     // (deep link) показываем лишь там. На iOS/десктопе кнопка вела бы в никуда,
     // получателю остаётся отсканировать QR телефоном или скачать APK.
@@ -87,15 +90,15 @@ pub async fn view_invite(
         "active"
     };
 
-    let comment = &invite.comment;
-    let expires = format_datetime(&invite.expires_at);
+    let comment = escape_html(&invite.comment);
+    let expires = escape_html(&format_datetime(&invite.expires_at));
     let active = status == "active";
-    let status_badge = match status {
-        "active" => r#"<span class="badge badge-active">Активно</span>"#,
-        "expired" => r#"<span class="badge badge-expired">Истекло</span>"#,
-        "consumed" => r#"<span class="badge badge-consumed">Уже использовано</span>"#,
-        _ => status,
+    let (badge_class, badge_label) = match status {
+        "expired" => ("badge-expired", "Истекло"),
+        "consumed" => ("badge-consumed", "Уже использовано"),
+        _ => ("badge-active", "Активно"),
     };
+    let status_badge = format!(r#"<span class="badge {badge_class}">{badge_label}</span>"#);
 
     // QR кодирует каноническую ссылку https://<host>/invite/<token> (LLD-04):
     // относительный путь приложение не парсит. Хост берём из hub_url инвайта,
@@ -106,11 +109,12 @@ pub async fn view_invite(
         invite.payload.hub_url.as_str()
     };
     let qr_data = build_https_url(hub_url, &token);
+    let qr_svg = render_qr_svg(&qr_data);
     // «Открыть в приложении» это гарантированный deep link на кастомной схеме:
     // на странице /view приложение заведомо не дефолтный обработчик (иначе
     // получатель не смотрел бы её в браузере), а xr:// перехватит установленный
     // клиент напрямую, без chooser'а. Если приложения нет, спасает «Скачать APK».
-    let deep_link = build_custom_url(hub_url, &token);
+    let deep_link = escape_html(&build_custom_url(hub_url, &token));
     // Абсолютный от корня путь: страница живёт под /api/v1/..., а раздача APK по
     // /api/v1/app/download (LLD-12), латест-алиас всегда тянет свежий релиз.
     let apk_url = "/api/v1/app/download/latest";
@@ -129,6 +133,11 @@ pub async fn view_invite(
         r#"<p class="note">Приложение доступно для Android. Отсканируйте QR телефоном или откройте эту ссылку на Android-устройстве.</p>"#.to_string()
     };
 
+    // Стили на странице инлайновые, поэтому CSP пускает их по одноразовому
+    // nonce, а не по 'unsafe-inline': разрешение по слову открыло бы дорогу и
+    // любому чужому <style>, если что-то всё-таки просочится в разметку.
+    let nonce = csp_nonce();
+
     let html = format!(
         r#"<!DOCTYPE html>
 <html lang="ru">
@@ -136,7 +145,7 @@ pub async fn view_invite(
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Приглашение xr-proxy</title>
-<style>
+<style nonce="{nonce}">
   * {{ box-sizing: border-box; }}
   body {{ font-family: -apple-system, system-ui, sans-serif; margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.5rem; background: #eceef2; }}
   /* Цвет текста задаём вместе с фоном карточки в каждом правиле: если вебвью
@@ -166,7 +175,7 @@ pub async fn view_invite(
   .store-tx small {{ font-size: 0.72rem; opacity: 0.85; }}
   .store-tx b {{ font-size: 1.05rem; font-weight: 700; }}
   .note {{ color: #5a5f6e; font-size: 0.85rem; line-height: 1.45; margin: 1rem 0 0; }}
-  .col-qr img {{ background: #fff; padding: 10px; border-radius: 12px; width: 220px; height: 220px; max-width: 100%; }}
+  .col-qr svg {{ background: #fff; padding: 10px; border-radius: 12px; width: 220px; height: 220px; max-width: 100%; }}
   .qr-cap {{ color: #7a7f8e; font-size: 0.82rem; margin: 0.6rem 0 0; }}
   @media (prefers-color-scheme: dark) {{
     body {{ background: #0f1017; }}
@@ -203,7 +212,7 @@ pub async fn view_invite(
       {platform_note}
     </div>
     <div class="col-qr">
-      <img src="https://api.qrserver.com/v1/create-qr-code/?size=300x300&amp;data={qr_data_encoded}" width="220" height="220" alt="QR-код приглашения">
+      {qr_svg}
       <p class="qr-cap">Отсканируйте телефоном</p>
     </div>
   </div>
@@ -220,10 +229,72 @@ pub async fn view_invite(
         open_in_app = open_in_app,
         platform_note = platform_note,
         apk_url = apk_url,
-        qr_data_encoded = urlencoding(&qr_data),
+        qr_svg = qr_svg,
+        nonce = nonce,
     );
 
-    Ok(Html(html))
+    Ok((
+        [(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            content_security_policy(&nonce),
+        )],
+        Html(html),
+    ))
+}
+
+/// Страница живёт целиком в своём ответе: ни картинок, ни скриптов, ни шрифтов
+/// со стороны она не тянет, поэтому всё запрещаем по умолчанию и открываем
+/// только инлайновые стили по nonce. Токен инвайта из адресной строки после
+/// этого никуда не утечёт: уносить его наружу нечему.
+fn content_security_policy(nonce: &str) -> String {
+    format!(
+        "default-src 'none'; style-src 'nonce-{nonce}'; img-src 'none'; \
+         form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
+    )
+}
+
+fn csp_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// QR рисуем сами инлайновым SVG. Раньше картинка тянулась с api.qrserver.com,
+/// то есть одноразовый токен инвайта уезжал в логи чужого сервиса, а без
+/// внешней сети страница оставалась без QR вовсе.
+fn render_qr_svg(data: &str) -> String {
+    let svg = match qrcode::QrCode::new(data.as_bytes()) {
+        Ok(code) => code
+            .render::<qrcode::render::svg::Color>()
+            .min_dimensions(300, 300)
+            .quiet_zone(true)
+            .dark_color(qrcode::render::svg::Color("#000000"))
+            .light_color(qrcode::render::svg::Color("#ffffff"))
+            .build(),
+        // Ссылка на инвайт в лимиты QR укладывается с запасом, но падать
+        // страницей из-за неё не стоит: остальные способы подключиться на месте.
+        Err(_) => return String::new(),
+    };
+    // Рендерер начинает с XML-декларации, в HTML она лишняя: там инлайновый SVG
+    // это обычный элемент разметки, а <?...?> разбирается как мусорный комментарий.
+    let svg = svg.strip_prefix(r#"<?xml version="1.0" standalone="yes"?>"#).unwrap_or(&svg);
+    svg.replacen("<svg ", r#"<svg role="img" aria-label="QR-код приглашения" "#, 1)
+}
+
+/// Экранирование для текста и для значений атрибутов в кавычках.
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Format RFC3339 datetime to human-readable "YYYY-MM-DD HH:MM:SS UTC".
@@ -484,38 +555,24 @@ mod tests {
         })
     }
 
-    /// Вытащить содержимое QR из HTML страницы /view: значение параметра
-    /// data в src картинки qrserver, percent-декодированное обратно.
-    fn qr_data_from_view(html: &str) -> String {
-        let start = html.find("&amp;data=").expect("no qr data in html") + "&amp;data=".len();
-        let end = start + html[start..].find('"').expect("unterminated img src");
-        percent_decode(&html[start..end])
+    /// Страница несёт QR картинкой из своих же байт, поэтому «что закодировано»
+    /// проверяем сравнением с QR ожидаемой ссылки, а ссылку в тесте пишем руками.
+    fn html_carries_qr_for(html: &str, data: &str) -> bool {
+        html.contains(&render_qr_svg(data))
     }
 
-    fn percent_decode(s: &str) -> String {
-        let bytes = s.as_bytes();
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%' && i + 2 < bytes.len() {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap();
-                out.push(u8::from_str_radix(hex, 16).unwrap());
-                i += 3;
-            } else {
-                out.push(bytes[i]);
-                i += 1;
-            }
-        }
-        String::from_utf8(out).unwrap()
+    async fn view_ua(state: Arc<AppState>, ua: &str) -> (String, String) {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::USER_AGENT, ua.parse().unwrap());
+        let ([(_, csp)], Html(html)) =
+            view_invite(State(state), extract::Path(TOKEN.to_string()), headers)
+                .await
+                .expect("view_invite failed");
+        (csp, html)
     }
 
     async fn view_html_ua(state: Arc<AppState>, ua: &str) -> String {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(axum::http::header::USER_AGENT, ua.parse().unwrap());
-        let Html(html) = view_invite(State(state), extract::Path(TOKEN.to_string()), headers)
-            .await
-            .expect("view_invite failed");
-        html
+        view_ua(state, ua).await.1
     }
 
     /// По умолчанию рендерим как Android: там показывается deep link.
@@ -528,20 +585,88 @@ mod tests {
     #[tokio::test]
     async fn qr_encodes_canonical_invite_url() {
         let state = state_with_invite("https://hub.example.com", "");
-        let qr = qr_data_from_view(&view_html(state).await);
+        let html = view_html(state).await;
+        let canonical = format!("https://hub.example.com/invite/{TOKEN}");
 
-        assert_eq!(qr, format!("https://hub.example.com/invite/{TOKEN}"));
-        let link = xr_proto::invite_url::parse_invite_link(&qr).expect("app must parse qr");
+        assert!(html_carries_qr_for(&html, &canonical), "на странице не QR канонической ссылки");
+        assert!(
+            !html_carries_qr_for(&html, &format!("https://hub.example.com/invite/{TOKEN}x")),
+            "QR не зависит от того, что в него кладут"
+        );
+        let link = xr_proto::invite_url::parse_invite_link(&canonical).expect("app must parse qr");
         assert_eq!(link.hub_url(), "https://hub.example.com");
         assert_eq!(link.token(), TOKEN);
     }
 
     #[tokio::test]
     async fn qr_host_falls_back_to_hub_config() {
-        let state = state_with_invite("", "https://fallback.example.com/");
-        let qr = qr_data_from_view(&view_html(state).await);
+        let html = view_html(state_with_invite("", "https://fallback.example.com/")).await;
 
-        assert_eq!(qr, format!("https://fallback.example.com/invite/{TOKEN}"));
+        assert!(
+            html_carries_qr_for(&html, &format!("https://fallback.example.com/invite/{TOKEN}")),
+            "при пустом hub_url в инвайте QR должен брать хост из дефолтов хаба"
+        );
+    }
+
+    // XR-192: QR грузился картинкой с api.qrserver.com, то есть одноразовый
+    // токен инвайта уходил в чужой сервис (и в его логи) при каждом открытии
+    // страницы, а без внешней сети получатель оставался без QR.
+    #[tokio::test]
+    async fn view_does_not_leak_token_to_third_party() {
+        let html = view_html(state_with_invite("https://hub.example.com", "")).await;
+
+        assert!(!html.contains("qrserver.com"), "QR всё ещё тянется со стороннего сервиса");
+        assert!(
+            !html.contains("src=\"http"),
+            "страница не должна грузить ничего по внешним ссылкам: {html}"
+        );
+        assert!(html.contains("<svg role=\"img\" aria-label=\"QR-код приглашения\""), "нет своего QR");
+    }
+
+    // XR-192: комментарий инвайта задаёт админ, и в HTML он подставлялся сырьём.
+    #[tokio::test]
+    async fn view_escapes_invite_comment() {
+        let state = state_with_invite("https://hub.example.com", "");
+        state.invites.write().await.get_mut(TOKEN).unwrap().comment =
+            r#"<script>alert(1)</script>"#.into();
+
+        let html = view_html(state).await;
+        assert!(!html.contains("<script>"), "комментарий уехал в разметку как есть");
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "комментарий не экранирован");
+    }
+
+    // XR-192: hub_url приезжает из payload инвайта и попадал в href без
+    // экранирования, кавычка в нём разрывала атрибут.
+    #[tokio::test]
+    async fn view_escapes_deep_link_attribute() {
+        let html = view_html(state_with_invite(r#"https://evil"onerror="x"#, "")).await;
+
+        assert!(!html.contains(r#""onerror=""#), "кавычка из hub_url разорвала атрибут: {html}");
+    }
+
+    // XR-192: у страницы не было CSP, хотя это единственная публичная HTML-ручка
+    // хаба и открывает её получатель инвайта по ссылке из мессенджера.
+    #[tokio::test]
+    async fn view_sets_strict_csp() {
+        let (csp, html) = view_ua(
+            state_with_invite("https://hub.example.com", ""),
+            "Mozilla/5.0 (Linux; Android 14; Pixel)",
+        )
+        .await;
+
+        assert!(csp.contains("default-src 'none'"), "CSP не запрещает всё по умолчанию: {csp}");
+        assert!(!csp.contains("unsafe-inline"), "CSP ослаблен до unsafe-inline: {csp}");
+
+        let nonce = csp
+            .split("style-src 'nonce-")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .expect("в CSP нет nonce для инлайновых стилей");
+        assert!(!nonce.is_empty());
+        assert!(
+            html.contains(&format!(r#"<style nonce="{nonce}">"#)),
+            "nonce из заголовка не проставлен тегу style"
+        );
     }
 
     // XR-033: /view это воронка для получателя без приложения. Кнопка «Открыть
@@ -605,3 +730,4 @@ mod tests {
         );
     }
 }
+
