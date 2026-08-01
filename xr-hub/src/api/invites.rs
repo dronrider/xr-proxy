@@ -645,7 +645,10 @@ mod tests {
     }
 
     // XR-192: у страницы не было CSP, хотя это единственная публичная HTML-ручка
-    // хаба и открывает её получатель инвайта по ссылке из мессенджера.
+    // хаба и открывает её получатель инвайта по ссылке из мессенджера. Политику
+    // сверяем целиком, а не по паре директив: ослабление любой из них это тихая
+    // дыра, а расширять политику всё равно осознанная правка, и пусть она
+    // проходит через этот тест.
     #[tokio::test]
     async fn view_sets_strict_csp() {
         let (csp, html) = view_ua(
@@ -654,19 +657,42 @@ mod tests {
         )
         .await;
 
-        assert!(csp.contains("default-src 'none'"), "CSP не запрещает всё по умолчанию: {csp}");
-        assert!(!csp.contains("unsafe-inline"), "CSP ослаблен до unsafe-inline: {csp}");
-
         let nonce = csp
             .split("style-src 'nonce-")
             .nth(1)
             .and_then(|rest| rest.split('\'').next())
             .expect("в CSP нет nonce для инлайновых стилей");
-        assert!(!nonce.is_empty());
+        assert!(!nonce.is_empty(), "nonce пустой: {csp}");
+        assert_eq!(
+            csp,
+            format!(
+                "default-src 'none'; style-src 'nonce-{nonce}'; img-src 'none'; \
+                 form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
+            ),
+            "политика разошлась с ожидаемой"
+        );
         assert!(
             html.contains(&format!(r#"<style nonce="{nonce}">"#)),
             "nonce из заголовка не проставлен тегу style"
         );
+    }
+
+    // Nonce на то и одноразовый: постоянное значение пускало бы чужой <style>
+    // на любую следующую страницу.
+    #[tokio::test]
+    async fn csp_nonce_is_fresh_for_every_response() {
+        let (first, _) = view_ua(
+            state_with_invite("https://hub.example.com", ""),
+            "Mozilla/5.0 (Linux; Android 14; Pixel)",
+        )
+        .await;
+        let (second, _) = view_ua(
+            state_with_invite("https://hub.example.com", ""),
+            "Mozilla/5.0 (Linux; Android 14; Pixel)",
+        )
+        .await;
+
+        assert_ne!(first, second, "nonce не меняется от ответа к ответу");
     }
 
     // XR-033: /view это воронка для получателя без приложения. Кнопка «Открыть
