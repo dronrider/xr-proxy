@@ -264,12 +264,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Wait for shutdown signal
+    let mut fatal: Option<String> = None;
     tokio::select! {
         result = proxy_handle => {
-            if let Err(e) = result {
-                let msg = format!("Proxy task failed: {}", e);
+            if let Some(msg) = proxy_failure(result) {
                 tracing::error!("{}", msg);
-                log_to_file(&msg);
+                fatal = Some(msg);
             }
         }
         _ = async {
@@ -293,7 +293,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("XR Proxy Client stopped");
     log_to_file("xr-client stopped");
-    Ok(())
+    match fatal {
+        // Правила файрвола к этому моменту уже сняты, поэтому падение
+        // объявляем в самом конце, а не выходом из середины.
+        Some(msg) => Err(msg.into()),
+        None => Ok(()),
+    }
 }
 
 /// Кодек для сервера пула: общий `[obfuscation]`, либо собранный заново, если
@@ -324,5 +329,48 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = sigterm.recv() => {},
+    }
+}
+
+/// Итог задачи прокси в сообщение об отказе. Мёртвый листенер и упавшая задача
+/// одинаково значат, что прокси больше нет: оба случая должны довести процесс
+/// до ненулевого кода выхода, иначе для procd это неотличимо от штатной
+/// остановки и в crash.log ничего не попадёт.
+fn proxy_failure<E: std::fmt::Display>(
+    result: Result<std::io::Result<()>, E>,
+) -> Option<String> {
+    match result {
+        Err(e) => Some(format!("Proxy task failed: {}", e)),
+        Ok(Err(e)) => Some(format!("Proxy listener is dead: {}", e)),
+        Ok(Ok(())) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ради этого случая замечание и заводилось: `run_proxy` возвращает
+    /// `io::Result`, и раньше его ошибка терялась, проверялся только JoinError.
+    #[test]
+    fn dead_listener_is_a_failure() {
+        let dead: Result<std::io::Result<()>, String> =
+            Ok(Err(std::io::Error::from_raw_os_error(libc::EMFILE)));
+        let msg = proxy_failure(dead).expect("dead listener must be reported");
+        assert!(msg.contains("listener is dead"), "{msg}");
+        assert!(msg.contains("Too many open files"), "{msg}");
+    }
+
+    #[test]
+    fn panicked_task_is_a_failure() {
+        let panicked: Result<std::io::Result<()>, String> = Err("task panicked".into());
+        let msg = proxy_failure(panicked).expect("panicked task must be reported");
+        assert!(msg.contains("task failed"), "{msg}");
+    }
+
+    #[test]
+    fn clean_stop_is_not_a_failure() {
+        let clean: Result<std::io::Result<()>, String> = Ok(Ok(()));
+        assert_eq!(proxy_failure(clean), None);
     }
 }
