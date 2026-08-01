@@ -806,14 +806,19 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeParseInviteLi
 }
 
 /// Fetch invite metadata (no consume). Returns InviteInfo JSON on
-/// success (contains `status`: "active" | "consumed" | "expired"), or
-/// `{"error":".."}` on failure (network, 404, parse).
+/// success (contains `status`: "active" | "consumed" | "expired" и
+/// `reclaimable`: потреблённый инвайт принадлежит этой установке, XR-216),
+/// or `{"error":".."}` on failure (network, 404, parse).
+///
+/// `cache_dir` тот же, что у Apply: там лежит ключ установки, и запрос
+/// сведений обязан нести его, иначе хаб не отличит владельца от постороннего.
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeFetchInviteInfo(
     mut env: JNIEnv,
     _class: JClass,
     hub_url: JString,
     token: JString,
+    cache_dir: JString,
     timeout_ms: jlong,
 ) -> jstring {
     let hub_url = match read_jstring(&mut env, &hub_url) {
@@ -824,9 +829,15 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeFetchInviteIn
         Ok(s) => s,
         Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
     };
+    let cache_dir = match read_jstring(&mut env, &cache_dir) {
+        Ok(s) => PathBuf::from(s),
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
     let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
 
-    let result = with_onboarding_runtime(onboarding::fetch_invite_info(&hub_url, &token, timeout));
+    let result = with_onboarding_runtime(onboarding::fetch_invite_info(
+        &hub_url, &token, &cache_dir, timeout,
+    ));
     let json = match result {
         Ok(Ok(info)) => serde_json::to_string(&info)
             .unwrap_or_else(|e| json_error(&format!("serialize: {e}"))),
