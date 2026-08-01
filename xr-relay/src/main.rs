@@ -49,13 +49,16 @@ async fn main() -> anyhow::Result<()> {
     spawn_counter_logger(state.clone(), Duration::from_secs(config.counter_log_secs));
 
     let shutdown = tokio::signal::ctrl_c();
+    let mut outcome = Ok(());
     tokio::select! {
         r = serve(listener, codec, state, config.max_connections) => {
-            if let Err(e) = r {
+            if let Err(e) = &r {
                 tracing::error!("xr-relay listener is dead: {e}");
             }
+            outcome = r;
         }
         _ = shutdown => tracing::info!("xr-relay shutting down"),
     }
+    outcome?;
     Ok(())
 }
