@@ -88,6 +88,14 @@ Cargo-workspace + Android-модуль:
 
 Модули:
 
+- [accept.rs](../xr-proto/src/accept.rs) это общий accept-цикл листенеров
+  (xr-server, xr-client, xr-relay). Ошибка `accept()` сначала классифицируется:
+  проходящая (EMFILE и родня, ECONNABORTED, EINTR) даёт `warn` и паузу 100 мс,
+  после чего цикл живёт дальше, а незнакомый errno считается фатальным, и цикл
+  выходит с ошибкой. Тем же выходом кончаются сто проходящих ошибок подряд:
+  дескрипторы за десять секунд не освободились, крутиться дальше молча вредно,
+  процесс поднимет procd или systemd. До этого нехватка дескрипторов на всплеске
+  убивала листенер целиком, хотя проходит она за миллисекунды (XR-209).
 - [config.rs](../xr-proto/src/config.rs) — TOML-конфиги клиента/сервера. Ключевые
   структуры: `ClientConfig`, `ServerAddress`, `ObfuscationConfig`, `RoutingConfig`,
   `RoutingRule`, `ClientSettings`, `UdpRelayClientConfig`.
