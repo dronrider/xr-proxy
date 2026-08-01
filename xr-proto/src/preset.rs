@@ -112,6 +112,12 @@ pub struct InviteInfo {
     pub comment: String,
     pub status: String,
     pub expires_at: String,
+    /// Инвайт потреблён, но потребил его тот, кто спрашивает: claim с тем же
+    /// ключом снова отдаст payload (XR-216). Статус при этом честный,
+    /// `consumed`, врать «активен» посторонним нельзя. `default` оставляет поле
+    /// пустым для хабов и клиентов, которые про ключ не знают.
+    #[serde(default)]
+    pub reclaimable: bool,
 }
 
 #[cfg(test)]

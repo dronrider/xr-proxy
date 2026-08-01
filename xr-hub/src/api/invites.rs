@@ -41,6 +41,7 @@ pub async fn get_invite_info(
         comment: invite.comment.clone(),
         status: status.into(),
         expires_at: invite.expires_at.clone(),
+        reclaimable: false,
     }))
 }
 
