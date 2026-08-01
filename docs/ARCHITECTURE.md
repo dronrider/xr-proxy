@@ -207,8 +207,9 @@ Cargo-workspace + Android-модуль:
   `/public-key` + pre-warm preset cache через `PresetCache::write_to_disk`).
   Живёт рядом с `presets.rs`, чтобы переиспользовать тот же reqwest-клиент
   и формат кэша; JNI-обёртки в `xr-android-jni` лишь прокидывают вызовы.
-  Claim несёт ключ установки в `X-Claim-Id` (XR-216, раздел 5.3), чтобы
-  сорванный разбор ответа не сжигал одноразовый инвайт впустую.
+  Claim и запрос сведений несут ключ установки в `X-Claim-Id` (XR-216,
+  раздел 5.3), чтобы сорванный разбор ответа не сжигал одноразовый инвайт
+  впустую, а экран подтверждения пускал владельца ключа к повтору.
 
 **Важно:** `relay_errors` (счётчик) и хвост журнала это два независимых
 источника. Бадж вкладки Log в Android UI считается прямо по строкам хвоста и
@@ -270,7 +271,7 @@ xr-core** — там другая модель (TUN/smoltcp vs TPROXY).
 | `nativePushPacket(packet)` | Пакет TUN → `PacketQueue.inbound`. |
 | `nativePopPacket()` → `byte[]?` | Пакет `PacketQueue.outbound` → TUN. |
 | `nativeParseInviteLink(raw)` → `String (JSON)` | Парсинг invite-URL (LLD-04). Успех: `{kind,hub_url,token}`, ошибка: `{error}`. |
-| `nativeFetchInviteInfo(hub_url, token, timeoutMs)` → `String (JSON)` | GET `/api/v1/invite/<token>` → `InviteInfo` (без consume). |
+| `nativeFetchInviteInfo(hub_url, token, cacheDir, timeoutMs)` -> `String (JSON)` | GET `/api/v1/invite/<token>` отдаёт `InviteInfo` (без consume). `cacheDir` тот же, что у Apply: оттуда берётся ключ установки для `X-Claim-Id` (XR-216). |
 | `nativeApplyInvite(hub_url, token, preset, cacheDir, timeoutMs)` → `String (JSON)` | Claim + TOFU public-key + pre-warm preset. Одноразовый `tokio::runtime::Runtime` на вызов. |
 | `nativeCheckUpdate(hubUrl, currentCode, pinnedKeyB64, timeoutMs)` → `String (JSON)` | LLD-12. Fetch + verify манифеста pinned release-ключом. `{available, manifest?, error?}`. |
 | `nativeVerifyApk(path, sha256Hex)` → `Boolean` | LLD-12. Потоковая SHA-256 скачанного APK против манифеста. |
@@ -525,7 +526,7 @@ xr-client) держит `MuxPool`, который переиспользует �
 **Публичные эндпоинты:**
 - `GET /api/v1/presets` — список `PresetSummary` (имя, версия, дата, кол-во правил). Поддержка `ETag`.
 - `GET /api/v1/presets/:name` — полный `Preset` с правилами. `304 Not Modified` по `If-None-Match`.
-- `GET /api/v1/invite/:token` это `InviteInfo` (метаданные без секретов), инвайт не потребляет.
+- `GET /api/v1/invite/:token` это `InviteInfo` (метаданные без секретов), инвайт не потребляет. Читает `X-Claim-Id` и ставит `reclaimable`, когда потреблённый инвайт принадлежит спрашивающему (XR-216, см. ниже).
 - `POST /api/v1/invite/:token/claim` это `InvitePayload` (полный конфиг подключения). Одноразовый инвайт потребляется здесь же, повтор получает `410 Gone`; исключение это повтор того же клиента по ключу `X-Claim-Id` (XR-216, см. ниже).
 - `GET /api/v1/invite/:token/view` - HTML-страница приглашения для получателя (QR, deep link на Android, кнопка APK). Голые пути `/invite/:token` и `/invite/:token/view` редиректят сюда.
 - `GET /api/v1/public-key` — публичный ключ ed25519 для проверки подписей пресетов.
@@ -560,6 +561,19 @@ Admin SPA встроена в бинарь через `rust-embed`. Подроб
 `xr-core/onboarding.rs`: ключ это 16 случайных байт, он лежит файлом `claim-id`
 рядом с кэшем пресетов и переживает перезапуск приложения, поэтому повторить
 Apply можно и после обновления, которое чинит разбор.
+
+Одного идемпотентного claim мало: до него надо дойти. Приложение сначала
+спрашивает сведения об инвайте (`GET /api/v1/invite/:token`) и по статусу решает,
+показывать ли кнопку применения, поэтому `consumed` гасил её раньше, чем повтор
+успевал случиться. Ручка сведений тоже читает `X-Claim-Id` и ставит
+`InviteInfo.reclaimable`, когда потреблённый инвайт принадлежит спрашивающему;
+статус при этом остаётся честным (`consumed`), выдавать инвайт за активный нельзя,
+его видят и посторонние. Экран подтверждения включает кнопку по
+`status == "active" || reclaimable` и пишет владельцу, что инвайт уже применяли на
+этом устройстве и можно применить снова. На странице `/invite/:token/view` браузер
+ключа не держит и решить за приложение не может, поэтому у потреблённого (но не
+истёкшего) инвайта кнопка «Открыть в приложении» осталась живой, а под ней
+объяснение, кому она поможет; бейдж «Уже использовано» не меняется.
 
 **Состояние и его резерв (XR-224).** Хаб держит состояние файлами на диске:
 `config.toml` (хеш пароля админки, ключ обфускации и salt пула), ключ подписи
