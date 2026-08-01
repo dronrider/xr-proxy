@@ -1,4 +1,5 @@
 /// Transparent proxy core: accept connections, extract SNI, route, tunnel.
+use xr_proto::accept::accept_loop;
 use xr_proto::routing::{Action, Router};
 use xr_proto::server_pool::ServerPool;
 use xr_proto::sni;
@@ -85,25 +86,31 @@ pub async fn run_proxy(
     let listener = socket.listen(1024)?;
     tracing::info!("Transparent proxy listening on 0.0.0.0:{}", listen_port);
 
-    loop {
-        let (client_stream, client_addr) = listener.accept().await?;
-        let state = state.clone();
+    let listener = &listener;
+    accept_loop(
+        "proxy",
+        move || async move { listener.accept().await.map(Some) },
+        |client_stream, client_addr| {
+            let state = state.clone();
 
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(client_stream, client_addr, state).await {
-                let msg = e.to_string();
-                // Connection resets are normal (client closed tab, app timeout, etc.)
-                if msg.contains("reset by peer")
-                    || msg.contains("Broken pipe")
-                    || msg.contains("Connection refused")
-                {
-                    tracing::debug!("Connection from {} closed: {}", client_addr, msg);
-                } else {
-                    tracing::warn!("Connection from {} failed: {}", client_addr, e);
+            tokio::spawn(async move {
+                if let Err(e) = handle_connection(client_stream, client_addr, state).await {
+                    let msg = e.to_string();
+                    // Connection resets are normal (client closed tab, app timeout, etc.)
+                    if msg.contains("reset by peer")
+                        || msg.contains("Broken pipe")
+                        || msg.contains("Connection refused")
+                    {
+                        tracing::debug!("Connection from {} closed: {}", client_addr, msg);
+                    } else {
+                        tracing::warn!("Connection from {} failed: {}", client_addr, e);
+                    }
                 }
-            }
-        });
-    }
+            });
+            std::future::ready(())
+        },
+    )
+    .await
 }
 
 async fn handle_connection(
