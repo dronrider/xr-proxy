@@ -32,6 +32,9 @@ libc = "0.2"
 ed25519-dalek = "2"
 base64 = "0.22"
 sha2 = "0.10"
+# Ключ клиента для повторного claim инвайта (XR-216); rand уже в дереве через
+# xr-proto, отдельного веса кросс-сборке не добавляет.
+rand = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
