@@ -33,9 +33,15 @@ pub struct ApplyInviteResult {
 }
 
 /// GET the invite metadata. Does not consume.
+///
+/// Запрос несёт тот же ключ установки, что и claim (XR-216): хаб по нему
+/// отмечает в `InviteInfo.reclaimable`, что потреблённый инвайт принадлежит
+/// спрашивающему. Без ключа экран подтверждения гасит кнопку по статусу
+/// `consumed`, и до повторного claim дело не доходит вовсе.
 pub async fn fetch_invite_info(
     hub_url: &str,
     token: &str,
+    cache_dir: &Path,
     timeout: Duration,
 ) -> Result<InviteInfo, String> {
     let client = reqwest::Client::builder()
@@ -43,9 +49,18 @@ pub async fn fetch_invite_info(
         .build()
         .map_err(|e| format!("http client: {e}"))?;
 
+    // Сведения об инвайте ошибок наружу не несут, поэтому о несохранившемся
+    // ключе говорим в журнал; в Apply та же неудача попадает в errors.
+    let mut key_errors = Vec::new();
+    let claim_id = claim_id(cache_dir, &mut key_errors);
+    for e in &key_errors {
+        tracing::warn!("{e}");
+    }
+
     let url = format!("{}/api/v1/invite/{}", hub_url.trim_end_matches('/'), token);
     let resp = client
         .get(&url)
+        .header("X-Claim-Id", &claim_id)
         .send()
         .await
         .map_err(|e| format!("network: {e}"))?;
@@ -242,6 +257,9 @@ mod tests {
     const BROKEN_PAYLOAD: &str = r#"{"server_address":"203.0.113.10"}"#;
     const PRESET: &str = r#"{"name":"russia","version":3,"updated_at":"2026-01-01T00:00:00+00:00",
         "rules":{"default_action":"direct","rules":[]}}"#;
+    // Сведения о потреблённом инвайте, который хаб признал нашим (XR-216).
+    const INFO: &str = r#"{"token":"abcdefghij0123456789AB","preset":"russia","comment":"",
+        "status":"consumed","expires_at":"2099-01-01T00:00:00+00:00","reclaimable":true}"#;
 
     #[derive(Clone, Debug)]
     struct SeenRequest {
@@ -302,6 +320,8 @@ mod tests {
                         let (ctype, body) = if path.ends_with("/claim") {
                             let body = bodies.lock().unwrap().pop_front().unwrap_or_default();
                             ("application/json", body)
+                        } else if path.starts_with("/api/v1/invite/") {
+                            ("application/json", INFO.to_string())
                         } else if path.ends_with("/public-key") {
                             ("text/plain", PUBLIC_KEY.to_string())
                         } else {
@@ -321,11 +341,20 @@ mod tests {
         }
 
         fn claims(&self) -> Vec<SeenRequest> {
+            self.requests(|path| path.ends_with("/claim"))
+        }
+
+        /// Запросы сведений об инвайте: тот же путь, что у claim, но без хвоста.
+        fn infos(&self) -> Vec<SeenRequest> {
+            self.requests(|path| path.starts_with("/api/v1/invite/") && !path.ends_with("/claim"))
+        }
+
+        fn requests(&self, matches: impl Fn(&str) -> bool) -> Vec<SeenRequest> {
             self.seen
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|r| r.path.ends_with("/claim"))
+                .filter(|r| matches(&r.path))
                 .cloned()
                 .collect()
         }
@@ -366,6 +395,35 @@ mod tests {
             claims[1].claim_id.as_deref(),
             Some(key.as_str()),
             "ключ не пережил вторую попытку, повтор упрётся в 410"
+        );
+    }
+
+    // XR-216, провал проверки на проде: приложение спрашивает сведения об
+    // инвайте до применения и по ним решает, показывать ли кнопку. Запрос
+    // сведений обязан нести тот же ключ, что и claim, иначе хаб не признает
+    // потреблённый инвайт нашим и до повтора дело не дойдёт.
+    #[tokio::test]
+    async fn invite_info_request_carries_the_same_key_as_claim() {
+        let hub = FakeHub::start(vec![PAYLOAD]).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let info = fetch_invite_info(&hub.url, TOKEN, dir.path(), Duration::from_secs(5))
+            .await
+            .expect("сведения об инвайте не разобрались");
+        assert_eq!(info.status, "consumed");
+        assert!(info.reclaimable, "признак повторного применения не доехал до клиента");
+
+        apply(&hub, dir.path()).await;
+
+        let info_key = hub.infos()[0]
+            .claim_id
+            .clone()
+            .expect("запрос сведений ушёл без ключа, хаб не отличит владельца от чужого");
+        assert!(!info_key.is_empty(), "ключ пустой");
+        assert_eq!(
+            hub.claims()[0].claim_id.as_deref(),
+            Some(info_key.as_str()),
+            "сведения и claim ушли с разными ключами"
         );
     }
 
