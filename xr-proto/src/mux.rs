@@ -871,6 +871,19 @@ impl MuxWriteHalf {
     }
 
     pub async fn close(&mut self) -> io::Result<()> {
+        self.close_with(Vec::new()).await
+    }
+
+    /// Закрыть стрим, положив в Close причину (CLOSE_REASON_*): по ней пир
+    /// отличает сбой установки relay от обычного конца обмена (XR-094).
+    ///
+    /// Кадр идёт тем же FIFO, что и Data этого стрима, и ждёт места в очереди.
+    /// Отдавать Close приоритетным контрольным планом нельзя: он обгонит ещё не
+    /// записанный хвост Data, пир снимет стрим и молча выбросит догоняющие кадры.
+    /// Апстрим, закрывающий соединение сразу за последним блоком, терял так конец
+    /// ответа: TLS-хендшейк к нему не завершался, скачивание рвалось на хвосте
+    /// (XR-241).
+    pub async fn close_with(&mut self, payload: Vec<u8>) -> io::Result<()> {
         if self.closed {
             return Ok(());
         }
@@ -880,7 +893,7 @@ impl MuxWriteHalf {
             .send(OutFrame {
                 stream_id: self.stream_id,
                 command: Command::Close,
-                payload: Vec::new(),
+                payload,
             })
             .await;
         Ok(())
@@ -1114,11 +1127,15 @@ impl Multiplexer {
 
     /// Send a raw frame (used for ConnectAck, Ping, Pong).
     ///
-    /// Все кадры send_frame это КОНТРОЛЬ (Connect/ConnectAck/Ping/Pong), поэтому
-    /// идут по приоритетному контрольному каналу и НЕ встают в хвост за балком
-    /// Data (корень XR-086: ConnectAck нового стрима залипал за мегабайтами
-    /// download в общей FIFO writer'а). Контрольный канал сливается writer-таском
-    /// раньше Data (biased select), переполниться под балком не может.
+    /// Кадр уходит по приоритетному контрольному каналу и НЕ встаёт в хвост за
+    /// балком Data (корень XR-086: ConnectAck нового стрима залипал за
+    /// мегабайтами download в общей FIFO writer'а). Контрольный канал сливается
+    /// writer-таском раньше Data (biased select), переполниться под балком не
+    /// может.
+    ///
+    /// Годится только для кадров, которым нечего обгонять. Close стрима сюда НЕ
+    /// отдавать: он обгонит ещё не записанные Data своего стрима и обрежет ответ
+    /// (XR-241), для него есть `send_stream_close`.
     ///
     /// Инструментация: если отправка всё же виснет дольше 2с, значит стоит сам
     /// writer-таск (TCP send-буфер полон, сокет не принимает даже контроль),
@@ -1139,6 +1156,20 @@ impl Multiplexer {
                 fut.await.map_err(|_| broken())
             }
         }
+    }
+
+    /// Закрыть стрим, которого у нас нет объектом: отказ по входящему Connect,
+    /// когда стрим ещё не зарегистрирован. Кадр идёт балк-планом, как и Close
+    /// зарегистрированного стрима ([`MuxWriteHalf::close_with`]), чтобы правило
+    /// «Close стрима не обгоняет свои Data» держалось без исключений (XR-241).
+    ///
+    /// Ждём место в очереди (`send`, а не `try_send` как у `close_on_drop`):
+    /// потеряв этот Close, пир досидит до своего таймаута открытия.
+    pub async fn send_stream_close(&self, stream_id: u32, payload: Vec<u8>) -> io::Result<()> {
+        self.writer_tx
+            .send(OutFrame { stream_id, command: Command::Close, payload })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "mux writer closed"))
     }
 
     /// Take the new-stream notification receiver (server-side use).
@@ -1928,6 +1959,55 @@ mod tests {
             flood.is_ok(),
             "reader must keep draining the socket under a full writer channel (no deadlock)"
         );
+    }
+
+    /// XR-241: Close стрима обязан держать FIFO с Data этого же стрима. Уйди он
+    /// контрольным планом (приоритетным у writer'а), он обгонит ещё не записанный
+    /// хвост Data, пир снимет стрим по Close и молча выбросит догоняющие кадры:
+    /// ответ апстрима, закрывшего соединение сразу за последним блоком, приезжает
+    /// обрезанным. Переведи `send_stream_close` на `ctrl_tx`, и сюда доедет 0
+    /// байт из 262144, ровно как было у сервера до правки.
+    #[tokio::test]
+    async fn test_close_does_not_overtake_pending_data() {
+        const CHUNK: usize = 4096;
+        const CHUNKS: usize = 64;
+
+        let (client_io, server_io) = duplex(65536);
+        let codec = test_codec();
+        let client_mux = Multiplexer::new_client(client_io, codec.clone(), MuxCaps::LOCAL);
+        let server_mux = Multiplexer::new_server(server_io, codec, MuxCaps::LOCAL);
+
+        let server_task = tokio::spawn(async move {
+            let mut rx = server_mux.take_new_stream_rx().await.unwrap();
+            let ns = rx.recv().await.unwrap();
+            server_mux
+                .send_frame(ns.stream_id, Command::ConnectAck, vec![0])
+                .await
+                .unwrap();
+            let stream = server_mux.register_stream(ns.stream_id).await;
+            for _ in 0..CHUNKS {
+                stream.send(&vec![0x5a; CHUNK]).await.unwrap();
+            }
+            // Ровно так xr-server закрывает стрим после EOF от апстрима.
+            server_mux
+                .send_stream_close(ns.stream_id, Vec::new())
+                .await
+                .unwrap();
+        });
+
+        let target = TargetAddr::Domain("example.com".to_string(), 443);
+        let mut stream = mux_open_stream(&client_mux, &target).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut got = 0usize;
+            while let Some(data) = stream.recv().await {
+                got += data.len();
+            }
+            got
+        })
+        .await
+        .expect("stream must end on Close");
+        server_task.await.unwrap();
+        assert_eq!(got, CHUNK * CHUNKS, "хвост Data потерян под обгоняющим Close");
     }
 
     /// XR-134: причина Close пира должна быть доступна потребителю стрима
