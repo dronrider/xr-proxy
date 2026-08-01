@@ -1,3 +1,4 @@
+pub mod accept;
 pub mod app_update;
 pub mod config;
 pub mod invite_url;

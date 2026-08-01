@@ -23,6 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
 toml = "0.8"
 base64 = "0.22"
+libc = "0.2"
 rand = "0.8"
 tracing = "0.1"
 maxminddb = { version = "0.24", optional = true }
