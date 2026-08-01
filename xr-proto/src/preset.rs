@@ -46,6 +46,14 @@ pub struct Invite {
     pub consumed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_by_ip: Option<String>,
+    /// Ключ клиента, забравшего инвайт (XR-216). Одноразовый инвайт потребляется
+    /// на сервере в момент выдачи payload'а, поэтому любой сбой уже после этого
+    /// (тело не разобралось, оборвалась сеть на чтении) оставлял бы получателя
+    /// ни с чем. С ключом повтор того же клиента отдаёт payload снова, а чужой
+    /// повтор по-прежнему упирается в 410. `default` держит старые файлы инвайтов
+    /// читаемыми, у них ключа нет и повтор невозможен.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_id: Option<String>,
     pub one_time: bool,
     #[serde(default)]
     pub comment: String,
@@ -152,5 +160,34 @@ mod tests {
         assert_eq!(back.servers.len(), 2);
         assert_eq!(back.servers[0].name, "aeza");
         assert_eq!(back.server_address, "1.2.3.4", "legacy field keeps primary");
+    }
+
+    /// XR-216: ключ клиента добавлен к уже лежащим на диске инвайтам, и хаб
+    /// читает их файлы при старте. Инвайт без поля должен загружаться, иначе
+    /// апгрейд хаба потеряет весь выданный парк.
+    #[test]
+    fn test_stored_invite_without_claim_id_loads() {
+        let stored = r#"{
+            "token": "abc",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "expires_at": "2099-01-01T00:00:00+00:00",
+            "one_time": true,
+            "payload": {
+                "server_address": "1.2.3.4",
+                "server_port": 8443,
+                "obfuscation_key": "a2V5",
+                "modifier": "positional_xor_rotate",
+                "salt": 7,
+                "preset": "russia",
+                "hub_url": "https://hub.example"
+            }
+        }"#;
+        let invite: Invite = serde_json::from_str(stored).expect("старый инвайт не читается");
+        assert!(invite.claim_id.is_none());
+
+        // Пустой ключ в файле не появляется: повтор сверяется по равенству, и
+        // пустая строка в обеих частях сравнения открыла бы инвайт всем подряд.
+        let json = serde_json::to_string(&invite).unwrap();
+        assert!(!json.contains("claim_id"), "ключ без значения не сериализуем: {json}");
     }
 }

@@ -470,6 +470,7 @@ pub(crate) async fn build_invite(
         expires_at: expires.to_rfc3339(),
         consumed_at: None,
         claimed_by_ip: None,
+        claim_id: None,
         one_time,
         comment,
         payload,
@@ -526,6 +527,7 @@ mod tests {
             expires_at: "2099-01-01T00:00:00+00:00".into(),
             consumed_at: None,
             claimed_by_ip: None,
+            claim_id: None,
             one_time: true,
             comment: String::new(),
             payload: InvitePayload {

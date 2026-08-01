@@ -578,6 +578,7 @@ mod tests {
             expires_at: "2099-01-01T00:00:00+00:00".into(),
             consumed_at: None,
             claimed_by_ip: None,
+            claim_id: None,
             one_time: false,
             comment: String::new(),
             payload: InvitePayload {

@@ -86,6 +86,7 @@ mod tests {
             expires_at: "2026-01-02T00:00:00Z".into(),
             consumed_at: None,
             claimed_by_ip: None,
+            claim_id: None,
             one_time: true,
             comment: "xr-setup".into(),
             payload: xr_proto::preset::InvitePayload {
