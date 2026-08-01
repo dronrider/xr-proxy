@@ -323,6 +323,7 @@ fun MainScreen(
                         comment = ob.comment,
                         status = ob.status,
                         expiresAt = ob.expiresAt,
+                        reclaimable = ob.reclaimable,
                         willReplaceExisting = false,
                         applyEnabled = state.phase == ConnectPhase.Idle,
                         applyInProgress = ob.applyInProgress,

@@ -89,6 +89,9 @@ sealed interface OnboardingState {
         val comment: String,
         val status: String,
         val expiresAt: String,
+        /** Инвайт потреблён, но потребила его эта же установка: повторное
+         *  применение пройдёт по ключу из кэша (XR-216). */
+        val reclaimable: Boolean = false,
         val applyInProgress: Boolean = false,
     ) : OnboardingState
     object Completed : OnboardingState
@@ -993,7 +996,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             // Дальше экран ожидания говорит, к кому именно идёт запрос.
             _onboardingState.value = OnboardingState.Loading(hubUrl)
             val infoJson = withContext(Dispatchers.IO) {
-                NativeBridge.nativeFetchInviteInfo(hubUrl, token, 5_000L)
+                NativeBridge.nativeFetchInviteInfo(
+                    hubUrl, token, presetCacheDir.absolutePath, 5_000L,
+                )
             }
             val info = runCatching { JSONObject(infoJson) }.getOrNull()
             if (info == null) {
@@ -1012,6 +1017,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 comment = info.optString("comment"),
                 status = info.optString("status", "active"),
                 expiresAt = info.optString("expires_at"),
+                reclaimable = info.optBoolean("reclaimable"),
             )
         }
     }

@@ -131,8 +131,16 @@ object NativeBridge {
     external fun nativeParseInviteLink(raw: String): String
 
     /** GET invite metadata (does NOT consume). Returns InviteInfo JSON
-     *  (fields: token, preset, comment, status, expires_at) or `{"error":".."}`. */
-    external fun nativeFetchInviteInfo(hubUrl: String, token: String, timeoutMs: Long): String
+     *  (fields: token, preset, comment, status, expires_at, reclaimable) or
+     *  `{"error":".."}`. [cacheDir] тот же, что у [nativeApplyInvite]: оттуда
+     *  берётся ключ установки, по которому хаб узнаёт потреблённый нами же
+     *  инвайт и помечает его `reclaimable` (XR-216). */
+    external fun nativeFetchInviteInfo(
+        hubUrl: String,
+        token: String,
+        cacheDir: String,
+        timeoutMs: Long,
+    ): String
 
     /** Claim + TOFU public key + pre-warm preset cache. Returns JSON:
      *  `{"payload":..?,"public_key":..?,"preset_cached":bool,"errors":[..]}`.

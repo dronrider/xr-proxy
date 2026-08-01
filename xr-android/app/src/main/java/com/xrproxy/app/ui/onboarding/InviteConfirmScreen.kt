@@ -39,6 +39,9 @@ import java.time.format.DateTimeParseException
  * Подтверждение инвайта (LLD-04 §3.5). Данные — `InviteInfo` из
  * GET /api/v1/invite/:token; секретов нет, инвайт ещё не consume'нут.
  *
+ * [reclaimable] это потреблённый инвайт, который потребила эта же установка:
+ * применить его повторно можно, хаб узнаёт клиента по ключу (XR-216).
+ *
  * Кнопка «Применить» запускает фазу 2 (claim + preset fetch). Пока она в
  * полёте, индикация через `applyInProgress` — блокируем кнопку со
  * спиннером, чтобы не было двойных claim'ов.
@@ -50,6 +53,7 @@ fun InviteConfirmScreen(
     comment: String,
     status: String,
     expiresAt: String,
+    reclaimable: Boolean = false,
     willReplaceExisting: Boolean = false,
     applyEnabled: Boolean,
     applyInProgress: Boolean,
@@ -82,7 +86,17 @@ fun InviteConfirmScreen(
             }
             InviteField("Действителен", ttlLabel(expiresAt))
 
-            if (status != "active") {
+            if (reclaimable) {
+                // Инвайт потрачен нами же, и хаб отдаст настройки повторно
+                // (XR-216). Это не отказ, поэтому и не красным.
+                Spacer(Modifier.height(16.dp))
+                Text(
+                    "Этот инвайт уже применяли на этом устройстве. Можно применить снова",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodyMedium,
+                    textAlign = TextAlign.Center,
+                )
+            } else if (status != "active") {
                 Spacer(Modifier.height(16.dp))
                 val statusText = when (status) {
                     "consumed" -> "Этот инвайт уже использован"
@@ -120,7 +134,7 @@ fun InviteConfirmScreen(
 
                 Button(
                     onClick = onApply,
-                    enabled = applyEnabled && !applyInProgress && status == "active",
+                    enabled = applyEnabled && !applyInProgress && (status == "active" || reclaimable),
                     shape = RoundedCornerShape(28.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.primary,
@@ -140,7 +154,7 @@ fun InviteConfirmScreen(
                 }
             }
 
-            if (!applyEnabled && status == "active") {
+            if (!applyEnabled && (status == "active" || reclaimable)) {
                 Spacer(Modifier.height(8.dp))
                 Text(
                     "Сначала отключите VPN",
