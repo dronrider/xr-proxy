@@ -1259,14 +1259,29 @@ fn is_unreachable(err: &str) -> bool {
 /// relay takes over.
 const DIRECT_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 
-/// A quick liveness check of the direct agent address. Any HTTP answer (even an
-/// error status like 401) proves the agent is up and answering; only a transport
-/// error or the short deadline counts as unreachable. Unauthenticated on purpose:
-/// we only need the response line, not the body, and the probe carries no token.
+/// The agent's unauthenticated liveness handle and the whole of its answer: it
+/// lives at the host root, not under the share, because being up is a property
+/// of the agent host and not of a share (`xr-share/src/server.rs`).
+const HEALTHZ_PATH: &str = "/healthz";
+const HEALTHZ_BODY: &str = "ok";
+
+/// A quick liveness check of the direct agent address: our agent answers
+/// `GET /healthz` with a bare `ok`, and only that counts as alive. Any other
+/// answer means somebody else holds this address (a foreign host at a recycled
+/// LAN IP, a captive portal, a provider stub); treating it as alive handed the
+/// whole operation to that stranger, whose 404 or HTML then reached the user as
+/// the agent's own answer (XR-219). A transport error or the short deadline is
+/// unreachable as before. The probe is unauthenticated and carries no token.
 async fn direct_reachable(agent_url: &str, probe_timeout: Duration) -> bool {
     let Ok(client) = http_client(probe_timeout) else { return false };
-    let url = format!("{}/manifest", agent_url.trim_end_matches('/'));
-    client.get(&url).send().await.is_ok()
+    let Ok(mut url) = reqwest::Url::parse(agent_url) else { return false };
+    url.set_path(HEALTHZ_PATH);
+    url.set_query(None);
+    let Ok(resp) = client.get(url).send().await else { return false };
+    if !resp.status().is_success() {
+        return false;
+    }
+    matches!(resp.text().await, Ok(body) if body.trim() == HEALTHZ_BODY)
 }
 
 /// Run `op` over the direct transport first (plain HTTP at `agent_url`); if that
@@ -1284,11 +1299,12 @@ async fn direct_reachable(agent_url: &str, probe_timeout: Duration) -> bool {
 ///
 /// `candidates` are ordered direct base URLs (XR-050: LAN addresses first, then
 /// the public one). Each is probed with a short deadline when a fallback exists
-/// (another candidate or the relay); the first reachable one runs `op`. A
-/// candidate that answers *unreachable* or with a *pinned-manifest mismatch* (a
-/// wrong host answering at a stale LAN IP, or a MITM) is skipped for the next
-/// candidate; any other error is the agent's authoritative answer and returns at
-/// once. Only after every direct candidate is exhausted does the relay leg open.
+/// (another candidate or the relay); the first address where our agent answers
+/// the probe runs `op`. A candidate that fails the probe or answers as somebody
+/// other than our agent ([`should_try_next`]: a wrong host at a stale LAN IP, a
+/// captive portal, a MITM) is skipped for the next candidate; the agent's own
+/// authoritative answer returns at once. Only after every direct candidate is
+/// exhausted does the relay leg open.
 async fn direct_then_relay<T, F, Fut>(
     candidates: &[String],
     agent_pubkey: &str,
@@ -1315,7 +1331,7 @@ where
         // behaviour, preserved here for the final hop).
         let more_after = i + 1 < n || relay.is_some();
         if more_after && !direct_reachable(base, probe).await {
-            last_err = Some(format!("network: {base} недоступен"));
+            last_err = Some(format!("network: по адресу {base} агент шары не отвечает"));
             continue;
         }
         match op(http_client(timeout)?, base.clone()).await {
@@ -1364,11 +1380,28 @@ fn grant_direct_bases(grant: &ShareGrant) -> Vec<String> {
 
 /// Whether a failed direct attempt should fall through to the next candidate (or
 /// the relay) rather than being returned as the answer: a transport/unreachable
-/// error, or a pinned-manifest mismatch that means something other than our agent
-/// answered at this address. An authoritative agent answer (an HTTP status, an
-/// expired token) is not retried across addresses.
+/// error, or an answer that our agent would not have given, so somebody else
+/// holds this address. Besides a pinned-manifest mismatch that covers a body
+/// that is not a manifest at all (`parse:`, `read:`, a file whose hash does not
+/// match the listing) and the statuses a foreign host or a box on the way
+/// answers with: `404` and `5xx`. The real agent answers those over the relay
+/// too, so the retry costs seconds, while trusting them cost the user a
+/// stranger's page instead of the share (XR-219). An authoritative agent answer
+/// (`401`, `403`, `412`, `413`, `422`, `429`), a local failure and a cancelled
+/// or busy transfer are not retried across addresses: no other path fixes them.
 fn should_try_next(err: &str) -> bool {
-    is_unreachable(err) || err.starts_with("manifest_signature") || err == "manifest_unsigned"
+    is_unreachable(err)
+        || err.starts_with("manifest_signature")
+        || err == "manifest_unsigned"
+        || err.starts_with("parse:")
+        || err.starts_with("read:")
+        || err.starts_with("sha256 mismatch")
+        || matches!(http_status(err), Some(code) if code == 404 || (500..600).contains(&code))
+}
+
+/// The status behind an `http_<code>` error, if the error is one.
+fn http_status(err: &str) -> Option<u16> {
+    err.strip_prefix("http_").and_then(|s| s.parse().ok())
 }
 
 /// Confirm the pinned agent actually answers at `base` before a mutating op runs
@@ -2016,6 +2049,22 @@ mod tests {
         assert!(should_try_next("manifest_signature: bad"));
         assert!(!should_try_next("http_403"));
         assert!(!should_try_next("http_412"));
+        // A body that is not what our agent serves, and the statuses a foreign
+        // host or a box on the way answers with (XR-219).
+        assert!(should_try_next("parse: expected value at line 1 column 1"));
+        assert!(should_try_next("read: body closed"));
+        assert!(should_try_next("sha256 mismatch (want aa, got bb)"));
+        assert!(should_try_next("http_404"));
+        assert!(should_try_next("http_502"));
+        // The agent's own verdicts and our local failures stay put: no other
+        // path answers them differently.
+        assert!(!should_try_next("http_401"));
+        assert!(!should_try_next("http_413"));
+        assert!(!should_try_next("http_422"));
+        assert!(!should_try_next("http_429"));
+        assert!(!should_try_next("write: no space left on device"));
+        assert!(!should_try_next("read part: permission denied"));
+        assert!(!should_try_next("cancelled"));
     }
 
     /// The relay leg fails requests by closing the loopback socket, so `op`
@@ -2067,27 +2116,8 @@ mod tests {
     /// executed rather than stopping at the direct error (LLD-23 §2.4).
     #[tokio::test]
     async fn fetch_manifest_falls_back_to_relay_when_direct_unreachable() {
-        use xr_proto::share::{RelayObf, RelayToken};
         let token = ShareToken { share_id: "S".into(), scope: "share:read".into(), exp: 9_999_999_999, signature: "s".into() };
-        let relay = RelayGrant {
-            addr: "127.0.0.1".into(),
-            port: 2,
-            // Malformed key: RelayEndpoint::from_grant fails, so the relay branch
-            // returns "relay grant: ..." rather than a network error.
-            obf: RelayObf {
-                key: "@@@".into(),
-                salt: 0,
-                modifier: "positional_xor_rotate".into(),
-                padding_min: 0,
-                padding_max: 0,
-            },
-            relay_token: RelayToken {
-                share_id: "S".into(),
-                agent_pubkey: "QQ==".into(),
-                exp: 9_999_999_999,
-                signature: "s".into(),
-            },
-        };
+        let relay = broken_relay("S");
         let err = fetch_manifest_relay(
             "http://127.0.0.1:1/S", // refuses fast
             &token,
@@ -3013,6 +3043,43 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// A plain-text HTTP answer with an arbitrary status line: the liveness
+    /// handle answers a bare `ok`, not JSON, and a foreign host answers whatever
+    /// it likes.
+    fn text_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len(),
+        )
+    }
+
+    /// A host that passes the liveness probe (`GET /healthz` answered with `ok`)
+    /// and serves `other` for every other request. Lets a test put a real agent,
+    /// or a stranger convincing enough to reach the operation, behind the probe.
+    async fn serve_healthz_then(other: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let other = other.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if req.starts_with("GET /healthz ") {
+                        text_response("200 OK", "ok")
+                    } else {
+                        other
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
     #[tokio::test]
     async fn walk_skips_dead_lan_candidate_then_uses_public() {
         // The LAN candidate refuses fast; the walk falls through to the reachable
@@ -3058,7 +3125,9 @@ mod tests {
         // must fall through to the correct agent at the next address.
         let (key, pub_b64) = agent_key();
         let forged = MANIFEST_BODY.replace("\"aa\"", "\"bb\"");
-        let wrong = serve_manifest_forever(http_response(
+        // The wrong host answers the liveness probe too, so the walk really gets
+        // as far as the signature check instead of stopping at the probe.
+        let wrong = serve_healthz_then(http_response(
             &forged,
             &signed_headers(&key, "s1", 1234, MANIFEST_BODY),
         ))
@@ -3073,6 +3142,106 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(m.entries[0].sha256, "aa", "must serve the correct agent's manifest");
+    }
+
+    #[tokio::test]
+    async fn probe_skips_captive_portal() {
+        // A captive portal answers 200 with HTML on any path. Before XR-219 it
+        // passed the probe, served the manifest fetch, and its page came back as
+        // "parse: expected value at line 1 column 1" while the live agent at the
+        // next address was never tried. The share is unpinned (a pre-XR-046
+        // grant): with a pinned key the same page stops at the signature, so it
+        // is the unpinned share that shows the walk breaking.
+        let captive = serve_manifest_forever(text_response("200 OK", "<html>login</html>")).await;
+        let live = serve_manifest_forever(http_response(MANIFEST_BODY, "")).await;
+        let candidates = format!("{captive}/s1\n{live}/s1");
+        let m = fetch_manifest_relay(&candidates, &test_token("s1"), "", None, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(m.entries[0].sha256, "aa", "the live agent must serve the manifest");
+    }
+
+    #[tokio::test]
+    async fn probe_skips_foreign_host() {
+        // A foreign host at a recycled LAN IP (a router, a printer, a NAS) answers
+        // 404 on any path; before XR-219 that 404 came back as http_404 and the
+        // walk stopped there.
+        let (key, pub_b64) = agent_key();
+        let foreign = serve_manifest_forever(text_response("404 Not Found", "not found")).await;
+        let live = serve_manifest_forever(http_response(
+            MANIFEST_BODY,
+            &signed_headers(&key, "s1", 1234, MANIFEST_BODY),
+        ))
+        .await;
+        let candidates = format!("{foreign}/s1\n{live}/s1");
+        let m = fetch_manifest_relay(&candidates, &test_token("s1"), &pub_b64, None, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(m.entries[0].sha256, "aa", "the live agent must serve the manifest");
+    }
+
+    /// A relay grant whose obf key is malformed: opening the leg fails with
+    /// `relay grant: ...`, which is how a test tells "the walk got as far as the
+    /// relay" from "the walk stopped on the direct path".
+    fn broken_relay(share_id: &str) -> RelayGrant {
+        use xr_proto::share::{RelayObf, RelayToken};
+        RelayGrant {
+            addr: "127.0.0.1".into(),
+            port: 2,
+            obf: RelayObf {
+                key: "@@@".into(),
+                salt: 0,
+                modifier: "positional_xor_rotate".into(),
+                padding_min: 0,
+                padding_max: 0,
+            },
+            relay_token: RelayToken {
+                share_id: share_id.into(),
+                agent_pubkey: "QQ==".into(),
+                exp: 9_999_999_999,
+                signature: "s".into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn hijacked_direct_falls_back_to_relay() {
+        // The only direct address is held by a stranger answering 404. The relay
+        // leg is the share's real path, so the walk must get there; before XR-219
+        // it returned the stranger's http_404 and the relay stayed unopened.
+        let (_key, pub_b64) = agent_key();
+        let foreign = serve_manifest_forever(text_response("404 Not Found", "not found")).await;
+        let relay = broken_relay("s1");
+        let err = fetch_manifest_relay(
+            &format!("{foreign}/s1"),
+            &test_token("s1"),
+            &pub_b64,
+            Some(&relay),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("relay grant"), "the walk must reach the relay leg, got {err}");
+    }
+
+    #[tokio::test]
+    async fn authoritative_answer_stops_the_walk() {
+        // Our own agent answered the probe and then refused the request: 403 is
+        // its verdict, not a wrong host, so no other path is tried. The limit on
+        // XR-219: fixing the hijack must not turn every refusal into a walk.
+        let (_key, pub_b64) = agent_key();
+        let agent = serve_healthz_then(text_response("403 Forbidden", "")).await;
+        let relay = broken_relay("s1");
+        let err = fetch_manifest_relay(
+            &format!("{agent}/s1"),
+            &test_token("s1"),
+            &pub_b64,
+            Some(&relay),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "http_403");
     }
 
     /// A mock agent that answers `GET .../manifest` with a signed empty manifest
@@ -3120,7 +3289,9 @@ mod tests {
         // it and PUT to the correct agent at the next address, never to the wrong
         // one (XR-050 write-path guard).
         let (key, pub_b64) = agent_key();
-        let wrong = serve_manifest_forever(http_response("{\"entries\":[]}", "")).await; // unsigned
+        // Unsigned manifest, but the liveness probe is answered, so the walk
+        // reaches the signature check rather than skipping the host earlier.
+        let wrong = serve_healthz_then(http_response("{\"entries\":[]}", "")).await;
         let (good, mut rx) = serve_agent(key, "S", "HTTP/1.1 201 Created").await;
         let candidates = vec![format!("{wrong}/S"), format!("{good}/S")];
         let token = ShareToken {
@@ -3167,13 +3338,47 @@ mod tests {
     // direct reachability probe: fast relay fallback (XR-128)
 
     #[tokio::test]
-    async fn direct_reachable_true_on_any_http_answer() {
-        // Any HTTP response, even an unauthenticated 401, proves the agent is up.
-        let url = serve_once(
-            "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".into(),
-        )
-        .await;
-        assert!(direct_reachable(&url, Duration::from_secs(5)).await);
+    async fn probe_accepts_only_agent_healthz() {
+        // Alive is our agent's own answer at /healthz and nothing else: the probe
+        // used to accept any HTTP response, and a stranger at the address took the
+        // whole operation over (XR-219).
+        let agent = serve_once(text_response("200 OK", "ok")).await;
+        assert!(direct_reachable(&agent, Duration::from_secs(5)).await);
+        // Trailing whitespace from a proxy on the way is still our agent.
+        let padded = serve_once(text_response("200 OK", "ok\n")).await;
+        assert!(direct_reachable(&padded, Duration::from_secs(5)).await);
+
+        let captive = serve_once(text_response("200 OK", "<html>login</html>")).await;
+        assert!(!direct_reachable(&captive, Duration::from_secs(5)).await);
+        let foreign = serve_once(text_response("404 Not Found", "not found")).await;
+        assert!(!direct_reachable(&foreign, Duration::from_secs(5)).await);
+        let unauthorized = serve_once(text_response("401 Unauthorized", "")).await;
+        assert!(!direct_reachable(&unauthorized, Duration::from_secs(5)).await);
+        // A stub whose body happens to read `ok` under an error status is not
+        // the handle answering either: the status is checked, not just the body.
+        let stub = serve_once(text_response("503 Service Unavailable", "ok")).await;
+        assert!(!direct_reachable(&stub, Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn probe_goes_to_host_root_not_share() {
+        // The handle is the agent's, not the share's: /healthz sits at the host
+        // root, so the share_id in the base URL must be dropped from the probe.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string());
+            let _ = sock.write_all(text_response("200 OK", "ok").as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        assert!(direct_reachable(&format!("http://{addr}/s1"), Duration::from_secs(5)).await);
+        let line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(line, "GET /healthz HTTP/1.1", "probe must ask the host handle");
     }
 
     #[tokio::test]
