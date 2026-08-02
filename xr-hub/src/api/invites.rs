@@ -429,15 +429,8 @@ pub async fn claim_invite(
         consumed.claimed_by_ip = client_ip;
         consumed.claim_id = claim_id;
         let data_dir = Path::new(&state.config.server.data_dir);
-        storage::save_invite(data_dir, &consumed).map_err(|e| {
-            // Ручка публичная, и в теле ответа устройство каталогов хаба
-            // постороннему ни к чему; подробности с путём уходят в лог.
-            tracing::error!("не сохранилось потребление инвайта: {e:#}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to persist invite consumption".to_string(),
-            )
-        })?;
+        storage::save_invite(data_dir, &consumed)
+            .map_err(|e| crate::api::persist_failed("потребление инвайта", e))?;
         *invite = consumed;
     }
 
@@ -874,6 +867,7 @@ mod tests {
         std::fs::write(&data_dir, b"not a directory").unwrap();
         let state = state_with_invite_in("https://hub.example.com", "", data_dir.to_str().unwrap());
 
+        let (log, _guard) = crate::api::testlog::capture();
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-claim-id", "client-key-1".parse().unwrap());
         let (status, message) =
@@ -882,10 +876,16 @@ mod tests {
                 .map(|Json(p)| p)
                 .expect_err("клиент получил payload, хотя потребление на диск не легло");
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        // Ручка публичная, и устройство каталогов хаба постороннему ни к чему.
+        // Ручка публичная, и устройство каталогов хаба постороннему ни к чему,
+        // но оператору по логу отказ разбирать (XR-211, второй круг ревью).
         assert!(
             !message.contains(dir.path().to_str().unwrap()),
             "путь каталога данных уехал в ответ: {message}"
+        );
+        assert!(
+            log.text().contains(data_dir.to_str().unwrap()),
+            "в логе нет пути, по которому разбирать отказ: {}",
+            log.text()
         );
 
         // Память не должна разойтись с диском: там инвайт остаётся активным, и

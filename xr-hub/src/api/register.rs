@@ -268,7 +268,7 @@ pub async fn register(
         writable: false,
     };
     storage::save_share(Path::new(&state.config.server.data_dir), &share)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api::persist_failed("запись шары", e))?;
     state.shares.write().await.insert(share_id.clone(), share);
 
     Ok(Json(RegisterResp { share_id, addr, port: req.port }))
@@ -362,5 +362,68 @@ mod tests {
 
         // The invite half is registered and reachable by its token.
         assert!(state.invites.read().await.contains_key(inv));
+    }
+
+    /// Стенд, где запись шары заведомо не пройдёт: на месте каталога данных
+    /// лежит обычный файл, и `save_share` спотыкается на создании подкаталога.
+    fn state_with_unwritable_data_dir(data_dir: &std::path::Path) -> Arc<AppState> {
+        std::fs::write(data_dir, b"not a directory").unwrap();
+        let toml = format!(
+            "[server]\ndata_dir = \"{}\"\n[admin]\nusers = []\n",
+            data_dir.display()
+        );
+        let config: HubConfig = toml::from_str(&toml).unwrap();
+        Arc::new(AppState {
+            presets: RwLock::new(HashMap::new()),
+            invites: RwLock::new(HashMap::new()),
+            shares: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashMap::new()),
+            config,
+            signing: Some(crate::signing::SigningContext {
+                signing_key: SigningKey::from_bytes(&[42u8; 32]),
+            }),
+        })
+    }
+
+    // XR-211, второй круг ревью: ошибки `storage` несут путь каталога данных, и
+    // через `e.to_string()` он уходил в тело ответа публичной ручки. Регистрация
+    // открыта любому владельцу reg-токена, устройство каталогов хаба ему знать
+    // незачем; оператору тот же путь нужен, поэтому он остаётся в логе.
+    #[tokio::test]
+    async fn register_hides_data_dir_from_body_but_logs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let state = state_with_unwritable_data_dir(&data_dir);
+        let signing = state.signing.as_ref().unwrap();
+        let (token, _) = sign_reg_token(signing, 3600).unwrap();
+
+        let (log, _guard) = crate::api::testlog::capture();
+        let (status, body) = register(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(RegisterReq {
+                token,
+                name: "agent".into(),
+                addr: Some("203.0.113.9".into()),
+                port: 8443,
+                agent_pubkey: base64::engine::general_purpose::STANDARD
+                    .encode(SigningKey::from_bytes(&[7u8; 32]).verifying_key().as_bytes()),
+                owner: String::new(),
+            }),
+        )
+        .await
+        .map(|Json(r)| r.share_id)
+        .expect_err("регистрация обязана упасть на записи");
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !body.contains(data_dir.to_str().unwrap()),
+            "путь каталога данных уехал в тело ответа: {body}"
+        );
+        assert!(
+            log.text().contains(data_dir.to_str().unwrap()),
+            "в логе нет пути, по которому разбирать отказ: {}",
+            log.text()
+        );
     }
 }

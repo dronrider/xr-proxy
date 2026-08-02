@@ -9,6 +9,7 @@ pub mod shares;
 
 use std::sync::Arc;
 
+use axum::http::StatusCode;
 use axum::middleware;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
@@ -17,6 +18,20 @@ use tower_http::trace::TraceLayer;
 
 use crate::embed::spa_service;
 use crate::state::AppState;
+
+/// Тело ответа, когда состояние не легло на диск. Одно на все публичные ручки
+/// и без единой подробности: ошибки `storage` несут путь каталога данных
+/// (XR-211), а устройство каталогов хаба постороннему знать незачем.
+pub(crate) const PERSIST_FAILED: &str = "failed to persist state";
+
+/// Отказ записи для публичной ручки: наружу уходит [`PERSIST_FAILED`], полная
+/// ошибка с путём остаётся в логе оператора. Разбирать отказ по одному
+/// «Permission denied» без пути не по чему, поэтому в лог она едет целиком
+/// (`{e:#}` разворачивает цепочку контекстов).
+pub(crate) fn persist_failed(what: &str, e: anyhow::Error) -> (StatusCode, String) {
+    tracing::error!("не сохранилось {what}: {e:#}");
+    (StatusCode::INTERNAL_SERVER_ERROR, PERSIST_FAILED.to_string())
+}
 
 pub fn router(state: Arc<AppState>) -> Router {
     let cors = if state.config.admin.allowed_origins.is_empty() {
@@ -100,6 +115,55 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     // SPA fallback for admin UI.
     api.fallback_service(spa_service())
+}
+
+// regcheck:test-begin
+/// Перехват лога для тестов: обещание «путь остаётся в логе оператора»
+/// проверяется по настоящему выводу tracing, а не по чтению исходников.
+#[cfg(test)]
+pub(crate) mod testlog {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    pub(crate) struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Buffer {
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl io::Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+        type Writer = Buffer;
+
+        fn make_writer(&'a self) -> Buffer {
+            self.clone()
+        }
+    }
+
+    /// Гвард держать до конца теста: подписчик ставится на текущий поток, а
+    /// тесты гоняются на однопоточном рантайме, поэтому его хватает и на await.
+    pub(crate) fn capture() -> (Buffer, tracing::subscriber::DefaultGuard) {
+        let buf = Buffer::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::ERROR)
+            .finish();
+        (buf.clone(), tracing::subscriber::set_default(sub))
+    }
 }
 
 #[cfg(test)]
@@ -194,3 +258,4 @@ mod tests {
         }
     }
 }
+// regcheck:test-end

@@ -235,7 +235,7 @@ pub async fn add(
         writable: req.writable,
     };
     storage::save_share(Path::new(&state.config.server.data_dir), &share)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api::persist_failed("запись шары", e))?;
     state.shares.write().await.insert(share_id.clone(), share);
 
     let exp = now.saturating_add(ttl);
@@ -345,7 +345,7 @@ pub async fn unshare(
     shares.remove(&req.share_id);
     drop(shares);
     storage::delete_share_file(Path::new(&state.config.server.data_dir), &req.share_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| crate::api::persist_failed("снятие записи шары", e))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -413,7 +413,7 @@ pub async fn attach(
     }
     if changed {
         storage::save_invite(Path::new(&state.config.server.data_dir), invite)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| crate::api::persist_failed("шары инвайта", e))?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -439,7 +439,7 @@ pub async fn detach(
     invite.write_share_ids.retain(|s| s != &req.share_id);
     if invite.share_ids.len() != before || invite.write_share_ids.len() != wbefore {
         storage::save_invite(Path::new(&state.config.server.data_dir), invite)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| crate::api::persist_failed("шары инвайта", e))?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -851,5 +851,117 @@ mod tests {
         attach(State(state.clone()), Json(req(true))).await.unwrap();
         detach(State(state.clone()), Json(req(true))).await.unwrap();
         assert_eq!(snapshot(&state).await, (vec![], vec![]));
+    }
+
+    // XR-211, второй круг ревью: ошибки `storage` несут путь каталога данных, и
+    // через `e.to_string()` он уходил в тело ответа. Эти три ручки публичные
+    // (пускают по agent-credential, не по админской сессии), и устройство
+    // каталогов хаба предъявителю мандата знать незачем. Оператору тот же путь
+    // нужен, поэтому он обязан остаться в логе.
+
+    /// Стенд, где любая запись на диск заведомо не пройдёт: на месте каталога
+    /// данных лежит обычный файл. Возвращает состояние, мандат агента и путь.
+    fn unwritable_stand(
+        dir: &tempfile::TempDir,
+    ) -> (Arc<AppState>, String, std::path::PathBuf) {
+        let data_dir = dir.path().join("data");
+        std::fs::write(&data_dir, b"not a directory").unwrap();
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let identity = SigningKey::from_bytes(&[7u8; 32]);
+        let agent_pk = base64::engine::general_purpose::STANDARD
+            .encode(identity.verifying_key().as_bytes());
+        let cred = encode_blob(&sign_agent_credential(&hub, &agent_pk, now_unix() + 3600));
+        let config = format!(
+            "[server]\ndata_dir = {:?}\n[admin]\nusers = []\n",
+            data_dir.display().to_string()
+        );
+        let state = state_with(&config, hub, vec![share_rec("s", &agent_pk, false, true)]);
+        (state, cred, data_dir)
+    }
+
+    fn assert_body_hides_path_and_log_keeps_it(
+        who: &str,
+        err: (StatusCode, String),
+        log: &crate::api::testlog::Buffer,
+        data_dir: &std::path::Path,
+    ) {
+        let (status, body) = err;
+        let path = data_dir.to_str().unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{who}");
+        assert!(!body.contains(path), "{who}: путь каталога данных в теле ответа: {body}");
+        assert!(
+            log.text().contains(path),
+            "{who}: в логе нет пути, по которому разбирать отказ: {}",
+            log.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_hides_data_dir_from_body_but_logs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, cred, data_dir) = unwritable_stand(&dir);
+
+        let (log, _guard) = crate::api::testlog::capture();
+        let err = add(
+            State(state),
+            HeaderMap::new(),
+            Json(AddShareReq {
+                credential: cred,
+                name: "Photos".into(),
+                addr: Some("203.0.113.9".into()),
+                addrs: Vec::new(),
+                port: 8443,
+                ttl_seconds: None,
+                via_relay: false,
+                writable: false,
+            }),
+        )
+        .await
+        .map(|Json(r)| r.share_id)
+        .expect_err("add обязан упасть на записи");
+
+        assert_body_hides_path_and_log_keeps_it("add", err, &log, &data_dir);
+    }
+
+    #[tokio::test]
+    async fn attach_hides_data_dir_from_body_but_logs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, cred, data_dir) = unwritable_stand(&dir);
+        // Шара уже висит на инвайте на чтение, поэтому меняет запись именно
+        // write-привязка: без изменения ручка до save_invite не доходит.
+        let req = AttachReq {
+            credential: cred,
+            share_id: "s".into(),
+            invite_token: TOKEN.into(),
+            write: true,
+        };
+
+        let (log, _guard) = crate::api::testlog::capture();
+        let err = attach(State(state), Json(req))
+            .await
+            .map(|s| s.to_string())
+            .expect_err("attach обязан упасть на записи");
+
+        assert_body_hides_path_and_log_keeps_it("attach", err, &log, &data_dir);
+    }
+
+    #[tokio::test]
+    async fn detach_hides_data_dir_from_body_but_logs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, cred, data_dir) = unwritable_stand(&dir);
+        let req = AttachReq {
+            credential: cred,
+            share_id: "s".into(),
+            invite_token: TOKEN.into(),
+            write: false,
+        };
+
+        let (log, _guard) = crate::api::testlog::capture();
+        let err = detach(State(state), Json(req))
+            .await
+            .map(|s| s.to_string())
+            .expect_err("detach обязан упасть на записи");
+
+        assert_body_hides_path_and_log_keeps_it("detach", err, &log, &data_dir);
     }
 }
