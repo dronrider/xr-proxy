@@ -221,7 +221,11 @@ Cargo-workspace + Android-модуль:
   оригинальный домен для применения правил маршрутизации.
 - [session.rs](../xr-core/src/session.rs) — `SessionContext`, `relay_session_with_domain()`.
   Решает `Action::Proxy` vs `Direct`, поднимает relay-task. `connect_protected()`
-  защищает fd от петли через VPN (вызывает Kotlin-колбэк).
+  защищает fd от петли через VPN (вызывает Kotlin-колбэк). Оба пути relay,
+  и direct, и mux, живут под теми же таймаутами, что xr-client и сервер:
+  простой стороны 5 минут, потолок жизни сессии час. По простою relay
+  сворачивается сам, движок видит закрытый канал и снимает запись из
+  `sessions`.
 - [state.rs](../xr-core/src/state.rs) — `VpnState { Disconnected, Connecting,
   Connected, Disconnecting, Error(String) }` + `StateHandle` на базе
   `tokio::sync::watch`. Реактивная доставка смены состояния.
