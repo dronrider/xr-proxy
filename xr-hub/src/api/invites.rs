@@ -417,13 +417,28 @@ pub async fn claim_invite(
 
     let payload = invite.payload.clone();
 
-    // Consume one-time invites (unless dev_mode).
+    // Consume one-time invites (unless dev_mode). Пометка о потреблении сперва
+    // ложится на диск и только потом в память: раньше ошибка записи глоталась,
+    // клиент получал payload и 200, а поднявшийся после рестарта хаб читал из
+    // файла всё тот же активный инвайт и отдавал его второй раз. Отказ клиенту
+    // честнее: одноразовая ссылка не расходится надвое, а получатель приходит
+    // за payload'ом ещё раз по той же ссылке.
     if invite.one_time && !state.config.invites.dev_mode {
-        invite.consumed_at = Some(now);
-        invite.claimed_by_ip = client_ip;
-        invite.claim_id = claim_id;
+        let mut consumed = invite.clone();
+        consumed.consumed_at = Some(now);
+        consumed.claimed_by_ip = client_ip;
+        consumed.claim_id = claim_id;
         let data_dir = Path::new(&state.config.server.data_dir);
-        let _ = storage::save_invite(data_dir, invite);
+        storage::save_invite(data_dir, &consumed).map_err(|e| {
+            // Ручка публичная, и в теле ответа устройство каталогов хаба
+            // постороннему ни к чему; подробности с путём уходят в лог.
+            tracing::error!("не сохранилось потребление инвайта: {e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to persist invite consumption".to_string(),
+            )
+        })?;
+        *invite = consumed;
     }
 
     Ok(Json(payload))
@@ -683,7 +698,11 @@ mod tests {
     }
 
     fn stored_invite(dir: &tempfile::TempDir) -> Invite {
-        let path = dir.path().join("invites").join(format!("{TOKEN}.json"));
+        stored_invite_in(dir.path())
+    }
+
+    fn stored_invite_in(data_dir: &Path) -> Invite {
+        let path = data_dir.join("invites").join(format!("{TOKEN}.json"));
         let data = std::fs::read_to_string(&path).expect("инвайт не сохранён на диск");
         serde_json::from_str(&data).unwrap()
     }
@@ -839,6 +858,48 @@ mod tests {
             "2000-01-01T00:00:00+00:00".into();
 
         assert_eq!(claim(&state, Some("client-key-1")).await.unwrap_err(), StatusCode::GONE);
+    }
+
+    // XR-211: ошибка записи потребления глоталась (`let _ =`), клиент получал
+    // payload и 200, а поднявшийся после рестарта хаб читал из файла всё тот же
+    // активный инвайт: одноразовая ссылка срабатывала второй раз, уже у другого
+    // человека. Диск тут единственная память хаба, поэтому не легло на диск
+    // значит не потреблено, и отвечать успехом нельзя.
+    #[tokio::test]
+    async fn claim_fails_when_consumption_is_not_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        // На месте каталога данных обычный файл: save_invite спотыкается на
+        // создании подкаталога invites, как споткнулся бы на полном диске.
+        let data_dir = dir.path().join("data");
+        std::fs::write(&data_dir, b"not a directory").unwrap();
+        let state = state_with_invite_in("https://hub.example.com", "", data_dir.to_str().unwrap());
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-claim-id", "client-key-1".parse().unwrap());
+        let (status, message) =
+            claim_invite(State(state.clone()), extract::Path(TOKEN.to_string()), headers)
+                .await
+                .map(|Json(p)| p)
+                .expect_err("клиент получил payload, хотя потребление на диск не легло");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        // Ручка публичная, и устройство каталогов хаба постороннему ни к чему.
+        assert!(
+            !message.contains(dir.path().to_str().unwrap()),
+            "путь каталога данных уехал в ответ: {message}"
+        );
+
+        // Память не должна разойтись с диском: там инвайт остаётся активным, и
+        // получатель заберёт его по той же ссылке, когда запись пройдёт.
+        let invite = state.invites.read().await.get(TOKEN).cloned().unwrap();
+        assert!(invite.consumed_at.is_none(), "инвайт потреблён мимо диска");
+        assert!(invite.claim_id.is_none(), "ключ клиента запомнен мимо диска");
+
+        std::fs::remove_file(&data_dir).unwrap();
+        claim(&state, Some("client-key-1")).await.expect("повтор по починенному диску");
+        assert!(
+            stored_invite_in(&data_dir).consumed_at.is_some(),
+            "удачный claim не отметил потребление"
+        );
     }
 
     // Многоразовый инвайт ключом не ограничен: он не потребляется вовсе.
