@@ -27,6 +27,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -80,8 +82,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.state.ToggleableState
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -210,6 +215,19 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
             onAppDir = { vm.chooseStorage(storageCfg.shareId, null) },
             onCustom = { vm.hideStorageDialog(); startCustomPick(storageCfg.shareId) },
             onDismiss = { vm.dismissStorageDialog() },
+        )
+    }
+
+    // Диалог живёт на верхнем уровне экрана, а не внутри проводника: импорт
+    // доезжает и после того, как папку закрыли, а тост с длинным текстом
+    // причину всё равно съедал.
+    ui.importError?.let { text ->
+        ImportErrorDialog(
+            text = text,
+            onCopy = {
+                Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
+            },
+            onDismiss = { vm.dismissImportError() },
         )
     }
 }
@@ -752,6 +770,38 @@ private fun ImportDialog(onStart: (String, Int?) -> Unit, onDismiss: () -> Unit)
             ) { Text("Импортировать") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
+    )
+}
+
+/**
+ * Причина сорвавшегося импорта целиком (XR-161). Агент присылает хвост stderr
+ * плагина, а это несколько строк с адресами и кодами: в тосте от него видно
+ * два обрывка, и те исчезают через секунду. Текст моноширинный (это выхлоп
+ * утилиты), скроллится и уходит в буфер целиком, чтобы его можно было
+ * переслать владельцу шары.
+ */
+@Composable
+private fun ImportErrorDialog(text: String, onCopy: () -> Unit, onDismiss: () -> Unit) {
+    val clipboard = LocalClipboardManager.current
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Импорт не удался") },
+        text = {
+            Text(
+                text,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 12.sp,
+                lineHeight = 16.sp,
+                modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                clipboard.setText(AnnotatedString(text))
+                onCopy()
+            }) { Text("Скопировать") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Закрыть") } },
     )
 }
 

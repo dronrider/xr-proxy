@@ -133,6 +133,10 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         /** Live import job: the agent downloads, this screen polls every 2
          *  seconds. Leaving the screen stops the poll, not the download. */
         val importJob: ImportJob? = null,
+        /** Причина сорвавшегося импорта, как её назвал агент (XR-161). Тост её
+         *  обрезает: с Android 12 в нём две строки, а сюда приходит хвост
+         *  stderr плагина в несколько абзацев. Поэтому отдельный диалог. */
+        val importError: String? = null,
     )
 
     /** A URL-import job the open screen is tracking (LLD-29). */
@@ -1093,6 +1097,8 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     fun openImportDialog(shareId: String) = _ui.update { it.copy(importDialogFor = shareId) }
     fun dismissImportDialog() = _ui.update { it.copy(importDialogFor = null) }
 
+    fun dismissImportError() = _ui.update { it.copy(importError = null) }
+
     /** Start importing [url] into the currently open folder of the share.
      *  [height] null means "Максимум": the owner's cap alone limits quality. */
     fun startImport(config: ShareConfig, url: String, height: Int?) {
@@ -1114,9 +1120,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     startImportPolling(config, jobId)
                 },
                 onFailure = { e ->
-                    _ui.update {
-                        it.copy(message = "Импорт: ${humanImportError(e.message ?: "ошибка")}")
-                    }
+                    _ui.update { it.copy(importError = humanImportError(e.message ?: "ошибка")) }
                 },
             )
         }
@@ -1150,7 +1154,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                             _ui.update {
                                 it.copy(
                                     importJob = null,
-                                    message = "Импорт: ${humanImportError(result.exceptionOrNull()?.message ?: "ошибка")}",
+                                    importError = humanImportError(result.exceptionOrNull()?.message ?: "ошибка"),
                                 )
                             }
                             break
@@ -1165,7 +1169,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                         _ui.update {
                             it.copy(
                                 importJob = null,
-                                message = "Импорт не удался: ${state.error ?: "причина неизвестна"}",
+                                importError = state.error ?: "причина неизвестна",
                             )
                         }
                         break
