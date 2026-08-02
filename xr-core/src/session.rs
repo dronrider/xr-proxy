@@ -175,6 +175,15 @@ fn journal_target(domain: Option<&str>, addr: SocketAddr) -> String {
 /// (which may not send anything first) from paying visibly for the probe.
 const SNI_PEEK_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Простой сессии, после которого relay сворачивается сам. Столько же держат
+/// соседние пути: mux на клиенте и обе стороны сервера. Без него зависший за
+/// мобильным NAT direct-сокет занимал задачу, оба канала и запись в sessions
+/// до самого потолка жизни.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Потолок жизни сессии, общий для direct и mux.
+const MAX_LIFETIME: Duration = Duration::from_secs(3600);
+
 /// Wait briefly for the first client payload and try to extract an SNI
 /// hostname from it. Returns `(Some(sni), data)` on a TLS ClientHello,
 /// `(None, data)` on any other first packet (still worth preserving so the
@@ -361,7 +370,7 @@ async fn relay_direct(
     dst: SocketAddr,
     domain: Option<&str>,
     initial_data: Vec<u8>,
-    mut data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     waker: Arc<Notify>,
 ) -> io::Result<()> {
@@ -403,13 +412,36 @@ async fn relay_direct(
     ctx.stats.add_log(&format!("напрямую: {}", label));
     tracing::debug!("direct connect for {}", label);
 
+    relay_via_direct_stream(target, initial_data, data_rx, data_tx, waker).await
+}
+
+/// Relay data between smoltcp channels and a directly connected socket.
+///
+/// Обе стороны сворачиваются по простою, как upstream и downstream на сервере:
+/// молчащая сессия не должна висеть до потолка жизни, держа задачу, каналы и
+/// запись в `sessions` движка.
+async fn relay_via_direct_stream(
+    target: TcpStream,
+    initial_data: Vec<u8>,
+    mut data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    waker: Arc<Notify>,
+) -> io::Result<()> {
     let (mut tr, mut tw) = target.into_split();
 
     let upload = async move {
         if !initial_data.is_empty() {
             tw.write_all(&initial_data).await?;
         }
-        while let Some(data) = data_rx.recv().await {
+        loop {
+            let data = match tokio::time::timeout(IDLE_TIMEOUT, data_rx.recv()).await {
+                Ok(Some(data)) => data,
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::debug!("direct upload idle timeout (5m)");
+                    break;
+                }
+            };
             if data.is_empty() { break; }
             tw.write_all(&data).await?;
         }
@@ -419,7 +451,13 @@ async fn relay_direct(
     let download = async move {
         let mut buf = vec![0u8; 8192];
         loop {
-            let n = tr.read(&mut buf).await?;
+            let n = match tokio::time::timeout(IDLE_TIMEOUT, tr.read(&mut buf)).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    tracing::debug!("direct download idle timeout (5m)");
+                    break;
+                }
+            };
             if n == 0 { break; }
             if data_tx.send(buf[..n].to_vec()).await.is_err() { break; }
             // Wake event loop to deliver data to smoltcp immediately.
@@ -428,7 +466,7 @@ async fn relay_direct(
         Ok::<(), io::Error>(())
     };
 
-    let result = tokio::time::timeout(Duration::from_secs(3600), async {
+    let result = tokio::time::timeout(MAX_LIFETIME, async {
         tokio::select! {
             r = upload => r,
             r = download => r,
@@ -491,7 +529,7 @@ async fn relay_via_mux_stream(
         }
     };
 
-    match tokio::time::timeout(Duration::from_secs(3600), combined).await {
+    match tokio::time::timeout(MAX_LIFETIME, combined).await {
         Ok(r) => r,
         Err(_) => Ok(()),
     }
@@ -698,6 +736,89 @@ fn skip_dns_name(data: &[u8], mut pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Пара сокетов через loopback: слева то, что уходит в relay, справа
+    /// «сервер», которым в тесте распоряжаемся сами.
+    async fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connecting = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (peer, _) = listener.accept().await.unwrap();
+        (connecting.await.unwrap(), peer)
+    }
+
+    /// Молчащий direct-сокет (приложение уснуло, ответы за мобильным NAT не
+    /// доходят) сворачивается по простою, а не висит до потолка жизни.
+    #[tokio::test(start_paused = true)]
+    async fn direct_relay_gives_up_on_idle() {
+        let (target, _peer) = socket_pair().await;
+        // Отправители живы, EOF ни с одной стороны не приходит: единственное,
+        // что может закончить сессию, это таймаут.
+        let (_to_relay, data_rx) = tokio::sync::mpsc::channel(8);
+        let (data_tx, _from_relay) = tokio::sync::mpsc::channel(8);
+
+        let started = tokio::time::Instant::now();
+        let r = relay_via_direct_stream(
+            target, Vec::new(), data_rx, data_tx, Arc::new(Notify::new()),
+        ).await;
+
+        assert!(r.is_ok(), "простой это не ошибка: {:?}", r.err());
+        assert_eq!(started.elapsed(), Duration::from_secs(300));
+    }
+
+    /// Простой считается по каждой стороне отдельно. Данные снизу вверх идут,
+    /// сверху вниз тишина: сессию сворачивает download.
+    #[tokio::test(start_paused = true)]
+    async fn direct_relay_gives_up_when_only_upload_flows() {
+        let (target, mut peer) = socket_pair().await;
+        let (to_relay, data_rx) = tokio::sync::mpsc::channel(8);
+        let (data_tx, _from_relay) = tokio::sync::mpsc::channel(8);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(100)).await;
+                if to_relay.send(b"ping".to_vec()).await.is_err() { break; }
+            }
+        });
+        // Приёмник на той стороне нужен, иначе upload упрётся в буфер сокета.
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 64];
+            while peer.read(&mut buf).await.unwrap_or(0) > 0 {}
+        });
+
+        let started = tokio::time::Instant::now();
+        let r = relay_via_direct_stream(
+            target, Vec::new(), data_rx, data_tx, Arc::new(Notify::new()),
+        ).await;
+
+        assert!(r.is_ok(), "простой это не ошибка: {:?}", r.err());
+        assert_eq!(started.elapsed(), Duration::from_secs(300));
+    }
+
+    /// Зеркальный случай: качаем, но сами ничего не шлём, и сессию сворачивает
+    /// upload.
+    #[tokio::test(start_paused = true)]
+    async fn direct_relay_gives_up_when_only_download_flows() {
+        let (target, mut peer) = socket_pair().await;
+        let (_to_relay, data_rx) = tokio::sync::mpsc::channel(8);
+        let (data_tx, mut from_relay) = tokio::sync::mpsc::channel(8);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(100)).await;
+                if peer.write_all(b"pong").await.is_err() { break; }
+            }
+        });
+        tokio::spawn(async move { while from_relay.recv().await.is_some() {} });
+
+        let started = tokio::time::Instant::now();
+        let r = relay_via_direct_stream(
+            target, Vec::new(), data_rx, data_tx, Arc::new(Notify::new()),
+        ).await;
+
+        assert!(r.is_ok(), "простой это не ошибка: {:?}", r.err());
+        assert_eq!(started.elapsed(), Duration::from_secs(300));
+    }
 
     #[test]
     fn dns_query_format() {
