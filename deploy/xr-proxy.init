@@ -61,10 +61,16 @@ start_service() {
     # Setup UDP TPROXY rules if udp_relay is enabled in config
     if [ -x "$UDP_TPROXY" ] && grep -q '^\[udp_relay\]' "$CONFIG" 2>/dev/null; then
         if grep -A1 '^\[udp_relay\]' "$CONFIG" | grep -q 'enabled.*=.*true'; then
-            if "$UDP_TPROXY"; then
+            # Вывод скрипта забираем подстановкой, а не отдаём ему свой stdout.
+            # Свой конец трубы подстановка держит до конца, поэтому скрипту не
+            # прилетает PIPE от того, кто позвал init и закрыл вывод (ssh с
+            # `grep -q`, procd на загрузке): без этого он умирал на первой же
+            # печати, до установки правил, и перехват UDP молча выключался.
+            # Заодно причина отказа уходит в logread, а не в никуда.
+            if udp_out=$("$UDP_TPROXY" 2>&1); then
                 logger -t xr-proxy "UDP TPROXY rules installed"
             else
-                logger -t xr-proxy "WARNING: UDP TPROXY setup failed (check source_ips in config)"
+                logger -t xr-proxy "WARNING: UDP TPROXY setup failed: $(echo "$udp_out" | head -3 | tr '\n' ' ')"
             fi
         fi
     fi

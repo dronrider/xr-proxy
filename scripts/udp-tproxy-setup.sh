@@ -1,16 +1,26 @@
 #!/bin/sh
 # Setup nftables TPROXY rules for UDP relay.
-# Only intercepts UDP from specified devices — all other traffic passes through untouched.
+# Only intercepts UDP from specified devices, everything else passes through untouched.
 #
 # Usage:
-#   udp-tproxy-setup.sh                          — read IPs from config.toml
-#   udp-tproxy-setup.sh 192.168.1.188            — one device
-#   udp-tproxy-setup.sh 192.168.1.188 192.168.1.240  — multiple devices
+#   udp-tproxy-setup.sh                          - read IPs from config.toml
+#   udp-tproxy-setup.sh 192.168.1.188            - one device
+#   udp-tproxy-setup.sh 192.168.1.188 192.168.1.240  - multiple devices
 #
 # If no IPs are given and config has empty source_ips, the script refuses to run
 # (to prevent accidentally intercepting all LAN UDP including games/VoIP).
 
 set -e
+
+# Прогресс печатаем через say, а не голым echo. Вызвавший вправе закрыть свой
+# конец трубы (init под procd, ssh с `grep -q` на той стороне), и тогда обычный
+# echo валит скрипт сигналом PIPE прямо посреди установки: правила не встают, а
+# в logread приходит только «setup failed» без причины. С игнором PIPE запись
+# просто не удаётся, и на ход установки это не влияет.
+trap '' PIPE
+say() {
+    echo "$@" 2>/dev/null || true
+}
 
 TABLE="xr_udp_relay"
 FWMARK="0x200"
@@ -18,7 +28,7 @@ ROUTE_TABLE="201"
 CONFIG="/etc/xr-proxy/config.toml"
 TPROXY_PORT="1081"
 
-# ── Collect source IPs ──────────────────────────────────────────────
+# --- Collect source IPs ---------------------------------------------
 
 SOURCE_IPS=""
 
@@ -47,31 +57,31 @@ fi
 # Trim whitespace
 SOURCE_IPS=$(echo "$SOURCE_IPS" | xargs)
 
-# ── Safety check ────────────────────────────────────────────────────
+# --- Safety check ---------------------------------------------------
 
 if [ -z "$SOURCE_IPS" ]; then
-    echo "ERROR: No source IPs specified."
-    echo ""
-    echo "Without source IPs, ALL LAN UDP traffic (games, VoIP, video calls)"
-    echo "would be intercepted and broken when the proxy is stopped."
-    echo ""
-    echo "Fix: add source_ips to config.toml:"
-    echo '  source_ips = ["192.168.1.188"]'
-    echo ""
-    echo "Or pass IPs as arguments:"
-    echo "  $0 192.168.1.188 192.168.1.240"
+    say "ERROR: No source IPs specified."
+    say ""
+    say "Without source IPs, ALL LAN UDP traffic (games, VoIP, video calls)"
+    say "would be intercepted and broken when the proxy is stopped."
+    say ""
+    say "Fix: add source_ips to config.toml:"
+    say '  source_ips = ["192.168.1.188"]'
+    say ""
+    say "Or pass IPs as arguments:"
+    say "  $0 192.168.1.188 192.168.1.240"
     exit 1
 fi
 
-# ── Find nft ────────────────────────────────────────────────────────
+# --- Find nft -------------------------------------------------------
 
 NFT=""
 for p in /usr/sbin/nft /sbin/nft /usr/bin/nft; do
     [ -x "$p" ] && NFT="$p" && break
 done
-[ -z "$NFT" ] && echo "ERROR: nft not found" && exit 1
+[ -z "$NFT" ] && say "ERROR: nft not found" && exit 1
 
-# ── Build nftables rules ───────────────────────────────────────────
+# --- Build nftables rules -------------------------------------------
 
 # Get router's own LAN IP to exclude
 ROUTER_IP=$(ip -4 addr show br-lan 2>/dev/null | grep -o 'inet [0-9.]*' | awk '{print $2}')
@@ -88,7 +98,7 @@ else
     NFT_SADDR="ip saddr { $NFT_SET }"
 fi
 
-echo "Setting up UDP TPROXY for [$SOURCE_IPS] -> port $TPROXY_PORT"
+say "Setting up UDP TPROXY for [$SOURCE_IPS] -> port $TPROXY_PORT"
 
 # Clean up existing rules
 "$NFT" delete table ip "$TABLE" 2>/dev/null || true
@@ -107,9 +117,27 @@ ip rule del fwmark "$FWMARK" table "$ROUTE_TABLE" 2>/dev/null || true
 ip rule add fwmark "$FWMARK" table "$ROUTE_TABLE"
 ip route replace local default dev lo table "$ROUTE_TABLE"
 
-echo "Done."
-echo "Only intercepting UDP from: $SOURCE_IPS"
-[ -n "$ROUTER_IP" ] && echo "Router IP: $ROUTER_IP (not affected)"
-echo ""
-echo "To verify:  $NFT list table ip $TABLE"
-echo "To remove:  $NFT delete table ip $TABLE && ip rule del fwmark $FWMARK table $ROUTE_TABLE"
+# Итог считаем по тому, что реально встало в ядре, а не по коду последней
+# команды: раньше стартовое предупреждение врало в обе стороны, потому что
+# выходной код скрипта решала печать, а не установка.
+if ! "$NFT" list table ip "$TABLE" >/dev/null 2>&1; then
+    say "ERROR: table ip $TABLE is not installed"
+    exit 1
+fi
+if ! ip rule show | grep -q "fwmark $FWMARK"; then
+    say "ERROR: policy rule for fwmark $FWMARK is missing"
+    exit 1
+fi
+if ! ip route show table "$ROUTE_TABLE" | grep -q 'local default'; then
+    say "ERROR: local default route in table $ROUTE_TABLE is missing"
+    exit 1
+fi
+
+say "Done."
+say "Only intercepting UDP from: $SOURCE_IPS"
+[ -n "$ROUTER_IP" ] && say "Router IP: $ROUTER_IP (not affected)"
+say ""
+say "To verify:  $NFT list table ip $TABLE"
+say "To remove:  $NFT delete table ip $TABLE && ip rule del fwmark $FWMARK table $ROUTE_TABLE"
+
+exit 0

@@ -269,3 +269,324 @@ mod tests {
         assert!(SYSCTL_CONF.contains("net.ipv4.tcp_rmem=4096 131072 8388608"));
     }
 }
+
+/// Прогон роутерных скриптов на стенде из заглушек (XR-247). Скрипты уезжают
+/// на роутер этими же строками, поэтому гоняем вшитый текст, а не копию.
+#[cfg(all(test, unix))]
+mod router_script_tests {
+    use super::{ROUTER_INIT, UDP_TPROXY_SETUP};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// Настоящие nft и ip звать нельзя, они правят firewall машины, где идут
+    /// тесты. Заглушки пишут вызовы в лог и держат состояние файлами-метками,
+    /// поэтому `nft list table` и `ip rule show` отвечают по тому, что до них
+    /// действительно доехало.
+    const STUB_NFT: &str = r#"#!/bin/sh
+echo "nft $*" >> "$STAND/calls.log"
+case "$1" in
+    -f)
+        cat >> "$STAND/ruleset.txt"
+        [ -f "$STAND/swallow-table" ] || : > "$STAND/table"
+        ;;
+    list)   [ -f "$STAND/table" ] || exit 1 ;;
+    delete) rm -f "$STAND/table" ;;
+esac
+exit 0
+"#;
+
+    const STUB_IP: &str = r#"#!/bin/sh
+echo "ip $*" >> "$STAND/calls.log"
+case "$1 $2" in
+    "rule show")     [ -f "$STAND/rule" ] && echo "32765: from all fwmark 0x200 lookup 201" ;;
+    "route show")    [ -f "$STAND/route" ] && echo "local default dev lo scope host" ;;
+    "rule add")      [ -f "$STAND/swallow-rule" ] || : > "$STAND/rule" ;;
+    "rule del")      rm -f "$STAND/rule" ;;
+    "route replace") [ -f "$STAND/swallow-route" ] || : > "$STAND/route" ;;
+esac
+exit 0
+"#;
+
+    const STUB_LOGGER: &str = r#"#!/bin/sh
+echo "$*" >> "$STAND/syslog.log"
+"#;
+
+    struct Stand {
+        dir: tempfile::TempDir,
+    }
+
+    impl Stand {
+        fn new() -> Self {
+            let stand = Stand {
+                dir: tempfile::tempdir().expect("временный каталог"),
+            };
+            fs::create_dir(stand.at("bin")).expect("каталог заглушек");
+            for (name, body) in [("nft", STUB_NFT), ("ip", STUB_IP), ("logger", STUB_LOGGER)] {
+                write_exec(&stand.at("bin").join(name), body);
+            }
+            stand
+        }
+
+        fn at(&self, rel: &str) -> PathBuf {
+            self.dir.path().join(rel)
+        }
+
+        fn read(&self, rel: &str) -> String {
+            fs::read_to_string(self.at(rel)).unwrap_or_default()
+        }
+
+        /// Заглушки идут первыми и без системных sbin: настоящие nft и ip не
+        /// должны находиться даже по случайности.
+        fn path_env(&self) -> String {
+            format!("{}:/usr/bin:/bin", self.at("bin").display())
+        }
+
+        /// Вшитый скрипт настройки, у которого подменены только два пути:
+        /// откуда брать nft (искать его в /usr/sbin на машине с тестами
+        /// нельзя) и где лежит конфиг. Остальной текст тот же, что уезжает
+        /// на роутер.
+        fn setup_script(&self, config: &Path) -> PathBuf {
+            let body = replace_once(
+                UDP_TPROXY_SETUP,
+                "for p in /usr/sbin/nft /sbin/nft /usr/bin/nft; do",
+                &format!("for p in {}; do", self.at("bin").join("nft").display()),
+            );
+            let body = replace_once(
+                &body,
+                "CONFIG=\"/etc/xr-proxy/config.toml\"",
+                &format!("CONFIG=\"{}\"", config.display()),
+            );
+            let path = self.at("udp-tproxy-setup.sh");
+            write_exec(&path, &body);
+            path
+        }
+
+        fn write_config(&self, source_ips: &str) -> PathBuf {
+            let path = self.at("config.toml");
+            fs::write(
+                &path,
+                format!(
+                    "[udp_relay]\nenabled = true\nlisten_port = 1081\nsource_ips = [{source_ips}]\nflow_timeout_sec = 120\n"
+                ),
+            )
+            .expect("конфиг стенда");
+            path
+        }
+
+        /// `start_service` из вшитого init, без procd и с путями стенда.
+        /// PATH переставляем после подключения файла: сам init ставит впереди
+        /// системные sbin, а нам нужны заглушки.
+        fn init_driver(&self, setup_script: &Path, config: &Path) -> PathBuf {
+            let path = self.at("driver.sh");
+            let missing = self.at("no-such-file");
+            write_exec(
+                &path,
+                &format!(
+                    "set -e\n\
+                     . '{init}'\n\
+                     PATH='{path_env}'\n\
+                     CONFIG='{config}'\n\
+                     UDP_TPROXY='{setup}'\n\
+                     WATCHDOG='{missing}'\n\
+                     KILLSWITCH_SETUP='{missing}'\n\
+                     KILLSWITCH_CLEANUP='{missing}'\n\
+                     procd_open_instance() {{ :; }}\n\
+                     procd_set_param() {{ :; }}\n\
+                     procd_close_instance() {{ :; }}\n\
+                     start_service\n",
+                    init = self.write_init().display(),
+                    path_env = self.path_env(),
+                    config = config.display(),
+                    setup = setup_script.display(),
+                    missing = missing.display(),
+                ),
+            );
+            path
+        }
+
+        fn write_init(&self) -> PathBuf {
+            let path = self.at("xr-proxy.init");
+            fs::write(&path, ROUTER_INIT).expect("init стенда");
+            path
+        }
+
+        /// Запуск с закрытым stdout: ровно так скрипт видит вызвавшего,
+        /// который свой конец вывода уже закрыл.
+        fn run_without_stdout(&self, script: &Path, args: &str) -> std::process::Output {
+            self.run(&format!("exec '{}' {args} >&-", script.display()))
+        }
+
+        fn run(&self, command: &str) -> std::process::Output {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(command)
+                .env("STAND", self.dir.path())
+                .env("PATH", self.path_env())
+                .output()
+                .expect("запуск скрипта")
+        }
+    }
+
+    /// Подмена с проверкой: строка, которой в скрипте нет, значит стенд
+    /// разъехался со скриптом и тест проверяет не то, что думает.
+    fn replace_once(body: &str, needle: &str, replacement: &str) -> String {
+        assert!(
+            body.contains(needle),
+            "в скрипте нет строки {needle:?}, стенд надо чинить"
+        );
+        body.replace(needle, replacement)
+    }
+
+    fn write_exec(path: &Path, body: &str) {
+        fs::write(path, body).expect("запись скрипта стенда");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("права на скрипт");
+    }
+
+    /// Регрессия XR-247: `/etc/init.d/xr-proxy start` из-под вызвавшего, который
+    /// закрыл вывод, обязан поднять таблицу перехвата. До правки скрипт умирал
+    /// на первой печати, правила не вставали, а в logread шло голое
+    /// предупреждение.
+    #[test]
+    fn init_installs_tproxy_table_with_closed_stdout() {
+        let stand = Stand::new();
+        let config = stand.write_config("\"192.0.2.10\"");
+        let setup = stand.setup_script(&config);
+        let driver = stand.init_driver(&setup, &config);
+
+        let out = stand.run_without_stdout(&driver, "");
+        assert!(
+            out.status.success(),
+            "init отвалился: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let ruleset = stand.read("ruleset.txt");
+        assert!(
+            ruleset.contains("tproxy to :1081") && ruleset.contains("192.0.2.10"),
+            "правила перехвата не встали, nft получил: {ruleset:?}"
+        );
+        let syslog = stand.read("syslog.log");
+        assert!(
+            syslog.contains("UDP TPROXY rules installed"),
+            "в лог не попала установка правил: {syslog:?}"
+        );
+        assert!(
+            !syslog.contains("WARNING"),
+            "успешная установка отмечена предупреждением: {syslog:?}"
+        );
+    }
+
+    /// Тот же закрытый вывод, но скрипт зовут напрямую: он и сам обязан
+    /// доводить установку до конца, а не полагаться на то, как его позвали.
+    #[test]
+    fn setup_script_survives_closed_stdout() {
+        let stand = Stand::new();
+        let setup = stand.setup_script(&stand.write_config("\"192.0.2.10\""));
+
+        let out = stand.run_without_stdout(&setup, "192.0.2.10");
+        assert!(
+            out.status.success(),
+            "скрипт отвалился с кодом {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stand.read("ruleset.txt").contains("tproxy to :1081"),
+            "правила перехвата не встали"
+        );
+        assert!(
+            stand.read("calls.log").contains("ip rule add fwmark 0x200"),
+            "policy route не поднят"
+        );
+    }
+
+    /// Тот же скрипт, но вывод уходит в трубу, чей читатель уже закрылся: так
+    /// его видит `ssh роутер '/etc/init.d/xr-proxy restart' | grep -q ...`.
+    /// Без игнора PIPE его тут убивает сигналом на первой же печати.
+    #[test]
+    fn setup_script_survives_reader_that_closed_the_pipe() {
+        let stand = Stand::new();
+        let setup = stand.setup_script(&stand.write_config("\"192.0.2.10\""));
+
+        stand.run(&format!(
+            "{{ '{}' 192.0.2.10; echo \"code=$?\" > \"$STAND/code\"; }} | true",
+            setup.display()
+        ));
+
+        assert_eq!(
+            stand.read("code").trim(),
+            "code=0",
+            "скрипт не пережил закрытую трубу"
+        );
+        assert!(
+            stand.read("ruleset.txt").contains("tproxy to :1081"),
+            "правила перехвата не встали"
+        );
+    }
+
+    /// XR-244: код возврата обязан считаться по тому, что реально встало.
+    /// Здесь nft молча проглатывает набор правил, и скрипт обязан это заметить.
+    #[test]
+    fn setup_script_fails_when_table_did_not_appear() {
+        let stand = Stand::new();
+        fs::write(stand.at("swallow-table"), "").expect("метка стенда");
+        let setup = stand.setup_script(&stand.write_config("\"192.0.2.10\""));
+
+        let out = stand.run(&format!("exec '{}' 192.0.2.10", setup.display()));
+        assert!(!out.status.success(), "проглоченный набор правил сошёл за успех");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("table ip xr_udp_relay is not installed"),
+            "причина отказа не названа: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    /// Та же проверка состояния для policy route: без него правила nft лежат
+    /// мёртвым грузом, и молчаливого успеха тут быть не должно.
+    #[test]
+    fn setup_script_fails_when_policy_route_did_not_appear() {
+        for (swallowed, reason) in [
+            ("swallow-rule", "policy rule for fwmark 0x200 is missing"),
+            ("swallow-route", "local default route in table 201 is missing"),
+        ] {
+            let stand = Stand::new();
+            fs::write(stand.at(swallowed), "").expect("метка стенда");
+            let setup = stand.setup_script(&stand.write_config("\"192.0.2.10\""));
+
+            let out = stand.run(&format!("exec '{}' 192.0.2.10", setup.display()));
+            assert!(
+                !out.status.success(),
+                "{swallowed}: потерянный policy route сошёл за успех"
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains(reason),
+                "{swallowed}: причина отказа не названа: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+    }
+
+    /// Отказ настройки обязан доезжать до logread с причиной: без неё
+    /// предупреждение в логе не отличить от любого другого отказа.
+    #[test]
+    fn init_logs_why_tproxy_setup_failed() {
+        let stand = Stand::new();
+        let config = stand.write_config("\"192.0.2.10\"");
+        let failing = stand.at("failing-setup.sh");
+        write_exec(
+            &failing,
+            "#!/bin/sh\necho \"ERROR: No source IPs specified.\"\nexit 1\n",
+        );
+        let driver = stand.init_driver(&failing, &config);
+
+        stand.run(&format!("exec '{}'", driver.display()));
+
+        let syslog = stand.read("syslog.log");
+        assert!(
+            syslog.contains("No source IPs specified"),
+            "причина отказа не доехала до лога: {syslog:?}"
+        );
+    }
+}
