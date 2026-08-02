@@ -113,6 +113,49 @@ pub async fn run_proxy(
     .await
 }
 
+/// Сколько ждать хвост ClientHello, который не влез в первый сегмент.
+const SNI_FRAGMENT_WAIT: Duration = Duration::from_millis(500);
+
+/// Пауза между подглядываниями. Сокет остаётся читаемым, пока в нём лежат
+/// первые байты, поэтому `peek` возвращается сразу и тем же куском: новых байт
+/// приходится ждать по часам, иначе цикл сожрёт ядро.
+const SNI_PEEK_POLL: Duration = Duration::from_millis(5);
+
+/// Досмотреть первые байты клиента до целого рекорда с ClientHello и вернуть,
+/// сколько байт лежит в `buf`. Имя снималось с одной порции, а с постквантовым
+/// key_share рекорд перестал влезать в сегмент: обрезанное начало не давало
+/// имени, и проксируемый сайт уходил действием по умолчанию. `peek` байты не
+/// съедает, поэтому релей потом прочитает их сам.
+async fn peek_client_hello(
+    client: &TcpStream,
+    buf: &mut Vec<u8>,
+    first: usize,
+) -> io::Result<usize> {
+    let mut n = first;
+    let deadline = tokio::time::Instant::now() + SNI_FRAGMENT_WAIT;
+
+    while let Some(want) = sni::client_hello_record_len(&buf[..n]) {
+        if n >= want {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "SNI: ClientHello не собрался, {} байт из {}, маршрут по IP",
+                n,
+                want
+            );
+            break;
+        }
+        if buf.len() < want {
+            buf.resize(want, 0);
+        }
+        tokio::time::sleep(SNI_PEEK_POLL).await;
+        n = client.peek(&mut buf[..want]).await?;
+    }
+
+    Ok(n)
+}
+
 async fn handle_connection(
     mut client: TcpStream,
     client_addr: SocketAddr,
@@ -142,6 +185,7 @@ async fn handle_connection(
             return Ok(());
         }
     };
+    let n = peek_client_hello(&client, &mut peek_buf, n).await?;
     let sni_name = sni::extract_sni(&peek_buf[..n]);
 
     let sni_display = sni_name.as_deref().unwrap_or("-");
@@ -357,7 +401,166 @@ async fn relay_mux(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
     use xr_proto::config::{RoutingConfig, RoutingRule};
+
+    /// ClientHello с SNI и расширением перед ним: имя лежит дальше первого
+    /// сегмента, ровно как у браузера с постквантовым key_share.
+    fn client_hello(hostname: &str, key_share_len: usize) -> Vec<u8> {
+        let host = hostname.as_bytes();
+
+        let mut sni_ext = Vec::new();
+        sni_ext.extend_from_slice(&((host.len() + 3) as u16).to_be_bytes()); // list len
+        sni_ext.push(0x00); // host_name
+        sni_ext.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        sni_ext.extend_from_slice(host);
+
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&0x0033u16.to_be_bytes()); // key_share
+        extensions.extend_from_slice(&(key_share_len as u16).to_be_bytes());
+        extensions.extend(std::iter::repeat(0xa5).take(key_share_len));
+        extensions.extend_from_slice(&0u16.to_be_bytes()); // server_name
+        extensions.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&sni_ext);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0); // session id len
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher suites
+        body.extend_from_slice(&[0x01, 0x00]); // compression
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let mut hs = vec![0x01]; // ClientHello
+        let len = body.len();
+        hs.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
+        hs.extend_from_slice(&body);
+
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        record.extend_from_slice(&hs);
+        record
+    }
+
+    /// Поднимает пару сокетов и отдаёт принятое соединение вместе с концом,
+    /// в который пишет «браузер».
+    async fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = TcpStream::connect(addr).await.unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        (accepted, writer)
+    }
+
+    /// ClientHello приехал двумя сегментами: на первом имени нет, и без
+    /// дочитывания соединение ушло бы маршрутом по умолчанию. Рекорд взят
+    /// длиннее стартового буфера, чтобы под него пришлось расти.
+    #[tokio::test]
+    async fn peek_gathers_fragmented_client_hello() {
+        let hello = client_hello("news.example.org", 6000);
+        let (client, writer) = socket_pair().await;
+
+        let head = hello[..1400].to_vec();
+        let tail = hello[1400..].to_vec();
+        // Хвост уходит только после первого подглядывания, иначе тест зависел
+        // бы от того, кто из задач успел раньше.
+        let (send_tail, tail_wanted) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut writer = writer;
+            writer.write_all(&head).await.unwrap();
+            tail_wanted.await.unwrap();
+            writer.write_all(&tail).await.unwrap();
+            // Держим сокет открытым, чтобы дочитывание работало на живом
+            // соединении, а не на закрытом.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut buf = vec![0u8; 4096];
+        let first = client.peek(&mut buf).await.unwrap();
+        assert!(sni::extract_sni(&buf[..first]).is_none(), "первый сегмент имени не содержит");
+        send_tail.send(()).unwrap();
+
+        let n = peek_client_hello(&client, &mut buf, first).await.unwrap();
+        assert_eq!(n, hello.len());
+        assert_eq!(
+            sni::extract_sni(&buf[..n]).as_deref(),
+            Some("news.example.org"),
+        );
+    }
+
+    /// Байты остаются в сокете: релей после подглядывания читает их сам.
+    #[tokio::test]
+    async fn peek_does_not_consume_bytes() {
+        let hello = client_hello("news.example.org", 6000);
+        let (mut client, writer) = socket_pair().await;
+
+        let payload = hello.clone();
+        tokio::spawn(async move {
+            let mut writer = writer;
+            writer.write_all(&payload).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut buf = vec![0u8; 4096];
+        let first = client.peek(&mut buf).await.unwrap();
+        let n = peek_client_hello(&client, &mut buf, first).await.unwrap();
+        assert_eq!(n, hello.len());
+
+        let mut got = vec![0u8; hello.len()];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, hello);
+    }
+
+    /// Сырой TCP-протокол за ожидание платить не должен: не-handshake первый
+    /// байт выводит из цикла сразу.
+    #[tokio::test]
+    async fn peek_does_not_wait_for_non_tls() {
+        let (client, writer) = socket_pair().await;
+        tokio::spawn(async move {
+            let mut writer = writer;
+            writer.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut buf = vec![0u8; 4096];
+        let first = client.peek(&mut buf).await.unwrap();
+        let started = std::time::Instant::now();
+        let n = peek_client_hello(&client, &mut buf, first).await.unwrap();
+        assert_eq!(n, first);
+        assert!(started.elapsed() < SNI_FRAGMENT_WAIT, "ждали {:?}", started.elapsed());
+    }
+
+    /// Хвост так и не пришёл: ждём не дольше своего предела и отдаём то, что
+    /// собралось, вместо бесконечного ожидания.
+    #[tokio::test]
+    async fn peek_gives_up_on_missing_tail() {
+        let hello = client_hello("news.example.org", 6000);
+        let (client, writer) = socket_pair().await;
+
+        let head = hello[..1400].to_vec();
+        tokio::spawn(async move {
+            let mut writer = writer;
+            writer.write_all(&head).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut buf = vec![0u8; 4096];
+        let first = client.peek(&mut buf).await.unwrap();
+        let started = std::time::Instant::now();
+        // Свой предел досмотр обязан соблюдать сам, поэтому снаружи стоит
+        // заведомо больший: без него потерянный предел вешал бы прогон.
+        let n = tokio::time::timeout(
+            SNI_FRAGMENT_WAIT * 4,
+            peek_client_hello(&client, &mut buf, first),
+        )
+        .await
+        .expect("досмотр не уложился в свой предел")
+        .unwrap();
+        assert_eq!(n, 1400);
+        assert!(sni::extract_sni(&buf[..n]).is_none());
+        assert!(started.elapsed() < SNI_FRAGMENT_WAIT * 3, "ждали {:?}", started.elapsed());
+    }
 
     fn router_proxying(domains: &[&str]) -> Router {
         let cfg = RoutingConfig {
