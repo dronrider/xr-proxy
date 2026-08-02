@@ -18,6 +18,34 @@ use crate::protocol::MAX_DOMAIN_LEN;
 /// SNI extension (type 0x0000):
 ///   ServerNameList length(2) | NameType(1) | HostName length(2) | HostName...
 
+/// Заголовок TLS-рекорда: тип, версия и длина.
+pub const TLS_RECORD_HEADER_LEN: usize = 5;
+
+/// Дальше этого объёма первый рекорд не растёт: полезная часть TLSPlaintext
+/// ограничена 2^14 байтами. Предел нужен, чтобы соврамшая длина в заголовке не
+/// заставила прокси ждать байты, которых клиент не пришлёт.
+pub const MAX_CLIENT_HELLO: usize = TLS_RECORD_HEADER_LEN + 16384;
+
+/// Сколько всего байт должно набраться в буфере, чтобы первый рекорд лежал в
+/// нём целиком. `None` значит, что дочитывать нечего: это не handshake.
+///
+/// Съём имени с одной порции первых байт работал, пока ClientHello влезал в
+/// сегмент. Постквантовый обмен ключами (`X25519MLKEM768`) раздул key_share
+/// больше чем на килобайт, и рекорд поехал по нескольким сегментам: разбор
+/// видит обрезанное начало, `extract_sni` молча отдаёт `None`, а соединение
+/// уходит действием по умолчанию. Длина из заголовка и говорит, сколько ещё
+/// ждать.
+pub fn client_hello_record_len(buf: &[u8]) -> Option<usize> {
+    if buf.first() != Some(&0x16) {
+        return None;
+    }
+    if buf.len() < TLS_RECORD_HEADER_LEN {
+        return Some(TLS_RECORD_HEADER_LEN);
+    }
+    let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+    Some((TLS_RECORD_HEADER_LEN + record_len).min(MAX_CLIENT_HELLO))
+}
+
 /// Try to extract SNI hostname from a buffer that may contain a TLS ClientHello.
 /// Returns None if the data is not TLS or doesn't contain SNI.
 pub fn extract_sni(buf: &[u8]) -> Option<String> {
@@ -217,24 +245,70 @@ mod tests {
         }
     }
 
+    /// По заголовку рекорда видно, сколько байт ждать. Не-handshake и пустой
+    /// буфер ждать не заставляют, иначе прокси висел бы на каждом сыром TCP.
+    #[test]
+    fn test_record_len_from_header() {
+        let hello = build_rich_client_hello("news.example.org");
+        assert_eq!(client_hello_record_len(&hello), Some(hello.len()));
+        // Первый сегмент короче рекорда: ждать надо всю длину из заголовка.
+        assert_eq!(client_hello_record_len(&hello[..40]), Some(hello.len()));
+        // Заголовок ещё не набрался, но начало handshake уже видно.
+        assert_eq!(client_hello_record_len(&hello[..2]), Some(TLS_RECORD_HEADER_LEN));
+
+        assert_eq!(client_hello_record_len(b""), None);
+        assert_eq!(client_hello_record_len(b"GET / HTTP/1.1\r\n"), None);
+    }
+
+    /// Соврамший заголовок не должен превращать ожидание в бесконечное: рекорд
+    /// длиннее предела TLSPlaintext обрезается по нему.
+    #[test]
+    fn test_record_len_capped() {
+        let buf = [0x16, 0x03, 0x01, 0xff, 0xff];
+        assert_eq!(client_hello_record_len(&buf), Some(MAX_CLIENT_HELLO));
+    }
+
+    /// Крупный ClientHello (в жизни его раздувает постквантовый key_share) не
+    /// влезает в сегмент: на первой половине имени нет, на собранном рекорде
+    /// оно достаётся.
+    #[test]
+    fn test_sni_needs_full_record() {
+        let hello = build_large_client_hello("news.example.org");
+        let cut = 1400.min(hello.len() / 2);
+        assert_eq!(extract_sni(&hello[..cut]), None);
+        assert_eq!(client_hello_record_len(&hello[..cut]), Some(hello.len()));
+        assert_eq!(
+            extract_sni(&hello),
+            Some("news.example.org".to_string())
+        );
+    }
+
     /// Build a minimal TLS ClientHello with a given SNI for testing.
     fn build_test_client_hello(hostname: &str) -> Vec<u8> {
-        build_client_hello(hostname, 0, 1, false)
+        build_client_hello(hostname, 0, 1, false, 0)
     }
 
     /// То же, но с полями, которые есть у живого клиента.
     fn build_rich_client_hello(hostname: &str) -> Vec<u8> {
-        build_client_hello(hostname, 32, 30, true)
+        build_client_hello(hostname, 32, 30, true, 0)
+    }
+
+    /// Живой браузерный ClientHello с постквантовым обменом ключами: key_share
+    /// весит больше килобайта, стоит до SNI и выносит имя за первый сегмент.
+    fn build_large_client_hello(hostname: &str) -> Vec<u8> {
+        build_client_hello(hostname, 32, 30, true, 2048)
     }
 
     /// `session_id_len` и `cipher_count` набивают поля, которые разбор
     /// перепрыгивает по длине. При `padded` вокруг SNI встают чужие расширения,
-    /// а в ServerNameList первой идёт запись не-host_name.
+    /// а в ServerNameList первой идёт запись не-host_name. `key_share_len` это
+    /// вес расширения, которое лежит перед SNI.
     fn build_client_hello(
         hostname: &str,
         session_id_len: usize,
         cipher_count: usize,
         padded: bool,
+        key_share_len: usize,
     ) -> Vec<u8> {
         let host_bytes = hostname.as_bytes();
 
@@ -261,6 +335,11 @@ mod tests {
             extensions.extend_from_slice(&0x002bu16.to_be_bytes());
             extensions.extend_from_slice(&3u16.to_be_bytes());
             extensions.extend_from_slice(&[0x02, 0x03, 0x04]);
+        }
+        if key_share_len > 0 {
+            extensions.extend_from_slice(&0x0033u16.to_be_bytes()); // key_share
+            extensions.extend_from_slice(&(key_share_len as u16).to_be_bytes());
+            extensions.extend(std::iter::repeat(0xa5).take(key_share_len));
         }
         extensions.extend_from_slice(&0u16.to_be_bytes()); // ext type = SNI
         extensions.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
