@@ -73,8 +73,14 @@ sudo xr-share list
 ```
 
 `--writable` opts a folder into the write path and adds a write-binding on the
-attached invite; re-running `share` without the flag turns write back off. From a
-laptop the desktop harness mirrors `pull` for sending:
+attached invite; re-running `share` without the flag turns write back off.
+
+Re-sharing a path the agent already serves **replaces** that entry instead of
+adding a second one (XR-162): the flags of the last run win, the path gets a
+fresh `share_id`, and the previous registration is taken off the hub index. One
+folder is therefore one share, and a link printed by an earlier `share` of the
+same path stops working. From a laptop the desktop harness mirrors `pull` for
+sending:
 
 ```sh
 xr-share push --invite <TOKEN> --share <id|name> report.pdf   # upload (--to <rel> to rename)
