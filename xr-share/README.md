@@ -79,8 +79,17 @@ Re-sharing a path the agent already serves **replaces** that entry instead of
 adding a second one (XR-162): the flags of the last run win, the path gets a
 fresh `share_id`, and the previous registration is taken off the hub index. One
 folder is therefore one share, and a link printed by an earlier `share` of the
-same path stops working. From a laptop the desktop harness mirrors `pull` for
-sending:
+same path stops working.
+
+Invite bindings do **not** travel with the replacement, so repeat the
+`--invite` you used before (or set a default invite with a `--setup` token).
+The retired `share_id` leaves the hub together with whatever invites it hung
+on, and the agent cannot re-create those bindings: it never learns which
+invites carry a share, and the hub tells only an admin session. `share` says so
+on every replacement, and the new entry lands on the invites of that run alone;
+anything else is re-attached from the hub admin UI.
+
+From a laptop the desktop harness mirrors `pull` for sending:
 
 ```sh
 xr-share push --invite <TOKEN> --share <id|name> report.pdf   # upload (--to <rel> to rename)
