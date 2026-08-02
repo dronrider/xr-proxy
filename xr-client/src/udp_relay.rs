@@ -32,31 +32,182 @@ const SOCK_NONBLOCK: libc::c_int = 0o4000;
 
 // ── Flow tracking ──────────────────────────────────────────────────
 
+/// Из туннеля обратно приходит только `src_port` и `dst`, адреса устройства в
+/// `RelayPacket` нет. Поэтому туннельный порт и есть весь наш NAT: он уникален
+/// на устройство, и ответ по нему находит ровно одно устройство.
+const TUNNEL_PORT_POOL: std::ops::RangeInclusive<u16> = 40000..=65000;
+
 struct UdpFlow {
     src_addr: SocketAddr,
-    orig_dst: SocketAddr,
     last_activity: Instant,
 }
 
+/// Таблица флоу с NAT по туннельному порту. Логика сокетов не касается, чтобы
+/// гоняться юнитами там, где TPROXY не поднять.
+///
+/// Маппинг endpoint-independent: номер выдаётся на `(адрес, порт)` устройства и
+/// держится на всех его адресатов сразу. Иначе NAT на VPS становится symmetric,
+/// а от типа NAT у Switch и Xbox зависит мультиплеер, ради которого весь relay
+/// и заведён.
+struct FlowTable {
+    /// туннельный порт -> флоу
+    flows: HashMap<u16, UdpFlow>,
+    /// адрес устройства -> его туннельный порт
+    ports: HashMap<SocketAddr, u16>,
+    pool: std::ops::RangeInclusive<u16>,
+}
+
+impl FlowTable {
+    fn new(pool: std::ops::RangeInclusive<u16>) -> Self {
+        FlowTable {
+            flows: HashMap::new(),
+            ports: HashMap::new(),
+            pool,
+        }
+    }
+
+    /// Туннельный порт устройства, заводя флоу на первом пакете. `None` значит,
+    /// что свободных портов не осталось и пакет придётся отбросить.
+    fn touch(&mut self, src_addr: SocketAddr, now: Instant) -> Option<u16> {
+        if let Some(&port) = self.ports.get(&src_addr) {
+            if let Some(flow) = self.flows.get_mut(&port) {
+                flow.last_activity = now;
+            }
+            return Some(port);
+        }
+
+        let port = match self.allocate(src_addr.port()) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    "UDP relay: tunnel port pool exhausted ({} flows), dropping {}",
+                    self.flows.len(), src_addr
+                );
+                return None;
+            }
+        };
+        if port != src_addr.port() {
+            // Вторая приставка той же модели сидит на том же порту, что первая
+            // (Xbox 3074, PS 3478), и настоящий номер уже занят.
+            tracing::debug!("UDP relay: {} goes through tunnel port {}", src_addr, port);
+        }
+
+        self.ports.insert(src_addr, port);
+        self.flows.insert(port, UdpFlow { src_addr, last_activity: now });
+        Some(port)
+    }
+
+    /// Настоящий порт устройства достаётся тому, кто пришёл первым: NAT
+    /// приставок и P2P держатся на нём. Остальным идёт первый свободный номер
+    /// из пула, выдача детерминированная.
+    fn allocate(&self, preferred: u16) -> Option<u16> {
+        if preferred != 0 && !self.flows.contains_key(&preferred) {
+            return Some(preferred);
+        }
+        self.pool.clone().find(|p| !self.flows.contains_key(p))
+    }
+
+    /// Пакет от устройства, готовый к отправке в туннель.
+    fn upstream_packet(
+        &mut self,
+        src_addr: SocketAddr,
+        orig_dst: SocketAddr,
+        payload: Vec<u8>,
+        now: Instant,
+    ) -> Option<RelayPacket> {
+        let tunnel_port = self.touch(src_addr, now)?;
+        Some(RelayPacket {
+            relay_type: RelayType::Data,
+            dst: orig_dst,
+            src_port: tunnel_port,
+            payload,
+        })
+    }
+
+    /// Кому отдать ответ из туннеля и с какого адреса спуфить источник.
+    /// `packet.src_port` это туннельный порт, он же ключ таблицы, поэтому
+    /// поиска «любой флоу с таким портом» больше нет. Спуфим отправителя
+    /// пакета, а не `orig_dst` флоу: у входящего P2P это разные адреса.
+    fn downstream_target(
+        &mut self,
+        packet: &RelayPacket,
+        now: Instant,
+    ) -> Option<(SocketAddr, SocketAddr)> {
+        let flow = self.flows.get_mut(&packet.src_port)?;
+        flow.last_activity = now;
+        Some((flow.src_addr, packet.dst))
+    }
+
+    /// Снимает протухшие флоу, возвращая их туннельные порты в пул.
+    fn retire_expired(&mut self, timeout: Duration, now: Instant) -> usize {
+        let expired: Vec<u16> = self
+            .flows
+            .iter()
+            .filter(|(_, f)| now.duration_since(f.last_activity) >= timeout)
+            .map(|(port, _)| *port)
+            .collect();
+
+        for port in &expired {
+            if let Some(flow) = self.flows.remove(port) {
+                self.ports.remove(&flow.src_addr);
+            }
+        }
+        expired.len()
+    }
+
+    fn len(&self) -> usize {
+        self.flows.len()
+    }
+}
+
+/// Кэш спуфящих сокетов: адрес отправителя ответа -> сокет, забинденный на него
+/// с `IP_TRANSPARENT`. Адресатов в таблице флоу нет (номер выдаётся на
+/// устройство), поэтому живость сокета считается по нему самому: сокет живёт,
+/// пока через него шлют, и уходит по простою вместе с флоу своего устройства.
+struct SpoofCache {
+    sockets: HashMap<SocketAddr, SpoofEntry>,
+}
+
+struct SpoofEntry {
+    sock: Arc<std::net::UdpSocket>,
+    last_used: Instant,
+}
+
+impl SpoofCache {
+    fn new() -> Self {
+        SpoofCache { sockets: HashMap::new() }
+    }
+
+    fn get(&mut self, addr: SocketAddr, now: Instant) -> Option<Arc<std::net::UdpSocket>> {
+        let entry = self.sockets.get_mut(&addr)?;
+        entry.last_used = now;
+        Some(entry.sock.clone())
+    }
+
+    fn insert(&mut self, addr: SocketAddr, sock: Arc<std::net::UdpSocket>, now: Instant) {
+        self.sockets.insert(addr, SpoofEntry { sock, last_used: now });
+    }
+
+    fn retire_idle(&mut self, timeout: Duration, now: Instant) -> usize {
+        let before = self.sockets.len();
+        self.sockets
+            .retain(|_, e| now.duration_since(e.last_used) < timeout);
+        before - self.sockets.len()
+    }
+
+    fn len(&self) -> usize {
+        self.sockets.len()
+    }
+}
+
 struct RelayState {
-    /// Map: flow_key(src_port, dst) → flow info
-    flows: Mutex<HashMap<u64, UdpFlow>>,
-    /// Cache of spoofed sockets: orig_dst → socket bound to that address.
-    /// Used to send responses back to Switch with correct source address.
-    spoof_sockets: Mutex<HashMap<SocketAddr, Arc<std::net::UdpSocket>>>,
+    flows: Mutex<FlowTable>,
+    spoof_sockets: Mutex<SpoofCache>,
     obfuscator: Obfuscator,
     vps_addr: SocketAddr,
     flow_timeout: Duration,
     source_ips: Vec<Ipv4Addr>,
     exclude_ports: Vec<u16>,
-}
-
-fn flow_key(src_port: u16, dst: &SocketAddr) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    src_port.hash(&mut h);
-    dst.hash(&mut h);
-    h.finish()
 }
 
 // ── Main entry ─────────────────────────────────────────────────────
@@ -84,8 +235,8 @@ pub async fn run_udp_relay(
     }
 
     let state = Arc::new(RelayState {
-        flows: Mutex::new(HashMap::new()),
-        spoof_sockets: Mutex::new(HashMap::new()),
+        flows: Mutex::new(FlowTable::new(TUNNEL_PORT_POOL)),
+        spoof_sockets: Mutex::new(SpoofCache::new()),
         obfuscator,
         vps_addr,
         flow_timeout: Duration::from_secs(config.flow_timeout_sec),
@@ -133,26 +284,22 @@ pub async fn run_udp_relay(
             timer.tick().await;
             let timeout = clean_state.flow_timeout;
 
+            let now = Instant::now();
+
             let mut flows = clean_state.flows.lock().await;
-            let before = flows.len();
-            flows.retain(|_, f| f.last_activity.elapsed() < timeout);
-            let removed = before - flows.len();
+            let removed = flows.retire_expired(timeout, now);
             if removed > 0 {
                 tracing::debug!("UDP relay: cleaned {} expired flows ({} active)", removed, flows.len());
             }
-
-            // Collect active orig_dst addresses
-            let active_dsts: std::collections::HashSet<SocketAddr> =
-                flows.values().map(|f| f.orig_dst).collect();
             drop(flows);
 
-            // Clean spoof sockets for dead flows
+            // Спуфящий сокет уходит по собственному простою: адресатов в
+            // таблице флоу нет, а через живого пира шлют чаще, чем раз в
+            // flow_timeout.
             let mut spoof = clean_state.spoof_sockets.lock().await;
-            let spoof_before = spoof.len();
-            spoof.retain(|addr, _| active_dsts.contains(addr));
-            let spoof_removed = spoof_before - spoof.len();
+            let spoof_removed = spoof.retire_idle(timeout, now);
             if spoof_removed > 0 {
-                tracing::debug!("UDP relay: cleaned {} spoof sockets", spoof_removed);
+                tracing::debug!("UDP relay: cleaned {} spoof sockets ({} active)", spoof_removed, spoof.len());
             }
         }
     });
@@ -206,25 +353,14 @@ pub async fn run_udp_relay(
                 }
             }
 
-            let src_port = src_addr.port();
-
-            // Track flow for reverse path
-            let fkey = flow_key(src_port, &orig_dst);
-            {
+            // Флоу заводится вместе со своим туннельным портом, он и уходит в
+            // туннель вместо настоящего порта устройства.
+            let packet = {
                 let mut flows = up_state.flows.lock().await;
-                flows.insert(fkey, UdpFlow {
-                    src_addr,
-                    orig_dst,
-                    last_activity: Instant::now(),
-                });
-            }
-
-            // Encode and send
-            let packet = RelayPacket {
-                relay_type: RelayType::Data,
-                dst: orig_dst,
-                src_port,
-                payload: buf[..n].to_vec(),
+                match flows.upstream_packet(src_addr, orig_dst, buf[..n].to_vec(), Instant::now()) {
+                    Some(p) => p,
+                    None => continue,
+                }
             };
             let wire = udp_relay::encode_relay_packet(&up_state.obfuscator, &packet);
             if let Err(e) = up_tunnel.send_to(&wire, up_state.vps_addr).await {
@@ -258,25 +394,11 @@ pub async fn run_udp_relay(
                 RelayType::Keepalive => {}
                 RelayType::Data => {
                     // packet.dst = the remote server that responded (e.g. 3.71.152.160:33334)
-                    // packet.src_port = Switch's source port
+                    // packet.src_port = туннельный порт флоу
                     // We need to deliver payload to Switch with src = packet.dst (the server)
-
-                    // Find Switch address from flow table
-                    let fkey = flow_key(packet.src_port, &packet.dst);
                     let target_info = {
                         let mut flows = down_state.flows.lock().await;
-                        if let Some(flow) = flows.get_mut(&fkey) {
-                            flow.last_activity = Instant::now();
-                            Some((flow.src_addr, flow.orig_dst))
-                        } else {
-                            // Incoming P2P: find any flow with matching src_port
-                            flows.values_mut()
-                                .find(|f| f.src_addr.port() == packet.src_port)
-                                .map(|f| {
-                                    f.last_activity = Instant::now();
-                                    (f.src_addr, packet.dst)
-                                })
-                        }
+                        flows.downstream_target(&packet, Instant::now())
                     };
 
                     if let Some((switch_addr, orig_dst)) = target_info {
@@ -296,7 +418,7 @@ pub async fn run_udp_relay(
                         }
                     } else {
                         tracing::debug!(
-                            "UDP relay: no flow for port={} dst={}",
+                            "UDP relay: no flow for tunnel port={} dst={}",
                             packet.src_port, packet.dst
                         );
                     }
@@ -324,9 +446,9 @@ async fn get_or_create_spoof_socket(
 ) -> io::Result<Arc<std::net::UdpSocket>> {
     // Check cache first
     {
-        let cache = state.spoof_sockets.lock().await;
-        if let Some(sock) = cache.get(&spoof_addr) {
-            return Ok(sock.clone());
+        let mut cache = state.spoof_sockets.lock().await;
+        if let Some(sock) = cache.get(spoof_addr, Instant::now()) {
+            return Ok(sock);
         }
     }
 
@@ -335,7 +457,7 @@ async fn get_or_create_spoof_socket(
     let sock = Arc::new(sock);
 
     let mut cache = state.spoof_sockets.lock().await;
-    cache.insert(spoof_addr, sock.clone());
+    cache.insert(spoof_addr, sock.clone(), Instant::now());
 
     tracing::debug!("UDP relay: created spoof socket for {}", spoof_addr);
     Ok(sock)
@@ -567,4 +689,290 @@ fn is_private_ip(ip: &Ipv4Addr) -> bool {
     octets[0] == 10
         || (octets[0] == 172 && (octets[1] & 0xf0) == 16)
         || (octets[0] == 192 && octets[1] == 168)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn table() -> FlowTable {
+        FlowTable::new(TUNNEL_PORT_POOL)
+    }
+
+    fn data(src_port: u16, dst: SocketAddr, payload: &[u8]) -> RelayPacket {
+        RelayPacket {
+            relay_type: RelayType::Data,
+            dst,
+            src_port,
+            payload: payload.to_vec(),
+        }
+    }
+
+    /// Две приставки одной модели сидят на одном порту (Xbox 3074) и играют на
+    /// одном сервере. Пока ключом флоу был (src_port, dst), запись второй
+    /// затирала первую и ответы обеим уходили последнему написавшему.
+    #[test]
+    fn two_consoles_on_one_port_get_own_replies() {
+        let mut t = table();
+        let now = Instant::now();
+        let server = addr("203.0.113.5:3074");
+        let first = addr("192.168.1.10:3074");
+        let second = addr("192.168.1.11:3074");
+
+        let up_first = t.upstream_packet(first, server, b"a".to_vec(), now).unwrap();
+        let up_second = t.upstream_packet(second, server, b"b".to_vec(), now).unwrap();
+        assert_ne!(
+            up_first.src_port, up_second.src_port,
+            "двум устройствам нельзя отдавать один туннельный порт"
+        );
+
+        let reply_first = data(up_first.src_port, server, b"a-reply");
+        let reply_second = data(up_second.src_port, server, b"b-reply");
+        assert_eq!(
+            t.downstream_target(&reply_first, now),
+            Some((first, server))
+        );
+        assert_eq!(
+            t.downstream_target(&reply_second, now),
+            Some((second, server))
+        );
+    }
+
+    /// Маппинг endpoint-independent: одна приставка уходит на VPS одним и тем
+    /// же портом ко всем пирам сразу, иначе NAT на VPS становится symmetric и
+    /// мультиплеер у Switch и Xbox ломается.
+    #[test]
+    fn console_keeps_one_tunnel_port_for_all_peers() {
+        let mut t = table();
+        let now = Instant::now();
+        let console = addr("192.168.1.10:3074");
+        let matchmaking = addr("203.0.113.5:3074");
+        let peer = addr("198.51.100.7:51820");
+
+        let to_matchmaking = t.upstream_packet(console, matchmaking, b"a".to_vec(), now).unwrap();
+        let to_peer = t.upstream_packet(console, peer, b"b".to_vec(), now).unwrap();
+
+        assert_eq!(to_matchmaking.src_port, to_peer.src_port);
+        assert_eq!(to_matchmaking.dst, matchmaking);
+        assert_eq!(to_peer.dst, peer);
+        assert_eq!(t.len(), 1, "устройству положен один флоу на все назначения");
+    }
+
+    #[test]
+    fn first_console_keeps_its_real_port() {
+        let mut t = table();
+        let now = Instant::now();
+        let server = addr("203.0.113.5:3074");
+
+        let up = t
+            .upstream_packet(addr("192.168.1.10:3074"), server, b"a".to_vec(), now)
+            .unwrap();
+        assert_eq!(up.src_port, 3074, "NAT приставок держится на настоящем порту");
+    }
+
+    #[test]
+    fn substitute_port_comes_from_pool_head() {
+        let now = Instant::now();
+
+        let ports = || {
+            let mut t = table();
+            t.touch(addr("192.168.1.10:3074"), now).unwrap();
+            (
+                t.touch(addr("192.168.1.11:3074"), now).unwrap(),
+                t.touch(addr("192.168.1.12:3074"), now).unwrap(),
+            )
+        };
+
+        assert_eq!(ports(), (40000, 40001));
+        assert_eq!(ports(), (40000, 40001), "выдача обязана быть детерминированной");
+    }
+
+    #[test]
+    fn same_device_keeps_its_tunnel_port() {
+        let mut t = table();
+        let now = Instant::now();
+        let console = addr("192.168.1.11:3074");
+
+        t.touch(addr("192.168.1.10:3074"), now).unwrap();
+        let first = t.touch(console, now).unwrap();
+        let second = t.touch(console, now + Duration::from_secs(5)).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(t.len(), 2, "второй пакет того же устройства не заводит новый флоу");
+    }
+
+    /// Разные порты одного устройства это разные флоу: на VPS они и так уходят
+    /// разными сокетами, а спутать их между собой нельзя.
+    #[test]
+    fn two_ports_of_one_device_are_two_flows() {
+        let mut t = table();
+        let now = Instant::now();
+
+        assert_eq!(t.touch(addr("192.168.1.10:3074"), now), Some(3074));
+        assert_eq!(t.touch(addr("192.168.1.10:3478"), now), Some(3478));
+        assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn expired_flow_returns_its_port_to_pool() {
+        let mut t = table();
+        let now = Instant::now();
+        let timeout = Duration::from_secs(60);
+
+        t.touch(addr("192.168.1.10:3074"), now).unwrap();
+        assert_eq!(t.touch(addr("192.168.1.11:3074"), now), Some(40000));
+
+        let later = now + timeout;
+        assert_eq!(t.retire_expired(timeout, later), 2);
+        assert_eq!(t.len(), 0);
+
+        // Оба номера свободны снова: и настоящий порт, и подменный из пула.
+        assert_eq!(t.touch(addr("192.168.1.12:3074"), later), Some(3074));
+        assert_eq!(t.touch(addr("192.168.1.13:3074"), later), Some(40000));
+    }
+
+    #[test]
+    fn retired_flow_is_started_over_by_next_packet() {
+        let mut t = table();
+        let now = Instant::now();
+        let server = addr("203.0.113.5:3074");
+        let console = addr("192.168.1.10:3074");
+        let timeout = Duration::from_secs(60);
+
+        t.touch(console, now).unwrap();
+        let later = now + timeout;
+        t.retire_expired(timeout, later);
+
+        assert_eq!(t.touch(console, later), Some(3074));
+        assert_eq!(t.len(), 1, "флоу обязан завестись заново, а не остаться ссылкой на снятый порт");
+        assert_eq!(
+            t.downstream_target(&data(3074, server, b"reply"), later),
+            Some((console, server))
+        );
+    }
+
+    #[test]
+    fn live_flow_keeps_its_port_while_neighbour_expires() {
+        let mut t = table();
+        let now = Instant::now();
+        let server = addr("203.0.113.5:3074");
+        let live = addr("192.168.1.10:3074");
+        let timeout = Duration::from_secs(60);
+
+        t.touch(live, now).unwrap();
+        t.touch(addr("192.168.1.11:3074"), now).unwrap();
+
+        let later = now + timeout;
+        t.touch(live, later).unwrap();
+        assert_eq!(t.retire_expired(timeout, later), 1);
+        assert_eq!(
+            t.downstream_target(&data(3074, server, b"reply"), later),
+            Some((live, server))
+        );
+    }
+
+    #[test]
+    fn exhausted_pool_drops_packet_instead_of_reusing_port() {
+        let mut t = FlowTable::new(40000..=40000);
+        let now = Instant::now();
+        let server = addr("203.0.113.5:3074");
+
+        assert_eq!(t.touch(addr("192.168.1.10:3074"), now), Some(3074));
+        assert_eq!(t.touch(addr("192.168.1.11:3074"), now), Some(40000));
+        assert!(t
+            .upstream_packet(addr("192.168.1.12:3074"), server, b"c".to_vec(), now)
+            .is_none());
+        assert_eq!(t.len(), 2, "отброшенный пакет не оставляет флоу в таблице");
+    }
+
+    /// Входящий P2P: пакет пришёл от пира, которому мы не писали. Отдать его
+    /// надо владельцу туннельного порта, а спуфить адрес самого пира.
+    #[test]
+    fn incoming_p2p_goes_to_owner_of_tunnel_port() {
+        let mut t = table();
+        let now = Instant::now();
+        let server = addr("203.0.113.5:3074");
+        let console = addr("192.168.1.11:3074");
+        let peer = addr("198.51.100.7:51820");
+
+        t.touch(addr("192.168.1.10:3074"), now).unwrap();
+        let tunnel_port = t.touch(console, now).unwrap();
+        t.upstream_packet(console, server, b"a".to_vec(), now).unwrap();
+
+        assert_eq!(
+            t.downstream_target(&data(tunnel_port, peer, b"hi"), now),
+            Some((console, peer))
+        );
+    }
+
+    #[test]
+    fn reply_to_unknown_tunnel_port_is_dropped() {
+        let mut t = table();
+        let now = Instant::now();
+        let server = addr("203.0.113.5:3074");
+
+        t.touch(addr("192.168.1.10:3074"), now).unwrap();
+        assert_eq!(t.downstream_target(&data(3478, server, b"x"), now), None);
+    }
+
+    #[test]
+    fn reply_keeps_flow_alive() {
+        let mut t = table();
+        let now = Instant::now();
+        let server = addr("203.0.113.5:3074");
+        let console = addr("192.168.1.10:3074");
+        let timeout = Duration::from_secs(60);
+
+        t.touch(console, now).unwrap();
+        let later = now + timeout;
+        t.downstream_target(&data(3074, server, b"reply"), later);
+
+        assert_eq!(t.retire_expired(timeout, later), 0);
+    }
+
+    fn spoof_socket() -> Arc<std::net::UdpSocket> {
+        Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+    }
+
+    #[test]
+    fn spoof_socket_survives_under_traffic() {
+        let mut cache = SpoofCache::new();
+        let now = Instant::now();
+        let peer = addr("198.51.100.7:51820");
+        let timeout = Duration::from_secs(60);
+
+        cache.insert(peer, spoof_socket(), now);
+
+        // Пир отвечает раз в полминуты, сокет обязан дожить.
+        let mut t = now;
+        for _ in 0..4 {
+            t += timeout / 2;
+            assert!(cache.get(peer, t).is_some());
+            assert_eq!(cache.retire_idle(timeout, t), 0);
+        }
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn idle_spoof_socket_is_released() {
+        let mut cache = SpoofCache::new();
+        let now = Instant::now();
+        let quiet = addr("198.51.100.7:51820");
+        let live = addr("203.0.113.5:3074");
+        let timeout = Duration::from_secs(60);
+
+        cache.insert(quiet, spoof_socket(), now);
+        cache.insert(live, spoof_socket(), now);
+
+        let later = now + timeout;
+        cache.get(live, later).unwrap();
+        assert_eq!(cache.retire_idle(timeout, later), 1);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(quiet, later).is_none());
+        assert!(cache.get(live, later).is_some());
+    }
 }
