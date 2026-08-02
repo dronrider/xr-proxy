@@ -85,9 +85,11 @@ Invite bindings do **not** travel with the replacement, so repeat the
 `--invite` you used before (or set a default invite with a `--setup` token).
 The retired `share_id` leaves the hub together with whatever invites it hung
 on, and the agent cannot re-create those bindings: it never learns which
-invites carry a share, and the hub tells only an admin session. `share` says so
-on every replacement, and the new entry lands on the invites of that run alone;
-anything else is re-attached from the hub admin UI.
+invites carry a share, and the hub tells only an admin session. The new entry
+lands on the invites of that run alone; anything else is re-attached from the
+hub admin UI. `share` warns about the lost bindings when the entry it replaces
+had been attached at least once (the config remembers that much), so a plain
+invite-less share stays quiet.
 
 From a laptop the desktop harness mirrors `pull` for sending:
 
