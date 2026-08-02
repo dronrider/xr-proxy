@@ -7,6 +7,9 @@ mod release;
 mod signing;
 mod state;
 mod storage;
+// Логику build.rs держим отдельным файлом и подключаем её тестами (XR-238).
+#[cfg(test)]
+mod ui_dist;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -382,6 +385,12 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    if embed::UI_PLACEHOLDER {
+        tracing::warn!(
+            "admin UI не вшит, внутри заглушка: собрать cd xr-hub/admin-ui && npm ci && npm run build"
+        );
+    }
 
     let bind_addr: SocketAddr = hub_config
         .server

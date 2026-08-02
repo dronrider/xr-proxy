@@ -172,15 +172,25 @@ mod tests {
 
     // Голый путь без нашего маршрута отдавал бы страницу админки. Фиксируем, что
     // раньше туда и проваливалось: SPA-заглушка узнаётся по заголовку страницы.
+    // Собран admin UI или вшита заглушка (XR-238), решает build.rs, поэтому
+    // ответ сверяем с тем, что вшито.
     #[tokio::test]
     async fn unknown_path_still_serves_spa() {
         let resp = get("/no-such-route").await;
 
-        assert_eq!(resp.status(), StatusCode::OK);
+        let status = resp.status();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        assert!(
-            String::from_utf8_lossy(&body).contains("<title>xr-hub Admin</title>"),
-            "неизвестный путь должен отдавать SPA админки"
-        );
+        let body = String::from_utf8_lossy(&body).to_string();
+
+        if crate::embed::UI_PLACEHOLDER {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(body.contains("npm run build"), "заглушка молчит о сборке: {body}");
+        } else {
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                body.contains("<title>xr-hub Admin</title>"),
+                "неизвестный путь должен отдавать SPA админки"
+            );
+        }
     }
 }
