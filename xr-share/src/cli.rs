@@ -372,6 +372,7 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
             Ok(()) => println!("  прежняя запись {old} снята с хаба"),
             Err(e) => println!("  ! прежняя запись {old} осталась на хабе ({e}), сними её в админке"),
         }
+        println!("{}", retire_invite_notice(&invites));
     }
 
     // Attach to invites so their holders get access (the access anchor, п. 9.5).
@@ -951,6 +952,22 @@ fn upsert_share(shares: &mut Vec<ShareEntry>, entry: ShareEntry) -> Option<Strin
     }
 }
 
+/// Сказать вслух, что привязки вытесненной записи не переезжают на новую
+/// (XR-162). Перенести их нечем: агент не помнит, на каких инвайтах висел
+/// прежний `share_id`, а хаб такого списка ему не отдаёт (`attach`/`detach`
+/// ходят по токену инвайта, перечень инвайтов живёт за админской сессией).
+/// Молчать тут нельзя: вытеснение снимает прежнюю запись с хаба, и держатель
+/// инвайта теряет доступ к пути, ничего об этом не узнав.
+fn retire_invite_notice(attached: &[String]) -> &'static str {
+    if attached.is_empty() {
+        "  ! привязки прежней записи к инвайтам не переезжают, а новую привязать не к чему: \
+         повтори с --invite <токен>, иначе держатели инвайта шару не увидят"
+    } else {
+        "  ! привязки прежней записи к инвайтам не переезжают: новая висит только на инвайтах \
+         этого запуска, остальные привяжи заново"
+    }
+}
+
 fn same_path(a: &str, b: &str) -> bool {
     if a == b {
         return true;
@@ -1189,7 +1206,67 @@ mod tests {
         assert_eq!(cfg.import.unwrap().plugins[0].name, "свой");
     }
 
-    // -- повторный share того же пути (XR-162) --------------------------
+    #[test]
+    fn retire_invite_notice_names_the_lost_bindings() {
+        // Вытеснение без единого инвайта в этом запуске: доступ у держателей
+        // прежнего инвайта пропадает, команда обязана назвать выход.
+        let alone = retire_invite_notice(&[]);
+        assert!(alone.contains("--invite"), "подсказка называет флаг: {alone}");
+        // С инвайтами запуска предупреждение остаётся, но про остальные.
+        let attached = retire_invite_notice(&["inv".to_string()]);
+        assert!(attached.contains("остальные"), "предупреждение про прочие инвайты: {attached}");
+        assert_ne!(alone, attached);
+    }
+
+    #[test]
+    fn invites_prefer_explicit_then_default() {
+        // Explicit --invite wins and the default is ignored.
+        assert_eq!(
+            resolve_invites(&["a".into(), "b".into()], Some("def")),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // No explicit invite: fall back to the default from a setup token.
+        assert_eq!(resolve_invites(&[], Some("def")), vec!["def".to_string()]);
+        // Neither: no attach.
+        assert!(resolve_invites(&[], None).is_empty());
+    }
+}
+
+// regcheck:test-begin
+/// Повторный `share` того же пути (XR-162). Модуль отдельный и самодостаточный:
+/// его целиком переносит на базу `regcheck --inline`, поэтому зовёт он только
+/// то, что в базе уже есть.
+#[cfg(test)]
+mod share_upsert_tests {
+    use std::path::Path;
+
+    use crate::config::AgentConfig;
+
+    use super::{read_config, share, ShareArgs};
+
+    /// Конфиг агента с мандатом и без единой шары.
+    fn minimal_cfg() -> AgentConfig {
+        AgentConfig {
+            listen: "0.0.0.0:8443".into(),
+            hub_pubkey: "QQ==".into(),
+            hub_url: None,
+            agent_credential: Some("mandate".into()),
+            identity_key: None,
+            tls: None,
+            relay: None,
+            default_invite: None,
+            max_file_mb: None,
+            import: None,
+            shares: Vec::new(),
+            dir: None,
+            share_id: None,
+        }
+    }
+
+    fn write_cfg(path: &Path, cfg: &AgentConfig) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, toml::to_string(cfg).unwrap()).unwrap();
+    }
 
     /// Хаб-заглушка на живом TCP: `share` ходит к ней настоящим ureq, поэтому в
     /// тест попадает и разбор ответа, и то, какие запросы команда реально шлёт.
@@ -1235,6 +1312,20 @@ mod tests {
                 }
             });
             Self { url, seen }
+        }
+
+        /// Пары (share_id, инвайт), которые команда просила связать.
+        fn attached(&self) -> Vec<(String, String)> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(path, _)| path.ends_with("/share/attach"))
+                .map(|(_, body)| {
+                    let field = |k: &str| body[k].as_str().unwrap_or_default().to_string();
+                    (field("share_id"), field("invite_token"))
+                })
+                .collect()
         }
 
         /// share_id, которые команда просила снять с индекса хаба.
@@ -1343,6 +1434,46 @@ mod tests {
         let third = read_config(&cfg_path).unwrap();
         assert_eq!(third.shares.len(), 2);
         assert_eq!(hub.unshared(), vec!["s1".to_string()]);
+        // Ни одного инвайта в запуске: привязывать нечего и не к чему, а
+        // привязки снятой записи на хабе не остаётся. Про это команда
+        // предупреждает отдельной строкой (`retire_invite_notice`).
+        assert!(hub.attached().is_empty());
+    }
+
+    // Вытеснение уносит с хаба и привязку прежней записи к инвайту, перенести
+    // её нечем: агент не знает, на каких инвайтах она висела, а хаб такого
+    // списка не отдаёт. Держится доступ на том, что повторный `share`
+    // привязывает новую запись к инвайтам своего запуска, и вот это обязано
+    // работать при обновлении так же, как при первой регистрации.
+    #[test]
+    fn share_update_attaches_new_entry_to_its_invites() {
+        let hub = FakeHub::start();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        cfg_on_hub(&hub, &cfg_path);
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+
+        let with_invite = || {
+            let mut args = share_args(data.to_str().unwrap(), false);
+            args.invites = vec!["invTok".to_string()];
+            args
+        };
+        share(&cfg_path, with_invite()).unwrap();
+        share(&cfg_path, with_invite()).unwrap();
+
+        let cfg = read_config(&cfg_path).unwrap();
+        assert_eq!(cfg.shares.len(), 1);
+        assert_eq!(cfg.shares[0].share_id, "s2");
+        assert_eq!(hub.unshared(), vec!["s1".to_string()]);
+        assert_eq!(
+            hub.attached(),
+            vec![
+                ("s1".to_string(), "invTok".to_string()),
+                ("s2".to_string(), "invTok".to_string()),
+            ],
+            "обновлённая запись обязана лечь на тот же инвайт, иначе доступ пропадает"
+        );
     }
 
     // Путь в конфиге может быть записан не канонически (симлинк на ту же
@@ -1372,17 +1503,5 @@ mod tests {
         assert_eq!(after.shares[0].share_id, "s2");
         assert_eq!(hub.unshared(), vec!["s1".to_string()]);
     }
-
-    #[test]
-    fn invites_prefer_explicit_then_default() {
-        // Explicit --invite wins and the default is ignored.
-        assert_eq!(
-            resolve_invites(&["a".into(), "b".into()], Some("def")),
-            vec!["a".to_string(), "b".to_string()]
-        );
-        // No explicit invite: fall back to the default from a setup token.
-        assert_eq!(resolve_invites(&[], Some("def")), vec!["def".to_string()]);
-        // Neither: no attach.
-        assert!(resolve_invites(&[], None).is_empty());
-    }
 }
+// regcheck:test-end
