@@ -23,6 +23,8 @@ Language: Rust (core / server / OpenWRT client) + Kotlin (Android). All communic
 
 **IMPORTANT**: Before every commit, run `cargo test --workspace` AND verify zero warnings with `cargo test --workspace 2>&1 | grep "warning:" | grep -v "generated"`. Do NOT commit code with warnings.
 
+Свежий чекаут собирается и тестируется без npm: `admin-ui/dist` гитигнорен, и в отладочной сборке `xr-hub/build.rs` вшивает вместо него заглушку (XR-238), а хаб с ней отвечает `503` на весь admin UI. Релизный бинарь по-прежнему требует `cd xr-hub/admin-ui && npm ci && npm run build`.
+
 ```bash
 # Run all tests
 cargo test --workspace
