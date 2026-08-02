@@ -349,16 +349,30 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
         cfg.relay = Some(crate::config::RelayAgentConfig::from_descriptor(&desc));
     }
 
-    // Persist the share locally; the running agent hot-reloads it.
+    // Persist the share locally; the running agent hot-reloads it. Тот же путь
+    // обновляет свою запись, а не заводит вторую (XR-162).
     normalize_legacy(&mut cfg);
-    cfg.shares.push(ShareEntry {
-        share_id: share_id.clone(),
-        path: canon.display().to_string(),
-        name: Some(name.clone()),
-        writable: args.writable,
-        import: args.import,
-    });
+    let retired = upsert_share(
+        &mut cfg.shares,
+        ShareEntry {
+            share_id: share_id.clone(),
+            path: canon.display().to_string(),
+            name: Some(name.clone()),
+            writable: args.writable,
+            import: args.import,
+        },
+    );
     write_config(config_path, &cfg)?;
+
+    // Прежняя регистрация того же пути уходит с хаба: иначе в индексе висят два
+    // share_id на одну папку, потребитель видит её дважды, а снятое `--writable`
+    // остаётся в силе через старую привязку.
+    if let Some(old) = &retired {
+        match hub_unshare(&hub, &cred, old) {
+            Ok(()) => println!("  прежняя запись {old} снята с хаба"),
+            Err(e) => println!("  ! прежняя запись {old} осталась на хабе ({e}), сними её в админке"),
+        }
+    }
 
     // Attach to invites so their holders get access (the access anchor, п. 9.5).
     // A writable share carries the write flag, so the hub mints share:write for
@@ -377,7 +391,8 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     }
 
     let kind = if canon.is_file() { "файл" } else { "папка" };
-    println!("✓ Шара добавлена ({kind}): {name}");
+    let verb = if retired.is_some() { "обновлена" } else { "добавлена" };
+    println!("✓ Шара {verb} ({kind}): {name}");
     println!("  путь:     {}", canon.display());
     println!("  share_id: {share_id}");
     println!("  адрес:    {addr}:{port}");
@@ -912,6 +927,41 @@ fn write_config(path: &Path, cfg: &AgentConfig) -> Result<()> {
     setup::write_private(path, text.as_bytes())
 }
 
+/// Положить шару в список так, чтобы на один путь была ровно одна запись
+/// (XR-162). Повторный `share` того же пути обновляет прежнюю запись, на этом
+/// стоит заявленная семантика «`share` без `--writable` выключает запись»:
+/// вторая запись оставила бы рядом старую, с её правом на запись и своим
+/// share_id. Возвращает вытесненный `share_id`, когда он сменился, чтобы
+/// вызывающий снял его с хаба.
+///
+/// Пути сравниваются канонизированными, как их разрешает сам агент
+/// (`safepath`), поэтому хвостовой слеш и симлинк ведут к той же записи.
+/// Путь, который больше не канонизируется (папку унесли), сравнивается как
+/// записан: иначе две пропавшие шары схлопнулись бы в одну.
+fn upsert_share(shares: &mut Vec<ShareEntry>, entry: ShareEntry) -> Option<String> {
+    match shares.iter().position(|s| same_path(&s.path, &entry.path)) {
+        Some(idx) => {
+            let old = std::mem::replace(&mut shares[idx], entry);
+            (old.share_id != shares[idx].share_id).then_some(old.share_id)
+        }
+        None => {
+            shares.push(entry);
+            None
+        }
+    }
+}
+
+fn same_path(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let canon = |p: &str| Path::new(p).canonicalize().ok();
+    match (canon(a), canon(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// Fold a legacy single-share (`dir` + `share_id`) into the `[[share]]` list and
 /// clear the legacy fields, so the rewritten config is pure v2.
 fn normalize_legacy(cfg: &mut AgentConfig) {
@@ -1137,6 +1187,190 @@ mod tests {
         cfg.import = Some(custom);
         bootstrap_import(&mut cfg, &|_| false).unwrap();
         assert_eq!(cfg.import.unwrap().plugins[0].name, "свой");
+    }
+
+    // -- повторный share того же пути (XR-162) --------------------------
+
+    /// Хаб-заглушка на живом TCP: `share` ходит к ней настоящим ureq, поэтому в
+    /// тест попадает и разбор ответа, и то, какие запросы команда реально шлёт.
+    /// Каждый `share/add` выдаёт следующий по счёту share_id.
+    struct FakeHub {
+        url: String,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    impl FakeHub {
+        fn start() -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorder = seen.clone();
+            std::thread::spawn(move || {
+                let mut issued = 0u32;
+                for sock in listener.incoming() {
+                    let Ok(mut sock) = sock else { return };
+                    let (path, body) = read_request(&mut sock);
+                    let reply = if path.ends_with("/share/add") {
+                        issued += 1;
+                        serde_json::json!({
+                            "share_id": format!("s{issued}"),
+                            "addr": "198.51.100.7",
+                            "port": 8443,
+                            "token": "accessTok",
+                            "exp": 0,
+                        })
+                    } else {
+                        serde_json::json!({})
+                    };
+                    recorder.lock().unwrap().push((path, body));
+                    let text = reply.to_string();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        text.len()
+                    );
+                    use std::io::Write;
+                    let _ = sock.write_all(head.as_bytes());
+                    let _ = sock.write_all(text.as_bytes());
+                    let _ = sock.flush();
+                }
+            });
+            Self { url, seen }
+        }
+
+        /// share_id, которые команда просила снять с индекса хаба.
+        fn unshared(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(path, _)| path.ends_with("/share/unshare"))
+                .map(|(_, body)| body["share_id"].as_str().unwrap_or_default().to_string())
+                .collect()
+        }
+    }
+
+    /// Прочитать запрос заглушки: путь из стартовой строки и тело по
+    /// content-length.
+    fn read_request(sock: &mut std::net::TcpStream) -> (String, serde_json::Value) {
+        use std::io::Read;
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let mut split = None;
+        while split.is_none() {
+            match sock.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            }
+            split = raw.windows(4).position(|w| w == b"\r\n\r\n");
+        }
+        let Some(split) = split else { return (String::new(), serde_json::Value::Null) };
+        let head = String::from_utf8_lossy(&raw[..split]).to_string();
+        let path = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_default()
+            .to_string();
+        let len: usize = head
+            .lines()
+            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_string()))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut body = raw[split + 4..].to_vec();
+        while body.len() < len {
+            match sock.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => body.extend_from_slice(&chunk[..n]),
+            }
+        }
+        (path, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+    }
+
+    fn share_args(path: &str, writable: bool) -> ShareArgs {
+        ShareArgs {
+            path: path.to_string(),
+            name: None,
+            addr: Some("198.51.100.7".into()),
+            ttl: None,
+            invites: Vec::new(),
+            relay: false,
+            no_relay: true,
+            writable,
+            import: false,
+        }
+    }
+
+    /// Конфиг с мандатом на заглушку и пустым списком шар.
+    fn cfg_on_hub(hub: &FakeHub, path: &Path) {
+        let mut cfg = minimal_cfg();
+        cfg.shares.clear();
+        cfg.hub_url = Some(hub.url.clone());
+        write_cfg(path, &cfg);
+    }
+
+    // Инцидент XR-162: `share` того же пути заводил вторую запись вместо
+    // обновления прежней. Рядом оставались две регистрации одной папки, и
+    // заявленное «повторный `share` без `--writable` выключает запись»
+    // не работало: старая запись с правом записи никуда не девалась.
+    #[test]
+    fn share_same_path_updates_its_entry() {
+        let hub = FakeHub::start();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        cfg_on_hub(&hub, &cfg_path);
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let data_arg = data.to_str().unwrap().to_string();
+
+        share(&cfg_path, share_args(&data_arg, true)).unwrap();
+        let first = read_config(&cfg_path).unwrap();
+        assert_eq!(first.shares.len(), 1);
+        assert_eq!(first.shares[0].share_id, "s1");
+        assert!(first.shares[0].writable);
+        assert!(hub.unshared().is_empty(), "первой шаре нечего вытеснять");
+
+        share(&cfg_path, share_args(&data_arg, false)).unwrap();
+        let second = read_config(&cfg_path).unwrap();
+        assert_eq!(second.shares.len(), 1, "повторный share того же пути не должен плодить дубль");
+        assert_eq!(second.shares[0].share_id, "s2");
+        assert!(!second.shares[0].writable, "share без --writable выключает запись");
+        assert_eq!(hub.unshared(), vec!["s1".to_string()], "прежняя запись снимается с хаба");
+
+        // Другой путь это отдельная шара, дедуп её не съедает.
+        let other = dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        share(&cfg_path, share_args(other.to_str().unwrap(), false)).unwrap();
+        let third = read_config(&cfg_path).unwrap();
+        assert_eq!(third.shares.len(), 2);
+        assert_eq!(hub.unshared(), vec!["s1".to_string()]);
+    }
+
+    // Путь в конфиге может быть записан не канонически (симлинк на ту же
+    // папку, ручная правка): агент разрешает его через canonicalize, дедуп
+    // обязан считать так же, иначе одна папка снова получает две записи.
+    #[cfg(unix)]
+    #[test]
+    fn share_dedups_through_symlinked_path() {
+        let hub = FakeHub::start();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        cfg_on_hub(&hub, &cfg_path);
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&data, &link).unwrap();
+
+        share(&cfg_path, share_args(link.to_str().unwrap(), false)).unwrap();
+        // Запись, как её мог оставить прежний конфиг: путь через симлинк.
+        let mut cfg = read_config(&cfg_path).unwrap();
+        cfg.shares[0].path = link.display().to_string();
+        write_cfg(&cfg_path, &cfg);
+
+        share(&cfg_path, share_args(data.to_str().unwrap(), false)).unwrap();
+        let after = read_config(&cfg_path).unwrap();
+        assert_eq!(after.shares.len(), 1, "симлинк и настоящий путь это одна шара");
+        assert_eq!(after.shares[0].share_id, "s2");
+        assert_eq!(hub.unshared(), vec!["s1".to_string()]);
     }
 
     #[test]
