@@ -185,13 +185,36 @@ async fn peek_sni_from_rx(
     data_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
     timeout: Duration,
 ) -> (Option<String>, Vec<u8>) {
-    match tokio::time::timeout(timeout, data_rx.recv()).await {
-        Ok(Some(data)) if !data.is_empty() => {
-            let sni = xr_proto::sni::extract_sni(&data);
-            (sni, data)
+    let mut buf = match tokio::time::timeout(timeout, data_rx.recv()).await {
+        Ok(Some(data)) if !data.is_empty() => data,
+        _ => return (None, Vec::new()),
+    };
+
+    // Одного сообщения на ClientHello хватает не всегда: с постквантовым
+    // обменом ключами он перестал влезать в сегмент и приезжает кусками. Ждём
+    // остаток по длине из заголовка рекорда, столько же, сколько ждали первые
+    // байты. Не-TLS и уже собранный рекорд из цикла выходят сразу, поэтому
+    // сырые протоколы за это ожидание не платят.
+    let deadline = tokio::time::Instant::now() + timeout;
+    while let Some(want) = xr_proto::sni::client_hello_record_len(&buf) {
+        if buf.len() >= want {
+            break;
         }
-        _ => (None, Vec::new()),
+        match tokio::time::timeout_at(deadline, data_rx.recv()).await {
+            Ok(Some(data)) => buf.extend_from_slice(&data),
+            _ => {
+                tracing::warn!(
+                    "SNI: ClientHello не собрался, {} байт из {}, маршрут по IP",
+                    buf.len(),
+                    want
+                );
+                break;
+            }
+        }
     }
+
+    let sni = xr_proto::sni::extract_sni(&buf);
+    (sni, buf)
 }
 
 /// Spawn a relay task with a pre-resolved domain.
@@ -808,6 +831,38 @@ mod tests {
         // Initial_data must be preserved byte-for-byte — otherwise the target
         // would see a truncated TLS handshake and the connection would stall.
         assert_eq!(data, hello);
+    }
+
+    /// ClientHello приехал двумя сообщениями: одного мало, имя лежит во
+    /// втором. Без дочитывания соединение уходило действием по умолчанию.
+    #[tokio::test]
+    async fn peek_sni_gathers_fragmented_client_hello() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let hello = make_client_hello("chat.signal.org");
+        let cut = 20;
+        tx.send(hello[..cut].to_vec()).await.unwrap();
+        tx.send(hello[cut..].to_vec()).await.unwrap();
+
+        let (sni, data) = peek_sni_from_rx(&mut rx, Duration::from_millis(100)).await;
+        assert_eq!(sni.as_deref(), Some("chat.signal.org"));
+        // Релею уходит весь ClientHello, а не только первое сообщение.
+        assert_eq!(data, hello);
+    }
+
+    /// Хвост так и не пришёл: ждём не дольше своего предела, отдаём собранное
+    /// и оставляем решение по IP.
+    #[tokio::test]
+    async fn peek_sni_gives_up_on_missing_tail() {
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let hello = make_client_hello("chat.signal.org");
+        let head = hello[..20].to_vec();
+        _tx.send(head.clone()).await.unwrap();
+
+        let started = tokio::time::Instant::now();
+        let (sni, data) = peek_sni_from_rx(&mut rx, Duration::from_millis(50)).await;
+        assert!(sni.is_none());
+        assert_eq!(data, head);
+        assert!(started.elapsed() < Duration::from_millis(500), "ждали {:?}", started.elapsed());
     }
 
     #[tokio::test]
