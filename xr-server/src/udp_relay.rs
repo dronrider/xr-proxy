@@ -6,58 +6,37 @@ use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, Notify};
-use tokio::time::{interval, Duration};
+use tokio::sync::{mpsc, Mutex};
+use tokio::time::Duration;
 use xr_proto::obfuscation::Obfuscator;
 use xr_proto::udp_relay::{self, RelayPacket, RelayType};
 
 // -- Flow table -------------------------------------------------------
 
-/// Active outbound socket bound to a specific source port.
-struct BoundPort {
-    socket: Arc<UdpSocket>,
-    #[allow(dead_code)]
-    src_port: u16,
-    last_activity: Instant,
+/// Сколько пакетов держит очередь одного потока. Запас нужен на время bind:
+/// пока сокет поднимается, приём продолжает складывать сюда пакеты. Дальше
+/// таск разгребает очередь быстрее, чем она набирается, а переполнение значит,
+/// что назначение не успевает принимать - такой пакет отбрасываем, как отбросил
+/// бы его любой промежуточный узел.
+const FLOW_QUEUE: usize = 64;
+
+/// Пакет из туннеля, поставленный в очередь своему потоку.
+struct FlowPacket {
+    dst: SocketAddr,
+    payload: Vec<u8>,
 }
 
-/// Состояние слота src_port. Пока сокет поднимается, слот застолблён
-/// `Binding`, и остальные пакеты того же src_port ждут его через `Notify`
-/// вместо параллельного bind (XR-200: второй insert затирал `BoundPort`
-/// первого, тот сокет вместе со своим receiver-таском выпадал из таблицы и
-/// тёк до idle timeout).
-enum PortState {
-    Binding(Arc<Notify>),
-    Bound(BoundPort),
-}
-
-/// A known remote endpoint for reverse mapping.
-#[derive(Clone, Hash, Eq, PartialEq)]
-struct RemoteKey {
-    remote_addr: SocketAddr,
-    local_port: u16,
-}
-
-struct FlowTable {
-    /// src_port -> состояние привязки для исходящих
-    bound_ports: HashMap<u16, PortState>,
-    /// (remote_addr, local_port) -> client src_port for incoming
-    reverse_map: HashMap<RemoteKey, u16>,
-}
-
-impl FlowTable {
-    fn new() -> Self {
-        Self {
-            bound_ports: HashMap::new(),
-            reverse_map: HashMap::new(),
-        }
-    }
+/// Поток одного src_port со стороны таблицы: только отправной конец очереди.
+/// Сокет и его судьба целиком у таска потока, поэтому владелец сокета всегда
+/// ровно один и второй bind того же src_port сделать просто некому.
+struct Flow {
+    tx: mpsc::Sender<FlowPacket>,
 }
 
 struct ServerState {
-    flows: Mutex<FlowTable>,
+    /// src_port -> очередь его потока
+    flows: Mutex<HashMap<u16, Flow>>,
     obfuscator: Obfuscator,
     router_addr: Mutex<Option<SocketAddr>>,
     flow_timeout: Duration,
@@ -81,22 +60,12 @@ pub async fn run_udp_relay_server(
     tracing::info!("UDP relay server listening on {}", listen_addr);
 
     let state = Arc::new(ServerState {
-        flows: Mutex::new(FlowTable::new()),
+        flows: Mutex::new(HashMap::new()),
         obfuscator,
         router_addr: Mutex::new(None),
         flow_timeout: Duration::from_secs(flow_timeout_sec),
         incoming_port_min,
         incoming_port_max,
-    });
-
-    // Cleanup expired flows
-    let clean_state = state.clone();
-    tokio::spawn(async move {
-        let mut timer = interval(Duration::from_secs(30));
-        loop {
-            timer.tick().await;
-            cleanup_flows(&clean_state).await;
-        }
     });
 
     // Main receive loop from router
@@ -131,203 +100,157 @@ pub async fn run_udp_relay_server(
                 let _ = relay_socket.send_to(&reply, peer_addr).await;
             }
             RelayType::Data => {
-                handle_data_packet(
-                    &state,
-                    &relay_socket,
-                    peer_addr,
-                    packet,
-                ).await;
+                handle_data_packet(&state, &relay_socket, packet, bind_source_port).await;
             }
             _ => {}
         }
     }
 }
 
-/// Handle an incoming data packet from the router.
-async fn handle_data_packet(
+/// Положить пакет в очередь его потока, подняв поток, если пакет первый.
+/// Ждать тут нечего: bind нового src_port уходит внутрь таска, и приём
+/// продолжает разбирать пакеты остальных потоков, пока сокет поднимается.
+/// Очередь заводится и попадает в таблицу под тем же локом, под которым в неё
+/// кладут пакеты, поэтому порядок внутри потока сохраняется, а два первых
+/// пакета одного src_port не могут завести себе по потоку.
+async fn handle_data_packet<F, Fut>(
     state: &Arc<ServerState>,
     relay_socket: &Arc<UdpSocket>,
-    _router_addr: SocketAddr,
     packet: RelayPacket,
-) {
+    bind: F,
+) where
+    F: FnOnce(u16) -> Fut + Send + 'static,
+    Fut: Future<Output = io::Result<UdpSocket>> + Send,
+{
     let src_port = packet.src_port;
-    let dst = packet.dst;
-
-    {
-        let mut flows = state.flows.lock().await;
-        let rkey = RemoteKey {
-            remote_addr: dst,
-            local_port: src_port,
-        };
-        flows.reverse_map.insert(rkey, src_port);
-    }
-
-    let send_socket = match acquire_bound_socket(state, relay_socket, src_port, bind_source_port).await {
-        Some(sock) => sock,
-        None => return,
+    let queued = FlowPacket {
+        dst: packet.dst,
+        payload: packet.payload,
     };
 
-    // Send the original payload to the real destination
-    if let Err(e) = send_socket.send_to(&packet.payload, dst).await {
-        tracing::warn!("UDP relay: send to {} failed: {}", dst, e);
+    let mut flows = state.flows.lock().await;
+    let tx = match flows.get(&src_port) {
+        Some(flow) => flow.tx.clone(),
+        None => {
+            let (tx, rx) = mpsc::channel(FLOW_QUEUE);
+            flows.insert(src_port, Flow { tx: tx.clone() });
+
+            let flow_state = state.clone();
+            let flow_relay = relay_socket.clone();
+            tokio::spawn(async move {
+                run_flow(flow_state, flow_relay, src_port, rx, bind).await;
+            });
+            tx
+        }
+    };
+
+    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(queued) {
+        tracing::debug!("UDP relay: flow {} queue full, packet dropped", src_port);
     }
 }
 
-/// Вернуть сокет, привязанный к `src_port`, поднимая его при необходимости.
-/// Пакет, заставший слот пустым, резервирует его состоянием `Binding` и
-/// сам выполняет bind; все остальные пакеты того же src_port, пришедшие
-/// параллельно, застают резервацию и ждут её завершения через `Notify`
-/// вместо собственного bind (XR-200: без резервации второй insert затирал
-/// `BoundPort` первого, и его сокет с receiver-таском тёк до idle timeout).
-async fn acquire_bound_socket<F, Fut>(
-    state: &Arc<ServerState>,
-    relay_socket: &Arc<UdpSocket>,
+/// Что случилось с потоком раньше: пакет из туннеля наружу либо ответ из
+/// интернета обратно роутеру.
+enum FlowEvent {
+    /// `None` значит, что слот потока сняли и класть в очередь больше некому.
+    Outbound(Option<FlowPacket>),
+    Inbound(io::Result<(usize, SocketAddr)>),
+}
+
+/// Таск одного потока: поднимает сокет на src_port и дальше сам гоняет обе
+/// стороны, пока поток жив. Наружу отправляет пакеты из очереди по порядку,
+/// обратно заворачивает ответы роутеру. Слот в таблице снимает он же, так что
+/// осиротеть сокету не с чего: сокет умирает вместе с таском.
+async fn run_flow<F, Fut>(
+    state: Arc<ServerState>,
+    relay_socket: Arc<UdpSocket>,
     src_port: u16,
+    mut rx: mpsc::Receiver<FlowPacket>,
     bind: F,
-) -> Option<Arc<UdpSocket>>
-where
+) where
     F: FnOnce(u16) -> Fut,
     Fut: Future<Output = io::Result<UdpSocket>>,
 {
-    // Цикл крутится, только пока слот занят чужой резервацией; bind вызывается
-    // ровно один раз - в итерации, которая застаёт слот пустым и сама его
-    // резервирует.
-    loop {
-        let notify = {
-            let mut flows = state.flows.lock().await;
-            match flows.bound_ports.get_mut(&src_port) {
-                Some(PortState::Bound(bp)) => {
-                    bp.last_activity = Instant::now();
-                    return Some(bp.socket.clone());
-                }
-                Some(PortState::Binding(notify)) => Some(notify.clone()),
-                None => {
-                    flows
-                        .bound_ports
-                        .insert(src_port, PortState::Binding(Arc::new(Notify::new())));
-                    None
-                }
-            }
-        };
-
-        if let Some(notify) = notify {
-            // Слот уже застолблён другим пакетом - ждём его bind и переиспользуем
-            // готовый сокет вместо параллельного собственного.
-            notify.notified().await;
-            continue;
-        }
-        break;
-    }
-
-    // Слот застолблён этим вызовом - поднимаем сокет вне блокировки таблицы.
-    match bind(src_port).await {
-        Ok(sock) => {
-            let sock = Arc::new(sock);
-            let recv_sock = sock.clone();
-
-            let recv_state = state.clone();
-            let recv_relay = relay_socket.clone();
-            tokio::spawn(async move {
-                if let Err(e) = bound_port_receiver(recv_sock, src_port, recv_state, recv_relay).await {
-                    tracing::debug!("Bound port {} receiver ended: {}", src_port, e);
-                }
-            });
-
-            let mut flows = state.flows.lock().await;
-            let prev = flows.bound_ports.insert(
-                src_port,
-                PortState::Bound(BoundPort {
-                    socket: sock.clone(),
-                    src_port,
-                    last_activity: Instant::now(),
-                }),
-            );
-            if let Some(PortState::Binding(notify)) = prev {
-                notify.notify_waiters();
-            }
-            tracing::info!("UDP relay: bound source port {}", src_port);
-            Some(sock)
-        }
+    let socket = match bind(src_port).await {
+        Ok(sock) => sock,
         Err(e) => {
             tracing::warn!("UDP relay: failed to bind port {}: {}", src_port, e);
-            let mut flows = state.flows.lock().await;
-            if let Some(PortState::Binding(notify)) = flows.bound_ports.remove(&src_port) {
-                notify.notify_waiters();
-            }
-            None
+            // Слот снимаем сразу, иначе очередь копила бы пакеты в никуда:
+            // забирать их некому, а новый поток на этот src_port уже не завести.
+            state.flows.lock().await.remove(&src_port);
+            return;
         }
-    }
-}
+    };
+    tracing::info!("UDP relay: bound source port {}", src_port);
 
-/// Receiver task for a bound source port.
-/// Listens for responses from the internet and relays them back to the router.
-async fn bound_port_receiver(
-    socket: Arc<UdpSocket>,
-    src_port: u16,
-    state: Arc<ServerState>,
-    relay_socket: Arc<UdpSocket>,
-) -> io::Result<()> {
     let mut buf = vec![0u8; 65536];
-
     loop {
-        let result = tokio::time::timeout(
-            state.flow_timeout,
-            socket.recv_from(&mut buf),
-        ).await;
-
-        let (n, from_addr) = match result {
-            Ok(Ok((n, addr))) => (n, addr),
-            Ok(Err(e)) => {
-                tracing::debug!("Bound port {} recv error: {}", src_port, e);
-                continue;
+        let tick = tokio::time::timeout(state.flow_timeout, async {
+            tokio::select! {
+                queued = rx.recv() => FlowEvent::Outbound(queued),
+                res = socket.recv_from(&mut buf) => FlowEvent::Inbound(res),
             }
+        })
+        .await;
+
+        let event = match tick {
+            Ok(event) => event,
             Err(_) => {
-                // Timeout - port is idle, will be cleaned up
-                tracing::debug!("Bound port {} idle timeout", src_port);
-                return Ok(());
-            }
-        };
-
-        if n == 0 {
-            continue;
-        }
-
-        // Get router address
-        let router_addr = {
-            let ra = state.router_addr.lock().await;
-            match *ra {
-                Some(addr) => addr,
-                None => {
-                    tracing::debug!("No router address known, dropping response");
-                    continue;
+                // Простой дольше flow_timeout. Уходим под локом таблицы и там же
+                // перепроверяем очередь: класть в неё можно только с этим локом,
+                // поэтому пакет, проскочивший в последний момент, не теряется.
+                let mut flows = state.flows.lock().await;
+                match rx.try_recv() {
+                    Ok(queued) => FlowEvent::Outbound(Some(queued)),
+                    Err(_) => {
+                        flows.remove(&src_port);
+                        tracing::info!(
+                            "UDP relay: released port {} ({} active)",
+                            src_port,
+                            flows.len()
+                        );
+                        return;
+                    }
                 }
             }
         };
 
-        // Wrap response and send back to router
-        let response = RelayPacket {
-            relay_type: RelayType::Data,
-            dst: from_addr,
-            src_port,
-            payload: buf[..n].to_vec(),
-        };
-        let wire = udp_relay::encode_relay_packet(&state.obfuscator, &response);
-        if let Err(e) = relay_socket.send_to(&wire, router_addr).await {
-            tracing::warn!("UDP relay: send response to router failed: {}", e);
-        }
-
-        // Update flow activity
-        {
-            let mut flows = state.flows.lock().await;
-            if let Some(PortState::Bound(bp)) = flows.bound_ports.get_mut(&src_port) {
-                bp.last_activity = Instant::now();
+        match event {
+            FlowEvent::Outbound(Some(queued)) => {
+                if let Err(e) = socket.send_to(&queued.payload, queued.dst).await {
+                    tracing::warn!("UDP relay: send to {} failed: {}", queued.dst, e);
+                }
             }
-            // Update reverse mapping for this remote
-            let rkey = RemoteKey {
-                remote_addr: from_addr,
-                local_port: src_port,
-            };
-            flows.reverse_map.insert(rkey, src_port);
+            FlowEvent::Outbound(None) => return,
+            FlowEvent::Inbound(Ok((n, from_addr))) => {
+                if n == 0 {
+                    continue;
+                }
+
+                let router_addr = *state.router_addr.lock().await;
+                let router_addr = match router_addr {
+                    Some(addr) => addr,
+                    None => {
+                        tracing::debug!("No router address known, dropping response");
+                        continue;
+                    }
+                };
+
+                // Wrap response and send back to router
+                let response = RelayPacket {
+                    relay_type: RelayType::Data,
+                    dst: from_addr,
+                    src_port,
+                    payload: buf[..n].to_vec(),
+                };
+                let wire = udp_relay::encode_relay_packet(&state.obfuscator, &response);
+                if let Err(e) = relay_socket.send_to(&wire, router_addr).await {
+                    tracing::warn!("UDP relay: send response to router failed: {}", e);
+                }
+            }
+            FlowEvent::Inbound(Err(e)) => {
+                tracing::debug!("Bound port {} recv error: {}", src_port, e);
+            }
         }
     }
 }
@@ -357,112 +280,297 @@ async fn bind_source_port(port: u16) -> io::Result<UdpSocket> {
     }
 }
 
-/// Remove expired flows and their bound sockets.
-async fn cleanup_flows(state: &ServerState) {
-    let mut flows = state.flows.lock().await;
-    let timeout = state.flow_timeout;
-
-    let expired: Vec<u16> = flows
-        .bound_ports
-        .iter()
-        .filter_map(|(port, ps)| match ps {
-            PortState::Bound(bp) if bp.last_activity.elapsed() > timeout => Some(*port),
-            _ => None,
-        })
-        .collect();
-
-    for port in &expired {
-        flows.bound_ports.remove(port);
-        flows.reverse_map.retain(|_, src| src != port);
-        tracing::debug!("UDP relay: released port {}", port);
-    }
-
-    if !expired.is_empty() {
-        tracing::info!(
-            "UDP relay: cleaned {} expired ports ({} active)",
-            expired.len(),
-            flows.bound_ports.len()
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::oneshot;
+    use tokio::time::timeout;
     use xr_proto::obfuscation::{ModifierStrategy, Obfuscator};
 
-    fn test_state() -> Arc<ServerState> {
+    /// Запас на ожидание в тестах: успешный путь до него не доходит, а на
+    /// сломанном коде тест обязан упасть, а не повиснуть.
+    const WAIT: Duration = Duration::from_secs(5);
+
+    fn test_state(flow_timeout: Duration) -> Arc<ServerState> {
         Arc::new(ServerState {
-            flows: Mutex::new(FlowTable::new()),
+            flows: Mutex::new(HashMap::new()),
             obfuscator: Obfuscator::new(b"test-key".to_vec(), 7, ModifierStrategy::PositionalXorRotate),
             router_addr: Mutex::new(None),
-            flow_timeout: Duration::from_secs(60),
+            flow_timeout,
             incoming_port_min: 0,
             incoming_port_max: 0,
         })
     }
 
-    /// XR-200: два первых пакета одного src_port застают слот пустым
-    /// одновременно. До фикса каждый поднимал свой сокет и второй insert в
-    /// bound_ports затирал BoundPort первого - тот сокет вместе со своим
-    /// receiver-таском выпадал из таблицы и жил до idle timeout, никем не
-    /// используемый. Тест держит первый bind в подвешенном состоянии и
-    /// проверяет, что второй вызов в это время не поднимает собственный
-    /// сокет, а дожидается первого и переиспользует его.
+    async fn local_socket() -> Arc<UdpSocket> {
+        Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap())
+    }
+
+    fn data_packet(src_port: u16, dst: SocketAddr, payload: &[u8]) -> RelayPacket {
+        RelayPacket {
+            relay_type: RelayType::Data,
+            dst,
+            src_port,
+            payload: payload.to_vec(),
+        }
+    }
+
+    /// В бою сокет потока садится на настоящий src_port, но в тестах порт
+    /// берём эфемерный: конкретный номер ничего не проверяет, а занять его на
+    /// машине могли и без нас.
+    async fn bind_ephemeral() -> io::Result<UdpSocket> {
+        UdpSocket::bind("127.0.0.1:0").await
+    }
+
+    /// Дождаться, когда таск потока снимет свой слот. Ждём на мок-часах: пауза
+    /// между опросами настоящего времени не тратит, зато отпускает рантайм и
+    /// даёт таску дойти до своего шага.
+    async fn wait_slot_released(state: &Arc<ServerState>, src_port: u16) {
+        timeout(WAIT, async {
+            while state.flows.lock().await.contains_key(&src_port) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("слот потока обязан освободиться");
+    }
+
+    /// XR-200: приём не должен ждать bind. Раньше пакет обрабатывался прямо в
+    /// теле цикла recv_from, поэтому первый пакет нового src_port останавливал
+    /// relay целиком: пока поднимался его сокет, пакеты всех остальных потоков
+    /// лежали в буфере и ждали. Тест держит bind первого потока подвешенным и
+    /// проверяет, что второй поток за это время успевает подняться.
+    #[tokio::test(start_paused = true)]
+    async fn slow_bind_does_not_block_other_flows() {
+        let state = test_state(Duration::from_secs(3600));
+        let relay = local_socket().await;
+        let dst = local_socket().await.local_addr().unwrap();
+
+        let (_hold_tx, hold_rx) = oneshot::channel::<()>();
+        let slow_bind = move |_port| async move {
+            let _ = hold_rx.await;
+            bind_ephemeral().await
+        };
+        timeout(
+            WAIT,
+            handle_data_packet(&state, &relay, data_packet(41001, dst, b"first"), slow_bind),
+        )
+        .await
+        .expect("приём не должен ждать bind первого потока");
+
+        let (bound_tx, bound_rx) = oneshot::channel::<()>();
+        let fast_bind = move |_port| async move {
+            let sock = bind_ephemeral().await;
+            let _ = bound_tx.send(());
+            sock
+        };
+        timeout(
+            WAIT,
+            handle_data_packet(&state, &relay, data_packet(41002, dst, b"second"), fast_bind),
+        )
+        .await
+        .expect("приём не должен ждать bind второго потока");
+
+        timeout(WAIT, bound_rx)
+            .await
+            .expect("второй поток обязан подняться, пока первый висит в bind")
+            .unwrap();
+    }
+
+    /// Пакеты, накопившиеся за время bind, уходят наружу в том же порядке, в
+    /// каком пришли из туннеля. Таск на пакет вместо очереди на поток этот
+    /// порядок бы и сломал.
     #[tokio::test]
-    async fn concurrent_first_packets_share_single_bind() {
-        let state = test_state();
-        let relay_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let src_port = 40777;
+    async fn flow_keeps_packet_order() {
+        let state = test_state(Duration::from_secs(3600));
+        let relay = local_socket().await;
+        let peer = local_socket().await;
+        let dst = peer.local_addr().unwrap();
 
-        let bind_a_calls = Arc::new(AtomicUsize::new(0));
-        let (started_tx, started_rx) = oneshot::channel::<()>();
         let (release_tx, release_rx) = oneshot::channel::<()>();
-
-        let calls_a = bind_a_calls.clone();
-        let bind_a = move |port: u16| async move {
-            calls_a.fetch_add(1, Ordering::SeqCst);
-            let _ = started_tx.send(());
+        let slow_bind = move |_port| async move {
             let _ = release_rx.await;
-            bind_source_port(port).await
+            bind_ephemeral().await
         };
 
-        let task_a = tokio::spawn({
-            let state = state.clone();
-            let relay_socket = relay_socket.clone();
-            async move { acquire_bound_socket(&state, &relay_socket, src_port, bind_a).await }
-        });
+        handle_data_packet(&state, &relay, data_packet(41003, dst, b"1"), slow_bind).await;
+        for payload in [b"2", b"3"] {
+            handle_data_packet(&state, &relay, data_packet(41003, dst, payload), |_port| async {
+                unreachable!("поток уже поднят, второй bind ему не нужен")
+            })
+            .await;
+        }
 
-        // Дождаться, что первый пакет застолбил слот и вошёл в свой bind -
-        // без этого нет гарантии, что второй пакет вообще застанет резервацию.
-        started_rx.await.unwrap();
-
-        let bind_b_calls = Arc::new(AtomicUsize::new(0));
-        let calls_b = bind_b_calls.clone();
-        let bind_b = move |_port: u16| {
-            calls_b.fetch_add(1, Ordering::SeqCst);
-            async move { unreachable!("второй пакет не должен поднимать свой bind, пока первый ещё в процессе") }
-        };
-
-        let task_b = tokio::spawn({
-            let state = state.clone();
-            let relay_socket = relay_socket.clone();
-            async move { acquire_bound_socket(&state, &relay_socket, src_port, bind_b).await }
-        });
-
-        // Отпустить первый bind - только теперь он завершится и разбудит второй.
         release_tx.send(()).unwrap();
 
-        let sock_a = task_a.await.unwrap().expect("первый пакет обязан получить сокет");
-        let sock_b = task_b.await.unwrap().expect("второй пакет обязан получить сокет");
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let mut buf = [0u8; 64];
+        for _ in 0..3 {
+            let (n, _) = timeout(WAIT, peer.recv_from(&mut buf))
+                .await
+                .expect("пакеты из очереди обязаны дойти до назначения")
+                .unwrap();
+            got.push(buf[..n].to_vec());
+        }
+        assert_eq!(got, vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()]);
+    }
 
-        assert_eq!(bind_a_calls.load(Ordering::SeqCst), 1, "bind поднимается ровно один раз");
-        assert_eq!(bind_b_calls.load(Ordering::SeqCst), 0, "второй пакет не должен поднимать свой bind");
-        assert!(Arc::ptr_eq(&sock_a, &sock_b), "оба пакета обязаны получить один и тот же сокет");
+    /// Неудачный bind снимает слот, а не оставляет поток с очередью, в которую
+    /// некому смотреть: следующий пакет того же src_port обязан поднять поток
+    /// заново.
+    #[tokio::test(start_paused = true)]
+    async fn failed_bind_releases_slot() {
+        let state = test_state(Duration::from_secs(3600));
+        let relay = local_socket().await;
+        let dst = local_socket().await.local_addr().unwrap();
+        let src_port = 41004;
+
+        let (failed_tx, failed_rx) = oneshot::channel::<()>();
+        let failing_bind = move |_port| async move {
+            let _ = failed_tx.send(());
+            Err(io::Error::new(io::ErrorKind::AddrInUse, "порт занят"))
+        };
+        handle_data_packet(&state, &relay, data_packet(src_port, dst, b"first"), failing_bind).await;
+        timeout(WAIT, failed_rx).await.unwrap().unwrap();
+        wait_slot_released(&state, src_port).await;
+
+        let retry_calls = Arc::new(AtomicUsize::new(0));
+        let calls = retry_calls.clone();
+        let (bound_tx, bound_rx) = oneshot::channel::<()>();
+        let retry_bind = move |_port| async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let sock = bind_ephemeral().await;
+            let _ = bound_tx.send(());
+            sock
+        };
+        handle_data_packet(&state, &relay, data_packet(src_port, dst, b"second"), retry_bind).await;
+
+        timeout(WAIT, bound_rx)
+            .await
+            .expect("следующий пакет обязан поднять поток заново")
+            .unwrap();
+        assert_eq!(retry_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Ответ из интернета возвращается роутеру тем же таском потока.
+    #[tokio::test]
+    async fn flow_relays_response_to_router() {
+        let state = test_state(Duration::from_secs(3600));
+        let relay = local_socket().await;
+        let router = local_socket().await;
+        *state.router_addr.lock().await = Some(router.local_addr().unwrap());
+
+        let peer = local_socket().await;
+        let peer_addr = peer.local_addr().unwrap();
+        let src_port = 41005;
+
+        handle_data_packet(
+            &state,
+            &relay,
+            data_packet(src_port, peer_addr, b"ping"),
+            |_port| bind_ephemeral(),
+        )
+        .await;
+
+        let mut buf = [0u8; 64];
+        let (n, from) = timeout(WAIT, peer.recv_from(&mut buf))
+            .await
+            .expect("пакет обязан дойти до назначения")
+            .unwrap();
+        assert_eq!(&buf[..n], b"ping");
+        peer.send_to(b"pong", from).await.unwrap();
+
+        let mut wire = [0u8; 256];
+        let (n, _) = timeout(WAIT, router.recv_from(&mut wire))
+            .await
+            .expect("ответ обязан вернуться роутеру")
+            .unwrap();
+        let response = udp_relay::decode_relay_packet(&state.obfuscator, &wire[..n]).unwrap();
+        assert_eq!(response.src_port, src_port);
+        assert_eq!(response.dst, peer_addr);
+        assert_eq!(response.payload, b"pong".to_vec());
+    }
+
+    /// Пакет, попавший в очередь ровно в тот момент, когда поток пошёл сниматься
+    /// по таймауту, не теряется: слот снимается под локом таблицы, и под тем же
+    /// локом очередь перепроверяется. Тест держит лок сам, дожидается, пока
+    /// таймаут потока сработает, и кладёт пакет в очередь до того, как таск
+    /// доберётся до таблицы.
+    #[tokio::test(start_paused = true)]
+    async fn packet_queued_at_retire_is_not_lost() {
+        let flow_timeout = Duration::from_secs(1);
+        let state = test_state(flow_timeout);
+        let relay = local_socket().await;
+        let dst = local_socket().await.local_addr().unwrap();
+        let src_port = 41007;
+
+        let (bound_tx, bound_rx) = oneshot::channel::<()>();
+        let bind = move |_port| async move {
+            let sock = bind_ephemeral().await;
+            let _ = bound_tx.send(());
+            sock
+        };
+        handle_data_packet(&state, &relay, data_packet(src_port, dst, b"first"), bind).await;
+        bound_rx.await.unwrap();
 
         let flows = state.flows.lock().await;
-        assert_eq!(flows.bound_ports.len(), 1, "в таблице обязан остаться единственный слот на src_port");
+        let tx = flows.get(&src_port).unwrap().tx.clone();
+        // Пока лок наш, таск потока успевает протухнуть, упереться в таблицу и
+        // застрять на ней: снять слот без лока он не может.
+        tokio::time::sleep(flow_timeout * 2).await;
+        tx.try_send(FlowPacket {
+            dst,
+            payload: b"second".to_vec(),
+        })
+        .unwrap();
+        drop(flows);
+
+        // Таск забирает лок, видит непустую очередь и остаётся работать.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            state.flows.lock().await.contains_key(&src_port),
+            "поток с непустой очередью не снимается"
+        );
+        assert!(!tx.is_closed(), "очередь потока обязана остаться живой");
+        assert_eq!(
+            tx.capacity(),
+            FLOW_QUEUE,
+            "пакет обязан быть разобран, а не пропасть вместе с потоком"
+        );
+    }
+
+    /// Протухший поток уходит сам и уносит с собой сокет: порт снова свободен,
+    /// в таблице пусто, таск не остаётся висеть. Часы на паузе, поэтому
+    /// flow_timeout истекает не по настоящим секундам, а ровно тогда, когда
+    /// рантайму больше нечего делать.
+    #[tokio::test(start_paused = true)]
+    async fn idle_flow_releases_socket() {
+        let state = test_state(Duration::from_secs(1));
+        let relay = local_socket().await;
+        let dst = local_socket().await.local_addr().unwrap();
+        let src_port = 41006;
+
+        let (port_tx, port_rx) = oneshot::channel::<u16>();
+        let bind = move |_port| async move {
+            let sock = bind_ephemeral().await?;
+            let _ = port_tx.send(sock.local_addr().unwrap().port());
+            Ok(sock)
+        };
+        handle_data_packet(&state, &relay, data_packet(src_port, dst, b"first"), bind).await;
+        let bound_port = timeout(WAIT, port_rx).await.unwrap().unwrap();
+
+        // Порт занят, пока поток жив: сокетом владеет его таск.
+        assert!(
+            std::net::UdpSocket::bind(("127.0.0.1", bound_port)).is_err(),
+            "сокет живого потока обязан держать свой порт"
+        );
+
+        wait_slot_released(&state, src_port).await;
+
+        // Сокет живёт ровно столько, сколько таск: занять его порт заново
+        // получится только после того, как таск завершился.
+        std::net::UdpSocket::bind(("127.0.0.1", bound_port))
+            .expect("сокет протухшего потока обязан быть закрыт");
     }
 }
