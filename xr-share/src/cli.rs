@@ -360,6 +360,7 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
             name: Some(name.clone()),
             writable: args.writable,
             import: args.import,
+            attached: false,
         },
     );
     write_config(config_path, &cfg)?;
@@ -368,16 +369,20 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     // share_id на одну папку, потребитель видит её дважды, а снятое `--writable`
     // остаётся в силе через старую привязку.
     if let Some(old) = &retired {
-        match hub_unshare(&hub, &cred, old) {
-            Ok(()) => println!("  прежняя запись {old} снята с хаба"),
-            Err(e) => println!("  ! прежняя запись {old} осталась на хабе ({e}), сними её в админке"),
+        let id = &old.share_id;
+        match hub_unshare(&hub, &cred, id) {
+            Ok(()) => println!("  прежняя запись {id} снята с хаба"),
+            Err(e) => println!("  ! прежняя запись {id} осталась на хабе ({e}), сними её в админке"),
         }
-        println!("{}", retire_invite_notice(&invites));
+        if let Some(notice) = retire_invite_notice(old.attached, &invites) {
+            println!("{notice}");
+        }
     }
 
     // Attach to invites so their holders get access (the access anchor, п. 9.5).
     // A writable share carries the write flag, so the hub mints share:write for
     // these invites (LLD-28); without it the binding is read-only.
+    let mut bound = false;
     for invite in &invites {
         let body = serde_json::json!({
             "credential": cred,
@@ -386,9 +391,20 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
             "write": args.writable,
         });
         match hub_post(&format!("{}/api/v1/share/attach", hub.trim_end_matches('/')), &body) {
-            Ok(_) => println!("  ✓ привязана к инвайту {}", short(invite)),
+            Ok(_) => {
+                println!("  ✓ привязана к инвайту {}", short(invite));
+                bound = true;
+            }
             Err(e) => println!("  ! не удалось привязать к инвайту {}: {e}", short(invite)),
         }
+    }
+    // Запись помнит сам факт привязки, чтобы следующее вытеснение предупреждало
+    // о потерянных инвайтах по делу, а не при каждой перерегистрации (XR-162).
+    if bound {
+        if let Some(entry) = cfg.shares.iter_mut().find(|s| s.share_id == share_id) {
+            entry.attached = true;
+        }
+        write_config(config_path, &cfg)?;
     }
 
     let kind = if canon.is_file() { "файл" } else { "папка" };
@@ -932,18 +948,18 @@ fn write_config(path: &Path, cfg: &AgentConfig) -> Result<()> {
 /// (XR-162). Повторный `share` того же пути обновляет прежнюю запись, на этом
 /// стоит заявленная семантика «`share` без `--writable` выключает запись»:
 /// вторая запись оставила бы рядом старую, с её правом на запись и своим
-/// share_id. Возвращает вытесненный `share_id`, когда он сменился, чтобы
-/// вызывающий снял его с хаба.
+/// share_id. Возвращает вытесненную запись, когда `share_id` сменился: её надо
+/// снять с хаба, а по её признаку привязки решить, о чём предупреждать.
 ///
 /// Пути сравниваются канонизированными, как их разрешает сам агент
 /// (`safepath`), поэтому хвостовой слеш и симлинк ведут к той же записи.
 /// Путь, который больше не канонизируется (папку унесли), сравнивается как
 /// записан: иначе две пропавшие шары схлопнулись бы в одну.
-fn upsert_share(shares: &mut Vec<ShareEntry>, entry: ShareEntry) -> Option<String> {
+fn upsert_share(shares: &mut Vec<ShareEntry>, entry: ShareEntry) -> Option<ShareEntry> {
     match shares.iter().position(|s| same_path(&s.path, &entry.path)) {
         Some(idx) => {
             let old = std::mem::replace(&mut shares[idx], entry);
-            (old.share_id != shares[idx].share_id).then_some(old.share_id)
+            (old.share_id != shares[idx].share_id).then_some(old)
         }
         None => {
             shares.push(entry);
@@ -958,14 +974,20 @@ fn upsert_share(shares: &mut Vec<ShareEntry>, entry: ShareEntry) -> Option<Strin
 /// ходят по токену инвайта, перечень инвайтов живёт за админской сессией).
 /// Молчать тут нельзя: вытеснение снимает прежнюю запись с хаба, и держатель
 /// инвайта теряет доступ к пути, ничего об этом не узнав.
-fn retire_invite_notice(attached: &[String]) -> &'static str {
-    if attached.is_empty() {
+fn retire_invite_notice(had_binding: bool, attached_now: &[String]) -> Option<&'static str> {
+    if !had_binding {
+        // Записи и не давали инвайта: терять нечего, молчим. Предупреждение,
+        // которое срабатывает на каждой перерегистрации, читатель перестаёт
+        // замечать ровно тогда, когда оно по делу.
+        return None;
+    }
+    Some(if attached_now.is_empty() {
         "  ! привязки прежней записи к инвайтам не переезжают, а новую привязать не к чему: \
          повтори с --invite <токен>, иначе держатели инвайта шару не увидят"
     } else {
         "  ! привязки прежней записи к инвайтам не переезжают: новая висит только на инвайтах \
          этого запуска, остальные привяжи заново"
-    }
+    })
 }
 
 fn same_path(a: &str, b: &str) -> bool {
@@ -984,7 +1006,7 @@ fn same_path(a: &str, b: &str) -> bool {
 fn normalize_legacy(cfg: &mut AgentConfig) {
     if let (Some(dir), Some(id)) = (cfg.dir.take(), cfg.share_id.take()) {
         if !cfg.shares.iter().any(|s| s.share_id == id) {
-            cfg.shares.push(ShareEntry { share_id: id, path: dir, name: None, writable: false, import: false });
+            cfg.shares.push(ShareEntry { share_id: id, path: dir, name: None, writable: false, import: false, attached: false });
         }
     }
 }
@@ -1043,7 +1065,7 @@ mod tests {
             default_invite: None,
             max_file_mb: None,
             import: None,
-            shares: vec![ShareEntry { share_id: "s1".into(), path: "/srv/x".into(), name: None, writable: false, import: false }],
+            shares: vec![ShareEntry { share_id: "s1".into(), path: "/srv/x".into(), name: None, writable: false, import: false, attached: false }],
             dir: None,
             share_id: None,
         }
@@ -1206,16 +1228,47 @@ mod tests {
         assert_eq!(cfg.import.unwrap().plugins[0].name, "свой");
     }
 
+    // Признак привязки (XR-162) взводится успешным attach, переживает
+    // перезапись конфига и не наследуется вытесняющей записью: после
+    // перерегистрации без --invite шара действительно висит ни на чём.
+    #[test]
+    fn attach_marks_entry_and_replacement_starts_clean() {
+        use super::share_upsert_tests::{cfg_on_hub, share_args, FakeHub};
+
+        let hub = FakeHub::start();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        cfg_on_hub(&hub, &cfg_path);
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let data_arg = data.to_str().unwrap().to_string();
+
+        let mut with_invite = share_args(&data_arg, false);
+        with_invite.invites = vec!["invTok".to_string()];
+        share(&cfg_path, with_invite).unwrap();
+        let first = read_config(&cfg_path).unwrap();
+        assert!(first.shares[0].attached, "успешный attach обязан пометить запись");
+
+        share(&cfg_path, share_args(&data_arg, false)).unwrap();
+        let second = read_config(&cfg_path).unwrap();
+        assert_eq!(second.shares[0].share_id, "s2");
+        assert!(!second.shares[0].attached, "новая запись ни к одному инвайту не привязана");
+    }
+
     #[test]
     fn retire_invite_notice_names_the_lost_bindings() {
-        // Вытеснение без единого инвайта в этом запуске: доступ у держателей
-        // прежнего инвайта пропадает, команда обязана назвать выход.
-        let alone = retire_invite_notice(&[]);
+        // Вытеснение записи, которая висела на инвайте, а этот запуск инвайта
+        // не дал: доступ у держателей пропадает, команда обязана назвать выход.
+        let alone = retire_invite_notice(true, &[]).expect("тут предупреждать есть о чём");
         assert!(alone.contains("--invite"), "подсказка называет флаг: {alone}");
         // С инвайтами запуска предупреждение остаётся, но про остальные.
-        let attached = retire_invite_notice(&["inv".to_string()]);
+        let attached = retire_invite_notice(true, &["inv".to_string()]).unwrap();
         assert!(attached.contains("остальные"), "предупреждение про прочие инвайты: {attached}");
         assert_ne!(alone, attached);
+        // Записи инвайта не давали: терять нечего, и бесинвайтовая раздача
+        // (`share /srv/photos` вторым заходом) не должна получать пугалку.
+        assert_eq!(retire_invite_notice(false, &[]), None);
+        assert_eq!(retire_invite_notice(false, &["inv".to_string()]), None);
     }
 
     #[test]
@@ -1271,13 +1324,13 @@ mod share_upsert_tests {
     /// Хаб-заглушка на живом TCP: `share` ходит к ней настоящим ureq, поэтому в
     /// тест попадает и разбор ответа, и то, какие запросы команда реально шлёт.
     /// Каждый `share/add` выдаёт следующий по счёту share_id.
-    struct FakeHub {
+    pub(super) struct FakeHub {
         url: String,
         seen: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
     }
 
     impl FakeHub {
-        fn start() -> Self {
+        pub(super) fn start() -> Self {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1315,7 +1368,7 @@ mod share_upsert_tests {
         }
 
         /// Пары (share_id, инвайт), которые команда просила связать.
-        fn attached(&self) -> Vec<(String, String)> {
+        pub(super) fn attached(&self) -> Vec<(String, String)> {
             self.seen
                 .lock()
                 .unwrap()
@@ -1329,7 +1382,7 @@ mod share_upsert_tests {
         }
 
         /// share_id, которые команда просила снять с индекса хаба.
-        fn unshared(&self) -> Vec<String> {
+        pub(super) fn unshared(&self) -> Vec<String> {
             self.seen
                 .lock()
                 .unwrap()
@@ -1377,7 +1430,7 @@ mod share_upsert_tests {
         (path, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
     }
 
-    fn share_args(path: &str, writable: bool) -> ShareArgs {
+    pub(super) fn share_args(path: &str, writable: bool) -> ShareArgs {
         ShareArgs {
             path: path.to_string(),
             name: None,
@@ -1392,7 +1445,7 @@ mod share_upsert_tests {
     }
 
     /// Конфиг с мандатом на заглушку и пустым списком шар.
-    fn cfg_on_hub(hub: &FakeHub, path: &Path) {
+    pub(super) fn cfg_on_hub(hub: &FakeHub, path: &Path) {
         let mut cfg = minimal_cfg();
         cfg.shares.clear();
         cfg.hub_url = Some(hub.url.clone());

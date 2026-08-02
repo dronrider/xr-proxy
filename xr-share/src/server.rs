@@ -1284,6 +1284,7 @@ mod tests {
             name: None,
             writable: true,
             import: false,
+            attached: false,
         }];
         let shares = build_shares(&entries);
         assert!(!shares.get("F").unwrap().writable, "a file share must not be writable");

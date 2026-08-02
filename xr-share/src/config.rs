@@ -94,6 +94,15 @@ pub struct ShareEntry {
     /// write. Set by `xr-share share --writable --import`.
     #[serde(default)]
     pub import: bool,
+    /// Хоть раз привязывалась к инвайту (XR-162). Взводится успешным `attach`
+    /// в `xr-share share`, живёт в конфиге только ради одного: повторный
+    /// `share` вытесняет запись вместе с её привязками, и по этому признаку
+    /// команда отличает потерянную привязку от записи, которой инвайта и не
+    /// давали, а значит предупреждает по делу. Какие именно это были инвайты,
+    /// агент не знает и знать не может (хаб их списка не отдаёт). Конфиг без
+    /// поля читается как «не привязывалась».
+    #[serde(default)]
+    pub attached: bool,
 }
 
 /// Job limits and the plugin registry for URL import (LLD-29 п. 2.3). The block
@@ -264,6 +273,7 @@ impl AgentConfig {
                     // Legacy single-share configs predate writable shares.
                     writable: false,
                     import: false,
+                    attached: false,
                 });
             }
         }
@@ -335,6 +345,28 @@ mod tests {
         assert_eq!(cfg.agent_credential.as_deref(), Some("blob"));
     }
 
+    // Признак привязки к инвайту (XR-162) дописан к уже лежащим конфигам:
+    // запись без поля обязана читаться как «не привязывалась», а взведённое
+    // значение переживать перезапись, иначе предупреждение о потерянных
+    // привязках соврёт после первого же `share`.
+    #[test]
+    fn share_entry_without_attached_reads_as_unbound() {
+        let toml = r#"
+            listen = "0.0.0.0:8443"
+            hub_pubkey = "QQ=="
+            [[share]]
+            share_id = "a"
+            path = "/srv/photos"
+            writable = true
+        "#;
+        let mut cfg: AgentConfig = toml::from_str(toml).unwrap();
+        assert!(!cfg.resolved_shares()[0].attached);
+
+        cfg.shares[0].attached = true;
+        let back: AgentConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert!(back.resolved_shares()[0].attached, "признак обязан пережить перезапись конфига");
+    }
+
     #[test]
     fn folds_legacy_single_share() {
         let toml = r#"
@@ -392,7 +424,7 @@ mod tests {
             default_invite: Some("inv123".into()),
             max_file_mb: Some(100),
             import: None,
-            shares: vec![ShareEntry { share_id: "a".into(), path: "/srv/x".into(), name: Some("X".into()), writable: true, import: true }],
+            shares: vec![ShareEntry { share_id: "a".into(), path: "/srv/x".into(), name: Some("X".into()), writable: true, import: true, attached: true }],
             dir: None,
             share_id: None,
         };
