@@ -234,7 +234,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                         // failure is a real answer (expired invite, bad hub) and
                         // stays visible.
                         if (it.isOffline()) st.copy(loadingHub = false, hubOffline = true)
-                        else st.copy(loadingHub = false, message = "Шары по инвайту: ${it.message}")
+                        else st.copy(loadingHub = false, message = "Шары по инвайту: ${humanError(it.message ?: "ошибка")}")
                     },
                 )
             }
@@ -268,6 +268,10 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         e.startsWith("agent_offline") -> e.substringAfter(": ", "агент шары не на связи")
         e.startsWith("access_expired") -> e.substringAfter(": ", "доступ к шаре истёк")
         e.startsWith("stale_token") -> "токен шары устарел, обновите список по инвайту"
+        // Хаб честно ответил 410: инвайт истёк или его отозвали, а не просто
+        // не открылся (XR-121). Отдельно от прочих http_* - тем текст не пишем,
+        // это редкий случай, который проще разобрать по сырому коду в журнале.
+        e == "http_410" -> "инвайт истёк или отозван, примените его заново"
         // Транспортный сбой (нет сети, агент недоступен): с офлайн-полным
         // списком качать нечего, файл ждёт сеть. Категорию наружу не тащим.
         e.startsWith("network") -> "нет сети, попробуйте позже"
