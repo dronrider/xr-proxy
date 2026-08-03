@@ -123,6 +123,37 @@ mod tests {
         assert!(verify_preset(&preset, &ctx.verifying_key()).unwrap());
     }
 
+    /// XR-117: имя группы у правила это часть подписываемых данных, а его
+    /// отсутствие ничего к ним не добавляет. Подписи пресетов, выданные до
+    /// появления поля, поэтому остаются действительными.
+    #[test]
+    fn rule_name_enters_canonical_json_only_when_set() {
+        let preset = test_preset();
+        assert_eq!(
+            String::from_utf8(canonical_json(&preset)).unwrap(),
+            r#"{"description":"Test preset","name":"russia","rules":{"default_action":"direct","rules":[{"action":"proxy","domains":["youtube.com"],"ip_ranges":[],"geoip":[]}]},"updated_at":"2026-01-01T00:00:00Z","version":1}"#
+        );
+
+        let mut named = test_preset();
+        named.rules.rules[0].name = Some("YouTube".into());
+        assert_ne!(canonical_json(&preset), canonical_json(&named));
+    }
+
+    /// Переименование группы это правка пресета, и старая подпись под ней
+    /// не должна проходить.
+    #[test]
+    fn verify_fails_on_renamed_group() {
+        let key = SigningKey::generate(&mut rand::thread_rng());
+        let ctx = SigningContext { signing_key: key };
+        let mut preset = test_preset();
+        preset.rules.rules[0].name = Some("YouTube".into());
+        preset.signature = Some(ctx.sign_preset(&preset));
+        assert!(verify_preset(&preset, &ctx.verifying_key()).unwrap());
+
+        preset.rules.rules[0].name = Some("Видео".into());
+        assert!(!verify_preset(&preset, &ctx.verifying_key()).unwrap());
+    }
+
     #[test]
     fn verify_fails_on_tampered_data() {
         let key = SigningKey::generate(&mut rand::thread_rng());

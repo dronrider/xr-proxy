@@ -48,6 +48,12 @@ const geoipText = computed({
 <template>
   <div class="rule-row">
     <div class="row-header">
+      <input
+        class="rule-name"
+        :value="rule.name ?? ''"
+        placeholder="Название группы (например, Мессенджеры)"
+        @input="emit('update', { ...rule, name: ($event.target as HTMLInputElement).value || undefined })"
+      />
       <select
         :value="rule.action"
         @change="emit('update', { ...rule, action: ($event.target as HTMLSelectElement).value })"
@@ -76,7 +82,8 @@ const geoipText = computed({
 </template>
 
 <style scoped>
-.row-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; }
+.row-header { display: flex; gap: 0.5rem; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; }
+.rule-name { flex: 1; padding: 0.25rem 0.5rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-input); color: var(--text); }
 .row-header select { padding: 0.25rem 0.5rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-input); color: var(--text); }
 .btn-remove { padding: 0.25rem 0.5rem; font-size: 0.8rem; color: var(--danger); border: 1px solid var(--danger); background: transparent; border-radius: 4px; cursor: pointer; }
 .row-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }

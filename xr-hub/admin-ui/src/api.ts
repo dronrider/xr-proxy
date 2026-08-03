@@ -107,6 +107,8 @@ export interface LoginResponse {
 }
 
 export interface RoutingRule {
+  /** Название тематической группы, XR-117. Старые пресеты поля не имеют. */
+  name?: string
   action: string
   domains: string[]
   ip_ranges: string[]
