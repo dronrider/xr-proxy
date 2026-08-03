@@ -566,6 +566,7 @@ mod tests {
         let cfg = RoutingConfig {
             default_action: "direct".into(),
             rules: vec![RoutingRule {
+                name: None,
                 action: "proxy".into(),
                 domains: domains.iter().map(|s| s.to_string()).collect(),
                 ip_ranges: vec![],

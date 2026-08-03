@@ -110,6 +110,13 @@ pub struct RoutingConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingRule {
+    /// Название тематической группы («YouTube», «Мессенджеры»), которое хаб
+    /// раздаёт вместе с правилом, а клиенты показывают вместо счётчика доменов
+    /// (XR-117). Поле опциональное: пресеты, заведённые до него, читаются
+    /// по-прежнему, а без значения оно и не сериализуется, поэтому подпись
+    /// такого пресета остаётся прежней.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub action: String,
     #[serde(default)]
     pub domains: Vec<String>,
@@ -499,6 +506,100 @@ salt = 42
         assert_eq!(entries[0].key.as_deref(), Some("b3RoZXI="));
         assert_eq!(entries[0].salt, Some(42));
         assert!(entries[0].modifier.is_none());
+    }
+
+    /// XR-117: имя группы читается из TOML, а правило без имени остаётся
+    /// валидным. Пресеты и конфиги роутеров, заведённые до поля, лежат на
+    /// диске без него, и снятие `#[serde(default)]` сломало бы им разбор.
+    #[test]
+    fn test_rule_name_is_optional() {
+        let toml_str = format!(
+            r#"{BASE}
+[[routing.rules]]
+name = "YouTube"
+action = "proxy"
+domains = ["youtube.com"]
+
+[[routing.rules]]
+action = "proxy"
+domains = ["x.com"]
+"#
+        );
+        let cfg: ClientConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.routing.rules[0].name.as_deref(), Some("YouTube"));
+        assert!(cfg.routing.rules[1].name.is_none());
+    }
+
+    /// Правило без имени сериализуется ровно так, как до XR-117. От этого
+    /// зависит подпись пресета в хабе: она считается по JSON правил, и лишний
+    /// `"name":null` сделал бы недействительными все выданные подписи.
+    #[test]
+    fn test_rule_without_name_serializes_as_before() {
+        let rule = RoutingRule {
+            name: None,
+            action: "proxy".into(),
+            domains: vec!["youtube.com".into()],
+            ip_ranges: vec![],
+            geoip: vec![],
+        };
+        assert_eq!(
+            serde_json::to_string(&rule).unwrap(),
+            r#"{"action":"proxy","domains":["youtube.com"],"ip_ranges":[],"geoip":[]}"#
+        );
+
+        let named = RoutingRule {
+            name: Some("YouTube".into()),
+            ..rule
+        };
+        assert_eq!(
+            serde_json::to_string(&named).unwrap(),
+            r#"{"name":"YouTube","action":"proxy","domains":["youtube.com"],"ip_ranges":[],"geoip":[]}"#
+        );
+    }
+
+    /// Эталонный пресет из `configs/routing-russia.toml` разбирается и весь
+    /// состоит из именованных групп: по нему заводится боевой пресет хаба, и
+    /// правило без имени показалось бы там голым счётчиком доменов.
+    #[test]
+    fn test_reference_russia_preset_groups_are_named() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            routing: RoutingConfig,
+        }
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../configs/routing-russia.toml");
+        let content = std::fs::read_to_string(path).unwrap();
+        let cfg: Wrapper = toml::from_str(&content).unwrap();
+        let names: Vec<&str> = cfg
+            .routing
+            .rules
+            .iter()
+            .map(|r| r.name.as_deref().unwrap_or(""))
+            .collect();
+        assert!(!names.contains(&""), "группа без имени: {names:?}");
+        assert!(names.contains(&"Мессенджеры"), "{names:?}");
+        // Диапазоны Telegram уехали в группу мессенджеров вместе с доменами.
+        let messengers = cfg
+            .routing
+            .rules
+            .iter()
+            .find(|r| r.name.as_deref() == Some("Мессенджеры"))
+            .unwrap();
+        assert!(messengers.ip_ranges.contains(&"91.108.56.0/22".to_string()));
+    }
+
+    /// Пресет, скачанный с хаба и лежащий в кэше клиента без поля `name`,
+    /// разбирается по-прежнему (JSON-путь, в отличие от TOML выше).
+    #[test]
+    fn test_preset_json_without_name_parses() {
+        let stored = r#"{
+            "default_action": "direct",
+            "rules": [
+                {"action": "proxy", "domains": ["youtube.com"], "ip_ranges": [], "geoip": []}
+            ]
+        }"#;
+        let cfg: RoutingConfig = serde_json::from_str(stored).unwrap();
+        assert!(cfg.rules[0].name.is_none());
+        assert_eq!(cfg.rules[0].domains, vec!["youtube.com"]);
     }
 }
 
