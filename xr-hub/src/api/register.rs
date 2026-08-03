@@ -324,6 +324,7 @@ mod tests {
             signing: Some(crate::signing::SigningContext {
                 signing_key: SigningKey::from_bytes(&[42u8; 32]),
             }),
+            preset_gen: tokio::sync::watch::Sender::new(0),
         })
     }
 
@@ -382,6 +383,7 @@ mod tests {
             signing: Some(crate::signing::SigningContext {
                 signing_key: SigningKey::from_bytes(&[42u8; 32]),
             }),
+            preset_gen: tokio::sync::watch::Sender::new(0),
         })
     }
 

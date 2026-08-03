@@ -102,6 +102,7 @@ mod tests {
             sessions: RwLock::new(HashMap::new()),
             config,
             signing: None,
+            preset_gen: tokio::sync::watch::Sender::new(0),
         })
     }
 
