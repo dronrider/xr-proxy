@@ -52,6 +52,36 @@ describe('parseToml', () => {
     expect(result.config.rules[1].domains).toEqual(['gosuslugi.ru'])
   })
 
+  /** Имя набирается свободным текстом, и кавычка в нём раньше обрывала
+   *  значение: round-trip возвращал «AI » вместо «AI "умный" сервис», причём
+   *  молча, без ошибки на экране. */
+  it('кавычки и слеши в названии группы переживают round-trip', () => {
+    const tricky: RoutingRule = {
+      name: 'AI "умный" сервис \\ и прочее',
+      action: 'proxy',
+      domains: ['openai.com'],
+      ip_ranges: [],
+      geoip: [],
+    }
+    const toml = rulesToToml('direct', [tricky])
+    expect(toml).toContain('name = "AI \\"умный\\" сервис \\\\ и прочее"')
+
+    const result = parseToml(toml)
+    expect('config' in result).toBe(true)
+    if (!('config' in result)) return
+    expect(result.config.rules[0].name).toBe(tricky.name)
+    expect(result.config.rules[0].domains).toEqual(['openai.com'])
+  })
+
+  it('комментарий в списке доменов не попадает в правила', () => {
+    const result = parseToml(
+      '[routing]\ndefault_action = "direct"\n\n[[routing.rules]]\nname = "Мессенджеры"\naction = "proxy"\ndomains = [\n  # Telegram\n  "t.me",\n]\n',
+    )
+    expect('config' in result).toBe(true)
+    if (!('config' in result)) return
+    expect(result.config.rules[0].domains).toEqual(['t.me'])
+  })
+
   it('пресет, набранный руками до появления имён, читается без них', () => {
     const result = parseToml(
       '[routing]\ndefault_action = "direct"\n\n[[routing.rules]]\naction = "proxy"\ndomains = ["youtube.com"]\n',
