@@ -248,6 +248,7 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
     use xr_proto::obfuscation::{ModifierStrategy, Obfuscator};
+    use xr_proto::protocol::Frame;
 
     fn make_codec() -> Codec {
         let obfs = Obfuscator::new(
@@ -256,6 +257,25 @@ mod tests {
             ModifierStrategy::PositionalXorRotate,
         );
         Codec::new(obfs, 0, 0)
+    }
+
+    /// Дочитать один кадр из потока, накапливая в буфере ровно как это делает
+    /// сам handle_client - нужен тестам счастливого пути, которым важно не
+    /// то, сколько раз пришёл read, а то, что кадр в итоге собрался.
+    async fn read_one_frame(client: &mut TcpStream, codec: &Codec) -> Frame {
+        let mut buf = vec![0u8; 4096];
+        let mut filled = 0;
+        loop {
+            if let Some((frame, _)) = codec.decode_frame(&buf[..filled]).unwrap() {
+                return frame;
+            }
+            let n = tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf[filled..]))
+                .await
+                .expect("сервер обязан ответить на честный кадр")
+                .unwrap();
+            assert!(n > 0, "сервер закрыл соединение, не ответив ConnectAck");
+            filled += n;
+        }
     }
 
     /// XR-215: заголовок кадра честно обещает payload на 5000 байт, но по
@@ -306,5 +326,87 @@ mod tests {
             .await
             .unwrap()
             .expect("handle_client не должен возвращать ошибку, когда отдан fallback");
+    }
+
+    /// XR-215 (замечание ревью): мутации M1-M3 проверяли только недосрабатывание
+    /// условия (возврат старого бага), а от подмены в другую сторону -
+    /// `if true` вместо `filled >= buf.len()`, то есть fallback уходит на любом
+    /// `Ok(None)`, а не только на заполненном буфере - не было ни одного
+    /// теста. Честный маленький Connect-кадр, пришедший целиком за один
+    /// присед, обязан дособраться и дойти до ConnectAck.
+    #[tokio::test]
+    async fn honest_small_connect_frame_reaches_connect_ack() {
+        let codec = make_codec();
+
+        // Слушатель под "target" держим живым до конца теста: ConnectAck
+        // сервер шлёт раньше, чем достучится до цели, но сам connect к цели
+        // всё равно случится следом, и без живого листенера он бы упал.
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_codec = codec.clone();
+        tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let _ = handle_client(stream, peer, server_codec, Duration::from_secs(2), None).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        let payload = TargetAddr::Ip(target_addr).encode().unwrap();
+        let wire = codec.encode_frame(Command::Connect, &payload).unwrap();
+        client.write_all(&wire).await.unwrap();
+
+        let frame = read_one_frame(&mut client, &codec).await;
+        assert_eq!(
+            frame.command,
+            Command::ConnectAck,
+            "честный кадр в один присед должен дойти до ConnectAck, а не до fallback"
+        );
+
+        drop(target);
+    }
+
+    /// То же самое, но кадр приходит на сервер двумя read по частям: между
+    /// половинами есть пауза, поэтому сервер обязан хотя бы раз получить
+    /// `Ok(None)` от decode_frame ("нужно больше данных") и не уйти оттуда в
+    /// fallback, а честно дособрать кадр на втором read.
+    #[tokio::test]
+    async fn honest_connect_frame_split_across_reads() {
+        let codec = make_codec();
+
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_codec = codec.clone();
+        tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let _ = handle_client(stream, peer, server_codec, Duration::from_secs(2), None).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        let payload = TargetAddr::Ip(target_addr).encode().unwrap();
+        let wire = codec.encode_frame(Command::Connect, &payload).unwrap();
+        assert!(wire.len() > 2, "кадру есть что делить на части");
+        let split = wire.len() / 2;
+
+        client.write_all(&wire[..split]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.write_all(&wire[split..]).await.unwrap();
+
+        let frame = read_one_frame(&mut client, &codec).await;
+        assert_eq!(
+            frame.command,
+            Command::ConnectAck,
+            "кадр, пришедший двумя read по частям, должен дособраться и дойти до ConnectAck"
+        );
+
+        drop(target);
     }
 }
