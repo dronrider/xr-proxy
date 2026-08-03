@@ -321,6 +321,7 @@ mod tests {
             default_action: "direct".into(),
             rules: vec![
                 RoutingRule {
+                    name: None,
                     action: "proxy".into(),
                     domains: vec![
                         "youtube.com".into(),
@@ -331,6 +332,7 @@ mod tests {
                     geoip: vec![],
                 },
                 RoutingRule {
+                    name: None,
                     action: "direct".into(),
                     domains: vec!["*.corp.local".into()],
                     ip_ranges: vec![],
@@ -436,6 +438,7 @@ mod tests {
         let config = RoutingConfig {
             default_action: "direct".into(),
             rules: vec![RoutingRule {
+                name: None,
                 action: "proxy".into(),
                 domains: vec!["*".into()],
                 ip_ranges: vec![],
@@ -456,6 +459,7 @@ mod tests {
         let config = RoutingConfig {
             default_action: "direct".into(),
             rules: vec![RoutingRule {
+                name: None,
                 action: "proxy".into(),
                 domains: vec![
                     "*яндекс.рф".into(),
@@ -481,6 +485,7 @@ mod tests {
         let config = RoutingConfig {
             default_action: "direct".into(),
             rules: vec![RoutingRule {
+                name: None,
                 action: "proxy".into(),
                 domains: vec!["10.0.0.0/8".into(), "1.2.3.4".into(), "youtube.com".into()],
                 ip_ranges: vec![],
@@ -498,6 +503,7 @@ mod tests {
         let config = RoutingConfig {
             default_action: "direct".into(),
             rules: vec![RoutingRule {
+                name: None,
                 action: "proxy".into(),
                 domains: vec![" *.GitHub.com ".into(), "  YouTube.com".into()],
                 ip_ranges: vec![],
@@ -530,6 +536,7 @@ mod tests {
         let config = RoutingConfig {
             default_action: "direct".into(),
             rules: vec![RoutingRule {
+                name: None,
                 action: "proxy".into(),
                 domains: vec![],
                 ip_ranges: vec![
@@ -553,6 +560,7 @@ mod tests {
         let config = RoutingConfig {
             default_action: "direct".into(),
             rules: vec![RoutingRule {
+                name: None,
                 action: "proxy".into(),
                 domains: vec![],
                 ip_ranges: vec!["2001:b28:f23d::/48".into()],
@@ -575,6 +583,7 @@ mod tests {
         let config = RoutingConfig {
             default_action: "direct".into(),
             rules: vec![RoutingRule {
+                name: None,
                 action: "proxy".into(),
                 domains: vec!["*.telegram.org".into()],
                 ip_ranges: vec!["91.108.56.0/22".into()],
@@ -595,6 +604,7 @@ mod tests {
         let overrides = RoutingConfig {
             default_action: "direct".into(),
             rules: vec![RoutingRule {
+                name: None,
                 action: "direct".into(),
                 domains: vec!["github.corp.internal".into()],
                 ip_ranges: vec![],
@@ -604,6 +614,7 @@ mod tests {
         let preset = RoutingConfig {
             default_action: "proxy".into(), // ignored — overrides wins
             rules: vec![RoutingRule {
+                name: None,
                 action: "proxy".into(),
                 domains: vec!["*.github.com".into()],
                 ip_ranges: vec![],
@@ -630,6 +641,7 @@ mod tests {
         let preset = RoutingConfig {
             default_action: "proxy".into(),
             rules: vec![RoutingRule {
+                name: None,
                 action: "proxy".into(),
                 domains: vec!["youtube.com".into()],
                 ip_ranges: vec![],

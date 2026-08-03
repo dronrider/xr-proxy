@@ -94,6 +94,7 @@ mod tests {
             rules: RoutingConfig {
                 default_action: "direct".into(),
                 rules: vec![RoutingRule {
+                    name: None,
                     action: "proxy".into(),
                     domains: vec!["youtube.com".into()],
                     ip_ranges: vec![],

@@ -169,12 +169,14 @@ pub fn to_routing_config(rules: &[UserRule], default_action: &str) -> RoutingCon
             let pattern = normalize_pattern(&r.pattern);
             match classify_pattern(&pattern) {
                 Ok(RuleKind::Domain) | Ok(RuleKind::Wildcard) => Some(RoutingRule {
+                    name: None,
                     action: r.action.clone(),
                     domains: vec![pattern],
                     ip_ranges: vec![],
                     geoip: vec![],
                 }),
                 Ok(RuleKind::CidrV4) | Ok(RuleKind::CidrV6) => Some(RoutingRule {
+                    name: None,
                     action: r.action.clone(),
                     domains: vec![],
                     ip_ranges: vec![pattern],
@@ -285,6 +287,7 @@ mod tests {
         let preset = RoutingConfig {
             default_action: "direct".into(),
             rules: vec![RoutingRule {
+                name: None,
                 action: "proxy".into(),
                 domains: vec!["youtube.com".into(), "*.youtube.com".into()],
                 ip_ranges: vec![],
