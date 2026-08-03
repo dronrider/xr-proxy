@@ -19,19 +19,19 @@ fun buildMergedToml(
     appendLine("# Merged: user overrides + preset ${presetTag ?: "(не подключён)"}")
     appendLine()
     appendLine("[routing]")
-    appendLine("default_action = \"$defaultAction\"")
+    appendLine("default_action = ${tomlString(defaultAction)}")
 
     if (userRules.isNotEmpty()) {
         appendLine()
         appendLine("# --- User overrides ---")
         for (rule in userRules) {
             appendLine("[[routing.rules]]")
-            appendLine("action = \"${rule.action}\"")
+            appendLine("action = ${tomlString(rule.action)}")
             val isCidr = rule.pattern.contains('/')
             if (isCidr) {
-                appendLine("ip_ranges = [\"${rule.pattern}\"]")
+                appendLine("ip_ranges = [${tomlString(rule.pattern)}]")
             } else {
-                appendLine("domains = [\"${rule.pattern}\"]")
+                appendLine("domains = [${tomlString(rule.pattern)}]")
             }
         }
     }
@@ -43,8 +43,8 @@ fun buildMergedToml(
             appendLine("[[routing.rules]]")
             // Имя группы (XR-117) идёт первой строкой правила: по нему в
             // выгруженном конфиге видно, о чём эти двадцать доменов.
-            if (rule.name.isNotBlank()) appendLine("name = \"${rule.name}\"")
-            appendLine("action = \"${rule.action}\"")
+            if (rule.name.isNotBlank()) appendLine("name = ${tomlString(rule.name)}")
+            appendLine("action = ${tomlString(rule.action)}")
             if (rule.domains.isNotEmpty()) appendLine(tomlArray("domains", rule.domains))
             if (rule.ipRanges.isNotEmpty()) appendLine(tomlArray("ip_ranges", rule.ipRanges))
             if (rule.geoip.isNotEmpty()) appendLine(tomlArray("geoip", rule.geoip))
@@ -55,11 +55,27 @@ fun buildMergedToml(
 /** Многострочный массив, чтобы длинные списки доменов пресета читались. */
 private fun tomlArray(key: String, values: List<String>): String =
     if (values.size <= 3) {
-        "$key = [${values.joinToString(", ") { "\"$it\"" }}]"
+        "$key = [${values.joinToString(", ") { tomlString(it) }}]"
     } else {
         buildString {
             appendLine("$key = [")
-            values.forEach { appendLine("  \"$it\",") }
+            values.forEach { appendLine("  ${tomlString(it)},") }
             append("]")
         }
     }
+
+/**
+ * Строка в TOML-кавычках. Название группы владелец пресета набирает свободным
+ * текстом, и кавычка в нём оборвала бы значение: превью для того и печатается,
+ * чтобы его скопировали в конфиг роутера, а битый TOML туда не вставить.
+ * Экранирование одно на все строки, как в админке хаба.
+ */
+private fun tomlString(value: String): String {
+    val escaped = value
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    return "\"$escaped\""
+}
