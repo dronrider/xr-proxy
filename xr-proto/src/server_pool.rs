@@ -405,8 +405,10 @@ impl ServerPool {
             });
         }
         failures.sort_by_key(|(idx, _)| *idx);
-        // Вид ошибки берём у самого приоритетного: по нему вызывающий решает,
-        // уводить ли соединение в Direct.
+        // Вид ошибки берём у самого приоритетного: агрегат обязан отвечать за
+        // primary, а не за случайный резерв. По виду движок выбирает уровень
+        // записи в журнале (классификация в engine.rs), уход в Direct от него
+        // не зависит, там решает политика on_server_down.
         let kind = failures[0].1.kind();
         let details = failures
             .iter()
@@ -482,11 +484,15 @@ impl ServerPool {
                         self.slots[idx].label(),
                         PER_SERVER_OPEN_TIMEOUT
                     );
+                    // Имя сервера ставит агрегатор, а вот маркер "open timed
+                    // out" в тексте оставляем: по нему ищут корень зависаний в
+                    // логах роутера (XR-086, tools/loadtest/README.md), туда
+                    // текст уезжает целиком через warn клиента.
                     failures.push((
                         idx,
                         io::Error::new(
                             io::ErrorKind::TimedOut,
-                            format!("не ответил за {:?}", PER_SERVER_OPEN_TIMEOUT),
+                            format!("open timed out за {:?}", PER_SERVER_OPEN_TIMEOUT),
                         ),
                     ));
                 }
@@ -992,7 +998,9 @@ mod tests {
     }
 
     /// Молчащий пул: ни один сервер не отвечает и каждый упирается в свою
-    /// границу ожидания. Такой отказ тоже обязан называть всех, а не последнего.
+    /// границу ожидания. Такой отказ тоже обязан называть всех, а не последнего,
+    /// и сохранять маркер "open timed out", по которому зависания ищут в логах
+    /// роутера (XR-086).
     #[tokio::test(start_paused = true)]
     async fn test_silent_pool_names_all_servers() {
         let hang: ConnectFn =
@@ -1007,7 +1015,7 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("все 2 сервера недоступны"), "{}", text);
         assert!(text.contains("msk") && text.contains("aeza"), "{}", text);
-        assert_eq!(text.matches("не ответил за").count(), 2, "{}", text);
+        assert_eq!(text.matches("open timed out").count(), 2, "{}", text);
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 
