@@ -101,14 +101,15 @@ export function parseToml(text: string): { config: RoutingConfig } | { error: st
 
     return { config: { default_action: defAction, rules: parsed } }
   } catch (e) {
-    return { error: `Parse error: ${e}` }
+    return { error: e instanceof Error ? e.message : `Parse error: ${e}` }
   }
 }
 
 /**
  * Элементы массива. Идём по телу посимвольно, а не split'ом по запятым:
  * запятая и решётка внутри кавычек не должны рвать значение, а элемент без
- * кавычек (так пресет мог набрать человек) по-прежнему принимаем.
+ * кавычек (так пресет мог набрать человек) по-прежнему принимаем. Забытый
+ * разделитель между значениями это ошибка разбора, а не потеря домена молчком.
  */
 function parseTomlArray(block: string, key: string): string[] {
   const m = block.match(new RegExp(`${key}\\s*=\\s*\\[([^\\]]*?)\\]`, 's'))
@@ -143,7 +144,15 @@ function parseTomlArray(block: string, key: string): string[] {
       i++
       if (value) items.push(value)
       bare = ''
-      while (i < body.length && body[i] !== ',' && body[i] !== '\n') i++
+      // За закрывающей кавычкой законно идут только пробелы, разделитель или
+      // комментарий. Всё прочее это забытая запятая (`"a.com" "b.com"`), и
+      // молчать про неё нельзя: тихо потерянный домен в пресете значит, что
+      // сайт перестал ходить через прокси, а на экране всё как надо.
+      while (i < body.length && body[i] !== '\n' && /\s/.test(body[i])) i++
+      const tail = body[i]
+      if (i < body.length && tail !== ',' && tail !== '\n' && tail !== '#') {
+        throw new Error(`${key}: после "${value}" ждали запятую или перенос строки`)
+      }
     } else if (c === '#') {
       while (i < body.length && body[i] !== '\n') i++
     } else if (c === ',' || c === '\n') {
