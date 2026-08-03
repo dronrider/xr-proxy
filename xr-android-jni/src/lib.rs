@@ -1246,7 +1246,15 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeInviteShares(
                 .collect();
             serde_json::json!({ "shares": shares }).to_string()
         }
-        Ok(Err(e)) | Err(e) => json_error(&e),
+        Ok(Err(e)) | Err(e) => {
+            // WARN, не ERROR, когда инвайт просто истёк или отозван (410) - это
+            // штатный исход, а не поломка. Всё прочее (хаб не ответил, битый
+            // JSON) идёт в ERROR: раньше сюда ничего не писалось вовсе, и
+            // «шары по инвайту не грузятся» приходилось разбирать вслепую.
+            let level = if sync::is_invite_gone(&e) { "WARN" } else { "ERROR" };
+            journal_log(level, "files", &format!("шары по инвайту: {}", e));
+            json_error(&e)
+        }
     };
     jstring_into_raw(&mut env, json)
 }
