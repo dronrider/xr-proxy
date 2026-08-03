@@ -51,8 +51,9 @@ pub type SystemResolverFn = Arc<dyn Fn(&str) -> Option<Ipv4Addr> + Send + Sync>;
 pub struct SessionContext {
     /// `RwLock<Arc<Router>>` — тот же паттерн, что в `xr-client::proxy::ProxyState`.
     /// Background preset-refresh внутри `VpnEngine` подменяет активные правила
-    /// без рестарта движка (hot-swap). Hot path — один short-lived read-lock
-    /// на `resolve()` per сессию; write — раз в `hub_refresh_interval_secs`.
+    /// без рестарта движка (hot-swap). Hot path это один short-lived read-lock
+    /// на `resolve()` per сессию; write случается на пробуждении ручки
+    /// ожидания хаба (LLD-37), то есть в момент публикации новой версии.
     /// Живые сессии не «едут под ногами»: Action выбирается один раз по value.
     pub router: std::sync::RwLock<Arc<Router>>,
     pub codec: Codec,
