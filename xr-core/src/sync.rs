@@ -852,6 +852,15 @@ pub async fn list_invite_shares(
         .map_err(|e| format!("parse: {e}"))
 }
 
+/// Whether a [`list_invite_shares`] error means the invite itself is gone
+/// (expired or revoked, HTTP 410) rather than a passing failure (offline,
+/// hub outage, bad response). The caller needs this to show a human answer
+/// instead of the raw `http_410` and to keep the journal entry a WARN: an
+/// expired invite is an expected outcome, not a bug worth an ERROR (XR-121).
+pub fn is_invite_gone(err: &str) -> bool {
+    http_status(err) == Some(410)
+}
+
 /// One-shot mirror: fetch the manifest, scan `dest_root`, diff, and (unless
 /// `dry_run`) apply. This is what a background sync job calls; `dry_run` returns
 /// the plan only, so the UI can warn about deletions before committing.
@@ -2065,6 +2074,18 @@ mod tests {
         assert!(!should_try_next("write: no space left on device"));
         assert!(!should_try_next("read part: permission denied"));
         assert!(!should_try_next("cancelled"));
+    }
+
+    #[test]
+    fn is_invite_gone_matches_only_410() {
+        // XR-121: a stale invite must be told apart from every other failure
+        // shape, so the Kotlin side can show the "истёк/отозван" text on this
+        // one and log it as a WARN, not an ERROR.
+        assert!(is_invite_gone("http_410"));
+        assert!(!is_invite_gone("http_403"));
+        assert!(!is_invite_gone("http_500"));
+        assert!(!is_invite_gone("network: connection refused"));
+        assert!(!is_invite_gone("parse: expected value at line 1 column 1"));
     }
 
     /// The relay leg fails requests by closing the loopback socket, so `op`
