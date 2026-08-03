@@ -625,10 +625,22 @@ private fun PresetRuleCard(rule: com.xrproxy.app.data.CachedPresetRule) {
                     if (rule.ipRanges.isNotEmpty()) add("IP: ${rule.ipRanges.size}")
                     if (rule.geoip.isNotEmpty()) add("geoip: ${rule.geoip.size}")
                 }.joinToString(" · ")
-                Text(
-                    summary.ifBlank { "пустое правило" },
-                    style = MaterialTheme.typography.bodyMedium,
-                )
+                // Имя тематической группы (XR-117) отвечает на вопрос «что это
+                // за правило» лучше счётчика, поэтому счётчик уходит во вторую
+                // строку. Пресеты без имён показываются как раньше.
+                Column {
+                    Text(
+                        rule.name.ifBlank { summary.ifBlank { "пустое правило" } },
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    if (rule.name.isNotBlank() && summary.isNotBlank()) {
+                        Text(
+                            summary,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
             }
             if (expanded) {
                 Spacer(Modifier.height(8.dp))

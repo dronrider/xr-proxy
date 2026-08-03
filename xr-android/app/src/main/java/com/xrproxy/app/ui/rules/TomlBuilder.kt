@@ -41,6 +41,9 @@ fun buildMergedToml(
         appendLine("# --- Preset $presetTag ---")
         for (rule in preset.rules) {
             appendLine("[[routing.rules]]")
+            // Имя группы (XR-117) идёт первой строкой правила: по нему в
+            // выгруженном конфиге видно, о чём эти двадцать доменов.
+            if (rule.name.isNotBlank()) appendLine("name = \"${rule.name}\"")
             appendLine("action = \"${rule.action}\"")
             if (rule.domains.isNotEmpty()) appendLine(tomlArray("domains", rule.domains))
             if (rule.ipRanges.isNotEmpty()) appendLine(tomlArray("ip_ranges", rule.ipRanges))

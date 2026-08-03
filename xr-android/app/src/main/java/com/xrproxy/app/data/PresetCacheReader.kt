@@ -6,6 +6,8 @@ import java.io.File
 
 /** Правило пресета в том виде, в котором его раздаёт хаб. */
 data class CachedPresetRule(
+    /** Название тематической группы, если хаб его прислал (XR-117). */
+    val name: String,
     val action: String,
     val domains: List<String>,
     val ipRanges: List<String>,
@@ -38,6 +40,7 @@ object PresetCacheReader {
             val rules = (0 until (rulesArr?.length() ?: 0)).mapNotNull { i ->
                 val r = rulesArr?.optJSONObject(i) ?: return@mapNotNull null
                 CachedPresetRule(
+                    name = r.optString("name", ""),
                     action = r.optString("action", "proxy"),
                     domains = r.optJSONArray("domains").toStringList(),
                     ipRanges = r.optJSONArray("ip_ranges").toStringList(),
