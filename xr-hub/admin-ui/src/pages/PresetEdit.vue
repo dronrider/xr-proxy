@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { usePresetsStore } from '../stores/presets'
 import RulesEditor from '../components/RulesEditor.vue'
 import type { RoutingRule, RoutingConfig } from '../api'
+import { rulesToToml, parseToml as parsePresetToml } from '../presetToml'
 
 const route = useRoute()
 const router = useRouter()
@@ -104,64 +105,15 @@ async function save() {
   }
 }
 
-// ── TOML serializer ──
-
-function rulesToToml(defAction: string, rulesList: RoutingRule[]): string {
-  let out = `[routing]\ndefault_action = "${defAction}"\n`
-  for (const rule of rulesList) {
-    out += `\n[[routing.rules]]\naction = "${rule.action}"\n`
-    if (rule.domains.length) {
-      out += `domains = [\n${rule.domains.map((d) => `  "${d}",`).join('\n')}\n]\n`
-    }
-    if (rule.ip_ranges.length) {
-      out += `ip_ranges = [\n${rule.ip_ranges.map((r) => `  "${r}",`).join('\n')}\n]\n`
-    }
-    if (rule.geoip.length) {
-      out += `geoip = [${rule.geoip.map((g) => `"${g}"`).join(', ')}]\n`
-    }
-  }
-  return out
-}
-
-// ── TOML parser (minimal, for routing config format) ──
-
+/** Обёртка над разбором из `presetToml.ts`: кладёт ошибку на экран. */
 function parseToml(text: string): RoutingConfig | null {
-  try {
-    // Extract default_action
-    const daMatch = text.match(/default_action\s*=\s*"(\w+)"/)
-    const defAction = daMatch ? daMatch[1] : 'direct'
-
-    // Split by [[routing.rules]]
-    const blocks = text.split(/\[\[routing\.rules\]\]/).slice(1)
-    const parsed: RoutingRule[] = []
-
-    for (const block of blocks) {
-      const actionMatch = block.match(/action\s*=\s*"(\w+)"/)
-      const action = actionMatch ? actionMatch[1] : 'proxy'
-
-      const domains = parseTomlArray(block, 'domains')
-      const ip_ranges = parseTomlArray(block, 'ip_ranges')
-      const geoip = parseTomlArray(block, 'geoip')
-
-      parsed.push({ action, domains, ip_ranges, geoip })
-    }
-
-    tomlError.value = ''
-    return { default_action: defAction, rules: parsed }
-  } catch (e) {
-    tomlError.value = `Parse error: ${e}`
+  const result = parsePresetToml(text)
+  if ('error' in result) {
+    tomlError.value = result.error
     return null
   }
-}
-
-function parseTomlArray(block: string, key: string): string[] {
-  const re = new RegExp(`${key}\\s*=\\s*\\[([^\\]]*?)\\]`, 's')
-  const m = block.match(re)
-  if (!m) return []
-  return m[1]
-    .split(/,|\n/)
-    .map((s) => s.replace(/#.*$/, '').trim().replace(/^["']|["']$/g, ''))
-    .filter(Boolean)
+  tomlError.value = ''
+  return result.config
 }
 
 const tomlPreview = computed(() => rulesToToml(defaultAction.value, rules.value))

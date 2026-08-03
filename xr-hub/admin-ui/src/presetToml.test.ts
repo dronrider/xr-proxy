@@ -1,0 +1,65 @@
+import { describe, expect, it } from 'vitest'
+import { parseToml, rulesToToml } from './presetToml'
+import type { RoutingRule } from './api'
+
+const messengers: RoutingRule = {
+  name: 'Мессенджеры',
+  action: 'proxy',
+  domains: ['telegram.org', '*.telegram.org'],
+  ip_ranges: ['91.108.56.0/22'],
+  geoip: [],
+}
+
+const unnamed: RoutingRule = {
+  action: 'direct',
+  domains: ['gosuslugi.ru'],
+  ip_ranges: [],
+  geoip: [],
+}
+
+describe('rulesToToml', () => {
+  it('печатает имя группы первой строкой правила', () => {
+    expect(rulesToToml('direct', [messengers])).toBe(
+      '[routing]\ndefault_action = "direct"\n' +
+        '\n[[routing.rules]]\n' +
+        'name = "Мессенджеры"\n' +
+        'action = "proxy"\n' +
+        'domains = [\n  "telegram.org",\n  "*.telegram.org",\n]\n' +
+        'ip_ranges = [\n  "91.108.56.0/22",\n]\n',
+    )
+  })
+
+  it('правило без имени печатается как раньше', () => {
+    expect(rulesToToml('direct', [unnamed])).toBe(
+      '[routing]\ndefault_action = "direct"\n' +
+        '\n[[routing.rules]]\n' +
+        'action = "direct"\n' +
+        'domains = [\n  "gosuslugi.ru",\n]\n',
+    )
+  })
+})
+
+describe('parseToml', () => {
+  /** Переключение Visual <-> TOML гоняет пресет через обе функции, и потеря
+   *  имени здесь стёрла бы названия групп в боевом пресете. */
+  it('round-trip сохраняет имена групп и правила без имён', () => {
+    const result = parseToml(rulesToToml('direct', [messengers, unnamed]))
+    expect('config' in result).toBe(true)
+    if (!('config' in result)) return
+    expect(result.config.default_action).toBe('direct')
+    expect(result.config.rules[0]).toEqual(messengers)
+    expect(result.config.rules[1].name).toBeUndefined()
+    expect(result.config.rules[1].domains).toEqual(['gosuslugi.ru'])
+  })
+
+  it('пресет, набранный руками до появления имён, читается без них', () => {
+    const result = parseToml(
+      '[routing]\ndefault_action = "direct"\n\n[[routing.rules]]\naction = "proxy"\ndomains = ["youtube.com"]\n',
+    )
+    expect('config' in result).toBe(true)
+    if (!('config' in result)) return
+    expect(result.config.rules).toHaveLength(1)
+    expect(result.config.rules[0].name).toBeUndefined()
+    expect(result.config.rules[0].domains).toEqual(['youtube.com'])
+  })
+})
