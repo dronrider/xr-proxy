@@ -51,7 +51,15 @@ pub async fn handle_client(
                 break frame;
             }
             Ok(None) => {
-                if filled > 4096 {
+                if filled >= buf.len() {
+                    // Буфер заполнен целиком, а кадр всё ещё не собран (например,
+                    // header врёт про огромный payload_len, либо это вообще не
+                    // наш протокол). Раньше условие сравнивалось с тем же
+                    // размером буфера и никогда не срабатывало: цикл шёл на
+                    // следующий read в пустой остаток среза, тот немедленно
+                    // возвращал Ok(0), и код принимал это за закрытие клиентом -
+                    // соединение рвалось молча вместо fallback-ответа, и зонд
+                    // видел не то поведение, что у веб-сервера.
                     return send_fallback_and_close(&mut client, &buf[..filled], fallback_response).await;
                 }
                 continue;
@@ -232,5 +240,71 @@ async fn relay_obfuscated(
             tracing::debug!("Server relay timed out (1h max)");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+    use xr_proto::obfuscation::{ModifierStrategy, Obfuscator};
+
+    fn make_codec() -> Codec {
+        let obfs = Obfuscator::new(
+            b"handler-test-key-0123456789ABCD".to_vec(),
+            0xDEADBEEF,
+            ModifierStrategy::PositionalXorRotate,
+        );
+        Codec::new(obfs, 0, 0)
+    }
+
+    /// XR-215: заголовок кадра честно обещает payload на 5000 байт, но по
+    /// проводу приходят только первые 4096 - ровно ёмкость буфера первого
+    /// кадра, кадр целиком никогда не собирается. Сервер обязан ответить
+    /// fallback-страницей, а не рвать соединение.
+    #[tokio::test]
+    async fn overflow_during_handshake_sends_fallback_not_reset() {
+        let codec = make_codec();
+        let fallback_response = b"XR-215-FALLBACK".to_vec();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_codec = codec.clone();
+        let server_fallback = fallback_response.clone();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_client(
+                stream,
+                peer,
+                server_codec,
+                Duration::from_secs(2),
+                Some(server_fallback),
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        let oversized_payload = vec![0xABu8; 5000];
+        let wire = codec.encode_frame(Command::Connect, &oversized_payload).unwrap();
+        assert!(wire.len() > 4096, "кадр должен быть больше буфера хендшейка");
+        client.write_all(&wire[..4096]).await.unwrap();
+
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut received))
+            .await
+            .expect("сервер обязан ответить fallback и закрыть соединение, а не зависнуть")
+            .unwrap();
+
+        assert_eq!(
+            received, fallback_response,
+            "переполненный незавершённый кадр должен получать fallback-ответ, а не голый разрыв"
+        );
+
+        server
+            .await
+            .unwrap()
+            .expect("handle_client не должен возвращать ошибку, когда отдан fallback");
     }
 }
