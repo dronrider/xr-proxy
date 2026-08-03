@@ -2,10 +2,10 @@
 /// decode Connect command, connect to target, relay data.
 use std::io;
 use std::net::SocketAddr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Duration;
-use xr_proto::protocol::{Codec, Command, TargetAddr};
+use xr_proto::protocol::{Codec, Command, Frame, TargetAddr};
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);   // 5 min idle
 const MAX_LIFETIME: Duration = Duration::from_secs(3600);  // 1 hour max
@@ -32,42 +32,14 @@ pub async fn handle_client(
 
     // Read first frame (Connect command) with timeout
     let mut buf = vec![0u8; 4096];
-    let mut filled = 0;
 
-    let connect_frame = loop {
-        let n = tokio::time::timeout(timeout, client.read(&mut buf[filled..]))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))??;
-
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::ConnectionReset, "client closed"));
-        }
-        filled += n;
-
-        match codec.decode_frame(&buf[..filled]) {
-            Ok(Some((frame, consumed))) => {
-                buf.copy_within(consumed..filled, 0);
-                filled -= consumed;
-                break frame;
-            }
-            Ok(None) => {
-                if filled >= buf.len() {
-                    // Буфер заполнен целиком, а кадр всё ещё не собран (например,
-                    // header врёт про огромный payload_len, либо это вообще не
-                    // наш протокол). Раньше условие сравнивалось с тем же
-                    // размером буфера и никогда не срабатывало: цикл шёл на
-                    // следующий read в пустой остаток среза, тот немедленно
-                    // возвращал Ok(0), и код принимал это за закрытие клиентом -
-                    // соединение рвалось молча вместо fallback-ответа, и зонд
-                    // видел не то поведение, что у веб-сервера.
-                    return send_fallback_and_close(&mut client, &buf[..filled], fallback_response).await;
-                }
-                continue;
-            }
-            Err(_) => {
+    let (connect_frame, filled) = match read_first_frame(&mut client, &mut buf, &codec, timeout).await? {
+        FirstFrameOutcome::Ready(frame, leftover) => (frame, leftover),
+        FirstFrameOutcome::NeedFallback(reason) => {
+            if reason == FallbackReason::InvalidFrame {
                 tracing::debug!("Invalid frame from {}, sending fallback", client_addr);
-                return send_fallback_and_close(&mut client, &buf[..filled], fallback_response).await;
             }
+            return send_fallback_and_close(&mut client, fallback_response).await;
         }
     };
 
@@ -130,14 +102,81 @@ async fn resolve_target(addr: &TargetAddr) -> io::Result<SocketAddr> {
 
 async fn send_fallback_and_close(
     client: &mut TcpStream,
-    _initial_data: &[u8],
     fallback_response: Option<Vec<u8>>,
 ) -> io::Result<()> {
     if let Some(response) = fallback_response {
         let _ = client.write_all(&response).await;
     }
-    // Silently close — don't give probes any useful info
+    // Silently close - don't give probes any useful info
     Ok(())
+}
+
+/// Итог накопления первого кадра хендшейка: либо кадр собрался, либо
+/// приёмник обязан уйти в fallback (буфер кончился или заголовок не наш).
+#[derive(Debug)]
+enum FirstFrameOutcome {
+    /// Кадр разобран; второе поле - сколько байт после него уже лежит в
+    /// начале `buf` (хвост, прочитанный тем же read, что и сам кадр).
+    Ready(Frame, usize),
+    NeedFallback(FallbackReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallbackReason {
+    /// Буфер заполнен целиком, а кадр так и не собран.
+    Overflow,
+    /// `decode_frame` отверг заголовок - это не наш протокол.
+    InvalidFrame,
+}
+
+/// Копит первый кадр хендшейка из `reader` в `buf`, по одному `read` за раз, с
+/// таймаутом на каждый read. Обобщена по `AsyncRead`, а не завязана на
+/// `TcpStream`: тесту счастливого пути на разбиение кадра между двумя read
+/// нужен приёмник, у которого границы чтений заданы явно, а не тем, что
+/// успеет накопиться в сокете к моменту вызова `read` - на живом `TcpStream`
+/// это гонка (см. XR-215).
+async fn read_first_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    codec: &Codec,
+    timeout: Duration,
+) -> io::Result<FirstFrameOutcome> {
+    let mut filled = 0;
+
+    loop {
+        let n = tokio::time::timeout(timeout, reader.read(&mut buf[filled..]))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))??;
+
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::ConnectionReset, "client closed"));
+        }
+        filled += n;
+
+        match codec.decode_frame(&buf[..filled]) {
+            Ok(Some((frame, consumed))) => {
+                buf.copy_within(consumed..filled, 0);
+                return Ok(FirstFrameOutcome::Ready(frame, filled - consumed));
+            }
+            Ok(None) => {
+                if filled >= buf.len() {
+                    // Буфер заполнен целиком, а кадр всё ещё не собран (например,
+                    // header врёт про огромный payload_len, либо это вообще не
+                    // наш протокол). Раньше условие сравнивалось с тем же
+                    // размером буфера и никогда не срабатывало: цикл шёл на
+                    // следующий read в пустой остаток среза, тот немедленно
+                    // возвращал Ok(0), и код принимал это за закрытие клиентом -
+                    // соединение рвалось молча вместо fallback-ответа, и зонд
+                    // видел не то поведение, что у веб-сервера.
+                    return Ok(FirstFrameOutcome::NeedFallback(FallbackReason::Overflow));
+                }
+                continue;
+            }
+            Err(_) => {
+                return Ok(FirstFrameOutcome::NeedFallback(FallbackReason::InvalidFrame));
+            }
+        }
+    }
 }
 
 /// Relay data between client (obfuscated) and target (plaintext).
@@ -369,44 +408,79 @@ mod tests {
         drop(target);
     }
 
-    /// То же самое, но кадр приходит на сервер двумя read по частям: между
-    /// половинами есть пауза, поэтому сервер обязан хотя бы раз получить
-    /// `Ok(None)` от decode_frame ("нужно больше данных") и не уйти оттуда в
-    /// fallback, а честно дособрать кадр на втором read.
+    /// Мок-приёмник для детерминированной проверки разбиения кадра на два
+    /// read: границы чтений заданы явно списком чанков, а не тем, что успеет
+    /// накопиться на живом сокете к моменту вызова read. На реальном
+    /// TcpStream оба write_all без паузы между ними могут долежать в
+    /// сокетном буфере до первого read целиком, и разбиение на два read не
+    /// гарантировано - отсюда и был sleep, которого этот мок не требует.
+    struct ChunkedReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl ChunkedReader {
+        fn new(chunks: Vec<Vec<u8>>) -> Self {
+            Self { chunks: chunks.into() }
+        }
+    }
+
+    impl AsyncRead for ChunkedReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if let Some(chunk) = self.chunks.pop_front() {
+                assert!(
+                    chunk.len() <= buf.remaining(),
+                    "тестовый чанк не помещается в буфер read"
+                );
+                buf.put_slice(&chunk);
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// XR-215 (замечание ревью, второй проход): прежняя версия этого теста
+    /// разводила два write_all на живом TcpStream реальным
+    /// tokio::time::sleep(50ms), чтобы сервер успел прочитать первую половину
+    /// кадра раньше второй записи - тест не флакал сам (30/30 прогонов, в том
+    /// числе под нагрузкой), но его способность ловить мутацию M4 зависела от
+    /// исхода этой гонки, а не была гарантирована. Цикл приёма первого кадра
+    /// вынесен в read_first_frame и обобщён по AsyncRead ровно для этого
+    /// случая: границы двух read задаются явно чанками мока, безо всякого сна.
     #[tokio::test]
     async fn honest_connect_frame_split_across_reads() {
         let codec = make_codec();
 
-        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let target_addr = target.local_addr().unwrap();
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server_codec = codec.clone();
-        tokio::spawn(async move {
-            let (stream, peer) = listener.accept().await.unwrap();
-            let _ = handle_client(stream, peer, server_codec, Duration::from_secs(2), None).await;
-        });
-
-        let mut client = TcpStream::connect(addr).await.unwrap();
-
+        let target_addr: SocketAddr = "127.0.0.1:443".parse().unwrap();
         let payload = TargetAddr::Ip(target_addr).encode().unwrap();
         let wire = codec.encode_frame(Command::Connect, &payload).unwrap();
         assert!(wire.len() > 2, "кадру есть что делить на части");
         let split = wire.len() / 2;
 
-        client.write_all(&wire[..split]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        client.write_all(&wire[split..]).await.unwrap();
+        let mut reader = ChunkedReader::new(vec![wire[..split].to_vec(), wire[split..].to_vec()]);
+        let mut buf = vec![0u8; 4096];
 
-        let frame = read_one_frame(&mut client, &codec).await;
-        assert_eq!(
-            frame.command,
-            Command::ConnectAck,
-            "кадр, пришедший двумя read по частям, должен дособраться и дойти до ConnectAck"
-        );
+        let outcome = read_first_frame(&mut reader, &mut buf, &codec, Duration::from_secs(2))
+            .await
+            .expect("кадр, пришедший двумя read, должен дособраться без ошибки");
 
-        drop(target);
+        match outcome {
+            FirstFrameOutcome::Ready(frame, leftover) => {
+                assert_eq!(
+                    frame.command,
+                    Command::Connect,
+                    "кадр, дособранный из двух read, должен разобраться как Connect"
+                );
+                assert_eq!(leftover, 0, "после кадра в буфере не должно остаться лишних байт");
+            }
+            FirstFrameOutcome::NeedFallback(reason) => {
+                panic!(
+                    "кадр по частям ушёл в fallback ({:?}), а должен был дособраться",
+                    reason
+                );
+            }
+        }
     }
 }
