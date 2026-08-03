@@ -117,7 +117,11 @@ log_level = "info"                    # error, warn, info, debug
 # url = "https://xr-hub.example.com"
 # preset = "russia"
 # # trusted_public_key = "<base64 ed25519 public key>"  # optional, for signature verification
-# # refresh_interval_secs = 300                          # background check interval (default 5 min)
+# # refresh_interval_secs = 300                          # опрос в деградированном режиме (default 5 min)
+# Правила с хаба доезжают long-poll'ом (LLD-37): клиент висит на запросе со
+# своей версией пресета, и публикация будит его за секунды. refresh_interval_secs
+# на это не влияет, он остаётся потолком паузы, когда хаб недоступен и доставка
+# откатывается в обычный опрос.
 
 # ─── GeoIP (only with --features geoip build) ────────────────────────
 # [geoip]
