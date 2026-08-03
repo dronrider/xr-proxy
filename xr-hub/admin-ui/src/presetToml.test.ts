@@ -82,6 +82,27 @@ describe('parseToml', () => {
     expect(result.config.rules[0].domains).toEqual(['t.me'])
   })
 
+  /** Пресет правится руками в режиме «TOML Editor», и забытая запятая раньше
+   *  стоила бы домена молчком: сайт перестал бы ходить через прокси, а на
+   *  экране всё выглядело бы сохранённым. */
+  it('забытая запятая между доменами это ошибка на экране, а не потерянный домен', () => {
+    const result = parseToml(
+      '[routing]\ndefault_action = "direct"\n\n[[routing.rules]]\naction = "proxy"\ndomains = ["a.com" "b.com"]\n',
+    )
+    expect('error' in result).toBe(true)
+    if (!('error' in result)) return
+    expect(result.error).toContain('ждали запятую')
+  })
+
+  it('комментарий и пробелы после значения разбору не мешают', () => {
+    const result = parseToml(
+      '[routing]\ndefault_action = "direct"\n\n[[routing.rules]]\naction = "proxy"\ndomains = [\n  "t.me" ,  # Telegram\n  "discord.gg"  # Discord\n]\n',
+    )
+    expect('config' in result).toBe(true)
+    if (!('config' in result)) return
+    expect(result.config.rules[0].domains).toEqual(['t.me', 'discord.gg'])
+  })
+
   it('пресет, набранный руками до появления имён, читается без них', () => {
     const result = parseToml(
       '[routing]\ndefault_action = "direct"\n\n[[routing.rules]]\naction = "proxy"\ndomains = ["youtube.com"]\n',
