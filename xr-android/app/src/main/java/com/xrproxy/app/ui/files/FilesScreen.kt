@@ -10,7 +10,6 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
@@ -854,7 +853,7 @@ private fun FolderRow(
         Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(24.dp))
         Spacer(Modifier.width(8.dp))
         Column(modifier = Modifier.weight(1f)) {
-            Text(node.name, maxLines = 1, fontSize = 14.sp, modifier = Modifier.basicMarquee())
+            Text(node.name, maxLines = 1, fontSize = 14.sp, overflow = TextOverflow.MiddleEllipsis)
             Text("${node.fileCount} файл(ов)", fontSize = 10.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
@@ -920,7 +919,7 @@ private fun FileRow(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(modifier = Modifier.weight(1f).padding(start = 14.dp)) {
-            Text(node.name, maxLines = 1, fontSize = 13.sp, modifier = Modifier.basicMarquee())
+            Text(node.name, maxLines = 1, fontSize = 13.sp, overflow = TextOverflow.MiddleEllipsis)
             Text(
                 when {
                     downloaded -> humanSize(node.entry.size) + " - скачано, тап откроет"
