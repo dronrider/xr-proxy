@@ -68,6 +68,14 @@ pub struct WaitQuery {
     pub timeout_secs: Option<u64>,
 }
 
+/// Сколько держать запрос: клиент просит своё, но дольше [`WAIT_MAX_SECS`]
+/// висеть нельзя. Клиент таймаут считает от того, что попросил, а ответ
+/// длиннее минуты промежуточные прокси рвут сами, и клиент видит обрыв
+/// вместо честного 304.
+fn wait_hold(requested_secs: Option<u64>) -> Duration {
+    Duration::from_secs(requested_secs.unwrap_or(WAIT_DEFAULT_SECS).min(WAIT_MAX_SECS))
+}
+
 /// Ожидание новой версии пресета (LLD-37): пока версия совпадает с
 /// клиентской, запрос висит, а публикация из админки будит его через
 /// поколение в [`AppState::preset_gen`]. Сравнение идёт на неравенство, а не
@@ -78,7 +86,7 @@ pub async fn wait_preset(
     extract::Path(name): extract::Path<String>,
     Query(query): Query<WaitQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let hold = Duration::from_secs(query.timeout_secs.unwrap_or(WAIT_DEFAULT_SECS).min(WAIT_MAX_SECS));
+    let hold = wait_hold(query.timeout_secs);
     let deadline = tokio::time::Instant::now() + hold;
     // Подписка снимается до первой сверки версий: иначе публикация в этот
     // зазор прошла бы мимо, и клиент провисел бы полное удержание впустую.
@@ -383,5 +391,65 @@ mod tests {
         let resp = waiter.await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_preset(resp).await.version, 2);
+    }
+    // Публикация нового пресета тоже двигает поколение: ждущие на других
+    // именах перевзведутся и не провисят удержание впустую. По имени, которого
+    // в хабе ещё нет, ожидание не открыть (сразу 404), поэтому у создания
+    // проверяется сам побочный эффект.
+    #[tokio::test]
+    async fn create_preset_bumps_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_preset(dir.path());
+        let before = *state.preset_gen.borrow();
+
+        let created = create_preset(
+            State(state.clone()),
+            Json(CreatePresetRequest {
+                name: "turkey".into(),
+                description: String::new(),
+                rules: RoutingConfig {
+                    default_action: "direct".into(),
+                    rules: Vec::new(),
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.0, StatusCode::CREATED);
+
+        assert_eq!(*state.preset_gen.borrow(), before + 1);
+    }
+
+    // Удаление пресета из админки тоже будит висящий запрос, и клиент узнаёт
+    // об этом сразу: проснувшись, он не находит пресета и получает 404 вместо
+    // молчания до конца удержания.
+    #[tokio::test]
+    async fn delete_preset_wakes_waiter_with_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_preset(dir.path());
+
+        let waiter = tokio::spawn({
+            let state = state.clone();
+            async move { wait_request(state, "version=1&timeout_secs=5").await }
+        });
+        while state.preset_gen.receiver_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        delete_preset(State(state.clone()), extract::Path("russia".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(waiter.await.unwrap().status(), StatusCode::NOT_FOUND);
+    }
+
+    // Клиент вправе попросить больше потолка, но висеть дольше минуты нельзя:
+    // такой ответ рвут промежуточные прокси, и клиент видит обрыв вместо 304.
+    #[test]
+    fn wait_hold_is_capped_and_has_default() {
+        assert_eq!(wait_hold(None), Duration::from_secs(55));
+        assert_eq!(wait_hold(Some(10)), Duration::from_secs(10));
+        assert_eq!(wait_hold(Some(0)), Duration::ZERO);
+        assert_eq!(wait_hold(Some(600)), Duration::from_secs(60));
     }
 }
