@@ -1,16 +1,22 @@
-# ═══════════════════════════════════════════════════════════════
-# XR Proxy — Правила маршрутизации для России
-# Актуально на февраль 2026
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
+# XR Proxy: правила маршрутизации для России
+# Актуально на август 2026
+# ===============================================================
 #
-# Всё что не перечислено ниже — идёт напрямую без прокси.
+# Всё что не перечислено ниже, идёт напрямую без прокси.
 # Добавляйте/убирайте домены по необходимости.
+#
+# `name` у правила это название тематической группы. Хаб раздаёт его
+# клиентам вместе с доменами, и приложение показывает в просмотре пресета
+# и в TOML-превью именно его, а не «доменов: 24». Поле опциональное:
+# правило без имени работает как раньше.
 
 [routing]
 default_action = "direct"
 
-# ── YouTube (замедлён/фактически не работает) ─────────────────
+# --- YouTube (замедлён, фактически не работает) ---
 [[routing.rules]]
+name = "YouTube"
 action = "proxy"
 domains = [
   "youtube.com", "*.youtube.com",
@@ -22,11 +28,14 @@ domains = [
   "*.ggpht.com",
 ]
 
-# ── Meta (Facebook, Instagram, WhatsApp) ──────────────────────
-# Признана экстремистской, заблокирована
+# --- Соцсети ---
+# Meta признана экстремистской и заблокирована целиком, вместе с
+# WhatsApp; Twitter/X, LinkedIn и Snapchat заблокированы отдельно.
 [[routing.rules]]
+name = "Соцсети"
 action = "proxy"
 domains = [
+  # Meta: Facebook, Instagram, Threads, WhatsApp
   "facebook.com", "*.facebook.com",
   "fbcdn.net", "*.fbcdn.net",
   "*.fbsbx.com",
@@ -38,33 +47,49 @@ domains = [
   "wa.me", "*.wa.me",
   "messenger.com", "*.messenger.com",
   "meta.com", "*.meta.com",
-]
-
-# ── Twitter / X ───────────────────────────────────────────────
-[[routing.rules]]
-action = "proxy"
-domains = [
+  # Twitter / X
   "twitter.com", "*.twitter.com",
   "x.com", "*.x.com",
   "t.co",
   "twimg.com", "*.twimg.com",
   "tweetdeck.com", "*.tweetdeck.com",
+  # LinkedIn (заблокирован с 2016)
+  "linkedin.com", "*.linkedin.com",
+  "licdn.com", "*.licdn.com",
+  # Snapchat (заблокирован с декабря 2025)
+  "snapchat.com", "*.snapchat.com",
+  "snap.com", "*.snap.com",
+  "snapkit.co", "*.snapkit.co",
+  "*.sc-cdn.net",
 ]
 
-# ── Telegram (звонки заблокированы, ограничения каналов) ──────
-# Telegram часто подключается напрямую по IP без SNI,
-# поэтому помимо доменов нужны IP-диапазоны серверов.
+# --- Мессенджеры ---
+# У Telegram заблокированы звонки и ограничены каналы. Подключается он
+# часто напрямую по IP без SNI, поэтому помимо доменов нужны диапазоны
+# его серверов.
 [[routing.rules]]
+name = "Мессенджеры"
 action = "proxy"
 domains = [
+  # Telegram
   "telegram.org", "*.telegram.org",
   "t.me", "*.t.me",
   "telegram.me", "*.telegram.me",
   "telesco.pe",
   "tdesktop.com", "*.tdesktop.com",
   "*.tg.dev",
+  # Discord
+  "discord.com", "*.discord.com",
+  "discord.gg",
+  "discord.media", "*.discord.media",
+  "discordapp.com", "*.discordapp.com",
+  "discordapp.net", "*.discordapp.net",
+  # Signal
+  "signal.org", "*.signal.org",
+  "whispersystems.org", "*.whispersystems.org",
 ]
 ip_ranges = [
+  # Telegram
   "91.108.56.0/22",
   "91.108.4.0/22",
   "91.108.8.0/22",
@@ -81,26 +106,9 @@ ip_ranges = [
   "2a0a:f280::/32",
 ]
 
-# ── LinkedIn (заблокирован с 2016) ────────────────────────────
+# --- Google (основные сервисы, бывают частично недоступны) ---
 [[routing.rules]]
-action = "proxy"
-domains = [
-  "linkedin.com", "*.linkedin.com",
-  "licdn.com", "*.licdn.com",
-]
-
-# ── Snapchat (заблокирован с декабря 2025) ────────────────────
-[[routing.rules]]
-action = "proxy"
-domains = [
-  "snapchat.com", "*.snapchat.com",
-  "snap.com", "*.snap.com",
-  "snapkit.co", "*.snapkit.co",
-  "*.sc-cdn.net",
-]
-
-# ── Google (основные сервисы — могут быть частично недоступны) ─
-[[routing.rules]]
+name = "Google"
 action = "proxy"
 domains = [
   "google.com", "*.google.com",
@@ -115,19 +123,9 @@ domains = [
   "*.gvt2.com",
 ]
 
-# ── Discord ───────────────────────────────────────────────────
+# --- Медиа и стриминг ---
 [[routing.rules]]
-action = "proxy"
-domains = [
-  "discord.com", "*.discord.com",
-  "discord.gg",
-  "discord.media", "*.discord.media",
-  "discordapp.com", "*.discordapp.com",
-  "discordapp.net", "*.discordapp.net",
-]
-
-# ── Медиа и стриминг ─────────────────────────────────────────
-[[routing.rules]]
+name = "Медиа и стриминг"
 action = "proxy"
 domains = [
   # Twitch
@@ -148,36 +146,32 @@ domains = [
   "patreonusercontent.com", "*.patreonusercontent.com",
 ]
 
-# ── AI-сервисы ────────────────────────────────────────────────
+# --- AI-сервисы ---
+# Часть из них РКН не блокирует, наоборот: они сами отказывают
+# российским IP («app unavailable»), и прокси тут нужен ради
+# «нероссийского» выходного адреса.
 [[routing.rules]]
+name = "AI-сервисы"
 action = "proxy"
 domains = [
   "openai.com", "*.openai.com",
   "chatgpt.com", "*.chatgpt.com",
   "claude.ai", "*.claude.ai",
+  "claude.com", "*.claude.com",
+  "claudeusercontent.com", "*.claudeusercontent.com",
+  "claude.site", "*.claude.site",
   "anthropic.com", "*.anthropic.com",
   "perplexity.ai", "*.perplexity.ai",
   "gemini.google.com",
   "bard.google.com",
 ]
-
-# ── Geo-blocked: сами блокируют запросы из РФ ─────────────────
-# Эти сайты НЕ блокирует РКН — наоборот, они отказывают российским IP
-# («app unavailable»). Отдельная категория: ресурсы, которые надо
-# проксировать ради «нероссийского» выходного IP, а не из-за блокировки.
-[[routing.rules]]
-action = "proxy"
-domains = [
-  "claude.com", "*.claude.com",
-  "claudeusercontent.com", "*.claudeusercontent.com",
-  "claude.site", "*.claude.site",
-]
-# Anthropic edge (туда резолвятся claude.ai/claude.com) — ловит и
+# Anthropic edge (туда резолвятся claude.ai и claude.com) ловит и
 # соединения без читаемого SNI.
 ip_ranges = ["160.79.104.0/21"]
 
-# ── Разработка и IT ───────────────────────────────────────────
+# --- Разработка и IT ---
 [[routing.rules]]
+name = "Разработка и IT"
 action = "proxy"
 domains = [
   # GitHub (работает, но бывают проблемы)
@@ -197,20 +191,20 @@ domains = [
   "sstatic.net", "*.sstatic.net",
 ]
 
-# ── VPN/прокси-сайты и privacy ────────────────────────────────
+# --- Приватность и VPN ---
 [[routing.rules]]
+name = "Приватность и VPN"
 action = "proxy"
 domains = [
   "protonvpn.com", "*.protonvpn.com",
   "protonmail.com", "*.protonmail.com",
   "proton.me", "*.proton.me",
   "mullvad.net", "*.mullvad.net",
-  "signal.org", "*.signal.org",
-  "whispersystems.org", "*.whispersystems.org",
 ]
 
-# ── Новостные ресурсы (заблокированные независимые СМИ) ───────
+# --- Новости (заблокированные независимые СМИ) ---
 [[routing.rules]]
+name = "Новости"
 action = "proxy"
 domains = [
   "bbc.com", "*.bbc.com",
@@ -222,8 +216,9 @@ domains = [
   "rferl.org", "*.rferl.org",
 ]
 
-# ── Другое ────────────────────────────────────────────────────
+# --- Рабочие сервисы ---
 [[routing.rules]]
+name = "Рабочие сервисы"
 action = "proxy"
 domains = [
   # Cloudflare (частичные блокировки CDN)
