@@ -258,6 +258,19 @@ impl SwitchReason {
     }
 }
 
+/// Склонение слова «сервер» при числе: текст про исчерпанный пул читает
+/// пользователь в журнале и на экране ошибки, а «все 2 серверов» там режет глаз.
+fn servers_word(n: usize) -> &'static str {
+    if (11..=14).contains(&(n % 100)) {
+        return "серверов";
+    }
+    match n % 10 {
+        1 => "сервер",
+        2..=4 => "сервера",
+        _ => "серверов",
+    }
+}
+
 /// Клиентский пул серверов: primary/backup по приоритету, sticky-to-primary.
 pub struct ServerPool {
     /// Отсортированы по приоритету, индекс 0 это primary.
@@ -377,13 +390,43 @@ impl ServerPool {
         std::iter::once(start).chain((0..n).filter(move |i| *i != start))
     }
 
+    /// Ошибка на исчерпание пула. Прежде наружу уходила ошибка последнего
+    /// сервера по порядку обхода, и при поголовной недоступности (оператор
+    /// режет все VPS разом) виноватым названным оказывался случайный резерв,
+    /// а отказ primary пропадал вместе с диагнозом (XR-131). Теперь ошибка
+    /// перечисляет все серверы в порядке приоритета, primary первым, и
+    /// сразу говорит, что легли все.
+    ///
+    /// Отказ одного сервера пересказывать незачем, он возвращается как есть.
+    fn pool_exhausted(&self, mut failures: Vec<(usize, io::Error)>) -> io::Error {
+        if failures.len() <= 1 {
+            return failures.pop().map(|(_, e)| e).unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "no servers in pool")
+            });
+        }
+        failures.sort_by_key(|(idx, _)| *idx);
+        // Вид ошибки берём у самого приоритетного: по нему вызывающий решает,
+        // уводить ли соединение в Direct.
+        let kind = failures[0].1.kind();
+        let details = failures
+            .iter()
+            .map(|(idx, e)| format!("{} ({})", self.slots[*idx].label(), e))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let n = failures.len();
+        io::Error::new(
+            kind,
+            format!("все {} {} недоступны: {}", n, servers_word(n), details),
+        )
+    }
+
     /// Открыть логический стрим через активный сервер, при его отказе через
     /// следующий по приоритету здоровый (тот становится активным).
     /// `Err` значит, что исчерпан весь пул; вызывающий уводит соединение
     /// в Direct.
     pub async fn open_stream(&self, target: &TargetAddr) -> io::Result<MuxStream> {
         let start = self.active_index();
-        let mut last_err: Option<io::Error> = None;
+        let mut failures: Vec<(usize, io::Error)> = Vec::new();
 
         for idx in self.walk_order(start) {
             // Ограничиваем ожидание каждого сервера: молчащий primary иначе
@@ -430,7 +473,7 @@ impl ServerPool {
                         self.slots[idx].label(),
                         e
                     );
-                    last_err = Some(e);
+                    failures.push((idx, e));
                 }
                 Err(_) => {
                     self.slots[idx].mark_down();
@@ -439,16 +482,18 @@ impl ServerPool {
                         self.slots[idx].label(),
                         PER_SERVER_OPEN_TIMEOUT
                     );
-                    last_err = Some(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!("server {} open timed out", self.slots[idx].label()),
+                    failures.push((
+                        idx,
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("не ответил за {:?}", PER_SERVER_OPEN_TIMEOUT),
+                        ),
                     ));
                 }
             }
         }
 
-        Err(last_err
-            .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "no servers in pool")))
+        Err(self.pool_exhausted(failures))
     }
 
     /// Прогрев при старте / после смены сети. Тёплый профиль поднимает mux ко
@@ -463,7 +508,7 @@ impl ServerPool {
                 handles.push(tokio::spawn(async move { (idx, pool.warmup().await) }));
             }
             let mut best: Option<usize> = None;
-            let mut last_err: Option<io::Error> = None;
+            let mut failures: Vec<(usize, io::Error)> = Vec::new();
             for h in handles {
                 let Ok((idx, res)) = h.await else { continue };
                 match res {
@@ -473,7 +518,7 @@ impl ServerPool {
                     }
                     Err(e) => {
                         self.slots[idx].mark_down();
-                        last_err = Some(e);
+                        failures.push((idx, e));
                     }
                 }
             }
@@ -485,13 +530,11 @@ impl ServerPool {
                     self.switch_active(cur, idx, SwitchReason::Warmup);
                     Ok(())
                 }
-                None => Err(last_err.unwrap_or_else(|| {
-                    io::Error::new(io::ErrorKind::Other, "no servers in pool")
-                })),
+                None => Err(self.pool_exhausted(failures)),
             }
         } else {
             let start = self.active_index();
-            let mut last_err: Option<io::Error> = None;
+            let mut failures: Vec<(usize, io::Error)> = Vec::new();
             for idx in self.walk_order(start) {
                 match self.slots[idx].pool.warmup().await {
                     Ok(()) => {
@@ -503,12 +546,11 @@ impl ServerPool {
                     }
                     Err(e) => {
                         self.slots[idx].mark_down();
-                        last_err = Some(e);
+                        failures.push((idx, e));
                     }
                 }
             }
-            Err(last_err
-                .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "no servers in pool")))
+            Err(self.pool_exhausted(failures))
         }
     }
 
@@ -742,6 +784,16 @@ mod tests {
         })
     }
 
+    /// Отказ со своей причиной у каждого сервера: по ней видно, чей отказ
+    /// доехал до текста ошибки пула.
+    fn failing_connect_msg(msg: &'static str) -> ConnectFn {
+        failing_connect_kind(io::ErrorKind::ConnectionRefused, msg)
+    }
+
+    fn failing_connect_kind(kind: io::ErrorKind, msg: &'static str) -> ConnectFn {
+        Arc::new(move || Box::pin(async move { Err(io::Error::new(kind, msg)) }))
+    }
+
     fn failing_connect(counter: Arc<AtomicU32>) -> ConnectFn {
         Arc::new(move || {
             let counter = counter.clone();
@@ -881,6 +933,147 @@ mod tests {
         let err = pool.open_stream(&target()).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
         // Клиент на этом Err уводит соединение в Direct (on_server_down).
+    }
+
+    /// Пул лёг целиком (мобильный оператор режет все VPS разом). Ошибка обязана
+    /// сказать, что недоступны все, и назвать каждый сервер со своей причиной,
+    /// primary в том числе: раньше наружу уезжал отказ последнего по обходу, и
+    /// диагностика упиралась в случайный резерв (XR-131).
+    #[tokio::test]
+    async fn test_exhausted_pool_names_all_servers() {
+        let pool = ServerPool::new(
+            vec![
+                slot("msk", failing_connect_msg("primary refused")),
+                slot("fra", failing_connect_msg("first backup refused")),
+                slot(
+                    "aeza",
+                    failing_connect_kind(io::ErrorKind::NotConnected, "last backup refused"),
+                ),
+            ],
+            PoolProfile::mobile(),
+            None,
+        );
+
+        let err = pool.open_stream(&target()).await.unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("все 3 сервера недоступны"), "{}", text);
+        for (label, cause) in [
+            ("msk", "primary refused"),
+            ("fra", "first backup refused"),
+            ("aeza", "last backup refused"),
+        ] {
+            assert!(text.contains(label), "нет сервера {} в «{}»", label, text);
+            assert!(text.contains(cause), "нет причины {} в «{}»", cause, text);
+        }
+        // Вид ошибки достаётся от primary: по нему вызывающий решает про Direct.
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+    }
+
+    /// Обход начинается с активного, поэтому при работе через резерв primary
+    /// попадает в список не первым. В тексте порядок обязан быть приоритетным:
+    /// пользователь читает его сверху вниз и ждёт основной сервер первым.
+    #[tokio::test]
+    async fn test_exhausted_pool_lists_primary_first_from_backup() {
+        let pool = ServerPool::new(
+            vec![
+                slot("msk", failing_connect_msg("primary refused")),
+                slot("aeza", failing_connect_msg("backup refused")),
+            ],
+            PoolProfile::mobile(),
+            None,
+        );
+        // Работаем через резерв: обход пойдёт aeza -> msk.
+        pool.active.store(1, Ordering::Relaxed);
+
+        let text = pool.open_stream(&target()).await.unwrap_err().to_string();
+        let msk = text.find("msk").unwrap_or_else(|| panic!("нет primary в «{}»", text));
+        let aeza = text.find("aeza").unwrap_or_else(|| panic!("нет резерва в «{}»", text));
+        assert!(msk < aeza, "primary обязан идти первым: «{}»", text);
+    }
+
+    /// Молчащий пул: ни один сервер не отвечает и каждый упирается в свою
+    /// границу ожидания. Такой отказ тоже обязан называть всех, а не последнего.
+    #[tokio::test(start_paused = true)]
+    async fn test_silent_pool_names_all_servers() {
+        let hang: ConnectFn =
+            Arc::new(|| Box::pin(std::future::pending::<io::Result<TcpStream>>()));
+        let pool = ServerPool::new(
+            vec![slot("msk", hang.clone()), slot("aeza", hang)],
+            PoolProfile::mobile(),
+            None,
+        );
+
+        let err = pool.open_stream(&target()).await.unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("все 2 сервера недоступны"), "{}", text);
+        assert!(text.contains("msk") && text.contains("aeza"), "{}", text);
+        assert_eq!(text.matches("не ответил за").count(), 2, "{}", text);
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// Тот же диагноз на холодном прогреве (телефон, старт и смена сети):
+    /// именно этот путь питает «Сервер недоступен» на экране.
+    #[tokio::test]
+    async fn test_cold_warmup_exhausted_names_all_servers() {
+        let pool = ServerPool::new(
+            vec![
+                slot("msk", failing_connect_msg("primary refused")),
+                slot("aeza", failing_connect_msg("backup refused")),
+            ],
+            PoolProfile::mobile(),
+            None,
+        );
+
+        let text = pool.warmup().await.unwrap_err().to_string();
+        assert!(text.contains("все 2 сервера недоступны"), "{}", text);
+        assert!(text.contains("msk") && text.contains("primary refused"), "{}", text);
+        assert!(text.contains("aeza"), "{}", text);
+    }
+
+    /// Тёплый прогрев (роутер) ходит ко всем серверам параллельно, и порядок
+    /// завершения проб ничего не значит: отказ primary в тексте обязателен.
+    #[tokio::test]
+    async fn test_warm_warmup_exhausted_keeps_primary() {
+        let pool = ServerPool::new(
+            vec![
+                slot("msk", failing_connect_msg("primary refused")),
+                slot("fra", failing_connect_msg("first backup refused")),
+                slot("aeza", failing_connect_msg("last backup refused")),
+            ],
+            PoolProfile::router(),
+            None,
+        );
+
+        let text = pool.warmup().await.unwrap_err().to_string();
+        assert!(text.contains("все 3 сервера недоступны"), "{}", text);
+        assert!(text.contains("msk") && text.contains("primary refused"), "{}", text);
+        assert!(text.contains("aeza"), "{}", text);
+    }
+
+    /// Единственный сервер пересказывать нечем: его отказ уходит наружу как
+    /// есть, и «Сервер недоступен: ...» на экране остаётся прежним.
+    #[tokio::test]
+    async fn test_single_server_error_passes_through() {
+        let pool = ServerPool::new(
+            vec![slot("msk", failing_connect_msg("primary refused"))],
+            PoolProfile::mobile(),
+            None,
+        );
+
+        let err = pool.warmup().await.unwrap_err();
+        assert_eq!(err.to_string(), "primary refused");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+    }
+
+    #[test]
+    fn test_servers_word_declension() {
+        assert_eq!(servers_word(1), "сервер");
+        assert_eq!(servers_word(2), "сервера");
+        assert_eq!(servers_word(4), "сервера");
+        assert_eq!(servers_word(5), "серверов");
+        assert_eq!(servers_word(11), "серверов");
+        assert_eq!(servers_word(21), "сервер");
+        assert_eq!(servers_word(112), "серверов");
     }
 
     #[tokio::test]
