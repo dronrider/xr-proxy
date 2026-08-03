@@ -6,19 +6,62 @@ import type { RoutingConfig, RoutingRule } from './api'
  * владелец пресета понимает, о чём эти двадцать доменов.
  */
 export function rulesToToml(defAction: string, rulesList: RoutingRule[]): string {
-  let out = `[routing]\ndefault_action = "${defAction}"\n`
+  let out = `[routing]\ndefault_action = ${tomlString(defAction)}\n`
   for (const rule of rulesList) {
     out += '\n[[routing.rules]]\n'
-    if (rule.name) out += `name = "${rule.name}"\n`
-    out += `action = "${rule.action}"\n`
+    if (rule.name) out += `name = ${tomlString(rule.name)}\n`
+    out += `action = ${tomlString(rule.action)}\n`
     if (rule.domains.length) {
-      out += `domains = [\n${rule.domains.map((d) => `  "${d}",`).join('\n')}\n]\n`
+      out += `domains = [\n${rule.domains.map((d) => `  ${tomlString(d)},`).join('\n')}\n]\n`
     }
     if (rule.ip_ranges.length) {
-      out += `ip_ranges = [\n${rule.ip_ranges.map((r) => `  "${r}",`).join('\n')}\n]\n`
+      out += `ip_ranges = [\n${rule.ip_ranges.map((r) => `  ${tomlString(r)},`).join('\n')}\n]\n`
     }
     if (rule.geoip.length) {
-      out += `geoip = [${rule.geoip.map((g) => `"${g}"`).join(', ')}]\n`
+      out += `geoip = [${rule.geoip.map((g) => tomlString(g)).join(', ')}]\n`
+    }
+  }
+  return out
+}
+
+/**
+ * Строка в TOML-кавычках. Название группы владелец набирает свободным текстом,
+ * и кавычка в нём («AI "умный" сервис») без экранирования обрывала бы значение
+ * на середине: печать давала битый TOML, а обратный разбор молча возвращал
+ * огрызок имени. Экранируем все строки одинаково, включая домены.
+ */
+function tomlString(value: string): string {
+  const escaped = value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t')
+  return `"${escaped}"`
+}
+
+function unescapeChar(c: string): string {
+  switch (c) {
+    case 'n':
+      return '\n'
+    case 'r':
+      return '\r'
+    case 't':
+      return '\t'
+    default:
+      return c
+  }
+}
+
+/** Развернуть экранирование в значении из двойных кавычек. */
+function unescapeTomlString(raw: string): string {
+  let out = ''
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i] === '\\' && i + 1 < raw.length) {
+      out += unescapeChar(raw[i + 1])
+      i++
+    } else {
+      out += raw[i]
     }
   }
   return out
@@ -42,9 +85,10 @@ export function parseToml(text: string): { config: RoutingConfig } | { error: st
       const action = actionMatch ? actionMatch[1] : 'proxy'
 
       // Имя группы читаем обратно, иначе переключение Visual <-> TOML
-      // стирало бы названия из пресета.
-      const nameMatch = block.match(/^\s*name\s*=\s*"([^"]*)"/m)
-      const name = nameMatch?.[1] || undefined
+      // стирало бы названия из пресета. Кавычка внутри значения приходит
+      // экранированной, поэтому по ней разбор не заканчивается.
+      const nameMatch = block.match(/^\s*name\s*=\s*"((?:[^"\\]|\\.)*)"/m)
+      const name = nameMatch ? unescapeTomlString(nameMatch[1]) || undefined : undefined
 
       parsed.push({
         name,
@@ -61,12 +105,55 @@ export function parseToml(text: string): { config: RoutingConfig } | { error: st
   }
 }
 
+/**
+ * Элементы массива. Идём по телу посимвольно, а не split'ом по запятым:
+ * запятая и решётка внутри кавычек не должны рвать значение, а элемент без
+ * кавычек (так пресет мог набрать человек) по-прежнему принимаем.
+ */
 function parseTomlArray(block: string, key: string): string[] {
-  const re = new RegExp(`${key}\\s*=\\s*\\[([^\\]]*?)\\]`, 's')
-  const m = block.match(re)
+  const m = block.match(new RegExp(`${key}\\s*=\\s*\\[([^\\]]*?)\\]`, 's'))
   if (!m) return []
-  return m[1]
-    .split(/,|\n/)
-    .map((s) => s.replace(/#.*$/, '').trim().replace(/^["']|["']$/g, ''))
-    .filter(Boolean)
+
+  const body = m[1]
+  const items: string[] = []
+  let bare = ''
+  const flushBare = () => {
+    const t = bare.trim()
+    if (t) items.push(t)
+    bare = ''
+  }
+
+  let i = 0
+  while (i < body.length) {
+    const c = body[i]
+    if (c === '"' || c === "'") {
+      const quote = c
+      let value = ''
+      i++
+      while (i < body.length && body[i] !== quote) {
+        // Одинарные кавычки в TOML это literal string, экранирования в них нет.
+        if (quote === '"' && body[i] === '\\' && i + 1 < body.length) {
+          value += unescapeChar(body[i + 1])
+          i += 2
+        } else {
+          value += body[i]
+          i++
+        }
+      }
+      i++
+      if (value) items.push(value)
+      bare = ''
+      while (i < body.length && body[i] !== ',' && body[i] !== '\n') i++
+    } else if (c === '#') {
+      while (i < body.length && body[i] !== '\n') i++
+    } else if (c === ',' || c === '\n') {
+      flushBare()
+      i++
+    } else {
+      bare += c
+      i++
+    }
+  }
+  flushBare()
+  return items
 }
