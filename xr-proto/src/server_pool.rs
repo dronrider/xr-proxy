@@ -971,7 +971,8 @@ mod tests {
             assert!(text.contains(label), "нет сервера {} в «{}»", label, text);
             assert!(text.contains(cause), "нет причины {} в «{}»", cause, text);
         }
-        // Вид ошибки достаётся от primary: по нему вызывающий решает про Direct.
+        // Вид ошибки достаётся от primary, а не от последнего резерва: по виду
+        // движок выбирает уровень записи в журнале.
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
     }
 
