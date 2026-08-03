@@ -54,6 +54,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let public = Router::new()
         .route("/presets", get(presets::list_presets))
         .route("/presets/{name}", get(presets::get_preset))
+        .route("/presets/{name}/wait", get(presets::wait_preset))
         .route("/invite/{token}", get(invites::get_invite_info))
         .route("/invite/{token}/view", get(invites::view_invite))
         .route("/invite/{token}/claim", post(invites::claim_invite))
@@ -187,6 +188,7 @@ mod tests {
             sessions: RwLock::new(HashMap::new()),
             config,
             signing: None,
+            preset_gen: tokio::sync::watch::Sender::new(0),
         })
     }
 

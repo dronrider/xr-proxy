@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 use xr_proto::preset::{Invite, Preset};
 use xr_proto::share::ShareRecord;
 
@@ -18,6 +18,11 @@ pub struct AppState {
     pub sessions: RwLock<HashMap<String, String>>, // session_token → username
     pub config: HubConfig,
     pub signing: Option<SigningContext>,
+    /// Поколение пресетов (LLD-37): любая правка через админку двигает его, и
+    /// на этом просыпаются клиенты, висящие на ручке ожидания. Канал один на
+    /// все пресеты: разбудить лишних дешевле, чем вести канал на имя, чужой
+    /// подписчик сверит свою версию и перевзведётся.
+    pub preset_gen: watch::Sender<u64>,
 }
 
 /// Load state from disk and build AppState.
@@ -54,5 +59,6 @@ pub fn hydrate(config: HubConfig) -> Result<Arc<AppState>> {
         sessions: RwLock::new(HashMap::new()),
         config,
         signing,
+        preset_gen: watch::Sender::new(0),
     }))
 }

@@ -1,7 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::extract::{self, State};
+use axum::extract::{self, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -51,6 +52,62 @@ pub async fn get_preset(
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert("etag", etag.parse().unwrap());
     Ok((resp_headers, Json(preset.clone())))
+}
+
+/// Максимум удержания запроса ожидания и значение по умолчанию (LLD-37).
+/// Минута это потолок, за которым промежуточные прокси начинают рвать
+/// висящий ответ сами.
+const WAIT_MAX_SECS: u64 = 60;
+const WAIT_DEFAULT_SECS: u64 = 55;
+
+#[derive(Debug, Deserialize)]
+pub struct WaitQuery {
+    /// Версия, которая уже есть у клиента. Без кэша он присылает 0.
+    #[serde(default)]
+    pub version: u64,
+    pub timeout_secs: Option<u64>,
+}
+
+/// Ожидание новой версии пресета (LLD-37): пока версия совпадает с
+/// клиентской, запрос висит, а публикация из админки будит его через
+/// поколение в [`AppState::preset_gen`]. Сравнение идёт на неравенство, а не
+/// на «больше»: откат пресета админом обязан доезжать так же мгновенно, как
+/// и новая версия.
+pub async fn wait_preset(
+    State(state): State<Arc<AppState>>,
+    extract::Path(name): extract::Path<String>,
+    Query(query): Query<WaitQuery>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let hold = Duration::from_secs(query.timeout_secs.unwrap_or(WAIT_DEFAULT_SECS).min(WAIT_MAX_SECS));
+    let deadline = tokio::time::Instant::now() + hold;
+    // Подписка снимается до первой сверки версий: иначе публикация в этот
+    // зазор прошла бы мимо, и клиент провисел бы полное удержание впустую.
+    let mut gen_rx = state.preset_gen.subscribe();
+
+    loop {
+        {
+            let presets = state.presets.read().await;
+            let preset = presets.get(&name).ok_or(StatusCode::NOT_FOUND)?;
+            if preset.version != query.version {
+                let mut headers = HeaderMap::new();
+                headers.insert("etag", format!("\"{}\"", preset.version).parse().unwrap());
+                return Ok((headers, Json(preset.clone())));
+            }
+        }
+
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Err(StatusCode::NOT_MODIFIED);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(left) => return Err(StatusCode::NOT_MODIFIED),
+            changed = gen_rx.changed() => {
+                if changed.is_err() {
+                    return Err(StatusCode::NOT_MODIFIED);
+                }
+            }
+        }
+    }
 }
 
 pub async fn get_public_key(
@@ -103,6 +160,7 @@ pub async fn create_preset(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     presets.insert(preset.name.clone(), preset.clone());
+    bump_generation(&state);
     Ok((StatusCode::CREATED, Json(preset)))
 }
 
@@ -137,6 +195,7 @@ pub async fn update_preset(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     presets.insert(name, preset.clone());
+    bump_generation(&state);
     Ok(Json(preset))
 }
 
@@ -153,7 +212,14 @@ pub async fn delete_preset(
     storage::delete_preset_file(data_dir, &name)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    bump_generation(&state);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Разбудить всех, кто висит на ручке ожидания. Зовётся после записи на диск
+/// и вставки в мапу, чтобы проснувшийся увидел уже новую версию.
+fn bump_generation(state: &AppState) {
+    state.preset_gen.send_modify(|gen| *gen += 1);
 }
 
 fn validate_slug(name: &str) -> Result<(), (StatusCode, String)> {
@@ -171,4 +237,151 @@ fn validate_rules_size(rules: &RoutingConfig) -> Result<(), (StatusCode, String)
         return Err((StatusCode::PAYLOAD_TOO_LARGE, "max 10000 rules".into()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tokio::sync::RwLock;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::api::router;
+
+    fn preset(version: u64) -> Preset {
+        Preset {
+            name: "russia".into(),
+            version,
+            updated_at: "2026-08-03T00:00:00Z".into(),
+            description: String::new(),
+            rules: RoutingConfig {
+                default_action: "direct".into(),
+                rules: Vec::new(),
+            },
+            signature: None,
+        }
+    }
+
+    fn state_with_preset(dir: &Path) -> Arc<AppState> {
+        let toml = format!("[server]\ndata_dir = \"{}\"\n[admin]\nusers = []\n", dir.display());
+        let config: crate::config::HubConfig = toml::from_str(&toml).unwrap();
+        let mut presets = HashMap::new();
+        presets.insert("russia".to_string(), preset(1));
+        Arc::new(AppState {
+            presets: RwLock::new(presets),
+            invites: RwLock::new(HashMap::new()),
+            shares: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashMap::new()),
+            config,
+            signing: None,
+            preset_gen: tokio::sync::watch::Sender::new(0),
+        })
+    }
+
+    async fn wait_request(state: Arc<AppState>, query: &str) -> axum::response::Response {
+        router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/presets/russia/wait?{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn body_preset(resp: axum::response::Response) -> Preset {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // Клиент приносит устаревшую версию: ждать нечего, пресет уходит сразу и
+    // целиком, лишнего round trip за телом не будет.
+    #[tokio::test]
+    async fn wait_returns_preset_when_version_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let resp = wait_request(state_with_preset(dir.path()), "version=0&timeout_secs=55").await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("etag").unwrap(), "\"1\"");
+        assert_eq!(body_preset(resp).await.version, 1);
+    }
+
+    // Откат версии админом это тоже изменение: сравнение идёт на неравенство,
+    // и версия выше локальной доезжает так же, как новая.
+    #[tokio::test]
+    async fn wait_returns_preset_when_client_is_ahead() {
+        let dir = tempfile::tempdir().unwrap();
+        let resp = wait_request(state_with_preset(dir.path()), "version=9&timeout_secs=55").await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_preset(resp).await.version, 1);
+    }
+
+    // Истёкшее удержание отвечает 304 без тела. Нулевой таймаут делает кейс
+    // детерминированным: ждать в тесте нечего, ответ приходит сразу.
+    #[tokio::test]
+    async fn wait_times_out_with_not_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let resp = wait_request(state_with_preset(dir.path()), "version=1&timeout_secs=0").await;
+
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn wait_unknown_preset_is_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let resp = router(state_with_preset(dir.path()))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/presets/turkey/wait?version=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // Ради чего всё и заводилось: публикация будит висящий запрос, и новая
+    // версия уходит клиенту, не дожидаясь конца удержания. Синхронизация без
+    // sleep: тест ждёт, пока обработчик подпишется на поколение, и только
+    // тогда публикует.
+    #[tokio::test]
+    async fn wait_wakes_up_on_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_preset(dir.path());
+
+        let waiter = tokio::spawn({
+            let state = state.clone();
+            async move { wait_request(state, "version=1&timeout_secs=5").await }
+        });
+        while state.preset_gen.receiver_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let published = update_preset(
+            State(state.clone()),
+            extract::Path("russia".to_string()),
+            Json(CreatePresetRequest {
+                name: "russia".into(),
+                description: "новая версия".into(),
+                rules: RoutingConfig {
+                    default_action: "direct".into(),
+                    rules: Vec::new(),
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(published.0.version, 2);
+
+        let resp = waiter.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_preset(resp).await.version, 2);
+    }
 }
