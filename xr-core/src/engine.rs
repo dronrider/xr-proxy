@@ -34,6 +34,18 @@ use crate::stats::Stats;
 /// to the same dst port (e.g. 443) don't conflict.
 static EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(10000);
 
+/// Текст ошибки прогрева, он же уходит на экран приложения. Пул из нескольких
+/// серверов присылает ошибку, которая уже перечисляет их все (XR-131): префикс
+/// про один сервер сузил бы её до последнего резерва, хотя при блокировке
+/// оператором ложатся все разом, primary в том числе.
+fn warmup_error_text(pool_size: usize, e: &io::Error) -> String {
+    if pool_size > 1 {
+        format!("Нет связи, {}", e)
+    } else {
+        format!("Сервер недоступен: {}", e)
+    }
+}
+
 fn next_ephemeral_port() -> u16 {
     let port = EPHEMERAL_PORT.fetch_add(1, Ordering::Relaxed);
     if port >= 60000 {
@@ -342,7 +354,7 @@ impl VpnEngine {
                     return;
                 }
                 Some(Err(e)) => {
-                    let msg = format!("Сервер недоступен: {}", e);
+                    let msg = warmup_error_text(ctx.server_pool.size(), &e);
                     stats.add_error(&msg);
                     state.set(VpnState::Error(msg));
                     return;
@@ -987,6 +999,23 @@ fn ipv4_checksum(h: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Пул из нескольких серверов уже сам говорит, что легли все (XR-131);
+    /// экран не должен сводить это к одному серверу.
+    #[test]
+    fn warmup_error_text_keeps_the_whole_pool() {
+        let pool_err = io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "все 2 сервера недоступны: msk (refused), aeza (refused)",
+        );
+        let msg = warmup_error_text(2, &pool_err);
+        assert!(msg.contains("все 2 сервера недоступны"), "{}", msg);
+        assert!(!msg.starts_with("Сервер недоступен"), "{}", msg);
+
+        // Один сервер в пуле, текст прежний.
+        let one = io::Error::new(io::ErrorKind::ConnectionRefused, "refused");
+        assert_eq!(warmup_error_text(1, &one), "Сервер недоступен: refused");
+    }
 
     #[test]
     fn test_parse_ipv4_header() {
