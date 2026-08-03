@@ -10,223 +10,276 @@
 # клиентам вместе с доменами, и приложение показывает в просмотре пресета
 # и в TOML-превью именно его, а не «доменов: 24». Поле опциональное:
 # правило без имени работает как раньше.
+#
+# Файл держится в соответствии с боевым пресетом `russia` на хабе
+# (сверен на версии 37): те же группы, те же имена, тот же состав.
+# Запись `*.example.com` покрывает и поддомены, и сам `example.com`,
+# поэтому голая форма рядом со звёздочной не нужна.
 
 [routing]
 default_action = "direct"
 
-# --- YouTube (замедлён, фактически не работает) ---
+# --- YouTube и личные сервисы ---
+# YouTube замедлён и фактически не работает; рядом живут личные
+# сервисы владельца пресета, которым тоже нужен обход.
 [[routing.rules]]
-name = "YouTube"
+name = "YouTube и личные сервисы"
 action = "proxy"
 domains = [
-  "youtube.com", "*.youtube.com",
-  "youtu.be",
-  "*.googlevideo.com",
-  "*.ytimg.com",
-  "youtube-nocookie.com", "*.youtube-nocookie.com",
-  "*.youtube-ui.l.google.com",
+  "*.coderabbit.ai", "*.zoobr.top", "*.claudelog.com",
+  "*.grizzlysms.com", "*.smtp2go.com", "*.forklog.com",
+  "*.kimi.com", "*.xmpp.org", "*.youtube.ru",
+  "*.youtube.com", "*.youtu.be", "*.googlevideo.com",
+  "*.ytimg.com", "*.youtube-nocookie.com", "*.youtube-ui.l.google.com",
   "*.ggpht.com",
 ]
 
-# --- Соцсети ---
-# Meta признана экстремистской и заблокирована целиком, вместе с
-# WhatsApp; Twitter/X, LinkedIn и Snapchat заблокированы отдельно.
+# --- Meta и WhatsApp ---
+# Meta признана экстремистской и заблокирована целиком, вместе с WhatsApp.
 [[routing.rules]]
-name = "Соцсети"
+name = "Meta и WhatsApp"
 action = "proxy"
 domains = [
-  # Meta: Facebook, Instagram, Threads, WhatsApp
-  "facebook.com", "*.facebook.com",
-  "fbcdn.net", "*.fbcdn.net",
-  "*.fbsbx.com",
-  "instagram.com", "*.instagram.com",
-  "*.cdninstagram.com",
-  "threads.net", "*.threads.net",
-  "whatsapp.com", "*.whatsapp.com",
-  "whatsapp.net", "*.whatsapp.net",
-  "wa.me", "*.wa.me",
-  "messenger.com", "*.messenger.com",
-  "meta.com", "*.meta.com",
-  # Twitter / X
-  "twitter.com", "*.twitter.com",
-  "x.com", "*.x.com",
-  "t.co",
-  "twimg.com", "*.twimg.com",
-  "tweetdeck.com", "*.tweetdeck.com",
-  # LinkedIn (заблокирован с 2016)
-  "linkedin.com", "*.linkedin.com",
-  "licdn.com", "*.licdn.com",
-  # Snapchat (заблокирован с декабря 2025)
-  "snapchat.com", "*.snapchat.com",
-  "snap.com", "*.snap.com",
-  "snapkit.co", "*.snapkit.co",
+  "*.facebook.com", "*.fbcdn.net", "*.fbsbx.com",
+  "*.instagram.com", "*.cdninstagram.com", "*.threads.net",
+  "*.whatsapp.com", "*.whatsapp.net", "*.wa.me",
+  "*.messenger.com", "*.meta.com",
+]
+
+# --- Twitter и X ---
+# Заблокирован с марта 2022.
+[[routing.rules]]
+name = "Twitter и X"
+action = "proxy"
+domains = [
+  "*.twitter.com", "*.x.com", "t.co",
+  "*.twimg.com", "*.tweetdeck.com",
+]
+
+# --- Telegram ---
+# Домены и подсети дата-центров: часть клиентов ходит мимо DNS,
+# по одним адресам.
+[[routing.rules]]
+name = "Telegram"
+action = "proxy"
+domains = [
+  "*.telegram.org", "*.t.me", "*.telegram.me",
+  "telesco.pe", "*.tdesktop.com", "*.tg.dev",
+]
+ip_ranges = [
+  "91.108.56.0/22", "91.108.4.0/22", "91.108.8.0/22",
+  "91.108.16.0/22", "91.108.12.0/22", "91.108.20.0/22",
+  "149.154.160.0/20", "91.105.192.0/23", "185.76.151.0/24",
+  "2001:b28:f23d::/48", "2001:b28:f23f::/48", "2001:67c:4e8::/48",
+  "2001:b28:f23c::/48", "2a0a:f280::/32",
+]
+
+# --- LinkedIn ---
+# Заблокирован с 2016.
+[[routing.rules]]
+name = "LinkedIn"
+action = "proxy"
+domains = [
+  "*.linkedin.com", "*.licdn.com",
+]
+
+# --- Snapchat ---
+# Заблокирован с декабря 2025.
+[[routing.rules]]
+name = "Snapchat"
+action = "proxy"
+domains = [
+  "*.snapchat.com", "*.snap.com", "*.snapkit.co",
   "*.sc-cdn.net",
 ]
 
-# --- Мессенджеры ---
-# У Telegram заблокированы звонки и ограничены каналы. Подключается он
-# часто напрямую по IP без SNI, поэтому помимо доменов нужны диапазоны
-# его серверов.
-[[routing.rules]]
-name = "Мессенджеры"
-action = "proxy"
-domains = [
-  # Telegram
-  "telegram.org", "*.telegram.org",
-  "t.me", "*.t.me",
-  "telegram.me", "*.telegram.me",
-  "telesco.pe",
-  "tdesktop.com", "*.tdesktop.com",
-  "*.tg.dev",
-  # Discord
-  "discord.com", "*.discord.com",
-  "discord.gg",
-  "discord.media", "*.discord.media",
-  "discordapp.com", "*.discordapp.com",
-  "discordapp.net", "*.discordapp.net",
-  # Signal
-  "signal.org", "*.signal.org",
-  "whispersystems.org", "*.whispersystems.org",
-]
-ip_ranges = [
-  # Telegram
-  "91.108.56.0/22",
-  "91.108.4.0/22",
-  "91.108.8.0/22",
-  "91.108.16.0/22",
-  "91.108.12.0/22",
-  "91.108.20.0/22",
-  "149.154.160.0/20",
-  "91.105.192.0/23",
-  "185.76.151.0/24",
-  "2001:b28:f23d::/48",
-  "2001:b28:f23f::/48",
-  "2001:67c:4e8::/48",
-  "2001:b28:f23c::/48",
-  "2a0a:f280::/32",
-]
-
-# --- Google (основные сервисы, бывают частично недоступны) ---
+# --- Google ---
+# Часть сервисов замедлена, gvt-домены отдают обновления.
 [[routing.rules]]
 name = "Google"
 action = "proxy"
 domains = [
-  "google.com", "*.google.com",
-  "google.ru", "*.google.ru",
-  "*.googleapis.com",
-  "*.gstatic.com",
-  "*.googleusercontent.com",
-  "*.google-analytics.com",
-  "*.googletagmanager.com",
-  "gmail.com", "*.gmail.com",
-  "*.gvt1.com",
+  "*.google.com", "*.google.ru", "*.googleapis.com",
+  "*.gstatic.com", "*.googleusercontent.com", "*.google-analytics.com",
+  "*.googletagmanager.com", "*.gmail.com", "*.gvt1.com",
   "*.gvt2.com",
 ]
 
-# --- Медиа и стриминг ---
+# --- Discord ---
+# Заблокирован с октября 2024.
 [[routing.rules]]
-name = "Медиа и стриминг"
+name = "Discord"
 action = "proxy"
 domains = [
-  # Twitch
-  "twitch.tv", "*.twitch.tv",
-  "twitchcdn.net", "*.twitchcdn.net",
-  "jtvnw.net", "*.jtvnw.net",
-  # Spotify
-  "spotify.com", "*.spotify.com",
-  "scdn.co", "*.scdn.co",
-  "spotifycdn.com", "*.spotifycdn.com",
-  # SoundCloud
-  "soundcloud.com", "*.soundcloud.com",
-  "sndcdn.com", "*.sndcdn.com",
-  # Medium
-  "medium.com", "*.medium.com",
-  # Patreon (заблокирован с 2022)
-  "patreon.com", "*.patreon.com",
-  "patreonusercontent.com", "*.patreonusercontent.com",
+  "*.discord.com", "discord.gg", "*.discord.media",
+  "*.discordapp.com", "*.discordapp.net",
+]
+
+# --- Стриминг и подписки ---
+# Ушли с рынка либо режут оплату из России.
+[[routing.rules]]
+name = "Стриминг и подписки"
+action = "proxy"
+domains = [
+  "*.twitch.tv", "*.twitchcdn.net", "*.jtvnw.net",
+  "*.spotify.com", "*.scdn.co", "*.spotifycdn.com",
+  "*.soundcloud.com", "*.sndcdn.com", "*.medium.com",
+  "*.patreon.com", "*.patreonusercontent.com",
 ]
 
 # --- AI-сервисы ---
-# Часть из них РКН не блокирует, наоборот: они сами отказывают
-# российским IP («app unavailable»), и прокси тут нужен ради
-# «нероссийского» выходного адреса.
+# Отказывают по гео: с российского адреса не пускают ни в чат, ни в API.
 [[routing.rules]]
 name = "AI-сервисы"
 action = "proxy"
 domains = [
-  "openai.com", "*.openai.com",
-  "chatgpt.com", "*.chatgpt.com",
-  "claude.ai", "*.claude.ai",
-  "claude.com", "*.claude.com",
-  "claudeusercontent.com", "*.claudeusercontent.com",
-  "claude.site", "*.claude.site",
-  "anthropic.com", "*.anthropic.com",
-  "perplexity.ai", "*.perplexity.ai",
-  "gemini.google.com",
-  "bard.google.com",
+  "*.openai.com", "*.chatgpt.com", "*.claude.ai",
+  "*.anthropic.com", "*.perplexity.ai", "gemini.google.com",
+  "bard.google.com", "stripe.com",
 ]
-# Anthropic edge (туда резолвятся claude.ai и claude.com) ловит и
-# соединения без читаемого SNI.
-ip_ranges = ["160.79.104.0/21"]
+
+# --- Claude ---
+# Своя группа: помимо доменов нужна подсеть, инференс ходит мимо CDN.
+[[routing.rules]]
+name = "Claude"
+action = "proxy"
+domains = [
+  "claude.com", "*.claude.com", "claudeusercontent.com",
+  "*.claudeusercontent.com", "claude.site", "*.claude.site",
+]
+ip_ranges = [
+  "160.79.104.0/21",
+]
 
 # --- Разработка и IT ---
+# Периодически недоступны или отдают частичный контент.
 [[routing.rules]]
 name = "Разработка и IT"
 action = "proxy"
 domains = [
-  # GitHub (работает, но бывают проблемы)
-  "github.com", "*.github.com",
-  "github.io", "*.github.io",
-  "githubusercontent.com", "*.githubusercontent.com",
-  "githubassets.com", "*.githubassets.com",
-  # Docker Hub
-  "docker.io", "*.docker.io",
-  "docker.com", "*.docker.com",
-  # npm
-  "npmjs.com", "*.npmjs.com",
-  "npmjs.org", "*.npmjs.org",
-  # Stack Overflow
-  "stackoverflow.com", "*.stackoverflow.com",
-  "stackexchange.com", "*.stackexchange.com",
-  "sstatic.net", "*.sstatic.net",
+  "*.github.com", "*.github.io", "*.githubusercontent.com",
+  "*.githubassets.com", "*.npmjs.com", "*.npmjs.org",
+  "*.stackoverflow.com", "*.stackexchange.com", "*.sstatic.net",
 ]
 
 # --- Приватность и VPN ---
+# Сайты заблокированы как средства обхода.
 [[routing.rules]]
 name = "Приватность и VPN"
 action = "proxy"
 domains = [
-  "protonvpn.com", "*.protonvpn.com",
-  "protonmail.com", "*.protonmail.com",
-  "proton.me", "*.proton.me",
-  "mullvad.net", "*.mullvad.net",
+  "*.protonvpn.com", "*.protonmail.com", "*.proton.me",
+  "*.mullvad.net", "*.signal.org", "*.whispersystems.org",
 ]
 
-# --- Новости (заблокированные независимые СМИ) ---
+# --- Новости ---
+# Заблокированы Роскомнадзором.
 [[routing.rules]]
 name = "Новости"
 action = "proxy"
 domains = [
-  "bbc.com", "*.bbc.com",
-  "bbc.co.uk", "*.bbc.co.uk",
-  "*.bbci.co.uk",
-  "dw.com", "*.dw.com",
-  "currenttime.tv", "*.currenttime.tv",
-  "svoboda.org", "*.svoboda.org",
-  "rferl.org", "*.rferl.org",
+  "*.meduza.io", "*.bbc.com", "*.bbc.co.uk",
+  "*.bbci.co.uk", "*.dw.com", "*.currenttime.tv",
+  "*.svoboda.org", "*.rferl.org",
 ]
 
 # --- Рабочие сервисы ---
+# Режут регистрацию и оплату, часть отдаёт 403 по гео.
 [[routing.rules]]
 name = "Рабочие сервисы"
 action = "proxy"
 domains = [
-  # Cloudflare (частичные блокировки CDN)
-  "cloudflare.com", "*.cloudflare.com",
-  "*.cloudflareinsights.com",
-  # Notion
-  "notion.so", "*.notion.so",
-  "notion.com", "*.notion.com",
-  # Figma
-  "figma.com", "*.figma.com",
+  "*.hetzner.com", "*.cloudflare.com", "*.cloudflareinsights.com",
+  "*.notion.so", "*.notion.com", "*.figma.com",
+]
+
+# --- ReVanced ---
+# Патчер YouTube и зеркало, заблокированы вместе с ним.
+[[routing.rules]]
+name = "ReVanced"
+action = "proxy"
+domains = [
+  "*.r-m.de", "revanced.app",
+]
+
+# --- Торрент-трекеры и библиотеки ---
+# Заблокированы по решению судов, зеркала меняются пачками,
+# поэтому доменов много.
+[[routing.rules]]
+name = "Торрент-трекеры и библиотеки"
+action = "proxy"
+domains = [
+  "*.pornolab.net", "*.rutracker.org", "*.rutracker.net",
+  "*.rutracker.cc", "*.nnm-club.me", "*.nnmclub.to",
+  "*.nnm-club.ws", "*.nnm-club.lib", "*.kinozal.tv",
+  "*.kinozal.guru", "*.kinozal.me", "*.rutor.info",
+  "*.rutor.org", "*.rutor.is", "*.new-rutor.org",
+  "*.thepiratebay.org", "*.thepiratebay.tn", "*.thepiratebay.cy",
+  "*.tpb.party", "*.pirate-proxy.app", "*.1337x.to",
+  "*.1337x.tw", "*.x1337x.ws", "*.x1337x.eu",
+  "*.x1337x.se", "*.yts.mx", "*.yts.am",
+  "*.yts.rs", "*.yts.lt", "*.eztv.re",
+  "*.eztv.io", "*.eztv.ag", "*.eztv.tf",
+  "*.limetorrents.lol", "*.limetorrents.info", "*.limetorrents.zone",
+  "*.torrentgalaxy.to", "*.torrentgalaxy.mx", "*.magnetdl.com",
+  "*.magnetdl.ai", "*.nyaa.si", "*.nyaa.land",
+  "*.flibusta.is", "*.flibusta.site", "flibusta.appspot.com",
+  "*.libgen.is", "*.libgen.rs", "*.libgen.li",
+  "*.libgen.gs", "*.z-lib.io", "*.z-lib.org",
+  "*.b-ok.cc",
+]
+
+# --- TMDb ---
+# База метаданных фильмов: нужна медиасерверу и клиентам.
+[[routing.rules]]
+name = "TMDb"
+action = "proxy"
+domains = [
+  "*.themoviedb.org", "*.tmdb.org",
+]
+
+# --- Медиасервер и метаданные ---
+# Домашний медиасервер тянет отсюда метаданные, субтитры и образы.
+[[routing.rules]]
+name = "Медиасервер и метаданные"
+action = "proxy"
+domains = [
+  "*.jellyfin.org", "*.thetvdb.com", "*.musicbrainz.org",
+  "*.coverartarchive.org", "*.fanart.tv", "*.omdbapi.com",
+  "*.anidb.net", "*.trakt.tv", "*.sonarr.tv",
+  "*.radarr.video", "*.lidarr.audio", "*.readarr.com",
+  "*.prowlarr.com", "*.servarr.com", "*.opensubtitles.com",
+  "*.opensubtitles.org", "*.subscene.com", "*.addic7ed.com",
+  "*.imdb.com", "*.docker.com", "*.docker.io",
+  "*.ghcr.io", "*.linuxserver.io", "*.qbittorrent.org",
+  "*.transmissionbt.com", "*.deluge-torrent.org", "*.sabnzbd.org",
+  "*.nzbget.com", "*.last.fm", "*.audioscrobbler.com",
+  "*.hellointerview.com", "*.ipinfo.io",
+]
+
+# --- Кино, аниме и репаки ---
+# Онлайн-кинотеатры, аниме-трекеры и репаки, все заблокированы.
+[[routing.rules]]
+name = "Кино, аниме и репаки"
+action = "proxy"
+domains = [
+  "*.anidub.com", "*.anidub.ws", "*.anidub.cc",
+  "*.anidub.top", "*.anidub.tv", "*.anidub.vip",
+  "*.anidub.moe", "*.anilibria.tv", "*.anilibria.top",
+  "*.anilibria.app", "*.animedia.tv", "*.animespirit.ru",
+  "*.animelayer.ru", "*.shikimori.one", "*.shikimori.me",
+  "*.nnmclub.com", "*.nnmclub.ro", "*.nnmclub.tw",
+  "*.nnm-club.tw", "*.lostfilm.tv", "*.lostfilm.uno",
+  "*.lostfilm.tw", "*.lostfilm.run", "*.lostfilm.win",
+  "*.filmix.ac", "*.filmix.cc", "*.filmix.life",
+  "*.filmix.bz", "*.hdrezka.ag", "*.hdrezka.me",
+  "*.hdrezka.cm", "*.rezka.ag", "*.rezka.cm",
+  "*.rezka.tv", "*.lordfilm.ac", "*.lordfilm.club",
+  "*.lordfilm.me", "*.kinogo.la", "*.kinogo.ec",
+  "*.kinogo.cc", "*.kinokrad.cc", "*.baskino.me",
+  "*.rg-mechanics.org", "*.rg-mechanics.net", "*.xatab-repack.net",
+  "*.fitgirl-repacks.site", "*.fitgirl.io", "*.skidrowreloaded.com",
+  "*.skidrowcrack.com", "*.booktracker.org", "*.booktracker-org.com",
+  "*.twirpx.com", "*.pornhub.org", "*.pornhub.com",
+  "*.etahub.com", "*.phncdn.com",
 ]

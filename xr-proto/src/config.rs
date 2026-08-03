@@ -576,15 +576,18 @@ domains = ["x.com"]
             .map(|r| r.name.as_deref().unwrap_or(""))
             .collect();
         assert!(!names.contains(&""), "группа без имени: {names:?}");
-        assert!(names.contains(&"Мессенджеры"), "{names:?}");
-        // Диапазоны Telegram уехали в группу мессенджеров вместе с доменами.
-        let messengers = cfg
+        // Диапазоны Telegram лежат в одной группе с его доменами: часть клиентов
+        // ходит мимо DNS, по голым адресам, и разнесённые по разным группам они
+        // разъедутся при следующей правке. Группу ищем по домену, а не по имени:
+        // имена держатся в соответствии с боевым пресетом и там переименовываются.
+        let telegram = cfg
             .routing
             .rules
             .iter()
-            .find(|r| r.name.as_deref() == Some("Мессенджеры"))
-            .unwrap();
-        assert!(messengers.ip_ranges.contains(&"91.108.56.0/22".to_string()));
+            .find(|r| r.domains.iter().any(|d| d.ends_with("telegram.org")))
+            .expect("в пресете нет группы с доменами Telegram");
+        assert!(telegram.name.is_some());
+        assert!(telegram.ip_ranges.contains(&"91.108.56.0/22".to_string()));
     }
 
     /// Пресет, скачанный с хаба и лежащий в кэше клиента без поля `name`,
