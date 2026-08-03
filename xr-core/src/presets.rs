@@ -14,6 +14,17 @@ pub enum RefreshOutcome {
     UpToDate(u64),
 }
 
+/// Сколько хаб держит висящий запрос ожидания. Потолок на его стороне 60
+/// секунд, запас нужен промежуточным прокси, которые режут долгие ответы.
+pub const WAIT_HOLD: Duration = Duration::from_secs(55);
+
+/// Насколько клиентский таймаут больше удержания на хабе.
+const WAIT_TIMEOUT_MARGIN: Duration = Duration::from_secs(15);
+
+/// С чего начинается пауза деградированного режима, дальше удвоение до
+/// `fallback_interval`.
+const DEGRADED_BACKOFF_START: Duration = Duration::from_secs(5);
+
 /// Caches a single preset locally and fetches updates from the hub.
 pub struct PresetCache {
     cache_dir: PathBuf,
@@ -141,6 +152,59 @@ impl PresetCache {
         Ok(RefreshOutcome::Updated(version))
     }
 
+    /// Ожидание изменения пресета на хабе (LLD-37): запрос висит на ручке
+    /// `wait` со своей версией и возвращается либо новым пресетом, либо
+    /// `UpToDate` по истечении удержания. Без кэша уходит `version=0`, такой
+    /// версии не бывает, и хаб сразу отдаёт текущий пресет: бутстрап
+    /// достаётся тем же вызовом.
+    ///
+    /// Клиентский таймаут заведомо больше удержания, иначе клиент рвёт
+    /// собственный висящий запрос и обновление не доезжает никогда.
+    pub async fn wait_for_update(&mut self, hold: Duration) -> Result<RefreshOutcome, String> {
+        let local_version = self.cached.as_ref().map(|p| p.version).unwrap_or(0);
+        let client = reqwest::Client::builder()
+            .timeout(hold + WAIT_TIMEOUT_MARGIN)
+            .danger_accept_invalid_certs(false)
+            .build()
+            .map_err(|e| format!("http client: {}", e))?;
+        let url = format!(
+            "{}/api/v1/presets/{}/wait?version={}&timeout_secs={}",
+            self.hub_url,
+            self.preset_name,
+            local_version,
+            hold.as_secs()
+        );
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("network: {}", e))?;
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(RefreshOutcome::UpToDate(local_version));
+        }
+        if !resp.status().is_success() {
+            return Err(format!("http_{}", resp.status().as_u16()));
+        }
+        let preset: Preset = resp
+            .json()
+            .await
+            .map_err(|e| format!("bad preset: {}", e))?;
+
+        tracing::info!(
+            "preset '{}' v{} received from hub (long-poll)",
+            preset.name,
+            preset.version
+        );
+
+        if let Err(e) = self.save_to_disk(&preset) {
+            tracing::warn!("failed to save preset cache: {}", e);
+        }
+
+        let version = preset.version;
+        self.cached = Some(preset);
+        Ok(RefreshOutcome::Updated(version))
+    }
+
     /// Get the cached routing config, if any.
     pub fn routing_config(&self) -> Option<&RoutingConfig> {
         self.cached.as_ref().map(|p| &p.rules)
@@ -166,6 +230,70 @@ impl PresetCache {
         std::fs::write(&tmp, data)?;
         std::fs::rename(&tmp, &path)?;
         Ok(())
+    }
+}
+
+/// Фоновая доставка правил с хаба, одна на всех потребителей (LLD-37):
+/// её крутят и `xr-client`, и `VpnEngine`, раньше у каждого был свой почти
+/// дословно совпадающий цикл. `on_rules` зовётся на каждой новой версии,
+/// вызывающий собирает merged-роутер и подменяет свой `RwLock`.
+///
+/// Пока хаб отвечает, правило доезжает за секунды. Отказ уводит в
+/// деградированный режим: пауза с backoff от [`DEGRADED_BACKOFF_START`] до
+/// `fallback_interval`, на каждом пробуждении обычный опрос (обновления
+/// продолжают доезжать с прежней скоростью) и новая попытка встать на
+/// ожидание. `shutdown` завершает цикл: движок передаёт свой сигнал
+/// остановки, у xr-client цикл живёт до конца процесса.
+pub async fn watch_loop(
+    mut cache: PresetCache,
+    fallback_interval: Duration,
+    shutdown: impl std::future::Future<Output = ()>,
+    mut on_rules: impl FnMut(&RoutingConfig),
+) {
+    let work = async {
+        let mut backoff = Duration::ZERO;
+        loop {
+            if !backoff.is_zero() {
+                tokio::time::sleep(backoff).await;
+                if cache.fetch_if_stale(Duration::from_secs(5)).await {
+                    if let Some(rules) = cache.routing_config() {
+                        on_rules(rules);
+                    }
+                }
+            }
+            match cache.wait_for_update(WAIT_HOLD).await {
+                Ok(RefreshOutcome::Updated(version)) => {
+                    backoff = Duration::ZERO;
+                    if let Some(rules) = cache.routing_config() {
+                        on_rules(rules);
+                    }
+                    tracing::info!("preset updated to v{} without restart", version);
+                }
+                Ok(RefreshOutcome::UpToDate(_)) => {
+                    backoff = Duration::ZERO;
+                }
+                Err(e) => {
+                    backoff = next_backoff(backoff, fallback_interval);
+                    tracing::warn!(
+                        "preset wait failed ({}), falling back to polling every {}s",
+                        e,
+                        backoff.as_secs()
+                    );
+                }
+            }
+        }
+    };
+    tokio::select! {
+        _ = work => {}
+        _ = shutdown => {}
+    }
+}
+
+fn next_backoff(current: Duration, cap: Duration) -> Duration {
+    if current.is_zero() {
+        DEGRADED_BACKOFF_START.min(cap)
+    } else {
+        (current * 2).min(cap)
     }
 }
 
@@ -233,5 +361,241 @@ mod tests {
         let url = serve_once("", "HTTP/1.1 500 Internal Server Error").await;
         let err = list_presets(&url, Duration::from_secs(5)).await.unwrap_err();
         assert_eq!(err, "http_500");
+    }
+    /// Мок-хаба хватает на несколько запросов подряд: `respond` выбирает ответ
+    /// по пути запроса, а `None` оставляет соединение висеть, изображая
+    /// удержание на ручке ожидания. Путь каждого запроса уходит в канал, по
+    /// нему тесты сверяют, какую версию клиент принёс с собой.
+    fn serve_hub<F>(respond: F) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>)
+    where
+        F: Fn(&str) -> Option<String> + Send + Sync + 'static,
+    {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let respond = std::sync::Arc::new(respond);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let respond = respond.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let Ok(n) = sock.read(&mut buf).await else { return };
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let _ = tx.send(path.clone());
+                    match respond(&path) {
+                        Some(resp) => {
+                            let _ = sock.write_all(resp.as_bytes()).await;
+                        }
+                        None => {
+                            // Сокет держим живым, иначе клиент увидит обрыв
+                            // вместо честного ожидания.
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{}", addr), rx)
+    }
+
+    fn json_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    const PRESET_V3: &str = r#"{"name":"russia","version":3,"updated_at":"2026-08-03T00:00:00Z","description":"","rules":{"default_action":"direct","rules":[{"action":"proxy","domains":["example.com"]}]}}"#;
+
+    // Новая версия приезжает тем же запросом, каким её ждали: лишнего похода
+    // за телом нет, кэш ложится на диск, а следующее ожидание уносит уже
+    // свежую версию (иначе хаб отдавал бы одно и то же по кругу).
+    #[tokio::test]
+    async fn wait_for_update_applies_preset_and_carries_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, mut requests) = serve_hub(|path| {
+            if path.contains("version=0") {
+                Some(json_response(PRESET_V3))
+            } else {
+                Some("HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_string())
+            }
+        });
+
+        let mut cache = PresetCache::new(dir.path(), &url, "russia");
+        let first = cache.wait_for_update(Duration::from_secs(1)).await.unwrap();
+        let second = cache.wait_for_update(Duration::from_secs(1)).await.unwrap();
+
+        assert_eq!(first, RefreshOutcome::Updated(3));
+        assert_eq!(second, RefreshOutcome::UpToDate(3));
+        assert_eq!(
+            cache.routing_config().unwrap().rules[0].domains,
+            vec!["example.com".to_string()]
+        );
+
+        let on_disk = std::fs::read_to_string(dir.path().join("russia.json")).unwrap();
+        let saved: Preset = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(saved.version, 3);
+
+        let first_path = requests.recv().await.unwrap();
+        let second_path = requests.recv().await.unwrap();
+        assert!(first_path.contains("version=0"), "первый запрос: {first_path}");
+        assert!(second_path.contains("version=3"), "второй запрос: {second_path}");
+        assert!(first_path.contains("timeout_secs=1"), "первый запрос: {first_path}");
+    }
+
+    // Старый хаб ручки ожидания не знает и отдаёт страницу админки. Разбор
+    // падает, и цикл уходит в деградированный опрос: специальной детекции
+    // версии хаба не заводим.
+    #[tokio::test]
+    async fn wait_for_update_rejects_spa_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, _requests) = serve_hub(|_| {
+            Some(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "<title>xr-hub Admin</title>".len(),
+                "<title>xr-hub Admin</title>"
+            ))
+        });
+
+        let mut cache = PresetCache::new(dir.path(), &url, "russia");
+        let err = cache
+            .wait_for_update(Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(err.starts_with("bad preset"), "неожиданная ошибка: {err}");
+    }
+
+    #[tokio::test]
+    async fn wait_for_update_maps_http_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, _requests) = serve_hub(|_| {
+            Some("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string())
+        });
+
+        let mut cache = PresetCache::new(dir.path(), &url, "russia");
+        let err = cache
+            .wait_for_update(Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, "http_500");
+    }
+
+    // Цикл ждёт события, а не тикает по часам: первый же ответ хаба доводит
+    // правила до вызывающего, дальше запрос висит, а сигнал остановки
+    // завершает задачу.
+    #[tokio::test]
+    async fn watch_loop_delivers_rules_and_stops_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, _requests) = serve_hub(|path| {
+            if path.contains("version=0") {
+                Some(json_response(PRESET_V3))
+            } else {
+                None
+            }
+        });
+
+        let cache = PresetCache::new(dir.path(), &url, "russia");
+        let (rules_tx, mut rules_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            watch_loop(
+                cache,
+                Duration::from_secs(300),
+                async {
+                    let _ = stop_rx.await;
+                },
+                move |rules| {
+                    let _ = rules_tx.send(rules.rules[0].domains.clone());
+                },
+            )
+            .await;
+        });
+
+        let domains = tokio::time::timeout(Duration::from_secs(5), rules_rx.recv())
+            .await
+            .expect("правила не доехали за отведённое время")
+            .unwrap();
+        assert_eq!(domains, vec!["example.com".to_string()]);
+
+        stop_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("цикл не завершился по сигналу остановки")
+            .unwrap();
+    }
+
+    // Хаб без ручки ожидания (или просто отвечающий отказом) не должен
+    // останавливать доставку: цикл выжидает backoff и продолжает прежним
+    // опросом. Интервал в тесте маленький, потолок backoff считается от него,
+    // поэтому ждать нечего и часы не нужны.
+    #[tokio::test]
+    async fn watch_loop_falls_back_to_polling_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, _requests) = serve_hub(|path| {
+            if path.contains("/wait") {
+                Some("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string())
+            } else if path == "/api/v1/presets" {
+                Some(json_response(
+                    r#"[{"name":"russia","version":3,"updated_at":"2026-08-03T00:00:00Z","rules_count":1}]"#,
+                ))
+            } else if path == "/api/v1/presets/russia" {
+                Some(json_response(PRESET_V3))
+            } else {
+                None
+            }
+        });
+
+        let cache = PresetCache::new(dir.path(), &url, "russia");
+        let (rules_tx, mut rules_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            watch_loop(
+                cache,
+                Duration::from_millis(20),
+                async {
+                    let _ = stop_rx.await;
+                },
+                move |rules| {
+                    let _ = rules_tx.send(rules.rules[0].domains.clone());
+                },
+            )
+            .await;
+        });
+
+        let domains = tokio::time::timeout(Duration::from_secs(5), rules_rx.recv())
+            .await
+            .expect("деградированный опрос не привёз правила")
+            .unwrap();
+        assert_eq!(domains, vec!["example.com".to_string()]);
+
+        stop_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[test]
+    fn backoff_doubles_and_stops_at_interval() {
+        let cap = Duration::from_secs(300);
+        let first = next_backoff(Duration::ZERO, cap);
+        assert_eq!(first, DEGRADED_BACKOFF_START);
+        assert_eq!(next_backoff(first, cap), Duration::from_secs(10));
+        assert_eq!(next_backoff(Duration::from_secs(200), cap), cap);
+        // Потолок ниже стартовой паузы (короткий refresh_interval_secs в
+        // конфиге) не должен делать паузу длиннее самого потолка.
+        assert_eq!(
+            next_backoff(Duration::ZERO, Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
     }
 }

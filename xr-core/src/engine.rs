@@ -269,11 +269,13 @@ impl VpnEngine {
             });
         }
 
-        // Background preset refresh — hot-swaps `ctx.router` when the hub
+        // Background preset watch: hot-swaps `ctx.router` when the hub
         // publishes a new version. Поведение то же, что в `xr-client` (см.
         // LLD-01 §5.4): оператор правит пресет один раз, а каждый VpnEngine
         // (телефон, ноутбук) подхватывает правила без рестарта. Live-сессии
         // продолжают со своим Action, новые подключения видят обновления.
+        // Цикл общий с xr-client (LLD-37): пока хаб отвечает, правило
+        // доезжает за секунды висящим запросом, иначе прежний опрос.
         if let (Some(hub_url), Some(preset_name), Some(cache_dir)) = (
             self.config.hub_url.clone(),
             self.config.hub_preset.clone(),
@@ -291,36 +293,33 @@ impl VpnEngine {
                     &preset_name,
                 );
                 cache.load_from_disk();
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {},
-                        _ = shutdown_rx_bg.changed() => return,
-                    }
-                    let changed = cache.fetch_if_stale(Duration::from_secs(5)).await;
-                    if !changed {
-                        continue;
-                    }
-                    let Some(preset_rules) = cache.routing_config() else {
-                        continue;
-                    };
-                    let new_router = Router::from_merged(
-                        &local_overrides,
-                        preset_rules,
-                        geoip_path_owned.as_deref(),
-                    );
-                    match ctx_bg.router.write() {
-                        Ok(mut guard) => {
-                            *guard = Arc::new(new_router);
-                            tracing::info!(
-                                "preset '{}' hot-swapped: new rules active without restart",
-                                preset_name
-                            );
+                crate::presets::watch_loop(
+                    cache,
+                    Duration::from_secs(interval_secs),
+                    async move {
+                        let _ = shutdown_rx_bg.changed().await;
+                    },
+                    |preset_rules| {
+                        let new_router = Router::from_merged(
+                            &local_overrides,
+                            preset_rules,
+                            geoip_path_owned.as_deref(),
+                        );
+                        match ctx_bg.router.write() {
+                            Ok(mut guard) => {
+                                *guard = Arc::new(new_router);
+                                tracing::info!(
+                                    "preset '{}' hot-swapped: new rules active without restart",
+                                    preset_name
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!("failed to acquire router write lock: {}", e);
+                            }
                         }
-                        Err(e) => {
-                            tracing::error!("failed to acquire router write lock: {}", e);
-                        }
-                    }
-                }
+                    },
+                )
+                .await;
             });
         }
 
