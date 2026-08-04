@@ -222,11 +222,19 @@ data class ShareConfig(
     /** URL import is available when the hub minted share:import into the token
      *  scope (a write-binding on the invite, LLD-29); the agent holds the rest
      *  of the gates. Same whole-name semantics as Rust's scope_contains. */
-    val canImport: Boolean
-        get() = runCatching {
-            JSONObject(tokenJson ?: return false).optString("scope")
-                .split(' ').contains("share:import")
-        }.getOrDefault(false)
+    val canImport: Boolean get() = hasScope("share:import")
+
+    /** Deleting a file from the share needs share:write in the token scope
+     *  (LLD-28): without it the row offers no such action, and the native call
+     *  would refuse before the network anyway. The agent still holds its own
+     *  gates (writable share, safepath). */
+    val canWrite: Boolean get() = hasScope("share:write")
+
+    /** Whole-name scope check, as Rust's scope_contains does it: the scope is a
+     *  space-separated list of names, and a prefix is not a match. */
+    private fun hasScope(name: String): Boolean = runCatching {
+        JSONObject(tokenJson ?: return false).optString("scope").split(' ').contains(name)
+    }.getOrDefault(false)
 
     /** Selection as the JSON array the native sync/plan calls expect. */
     fun selectionJson(): String = JSONArray().apply { selection.forEach { put(it) } }.toString()

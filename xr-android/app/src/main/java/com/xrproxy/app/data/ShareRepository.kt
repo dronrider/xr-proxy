@@ -314,6 +314,27 @@ class ShareRepository(private val context: Context) {
         )
     }
 
+    /** Delete a file from the share itself (LLD-28, XR-250), not just the local
+     *  copy: the agent drops it, so the file leaves every holder of the share.
+     *  The entry's hash goes out as `If-Match`, so a file the owner replaced
+     *  after this listing answers `http_412` instead of being wiped; an offline
+     *  row carries no hash and deletes what is there now. */
+    fun deleteRemote(config: ShareConfig, entry: ManifestEntry): Result<Unit> {
+        val token = config.tokenJson
+            ?: return Result.failure(IllegalStateException("no token"))
+        val res = NativeBridge.nativeDeleteFile(
+            config.importAddrArg, config.port, token, config.agentPubkey, config.relayArg,
+            entry.path, entry.sha256, WRITE_TIMEOUT_MS,
+        )
+        return runCatching {
+            val o = JSONObject(res)
+            o.optString("error").takeIf { it.isNotBlank() && it != "null" }?.let {
+                throw IllegalStateException(it)
+            }
+            if (!o.optBoolean("ok", false)) throw IllegalStateException("delete failed")
+        }
+    }
+
     /** The share's persistent hash-index file (XR-098). Lives in the app's
      *  private [Context.getFilesDir], never inside the share directory: that one
      *  is walked by [localPaths]/[localManifest] for the UI, cleaned by the
@@ -337,6 +358,9 @@ class ShareRepository(private val context: Context) {
         /** Transfers may be multi-GB; the engine uses a 10s connect-timeout, so a
          *  long total just bounds a genuinely stuck transfer. */
         private const val XFER_TIMEOUT_MS = 3_600_000L
+        /** Удаление файла из шары это короткий запрос к агенту, качать нечего;
+         *  держим тот же порядок ожидания, что у джоб импорта. */
+        private const val WRITE_TIMEOUT_MS = 30_000L
         /** Starting and polling an import job are short metadata calls: the
          *  agent downloads on its own machine, not the phone, so no long
          *  timeout is needed here. */

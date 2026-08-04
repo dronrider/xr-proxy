@@ -319,6 +319,25 @@ object NativeBridge {
         timeoutMs: Long,
     ): String
 
+    /** Delete [path] from the share itself (LLD-28, XR-250): the agent drops the
+     *  file, so it leaves every holder of the share, not only this device.
+     *  [expectedSha] is the hash of the manifest row the user acted on and goes
+     *  out as `If-Match`, so a file replaced on the agent meanwhile answers
+     *  `http_412` instead of being wiped; an empty string deletes whatever is
+     *  there now. Returns `{"ok":true}` or `{"error":".."}` (`not_found`,
+     *  `http_403`, `no_write_scope: ...` for a read-only grant, refused before
+     *  any network). */
+    external fun nativeDeleteFile(
+        addr: String,
+        port: Int,
+        tokenJson: String,
+        agentPubkey: String,
+        relayJson: String,
+        path: String,
+        expectedSha: String,
+        timeoutMs: Long,
+    ): String
+
     /** Move a share's downloaded files from [srcDir] to [dstDir] after a storage-
      *  directory change (XR-043), without re-downloading. Same-volume moves are
      *  renames; cross-volume is copy+remove, pre-checked against free space. Holds

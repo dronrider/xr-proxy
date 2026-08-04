@@ -106,7 +106,8 @@ import java.io.File
  * queues a download, the running row shows progress with a cancel, the minus
  * removes the local copy, a broken download keeps its progress under a red tint
  * with a retry. The row tap only opens a downloaded file. Folders are tri-state
- * like selective sync in Drive/Dropbox.
+ * like selective sync in Drive/Dropbox. Долгое нажатие открывает карточку файла,
+ * и в ней же живёт удаление из самой шары (XR-250), доступное с правом записи.
  */
 @Composable
 fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modifier) {
@@ -576,6 +577,9 @@ private fun ExplorerView(
     modifier: Modifier,
 ) {
     var detailsFor by remember { mutableStateOf<ManifestEntry?>(null) }
+    // Файл, который просят убрать из самой шары (XR-250). Держим отдельно от
+    // detailsFor: карточка файла закрывается, а подтверждение остаётся.
+    var deleteFromShare by remember { mutableStateOf<ManifestEntry?>(null) }
     // Открытие шары поднимает manifestLoading само, индикатор жеста поэтому
     // держим на локальном флаге ручных обновлений, как в списке шар (XR-232).
     var manualRefresh by remember { mutableStateOf(false) }
@@ -704,6 +708,17 @@ private fun ExplorerView(
         AlertDialog(
             onDismissRequest = { detailsFor = null },
             confirmButton = { TextButton(onClick = { detailsFor = null }) { Text("Закрыть") } },
+            // Удаление из шары живёт в карточке файла, а не второй кнопкой в
+            // строке (XR-250): минус рядом снимает локальную копию, и две
+            // похожие кнопки бок о бок повторили бы путаницу XR-044. Действие
+            // видно только с правом записи в токене.
+            dismissButton = {
+                if (cfg.canWrite) {
+                    TextButton(onClick = { detailsFor = null; deleteFromShare = e }) {
+                        Text("Удалить из шары", color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            },
             title = { Text("Файл") },
             text = {
                 Column {
@@ -711,10 +726,31 @@ private fun ExplorerView(
                     Spacer(Modifier.height(6.dp))
                     Text("Путь: ${e.path}", fontSize = 12.sp)
                     Text("Размер: ${humanSize(e.size)}", fontSize = 12.sp)
-                    Text("SHA-256: ${e.sha256.take(16)}…", fontSize = 12.sp,
+                    Text("SHA-256: ${e.sha256.take(16)}...", fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             },
+        )
+    }
+
+    deleteFromShare?.let { e ->
+        AlertDialog(
+            onDismissRequest = { deleteFromShare = null },
+            title = { Text("Удалить из шары?") },
+            text = {
+                Text(
+                    "«${e.path.substringAfterLast('/')}» пропадёт у всех, у кого есть доступ " +
+                        "к шаре, и с этого устройства. Вернуть файл сможет только владелец.",
+                    fontSize = 13.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    deleteFromShare = null
+                    vm.deleteFromShare(cfg, e)
+                }) { Text("Удалить", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { deleteFromShare = null }) { Text("Отмена") } },
         )
     }
 }

@@ -838,6 +838,65 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Удалить файл из самой шары (LLD-28, XR-250), а не только с телефона: агент
+     * убирает его у себя, и файл пропадает у всех держателей шары. Отсюда и
+     * подтверждение на экране, и отдельные от минуса слова: минус в строке
+     * снимает локальную копию, это действие необратимо.
+     *
+     * Порядок такой: сначала снимаем файл с закачки (иначе живая загрузка
+     * дописала бы `.part` уже удалённого файла), потом удаляем у агента, и
+     * только по успеху убираем локальную копию и строку из списка. Отказ
+     * оставляет всё как было, файл остаётся и в шаре, и на устройстве.
+     */
+    fun deleteFromShare(config: ShareConfig, entry: ManifestEntry) {
+        viewModelScope.launch {
+            _ui.update { st ->
+                st.copy(queue = st.queue.filterNot { it.matches(config.shareId, entry.path) })
+            }
+            maybeCancelNative(config.shareId, entry.path)
+            val result = withContext(Dispatchers.IO) { repo.deleteRemote(config, entry) }
+            result.fold(
+                onSuccess = {
+                    deselectPath(config.shareId, entry.path)
+                    withContext(Dispatchers.IO) { repo.deleteLocal(config, entry.path) }
+                    _ui.update { st ->
+                        st.copy(
+                            manifest = if (st.openShareId == config.shareId) {
+                                st.manifest.filterNot { it.path == entry.path }
+                            } else {
+                                st.manifest
+                            },
+                            localPaths = st.localPaths - entry.path,
+                            failed = st.failed.filterNot {
+                                it.shareId == config.shareId && it.path == entry.path
+                            },
+                            message = "Файл удалён из шары",
+                        )
+                    }
+                    // Свежий манифест от агента заодно перезапишет кэш листинга,
+                    // иначе удалённый файл вернулся бы строкой при офлайн-заходе.
+                    refreshManifest(config)
+                },
+                onFailure = { e ->
+                    _ui.update {
+                        it.copy(message = "Не удалось удалить: ${humanDeleteError(e.message ?: "ошибка")}")
+                    }
+                },
+            )
+        }
+    }
+
+    /** Отказы записи (LLD-28) поверх общего [humanError]: у агента здесь свои
+     *  коды, и «http_412» пользователю ничего не говорит. */
+    private fun humanDeleteError(e: String): String = when {
+        e == "not_found" -> "файла уже нет в шаре"
+        e == "http_403" -> "агент не разрешает запись в эту шару"
+        e == "http_412" -> "файл на агенте изменился, обновите список"
+        e.startsWith("no_write_scope") -> e.substringAfter(": ", "нет права записи на эту шару")
+        else -> humanError(e)
+    }
+
     /** The cancel control of any downloading or queued row: take the file off
      *  the wanted set and the queue; abort the native transfer only when it is
      *  exactly this file. The partial stays on disk, so a later plus resumes
