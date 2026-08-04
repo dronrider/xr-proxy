@@ -130,6 +130,12 @@ dependencies {
     // Явный апгрейд androidx.fragment — play-services-code-scanner транзитивно
     // тащит старый fragment, а lint требует >= 1.3.0 для registerForActivityResult.
     implementation("androidx.fragment:fragment-ktx:1.8.3")
+
+    // JVM-юниты на чистую Kotlin-логику модели: бизнес-логика приложения живёт
+    // в Rust и тестируется там, а тут покрывается то, что написано на Kotlin и
+    // обходится без Android SDK. Сейчас это раскладка списка проводника по
+    // группам (XR-258) с её границами недели, полуночи и пустых значений.
+    testImplementation("junit:junit:4.13.2")
 }
 
 // Task to build Rust native libraries before Android build.

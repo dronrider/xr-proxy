@@ -460,10 +460,12 @@ sealed interface ExplorerRow {
     /** Ключ строки для ленивого списка. */
     val key: String
 
-    data class Header(val title: String, val count: Int) : ExplorerRow {
-        // Нулевой байт в пути файла не встречается, поэтому заголовок не
-        // столкнётся ключом даже с файлом по имени «Сегодня».
-        override val key: String get() = "\u0000$title"
+    /** [group] это ключ группы, а не её название: канал может называться и
+     *  «Без источника», и тогда два заголовка с одним ключом уронили бы ленивый
+     *  список. Нулевой байт не встречается ни в пути файла, ни в имени
+     *  источника, поэтому с ключами строк заголовок не столкнётся. */
+    data class Header(val title: String, val count: Int, val group: String) : ExplorerRow {
+        override val key: String get() = "\u0000$group"
     }
 
     data class Node(val node: TreeNode) : ExplorerRow {
@@ -491,7 +493,7 @@ fun explorerRows(
     val rows = ArrayList<ExplorerRow>(nodes.size + 4)
     val folders = nodes.filterIsInstance<TreeNode.Folder>()
     if (folders.isNotEmpty()) {
-        rows.add(ExplorerRow.Header("Папки", folders.size))
+        rows.add(ExplorerRow.Header("Папки", folders.size, FOLDERS_KEY))
         folders.forEach { rows.add(ExplorerRow.Node(it)) }
     }
     val members = LinkedHashMap<String, MutableList<TreeNode.FileNode>>()
@@ -513,7 +515,7 @@ fun explorerRows(
     )
     for (key in order) {
         val files = members[key] ?: continue
-        rows.add(ExplorerRow.Header(titles[key] ?: key, files.size))
+        rows.add(ExplorerRow.Header(titles[key] ?: key, files.size, key))
         files.forEach { rows.add(ExplorerRow.Node(it)) }
     }
     return rows
@@ -522,11 +524,20 @@ fun explorerRows(
 /** Группа файла: ключ, заголовок и вес, которым группы расставляются. */
 private data class FileGroup(val key: String, val title: String, val rank: Long)
 
+/** Ключ группы для файлов, которым группировать нечем: имя источника приходит
+ *  от агента свободным текстом, и канал по имени «none» или «Без источника»
+ *  схлопнулся бы с безымянными, забрав себе их место в конце списка. Нулевой
+ *  байт в этот текст не попадает, как и в путь файла. */
+private const val NO_GROUP_KEY = "\u0000none"
+
+/** Ключ блока папок: он не группа файлов и с именем источника не пересекается. */
+private const val FOLDERS_KEY = "\u0000folders"
+
 /** Источник файла как его назвал агент (XR-255): у ролика это канал. Файл без
  *  источника не прячется, а собирается в свою группу последней. */
 private fun sourceGroup(entry: ManifestEntry): FileGroup {
     val source = entry.meta?.source?.trim().orEmpty()
-    return if (source.isEmpty()) FileGroup("none", "Без источника", Long.MIN_VALUE)
+    return if (source.isEmpty()) FileGroup(NO_GROUP_KEY, "Без источника", Long.MIN_VALUE)
     else FileGroup(source, source, entry.mtime)
 }
 
@@ -534,7 +545,7 @@ private fun sourceGroup(entry: ManifestEntry): FileGroup {
  *  манифеста, то есть когда файл появился у агента; запись без даты уходит в
  *  свою группу последней. */
 private fun dateGroup(mtime: Long, now: Long): FileGroup {
-    if (mtime <= 0L) return FileGroup("none", "Без даты", Long.MIN_VALUE)
+    if (mtime <= 0L) return FileGroup(NO_GROUP_KEY, "Без даты", Long.MIN_VALUE)
     val stamp = mtime * 1000
     val cal = Calendar.getInstance()
     cal.timeInMillis = now
