@@ -10,9 +10,11 @@ import com.xrproxy.app.data.ShareRepository
 import com.xrproxy.app.data.ShareStore
 import com.xrproxy.app.data.StorageAccess
 import com.xrproxy.app.jni.NativeBridge
+import com.xrproxy.app.model.FileSort
 import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
 import com.xrproxy.app.model.ShareGrant
+import com.xrproxy.app.model.SortOrder
 import com.xrproxy.app.model.isSelected
 import com.xrproxy.app.service.ShareSyncScheduler
 import kotlinx.coroutines.Dispatchers
@@ -110,6 +112,13 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
          *  visible. False means only local files are shown. */
         val offlineFullListing: Boolean = false,
         val localPaths: Set<String> = emptySet(),
+        /** Порядок строк проводника (XR-251): общий на все шары и переживает
+         *  перезапуск, поэтому едет из стора, а не живёт состоянием экрана. */
+        val sortOrder: SortOrder = SortOrder(),
+        /** Пути открытой шары, которые уже открывали с этого устройства
+         *  (XR-251). Наличие файла на диске тут ни при чём: минус в строке
+         *  снимает копию, а просмотр остаётся. */
+        val viewedPaths: Set<String> = emptySet(),
         /** FIFO of files queued with the per-row plus (XR-044); the head is the
          *  one being downloaded (or waiting out the background mirror's lock). */
         val queue: List<QueueItem> = emptyList(),
@@ -186,7 +195,8 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     init {
         viewModelScope.launch {
             val store = store()
-            _ui.update { it.copy(storeReady = true) }
+            val order = withContext(Dispatchers.IO) { store.sortOrder() }
+            _ui.update { it.copy(storeReady = true, sortOrder = order) }
             store.shares.collect { _configs.value = it }
         }
         (app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)?.let { cm ->
@@ -431,10 +441,17 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                 openShareId = config.shareId, currentPath = "",
                 manifest = emptyList(), manifestLoading = true,
                 offlineLocal = false, offlineFullListing = false,
+                viewedPaths = emptySet(),
             )
         }
         ensureTransferPolling()
         viewModelScope.launch {
+            // Отметки просмотра нужны первой же отрисовке строк, поэтому едут
+            // раньше и кэша, и манифеста.
+            val viewed = withContext(Dispatchers.IO) { store().viewed(config.shareId) }
+            _ui.update { st ->
+                if (st.openShareId != config.shareId) st else st.copy(viewedPaths = viewed)
+            }
             // Cache-first (XR-059): показать что-то мгновенно, а свежий манифест
             // заменит это, когда фетч дойдёт. Раньше кэшем служил только список
             // скачанных файлов, и повторный заход офлайн ронял шару до «видно
@@ -687,12 +704,25 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update {
             it.copy(
                 openShareId = null, currentPath = "", manifest = emptyList(),
-                localPaths = emptySet(), importJob = null, importDialogFor = null,
+                localPaths = emptySet(), viewedPaths = emptySet(),
+                importJob = null, importDialogFor = null,
             )
         }
     }
 
     fun navigateTo(path: String) = _ui.update { it.copy(currentPath = path) }
+
+    /** Тап по переключателю сортировки (XR-251): тот же режим разворачивает
+     *  направление, другой переключает поле и берёт своё привычное начало.
+     *  Выбор ложится в стор, поэтому переживает перезапуск и одинаков во всех
+     *  шарах. */
+    fun setSort(mode: FileSort) {
+        val current = _ui.value.sortOrder
+        val order = if (current.mode == mode) current.copy(descending = !current.descending)
+        else SortOrder.of(mode)
+        _ui.update { it.copy(sortOrder = order) }
+        viewModelScope.launch { withContext(Dispatchers.IO) { store().setSortOrder(order) } }
+    }
 
     fun navigateUp() {
         val p = _ui.value.currentPath
@@ -702,12 +732,21 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Tap a downloaded row: hand the local file to a viewer app. A file that
      *  vanished from disk (deleted via a file manager) flips its row back to
-     *  the plus instead of ignoring the tap. */
+     *  the plus instead of ignoring the tap. Отданный вьюеру файл считается
+     *  просмотренным (XR-251): отметка ложится в стор до показа, потому что
+     *  дальше файл уходит в чужое приложение и чем там кончилось, мы не узнаем. */
     fun openLocal(config: ShareConfig, entry: ManifestEntry) {
         viewModelScope.launch {
             val existing = withContext(Dispatchers.IO) { localFile(config, entry.path) }
             if (existing != null) {
-                _ui.update { it.copy(openFileEvent = existing) }
+                withContext(Dispatchers.IO) { store().markViewed(config.shareId, entry.path) }
+                _ui.update { st ->
+                    st.copy(
+                        openFileEvent = existing,
+                        viewedPaths = if (st.openShareId == config.shareId) st.viewedPaths + entry.path
+                        else st.viewedPaths,
+                    )
+                }
             } else {
                 _ui.update { st ->
                     st.copy(

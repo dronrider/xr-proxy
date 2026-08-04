@@ -342,14 +342,39 @@ fun coveredByAncestor(path: String, selection: Set<String>): Boolean {
 fun isSelected(path: String, selection: Set<String>): Boolean =
     selection.contains(path) || coveredByAncestor(path, selection)
 
+/** Чем сортируется уровень проводника (XR-251). */
+enum class FileSort { NAME, DATE }
+
+/**
+ * Порядок строк проводника: поле и направление. Один на все шары, потому что
+ * от проводника ждут одной привычки, а не настройки на каждую папку.
+ */
+data class SortOrder(val mode: FileSort = FileSort.NAME, val descending: Boolean = false) {
+    companion object {
+        /** Направление, с которого режим начинают: имена читают от «а», даты
+         *  смотрят от свежих. */
+        fun of(mode: FileSort) = SortOrder(mode, mode == FileSort.DATE)
+    }
+}
+
 /**
  * Compute the immediate children of folder [dir] (`""` = root) from a flat
- * manifest: sub-folders first (alphabetical), then files. Folder-relative names
- * only, so the explorer shows one level at a time (Windows-Explorer style).
+ * manifest: sub-folders first, then files. Folder-relative names only, so the
+ * explorer shows one level at a time (Windows-Explorer style).
+ *
+ * Порядок внутри каждой из двух групп задаёт [order], папки остаются выше
+ * файлов в любом режиме (XR-251). Даты у папки своей нет, поэтому по дате она
+ * встаёт по самому свежему файлу внутри. Совпавшие ключи разводит имя, иначе
+ * файлы одной секунды переставлялись бы от прогона к прогону.
  */
-fun explorerLevel(entries: List<ManifestEntry>, dir: String): List<TreeNode> {
+fun explorerLevel(
+    entries: List<ManifestEntry>,
+    dir: String,
+    order: SortOrder = SortOrder(),
+): List<TreeNode> {
     val prefix = if (dir.isEmpty()) "" else "$dir/"
     val folders = LinkedHashMap<String, Int>() // sub-folder name -> file count under it
+    val folderMtime = HashMap<String, Long>() // sub-folder name -> newest mtime under it
     val files = ArrayList<TreeNode.FileNode>()
     for (e in entries) {
         if (!e.path.startsWith(prefix)) continue
@@ -360,12 +385,23 @@ fun explorerLevel(entries: List<ManifestEntry>, dir: String): List<TreeNode> {
         } else {
             val folderName = rest.substring(0, slash)
             folders[folderName] = (folders[folderName] ?: 0) + 1
+            folderMtime[folderName] = maxOf(folderMtime[folderName] ?: 0L, e.mtime)
         }
     }
     val out = ArrayList<TreeNode>(folders.size + files.size)
-    folders.entries.sortedBy { it.key.lowercase() }.forEach { (n, c) ->
-        out.add(TreeNode.Folder(n, if (dir.isEmpty()) n else "$dir/$n", c))
+    val folderRows = folders.map { (n, c) ->
+        TreeNode.Folder(n, if (dir.isEmpty()) n else "$dir/$n", c)
     }
-    files.sortedBy { it.name.lowercase() }.forEach { out.add(it) }
+    sortRows(folderRows, order) { folderMtime[it.name] ?: 0L }.forEach { out.add(it) }
+    sortRows(files, order) { it.entry.mtime }.forEach { out.add(it) }
     return out
+}
+
+private fun <T : TreeNode> sortRows(rows: List<T>, order: SortOrder, mtime: (T) -> Long): List<T> {
+    val byName = compareBy<T> { it.name.lowercase() }
+    val primary = when (order.mode) {
+        FileSort.NAME -> byName
+        FileSort.DATE -> compareBy<T> { mtime(it) }
+    }
+    return rows.sortedWith(if (order.descending) primary.reversed().then(byName) else primary.then(byName))
 }

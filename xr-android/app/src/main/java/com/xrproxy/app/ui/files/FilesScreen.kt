@@ -34,6 +34,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddLink
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Folder
@@ -45,11 +47,14 @@ import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -93,12 +98,16 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xrproxy.app.data.StorageAccess
 import com.xrproxy.app.ui.components.XrPullToRefresh
+import com.xrproxy.app.model.FileSort
 import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
+import com.xrproxy.app.model.SortOrder
 import com.xrproxy.app.model.TreeNode
 import com.xrproxy.app.model.explorerLevel
 import kotlinx.coroutines.launch
 import java.io.File
+import java.text.DateFormat
+import java.util.Date
 
 /**
  * Files tab (LLD-19, XR-031): a list of shares ("drives") and an Explorer that
@@ -108,6 +117,9 @@ import java.io.File
  * with a retry. The row tap only opens a downloaded file. Folders are tri-state
  * like selective sync in Drive/Dropbox. Долгое нажатие открывает карточку файла,
  * и в ней же живёт удаление из самой шары (XR-250), доступное с правом записи.
+ * Привычки файлового менеджера (XR-251): порядок строк переключается в шапке
+ * проводника, строка файла несёт дату из манифеста, открытый файл помечается
+ * просмотренным, а ютуб-идентификатор в хвосте имени на экране не показывается.
  */
 @Composable
 fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modifier) {
@@ -588,7 +600,12 @@ private fun ExplorerView(
     // Derived once per state change, not per recomposition: a big manifest
     // with a long queue would otherwise be rescanned for every visible row on
     // every 500ms progress tick.
-    val level = remember(ui.manifest, ui.currentPath) { explorerLevel(ui.manifest, ui.currentPath) }
+    val level = remember(ui.manifest, ui.currentPath, ui.sortOrder) {
+        explorerLevel(ui.manifest, ui.currentPath, ui.sortOrder)
+    }
+    // Формат берём системный: короткая дата в том виде, в каком её показывает
+    // сам телефон.
+    val dateFormat = remember(context) { android.text.format.DateFormat.getDateFormat(context) }
     val queuedPaths = remember(ui.queue, cfg.shareId) {
         ui.queue.asSequence().filter { it.shareId == cfg.shareId }.map { it.entry.path }.toHashSet()
     }
@@ -628,7 +645,10 @@ private fun ExplorerView(
             Spacer(Modifier.width(4.dp))
             Switch(checked = cfg.syncEnabled, onCheckedChange = { vm.setSyncEnabled(cfg.shareId, it) })
         }
-        Breadcrumbs(cfg.name, ui.currentPath) { vm.navigateTo(it) }
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Breadcrumbs(cfg.name, ui.currentPath, Modifier.weight(1f)) { vm.navigateTo(it) }
+            SortButton(ui.sortOrder) { vm.setSort(it) }
+        }
         if (ui.offlineLocal && ui.manifest.isNotEmpty()) {
             Text(
                 // Полный кэшированный манифест показывает и не скачанные файлы,
@@ -686,6 +706,8 @@ private fun ExplorerView(
                                     isHead = node.entry.path == headPath,
                                     queued = node.entry.path != headPath && node.entry.path in queuedPaths,
                                     failed = failedByPath[node.entry.path],
+                                    viewed = node.entry.path in ui.viewedPaths,
+                                    dateFormat = dateFormat,
                                 ) { detailsFor = it }
                             }
                             HorizontalDivider()
@@ -902,7 +924,10 @@ private fun FolderRow(
  *  current state: plus = queue the download, cross = cancel it, minus = delete
  *  the local copy, replay = resume a broken download from its partial. The row
  *  tap only opens a downloaded file; progress (ours or the background mirror's,
- *  matched by share + path) is painted behind the row itself. */
+ *  matched by share + path) is painted behind the row itself. Дату и признак
+ *  просмотра (XR-251) держим слева от этих управлений: глазок идёт перед
+ *  именем, дата открывает строку с размером, так что ни с прогрессом, ни с
+ *  красной подсветкой ошибки они не спорят. */
 @Composable
 private fun FileRow(
     node: TreeNode.FileNode,
@@ -912,6 +937,8 @@ private fun FileRow(
     isHead: Boolean,
     queued: Boolean,
     failed: FilesViewModel.FailedDownload?,
+    viewed: Boolean,
+    dateFormat: DateFormat,
     onDetails: (ManifestEntry) -> Unit,
 ) {
     val path = node.entry.path
@@ -955,19 +982,37 @@ private fun FileRow(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(modifier = Modifier.weight(1f).padding(start = 14.dp)) {
-            Text(node.name, maxLines = 1, fontSize = 13.sp, overflow = TextOverflow.MiddleEllipsis)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (viewed) {
+                    Icon(
+                        Icons.Default.Visibility, contentDescription = "Просмотрено",
+                        modifier = Modifier.size(13.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.width(4.dp))
+                }
+                Text(
+                    displayFileName(node.name), maxLines = 1, fontSize = 13.sp,
+                    overflow = TextOverflow.MiddleEllipsis, modifier = Modifier.weight(1f),
+                )
+            }
+            val status = when {
+                downloaded -> humanSize(node.entry.size) + " - скачано, тап откроет"
+                snap != null && snap.filesTotal == 1L ->
+                    "${humanSize(snap.bytesDone)} из ${humanSize(node.entry.size)}" +
+                        " - ${humanSize(snap.speedBytesPerSec)}/с"
+                bgFetch -> "качается фоновым синком"
+                isHead -> "готовится..."
+                queued -> humanSize(node.entry.size) + " - в очереди"
+                failed != null -> "оборвалось на ${humanSize(failed.bytesDone)} из ${humanSize(failed.bytesTotal)}"
+                else -> humanSize(node.entry.size)
+            }
+            // Дата это mtime из манифеста, то есть когда файл появился у агента.
+            // Нулевой mtime бывает у записи без даты, тогда строка остаётся
+            // прежней, без пустого разделителя.
+            val date = node.entry.mtime.takeIf { it > 0 }?.let { dateFormat.format(Date(it * 1000)) }
             Text(
-                when {
-                    downloaded -> humanSize(node.entry.size) + " - скачано, тап откроет"
-                    snap != null && snap.filesTotal == 1L ->
-                        "${humanSize(snap.bytesDone)} из ${humanSize(node.entry.size)}" +
-                            " - ${humanSize(snap.speedBytesPerSec)}/с"
-                    bgFetch -> "качается фоновым синком"
-                    isHead -> "готовится..."
-                    queued -> humanSize(node.entry.size) + " - в очереди"
-                    failed != null -> "оборвалось на ${humanSize(failed.bytesDone)} из ${humanSize(failed.bytesTotal)}"
-                    else -> humanSize(node.entry.size)
-                },
+                if (date == null) status else "$date - $status",
                 fontSize = 10.sp,
                 color = when {
                     showError -> errorColor
@@ -1048,10 +1093,57 @@ private fun ProgressBar(p: FilesViewModel.Progress?, onCancel: () -> Unit) {
     }
 }
 
+/**
+ * Переключатель порядка строк (XR-251). В шапке проводника видно, чем список
+ * отсортирован и в какую сторону; меню меняет поле, а повторный выбор того же
+ * разворачивает направление, как это делают файловые менеджеры. Направление
+ * названо и словом в contentDescription, иначе стрелку не прочитать ни
+ * скринридеру, ни экранному сценарию.
+ */
 @Composable
-private fun Breadcrumbs(shareName: String, currentPath: String, onJump: (String) -> Unit) {
+private fun SortButton(order: SortOrder, onPick: (FileSort) -> Unit) {
+    var menuOpen by remember { mutableStateOf(false) }
+    val arrow = if (order.descending) Icons.Default.ArrowDownward else Icons.Default.ArrowUpward
+    val direction = if (order.descending) "по убыванию" else "по возрастанию"
+    Box {
+        TextButton(onClick = { menuOpen = true }, contentPadding = PaddingValues(horizontal = 8.dp)) {
+            Text(sortLabel(order.mode), fontSize = 13.sp)
+            Spacer(Modifier.width(2.dp))
+            Icon(arrow, contentDescription = direction, modifier = Modifier.size(14.dp))
+        }
+        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+            FileSort.entries.forEach { mode ->
+                DropdownMenuItem(
+                    text = { Text(sortMenuLabel(mode)) },
+                    trailingIcon = {
+                        if (mode == order.mode) Icon(arrow, contentDescription = direction)
+                    },
+                    onClick = { menuOpen = false; onPick(mode) },
+                )
+            }
+        }
+    }
+}
+
+private fun sortLabel(mode: FileSort): String = when (mode) {
+    FileSort.NAME -> "Имя"
+    FileSort.DATE -> "Дата"
+}
+
+private fun sortMenuLabel(mode: FileSort): String = when (mode) {
+    FileSort.NAME -> "По имени"
+    FileSort.DATE -> "По дате"
+}
+
+@Composable
+private fun Breadcrumbs(
+    shareName: String,
+    currentPath: String,
+    modifier: Modifier = Modifier,
+    onJump: (String) -> Unit,
+) {
     val segments = if (currentPath.isEmpty()) emptyList() else currentPath.split('/')
-    Row(modifier = Modifier.fillMaxWidth().padding(bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(modifier = modifier.padding(bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
         Text(
             shareName, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
             color = MaterialTheme.colorScheme.primary,
@@ -1097,6 +1189,25 @@ private fun openLocalFile(context: Context, file: File) {
     } catch (_: Exception) {
         Toast.makeText(context, "Нет приложения, чтобы открыть этот файл", Toast.LENGTH_SHORT).show()
     }
+}
+
+/** Хвост, который импорт с ютуба дописывает к имени: идентификатор ролика в
+ *  квадратных скобках, ровно 11 символов алфавита base64url. Правило узкое
+ *  намеренно, иначе под нож ушли бы обычные «[2024]» и «[rus]». */
+private val YOUTUBE_ID_SUFFIX = Regex("""\s*\[[A-Za-z0-9_-]{11}]$""")
+
+/** Имя файла для показа (XR-251). В узкой строке эллипсис в середине оставляет
+ *  начало и хвост, и от ютуб-импорта на экране остаётся идентификатор вместо
+ *  названия. Настоящее имя это ключ строки, путь скачивания и то, что уходит в
+ *  JNI, поэтому режем только здесь, на отрисовке. */
+private fun displayFileName(name: String): String {
+    val dot = name.lastIndexOf('.')
+    val stem = if (dot > 0) name.substring(0, dot) else name
+    val ext = if (dot > 0) name.substring(dot) else ""
+    val trimmed = stem.replace(YOUTUBE_ID_SUFFIX, "")
+    // Имя из одного идентификатора («[dQw4w9WgXcQ].mp4») оставляем как есть:
+    // пустая строка в списке хуже лишних скобок.
+    return if (trimmed.isBlank()) name else trimmed + ext
 }
 
 private fun humanSize(bytes: Long): String = when {
