@@ -250,7 +250,7 @@ mod tests {
     use xr_proto::share::{ShareManifest, ShareManifestEntry};
 
     fn entry(path: &str, sha: &str) -> ShareManifestEntry {
-        ShareManifestEntry { path: path.into(), size: 1, mtime: 0, sha256: sha.into() }
+        ShareManifestEntry { path: path.into(), size: 1, mtime: 0, sha256: sha.into(), meta: None }
     }
 
     #[test]

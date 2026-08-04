@@ -80,7 +80,8 @@ sandbox = "auto"
 # release. Contract: argv in (the {url} element is replaced by the link as ONE
 # literal argument, no shell; {height} inside any element becomes the validated
 # effective height), files out in the job's cwd (top-level, non-hidden ones are
-# published), optional `xr-progress <percent>` lines on stdout.
+# published), optional `xr-progress <percent>` lines on stdout, optional origin
+# lines in .xr-meta.tsv (XR-255).
 [[import.plugin]]
 name = "yt-dlp"
 # Host suffixes matched at label boundaries (youtu.be also matches
@@ -101,6 +102,13 @@ args = [
   # The published file is named from the video title (plus the id, so two
   # videos with one title do not clobber each other).
   "-o", "%(title).200B [%(id)s].%(ext)s",
+  # Where the file came from (XR-255): one tab-separated line per output file
+  # into .xr-meta.tsv in the job dir, which the agent reads and turns into the
+  # origin shown in the app. Writing to a file, not to the screen, keeps the
+  # progress stream alone (a plain --print would imply --quiet).
+  "--print-to-file",
+  "after_move:%(filepath)s\t%(webpage_url)s\t%(channel,uploader|)s\t%(channel_url,uploader_url|)s\t%(upload_date|)s\t%(title|)s",
+  ".xr-meta.tsv",
   "{url}",
 ]
 

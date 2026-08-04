@@ -8,6 +8,7 @@ mod cli;
 mod config;
 mod import;
 mod manifest;
+mod meta;
 mod pull;
 mod push;
 #[cfg(feature = "relay")]
@@ -190,6 +191,9 @@ async fn run(path: &Path) -> Result<()> {
     for root in shares.values() {
         if !root.is_file {
             import::sweep_share_root(&root.path);
+            // One-off pass over files downloaded before XR-255: fill in what
+            // their names still give away and drop rows whose file is gone.
+            meta::backfill(&root.path);
         }
     }
 

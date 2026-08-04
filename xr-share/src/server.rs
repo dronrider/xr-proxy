@@ -382,7 +382,7 @@ async fn handle_put(
     rel: &str,
     req: Request,
 ) -> Result<Response, (StatusCode, &'static str)> {
-    let target = {
+    let (target, root) = {
         let shares = state.snapshot();
         let share = shares
             .get(share_id)
@@ -391,7 +391,9 @@ async fn handle_put(
             return Err((StatusCode::FORBIDDEN, "share is read-only"));
         }
         check_token(state, share_id, SCOPE_WRITE, &req)?;
-        resolve_within(&share.path, rel).map_err(|_| (StatusCode::FORBIDDEN, "path rejected"))?
+        let target = resolve_within(&share.path, rel)
+            .map_err(|_| (StatusCode::FORBIDDEN, "path rejected"))?;
+        (target, share.path.clone())
     };
 
     if target.is_dir() {
@@ -441,6 +443,11 @@ async fn handle_put(
     if let Ok(meta) = std::fs::metadata(&target) {
         state.hash_cache.seed(&target, meta.len(), mtime_secs(&meta), sha);
     }
+    // Bytes uploaded by hand did not come from whatever page used to live at
+    // this path (XR-255), so the old origin goes away with the old content.
+    if let Some(key) = crate::meta::rel_key(&root, &target) {
+        crate::meta::forget(&root, &key);
+    }
 
     let status = if existed {
         StatusCode::NO_CONTENT
@@ -460,7 +467,7 @@ async fn handle_delete(
     rel: &str,
     req: Request,
 ) -> Result<Response, (StatusCode, &'static str)> {
-    let target = {
+    let (target, root) = {
         let shares = state.snapshot();
         let share = shares
             .get(share_id)
@@ -469,7 +476,9 @@ async fn handle_delete(
             return Err((StatusCode::FORBIDDEN, "share is read-only"));
         }
         check_token(state, share_id, SCOPE_WRITE, &req)?;
-        resolve_within(&share.path, rel).map_err(|_| (StatusCode::FORBIDDEN, "path rejected"))?
+        let target = resolve_within(&share.path, rel)
+            .map_err(|_| (StatusCode::FORBIDDEN, "path rejected"))?;
+        (target, share.path.clone())
     };
 
     if target.is_dir() {
@@ -490,6 +499,11 @@ async fn handle_delete(
     tokio::fs::remove_file(&target)
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "delete failed"))?;
+    // The origin goes with the file: a later upload under the same name is a
+    // different file and must not inherit somebody else's page (XR-255).
+    if let Some(key) = crate::meta::rel_key(&root, &target) {
+        crate::meta::forget(&root, &key);
+    }
     tracing::info!("DELETE share={share_id} rel={rel}");
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -1486,6 +1500,131 @@ mod tests {
         let m: ShareManifest = serde_json::from_slice(&body).unwrap();
         let entry = m.entries.iter().find(|e| e.path == "видео/Ролик [abc].mp4").expect("в манифесте");
         assert_eq!(entry.sha256, sha_hex(b"video-bytes"));
+    }
+
+    /// The listing entry for `path`, as a browsing consumer sees it.
+    async fn manifest_entry(
+        app: &Router,
+        tok: &ShareToken,
+        path: &str,
+    ) -> xr_proto::share::ShareManifestEntry {
+        let r = app.clone().oneshot(get_with_token("/I/manifest", Some(tok))).await.unwrap();
+        let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let m: ShareManifest = serde_json::from_slice(&body).unwrap();
+        m.entries
+            .into_iter()
+            .find(|e| e.path == path)
+            .unwrap_or_else(|| panic!("в манифесте нет {path}"))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_import_writes_file_origin() {
+        // XR-255: the plugin's origin line reaches the listing under the same
+        // signature as the rest of the row, a second output file the plugin
+        // said nothing about still knows the page it came from, and all of it
+        // survives the agent restarting (the index is on disk, the job table
+        // is not).
+        let key = SigningKey::from_bytes(&[41u8; 32]);
+        let share = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let script = write_script(
+            bin.path(),
+            "printf 'video-bytes' > 'Ролик [dQw4w9WgXcQ].mp4'\n\
+             printf 'sub-bytes' > 'Ролик [dQw4w9WgXcQ].srt'\n\
+             printf '%s\\n' \
+             'Ролик [dQw4w9WgXcQ].mp4\thttps://www.youtube.com/watch?v=dQw4w9WgXcQ\tКанал автора\thttps://www.youtube.com/@avtor\t20260731\tНастоящий заголовок' \
+             > .xr-meta.tsv",
+        );
+        let (app, tok) = import_app(&key, share.path(), Some(one_plugin(&script, &["{url}"], &["*"], 1080)), None);
+
+        let (status, v) = post_import(
+            &app, Some(&tok), "/I/import",
+            serde_json::json!({ "url": PUB_URL, "dest": "видео" }),
+        ).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{v}");
+        let job_id = v["job_id"].as_str().unwrap().to_string();
+        let v = wait_finished(&app, &tok, &job_id).await;
+        assert_eq!(v["state"], "done", "{v}");
+
+        let entry = manifest_entry(&app, &tok, "видео/Ролик [dQw4w9WgXcQ].mp4").await;
+        let origin = entry.meta.as_ref().expect("источник у импортированного файла");
+        assert_eq!(origin.url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+        assert_eq!(origin.source, "Канал автора");
+        assert_eq!(origin.source_url, "https://www.youtube.com/@avtor");
+        assert_eq!(origin.published, "2026-07-31", "дату агент приводит к одному виду");
+        assert_eq!(origin.title, "Настоящий заголовок");
+
+        // The plugin named only the video; the subtitles still carry the link
+        // the job was started with, because the job knew it all along.
+        let sub = manifest_entry(&app, &tok, "видео/Ролик [dQw4w9WgXcQ].srt").await;
+        let sub_origin = sub.meta.as_ref().expect("источник у второго файла");
+        assert_eq!(sub_origin.url, PUB_URL);
+        assert_eq!(sub_origin.source, "");
+
+        // The plugin's own line file is service data: never published, never
+        // listed.
+        assert!(!share.path().join("видео/.xr-meta.tsv").exists());
+        assert!(manifest_paths(&app, "I", &tok)
+            .await
+            .iter()
+            .all(|p| !p.contains(".xr-meta")));
+
+        // A fresh agent over the same directory (a restart) still knows it.
+        let (again, tok2) = import_app(&key, share.path(), None, None);
+        let entry = manifest_entry(&again, &tok2, "видео/Ролик [dQw4w9WgXcQ].mp4").await;
+        assert_eq!(entry.meta.expect("источник пережил рестарт").source, "Канал автора");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_write_path_drops_stale_origin() {
+        // XR-255: whatever lands at a path by hand did not come from the page
+        // the old file came from, so PUT and DELETE take the origin with them.
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let share = tempfile::tempdir().unwrap();
+        let root = share.path().canonicalize().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let script = write_script(
+            bin.path(),
+            "printf 'v' > 'Ролик.mp4'\n\
+             printf 'Ролик.mp4\thttps://host/page\tКанал\t\t\t\\n' > .xr-meta.tsv",
+        );
+        let (app, tok) = import_app(&key, share.path(), Some(one_plugin(&script, &["{url}"], &["*"], 1080)), None);
+        let (_, v) = post_import(
+            &app, Some(&tok), "/I/import",
+            serde_json::json!({ "url": PUB_URL, "dest": "" }),
+        ).await;
+        let job_id = v["job_id"].as_str().unwrap().to_string();
+        assert_eq!(wait_finished(&app, &tok, &job_id).await["state"], "done");
+        assert!(crate::meta::load(&root).contains_key("Ролик.mp4"));
+
+        // An upload over the same name replaces the content, so the old origin
+        // must not stay and claim the new bytes.
+        let r = app
+            .clone()
+            .oneshot(write_req("PUT", "/I/file/Ролик.mp4", Some(&tok), &[], b"new-bytes"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        assert!(!crate::meta::load(&root).contains_key("Ролик.mp4"));
+        assert!(manifest_entry(&app, &tok, "Ролик.mp4").await.meta.is_none());
+
+        // And a delete takes the row with the file.
+        crate::meta::record(
+            &root,
+            &[("Ролик.mp4".to_string(), xr_proto::share::FileMeta {
+                url: "https://host/page".into(),
+                ..Default::default()
+            })],
+        );
+        let r = app
+            .clone()
+            .oneshot(write_req("DELETE", "/I/file/Ролик.mp4", Some(&tok), &[], b""))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        assert!(!crate::meta::load(&root).contains_key("Ролик.mp4"));
     }
 
     #[tokio::test]

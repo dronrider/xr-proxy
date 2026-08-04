@@ -399,6 +399,7 @@ mod tests {
                     size: 1,
                     mtime: 0,
                     sha256: String::new(),
+                    meta: None,
                 })
                 .collect(),
         }

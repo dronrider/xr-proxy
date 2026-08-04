@@ -448,6 +448,8 @@ impl ImportManager {
             dest_dir,
             dest_rel: spec.dest_rel.clone(),
             max_file_bytes: spec.max_file_bytes,
+            share_root: spec.share_root.clone(),
+            url: spec.url.clone(),
         };
         let cache = self.cache.clone();
         tokio::task::spawn_blocking(move || publish_files(&publish, &cache))
@@ -603,12 +605,23 @@ struct PublishSpec {
     dest_dir: PathBuf,
     dest_rel: String,
     max_file_bytes: Option<u64>,
+    /// Share root, where the origin index lives (XR-255).
+    share_root: PathBuf,
+    /// The link the job was started with. Every imported file gets at least
+    /// this, whatever the plugin knows.
+    url: String,
 }
 
 /// Publish the job dir's output into the share: top-level regular files only,
 /// hidden names skipped (that also covers `.xr-*`), each checked against
 /// `max_file_mb`, hashed, fsync'd and renamed over the target, hash seeded
 /// (LLD-29 п. 2.7). A mid-way failure reports what did get published.
+///
+/// The origin of each file (XR-255) is written after its rename, so a job that
+/// dies half-way never leaves a row without a file. What the plugin left in its
+/// [`meta::PLUGIN_FILE`](crate::meta::PLUGIN_FILE) enriches the job's own link;
+/// a plugin that says nothing still publishes, the file just knows only the
+/// page it came from.
 fn publish_files(spec: &PublishSpec, cache: &HashCache) -> Result<Vec<String>, String> {
     let mut names: Vec<String> = Vec::new();
     let entries = std::fs::read_dir(&spec.job_dir).map_err(|e| format!("чтение рабочей папки: {e}"))?;
@@ -627,11 +640,17 @@ fn publish_files(spec: &PublishSpec, cache: &HashCache) -> Result<Vec<String>, S
         return Err("плагин завершился успешно, но не оставил ни одного файла".into());
     }
 
+    let plugin_meta = std::fs::read(spec.job_dir.join(crate::meta::PLUGIN_FILE))
+        .map(|raw| crate::meta::parse_plugin_output(&String::from_utf8_lossy(&raw)))
+        .unwrap_or_default();
+
     let mut published: Vec<String> = Vec::new();
+    let mut origins: Vec<(String, xr_proto::share::FileMeta)> = Vec::new();
     for name in names {
         let src = spec.job_dir.join(&name);
         let result = publish_one(&src, spec, &name, cache);
         if let Err(e) = result {
+            crate::meta::record(&spec.share_root, &origins);
             let suffix = if published.is_empty() {
                 String::new()
             } else {
@@ -639,8 +658,15 @@ fn publish_files(spec: &PublishSpec, cache: &HashCache) -> Result<Vec<String>, S
             };
             return Err(format!("{name}: {e}{suffix}"));
         }
-        published.push(rel_path(&spec.dest_rel, &name));
+        let rel = rel_path(&spec.dest_rel, &name);
+        let mut origin = plugin_meta.get(&name).cloned().unwrap_or_default();
+        if origin.url.is_empty() {
+            origin.url = spec.url.clone();
+        }
+        origins.push((rel.clone(), origin));
+        published.push(rel);
     }
+    crate::meta::record(&spec.share_root, &origins);
     Ok(published)
 }
 

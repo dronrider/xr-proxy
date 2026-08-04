@@ -123,7 +123,7 @@ pub(crate) fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
 /// for directories: an import job dir's contents must never surface, however
 /// the files inside are named (LLD-29 п. 3.8). The root itself is exempt so an
 /// oddly-named share still serves.
-fn walk_share(root: &Path) -> impl Iterator<Item = walkdir::Result<walkdir::DirEntry>> {
+pub(crate) fn walk_share(root: &Path) -> impl Iterator<Item = walkdir::Result<walkdir::DirEntry>> {
     WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -135,6 +135,7 @@ fn walk_share(root: &Path) -> impl Iterator<Item = walkdir::Result<walkdir::DirE
 /// tests).
 pub fn build_manifest(root: &Path, cache: &HashCache) -> Result<ShareManifest> {
     let mut entries = Vec::new();
+    let mut origin = crate::meta::load(root);
 
     for entry in walk_share(root) {
         let entry = entry.context("walking share directory")?;
@@ -155,10 +156,11 @@ pub fn build_manifest(root: &Path, cache: &HashCache) -> Result<ShareManifest> {
         let mtime = mtime_secs(&meta);
 
         entries.push(ShareManifestEntry {
-            path: rel,
             size: meta.len(),
             mtime,
             sha256: cache.hashed(path, meta.len(), mtime)?,
+            meta: origin.remove(&rel),
+            path: rel,
         });
     }
 
@@ -173,6 +175,9 @@ pub fn build_manifest(root: &Path, cache: &HashCache) -> Result<ShareManifest> {
 /// yet" (skip verify / fall back to size+mtime).
 pub fn build_listing(root: &Path, cache: &HashCache) -> Result<ShareManifest> {
     let mut entries = Vec::new();
+    // One read of the share's origin index (XR-255) for the whole walk: the
+    // listing must stay instant, so a per-file open is out of the question.
+    let mut origin = crate::meta::load(root);
 
     for entry in walk_share(root) {
         let entry = entry.context("walking share directory")?;
@@ -192,10 +197,11 @@ pub fn build_listing(root: &Path, cache: &HashCache) -> Result<ShareManifest> {
         let mtime = mtime_secs(&meta);
 
         entries.push(ShareManifestEntry {
-            path: rel,
             size: meta.len(),
             mtime,
             sha256: cache.cached(path, meta.len(), mtime).unwrap_or_default(),
+            meta: origin.remove(&rel),
+            path: rel,
         });
     }
 
@@ -220,6 +226,9 @@ pub fn build_listing_for_file(path: &Path, cache: &HashCache) -> Result<ShareMan
             size: meta.len(),
             mtime,
             sha256: cache.cached(path, meta.len(), mtime).unwrap_or_default(),
+            // A single-file share is the file itself: there is no directory to
+            // keep an origin index in, and nothing imports into it either.
+            meta: None,
         }],
     })
 }
@@ -243,6 +252,7 @@ pub fn build_manifest_for_file(path: &Path, cache: &HashCache) -> Result<ShareMa
             size: meta.len(),
             mtime,
             sha256: cache.hashed(path, meta.len(), mtime)?,
+            meta: None,
         }],
     })
 }
@@ -355,6 +365,44 @@ mod tests {
 
         let l = build_listing(dir.path(), &cache).unwrap();
         assert_eq!(l.entries.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), vec!["real.txt"]);
+    }
+
+    #[test]
+    fn test_manifest_carries_file_origin() {
+        // XR-255: a row of the share's origin index lands on its own listing
+        // entry, and a file nobody imported carries none. Both builders show
+        // it, because the listing is what a browsing consumer gets and the
+        // hashed manifest is what the warmer builds.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("видео")).unwrap();
+        fs::write(dir.path().join("видео/Ролик.mp4"), b"hello").unwrap();
+        fs::write(dir.path().join("руками.txt"), b"hello").unwrap();
+        crate::meta::record(
+            dir.path(),
+            &[(
+                "видео/Ролик.mp4".to_string(),
+                xr_proto::share::FileMeta {
+                    url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+                    source: "Канал".into(),
+                    ..Default::default()
+                },
+            )],
+        );
+
+        let cache = HashCache::new();
+        for m in [
+            build_listing(dir.path(), &cache).unwrap(),
+            build_manifest(dir.path(), &cache).unwrap(),
+        ] {
+            // The index itself lives in the reserved namespace and is not listed.
+            assert_eq!(m.entries.len(), 2, "{:?}", m.entries);
+            let video = m.entries.iter().find(|e| e.path == "видео/Ролик.mp4").unwrap();
+            let origin = video.meta.as_ref().expect("источник у импортированного");
+            assert_eq!(origin.source, "Канал");
+            assert_eq!(origin.url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+            let by_hand = m.entries.iter().find(|e| e.path == "руками.txt").unwrap();
+            assert!(by_hand.meta.is_none(), "у файла руками источника нет");
+        }
     }
 
     #[test]

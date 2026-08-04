@@ -176,6 +176,15 @@ impl ImportConfig {
                     "download:xr-progress %(progress._percent_str)s".into(),
                     "-o".into(),
                     "%(title).200B [%(id)s].%(ext)s".into(),
+                    // Origin of the file (XR-255) into the job dir, one
+                    // tab-separated line per output. `--print-to-file` writes
+                    // to a file rather than the screen, so it neither implies
+                    // `--quiet` nor mixes into the progress stream.
+                    "--print-to-file".into(),
+                    "after_move:%(filepath)s\t%(webpage_url)s\t%(channel,uploader|)s\t\
+                     %(channel_url,uploader_url|)s\t%(upload_date|)s\t%(title|)s"
+                        .into(),
+                    crate::meta::PLUGIN_FILE.into(),
                     "{url}".into(),
                 ],
             }],
