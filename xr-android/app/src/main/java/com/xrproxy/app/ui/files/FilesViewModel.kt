@@ -119,6 +119,9 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
          *  (XR-251). Наличие файла на диске тут ни при чём: минус в строке
          *  снимает копию, а просмотр остаётся. */
         val viewedPaths: Set<String> = emptySet(),
+        /** Фильтр «только непросмотренные» (XR-256): общий на все шары и живёт
+         *  между запусками, как и порядок строк, поэтому едет из стора. */
+        val unviewedOnly: Boolean = false,
         /** FIFO of files queued with the per-row plus (XR-044); the head is the
          *  one being downloaded (or waiting out the background mirror's lock). */
         val queue: List<QueueItem> = emptyList(),
@@ -195,7 +198,13 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     init {
         viewModelScope.launch {
             val store = store()
-            _ui.update { it.copy(storeReady = true, sortOrder = store.sortOrder()) }
+            _ui.update {
+                it.copy(
+                    storeReady = true,
+                    sortOrder = store.sortOrder(),
+                    unviewedOnly = store.unviewedOnly(),
+                )
+            }
             store.shares.collect { _configs.value = it }
         }
         (app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)?.let { cm ->
@@ -732,6 +741,14 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         else SortOrder.of(mode)
         _ui.update { it.copy(sortOrder = order) }
         viewModelScope.launch { store().setSortOrder(order) }
+    }
+
+    /** Фильтр непросмотренных из меню вида (XR-256). Выбор ложится в стор рядом
+     *  с сортировкой: он про привычку смотреть медиатеку, а не про открытую
+     *  сейчас шару. */
+    fun setUnviewedOnly(on: Boolean) {
+        _ui.update { it.copy(unviewedOnly = on) }
+        viewModelScope.launch { store().setUnviewedOnly(on) }
     }
 
     fun navigateUp() {

@@ -36,6 +36,8 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddLink
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.CheckBox
+import androidx.compose.material.icons.filled.CheckBoxOutlineBlank
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Folder
@@ -47,7 +49,7 @@ import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Sync
-import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -88,6 +90,8 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -603,6 +607,17 @@ private fun ExplorerView(
     val level = remember(ui.manifest, ui.currentPath, ui.sortOrder) {
         explorerLevel(ui.manifest, ui.currentPath, ui.sortOrder)
     }
+    // Фильтр непросмотренных (XR-256) режет только файлы: папку без
+    // непросмотренного он оставляет, иначе в неё не зайти. Счётчик под шапкой
+    // считает по тем же файлам открытого уровня.
+    val fileCount = remember(level) { level.count { it is TreeNode.FileNode } }
+    val unviewedCount = remember(level, ui.viewedPaths) {
+        level.count { it is TreeNode.FileNode && it.entry.path !in ui.viewedPaths }
+    }
+    val shown = remember(level, ui.viewedPaths, ui.unviewedOnly) {
+        if (!ui.unviewedOnly) level
+        else level.filter { it !is TreeNode.FileNode || it.entry.path !in ui.viewedPaths }
+    }
     // Формат берём системный: короткая дата в том виде, в каком её показывает
     // сам телефон.
     val dateFormat = remember(context) { android.text.format.DateFormat.getDateFormat(context) }
@@ -648,6 +663,33 @@ private fun ExplorerView(
         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Breadcrumbs(cfg.name, ui.currentPath, Modifier.weight(1f)) { vm.navigateTo(it) }
             SortButton(ui.sortOrder) { vm.setSort(it) }
+            ViewMenuButton(ui.unviewedOnly) { vm.setUnviewedOnly(it) }
+        }
+        // Включённый фильтр говорит о себе сам: без этой строки короткий список
+        // не отличить от пропавших файлов.
+        if (ui.unviewedOnly) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
+                    .background(
+                        MaterialTheme.colorScheme.primary.copy(alpha = 0.10f),
+                        RoundedCornerShape(8.dp),
+                    )
+                    .padding(start = 10.dp, end = 4.dp, top = 3.dp, bottom = 3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "Только непросмотренные$SEP$unviewedCount из $fileCount",
+                    fontSize = 11.sp, color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.weight(1f),
+                )
+                Icon(
+                    Icons.Default.Close, contentDescription = "Снять фильтр",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(24.dp)
+                        .clickable { vm.setUnviewedOnly(false) }
+                        .padding(5.dp),
+                )
+            }
         }
         if (ui.offlineLocal && ui.manifest.isNotEmpty()) {
             Text(
@@ -697,8 +739,16 @@ private fun ExplorerView(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
+                    // Отфильтрованный дочиста уровень это не пустая папка, и
+                    // говорить о нём надо иначе.
+                    shown.isEmpty() -> item {
+                        Text(
+                            "Непросмотренных файлов здесь нет", modifier = Modifier.padding(16.dp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                     else -> {
-                        items(level, key = { it.path }) { node ->
+                        items(shown, key = { it.path }) { node ->
                             when (node) {
                                 is TreeNode.Folder -> FolderRow(node, folderPresence[node.path], cfg, vm)
                                 is TreeNode.FileNode -> FileRow(
@@ -981,29 +1031,35 @@ private fun FileRow(
             .padding(vertical = 3.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(modifier = Modifier.weight(1f).padding(start = 14.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                if (viewed) {
-                    Icon(
-                        Icons.Default.Visibility, contentDescription = "Просмотрено",
-                        modifier = Modifier.size(13.dp),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Spacer(Modifier.width(4.dp))
-                }
-                Text(
-                    displayFileName(node.name), maxLines = 1, fontSize = 13.sp,
-                    overflow = TextOverflow.MiddleEllipsis, modifier = Modifier.weight(1f),
+        // Точка у непросмотренного (XR-256): метится то, что ещё не смотрели,
+        // серого глазка на просмотренном владелец не видел вовсе. Метка стоит в
+        // тех же 14dp отступа колонки, поэтому имя не теряет ширины.
+        Box(modifier = Modifier.width(14.dp), contentAlignment = Alignment.Center) {
+            if (!viewed) {
+                Box(
+                    modifier = Modifier.size(7.dp)
+                        .background(MaterialTheme.colorScheme.primary, CircleShape)
+                        .semantics { contentDescription = "Не просмотрено" },
                 )
             }
+        }
+        Column(modifier = Modifier.weight(1f)) {
+            // Имя целиком в двух строках: эллипс посередине оставлял от ролика
+            // начало да расширение. Высоту строки держит кнопка справа со своими
+            // 48dp, и плотный межстрочный интервал укладывает колонку в этот
+            // запас.
+            Text(
+                displayFileName(node.name), maxLines = 2, fontSize = 13.sp,
+                lineHeight = 15.sp, overflow = TextOverflow.Ellipsis,
+            )
             val status = when {
-                downloaded -> humanSize(node.entry.size) + " - скачано, тап откроет"
+                downloaded -> humanSize(node.entry.size) + SEP + "скачано, тап откроет"
                 snap != null && snap.filesTotal == 1L ->
                     "${humanSize(snap.bytesDone)} из ${humanSize(node.entry.size)}" +
-                        " - ${humanSize(snap.speedBytesPerSec)}/с"
+                        SEP + "${humanSize(snap.speedBytesPerSec)}/с"
                 bgFetch -> "качается фоновым синком"
                 isHead -> "готовится..."
-                queued -> humanSize(node.entry.size) + " - в очереди"
+                queued -> humanSize(node.entry.size) + SEP + "в очереди"
                 failed != null -> "оборвалось на ${humanSize(failed.bytesDone)} из ${humanSize(failed.bytesTotal)}"
                 else -> humanSize(node.entry.size)
             }
@@ -1012,7 +1068,7 @@ private fun FileRow(
             // прежней, без пустого разделителя.
             val date = node.entry.mtime.takeIf { it > 0 }?.let { dateFormat.format(Date(it * 1000)) }
             Text(
-                if (date == null) status else "$date - $status",
+                if (date == null) status else "$date$SEP$status",
                 fontSize = 10.sp,
                 color = when {
                     showError -> errorColor
@@ -1125,6 +1181,41 @@ private fun SortButton(order: SortOrder, onPick: (FileSort) -> Unit) {
     }
 }
 
+/**
+ * Меню вида (XR-256). Пока в нём один пункт, фильтр непросмотренных, а
+ * группировка приедет сюда же (XR-258), поэтому это меню, а не отдельная
+ * кнопка-галочка в шапке. Включённый фильтр виден и по цвету иконки: список
+ * собран не как обычно, и сказать об этом надо там же, где его переключают.
+ */
+@Composable
+private fun ViewMenuButton(unviewedOnly: Boolean, onFilter: (Boolean) -> Unit) {
+    var menuOpen by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { menuOpen = true }) {
+            Icon(
+                Icons.Default.Tune,
+                contentDescription = if (unviewedOnly) "Вид, фильтр включён" else "Вид",
+                tint = if (unviewedOnly) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+            DropdownMenuItem(
+                text = { Text("Только непросмотренные") },
+                leadingIcon = {
+                    Icon(
+                        if (unviewedOnly) Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,
+                        contentDescription = null,
+                        tint = if (unviewedOnly) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                },
+                onClick = { menuOpen = false; onFilter(!unviewedOnly) },
+            )
+        }
+    }
+}
+
 private fun sortLabel(mode: FileSort): String = when (mode) {
     FileSort.NAME -> "Имя"
     FileSort.DATE -> "Дата"
@@ -1176,6 +1267,11 @@ private fun SectionLabel(text: String) {
 
 /** The plus control's "get it" green; same tone as the log screen's info colour. */
 private val DownloadGreen = Color(0xFF4CAF50)
+
+/** Разделитель кусков строки статуса: средняя точка, как в карточке шары.
+ *  Задана escape-последовательностью, вне раскладок en/ru её в исходник не
+ *  пускают правила проекта. */
+private const val SEP = " \u00B7 "
 
 private fun openLocalFile(context: Context, file: File) {
     try {

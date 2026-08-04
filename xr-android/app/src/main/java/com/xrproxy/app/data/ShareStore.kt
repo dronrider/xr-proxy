@@ -93,6 +93,13 @@ class ShareStore(private val prefs: SharedPreferences) {
             .apply()
     }
 
+    /** Фильтр «только непросмотренные» (XR-256), общий на все шары. */
+    fun unviewedOnly(): Boolean = prefs.getBoolean(KEY_UNVIEWED_ONLY, false)
+
+    fun setUnviewedOnly(on: Boolean) {
+        prefs.edit().putBoolean(KEY_UNVIEWED_ONLY, on).apply()
+    }
+
     /** Пути шары, которые с этого устройства уже открывали. Отметка живёт по
      *  паре (шара, путь) и держится здесь, а не в манифесте: манифест приходит
      *  от агента и знать про наши просмотры не может, а удаление локальной
@@ -128,6 +135,7 @@ class ShareStore(private val prefs: SharedPreferences) {
         private const val KEY_SORT = "explorer_sort"
         private const val KEY_SORT_DESC = "explorer_sort_desc"
         private const val KEY_VIEWED = "explorer_viewed"
+        private const val KEY_UNVIEWED_ONLY = "explorer_unviewed_only"
 
         fun create(context: Context): ShareStore {
             val masterKey = MasterKey.Builder(context)
