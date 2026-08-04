@@ -135,6 +135,10 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         val migratingShareId: String? = null,
         val openFileEvent: File? = null,
         val message: String? = null,
+        /** Путь файла, чей экран информации открыт (XR-257), или null. Держим
+         *  путь, а не саму строку: экран берёт её из свежего манифеста, поэтому
+         *  переживает обновление списка, а пропавший из шары файл его закрывает. */
+        val detailsPath: String? = null,
         /** Share whose storage-directory dialog is open (XR-043), or null. */
         val storageDialogFor: String? = null,
         /** True when the dialog is the first-sync prompt (auto-continues the
@@ -724,12 +728,18 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             it.copy(
                 openShareId = null, currentPath = "", manifest = emptyList(),
                 localPaths = emptySet(), viewedPaths = emptySet(),
-                importJob = null, importDialogFor = null,
+                importJob = null, importDialogFor = null, detailsPath = null,
             )
         }
     }
 
     fun navigateTo(path: String) = _ui.update { it.copy(currentPath = path) }
+
+    /** Экран информации о файле (XR-257). Открывается долгим тапом по любой
+     *  строке и обычным тапом по нескачанному файлу. */
+    fun openDetails(path: String) = _ui.update { it.copy(detailsPath = path) }
+
+    fun closeDetails() = _ui.update { it.copy(detailsPath = null) }
 
     /** Тап по переключателю сортировки (XR-251): тот же режим разворачивает
      *  направление, другой переключает поле и берёт своё привычное начало.
@@ -751,7 +761,14 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { store().setUnviewedOnly(on) }
     }
 
+    /** Кнопка «Назад» и системный жест: сначала закрывается экран информации о
+     *  файле, он лежит поверх открытой папки, и только потом идёт подъём по
+     *  дереву. */
     fun navigateUp() {
+        if (_ui.value.detailsPath != null) {
+            closeDetails()
+            return
+        }
         val p = _ui.value.currentPath
         if (p.isEmpty()) closeShare()
         else _ui.update { it.copy(currentPath = p.substringBeforeLast('/', "")) }
@@ -919,7 +936,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
      * только по успеху убираем локальную копию и строку из списка. Отказ
      * оставляет всё как было, файл остаётся и в шаре, и на устройстве.
      *
-     * Карточка файла открывается и для строки, которая качается прямо сейчас,
+     * Экран информации открывается и для строки, которая качается прямо сейчас,
      * поэтому одной отмены мало: `nativeCancelTransfer` просит писателя встать
      * на следующем чанке, и без ожидания он допишет и переименует файл уже
      * после нашей чистки, оставив на диске копию удалённого из шары файла.

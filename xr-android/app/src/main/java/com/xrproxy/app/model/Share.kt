@@ -95,19 +95,65 @@ data class ShareGrant(
 private fun stringList(arr: JSONArray?): List<String> =
     if (arr == null) emptyList() else (0 until arr.length()).map { arr.getString(it) }
 
+/**
+ * Откуда взялся файл (XR-255): что агент знает про страницу, с которой файл
+ * скачан. Поля необязательные каждое по отдельности, у файла, залитого руками,
+ * не заполнено ни одного. Едет внутри строки манифеста, то есть под подписью
+ * агента: канал и ссылка тут такие же неподделываемые, как хеш.
+ */
+data class FileMeta(
+    /** Страница, откуда файл скачан. */
+    val url: String = "",
+    /** Имя источника: для ролика это канал, для остального сайт или автор. */
+    val source: String = "",
+    /** Адрес страницы самого источника, для перехода в браузер. */
+    val sourceUrl: String = "",
+    /** Дата публикации в виде `ГГГГ-ММ-ДД`, не дата появления файла у агента. */
+    val published: String = "",
+    /** Заголовок со страницы; имя файла из него выведено, но подчищено. */
+    val title: String = "",
+) {
+    val isEmpty: Boolean
+        get() = url.isBlank() && source.isBlank() && sourceUrl.isBlank() &&
+            published.isBlank() && title.isBlank()
+
+    fun toJson(): JSONObject = JSONObject()
+        .put("url", url)
+        .put("source", source)
+        .put("source_url", sourceUrl)
+        .put("published", published)
+        .put("title", title)
+
+    companion object {
+        fun fromJson(o: JSONObject) = FileMeta(
+            url = o.optString("url"),
+            source = o.optString("source"),
+            sourceUrl = o.optString("source_url"),
+            published = o.optString("published"),
+            title = o.optString("title"),
+        )
+    }
+}
+
 /** One file in a share manifest. [sha256] is lowercase hex. */
 data class ManifestEntry(
     val path: String,
     val size: Long,
     val mtime: Long,
     val sha256: String,
+    /** Источник файла (XR-255), либо null: у файла без импорта поля нет и в
+     *  манифесте. */
+    val meta: FileMeta? = null,
 ) {
-    /** Re-serialize to the JSON shape `nativeDownloadFile` expects. */
+    /** Re-serialize to the JSON shape `nativeDownloadFile` expects. Источник
+     *  едет вместе со строкой: тем же методом пишется кэш манифеста (XR-099), и
+     *  без него офлайн-заход терял бы ссылку на канал. */
     fun toJson(): String = JSONObject()
         .put("path", path)
         .put("size", size)
         .put("mtime", mtime)
         .put("sha256", sha256)
+        .also { o -> meta?.let { o.put("meta", it.toJson()) } }
         .toString()
 
     companion object {
@@ -116,6 +162,7 @@ data class ManifestEntry(
             size = o.optLong("size"),
             mtime = o.optLong("mtime"),
             sha256 = o.getString("sha256"),
+            meta = o.optJSONObject("meta")?.let { FileMeta.fromJson(it) }?.takeIf { !it.isEmpty },
         )
     }
 }

@@ -4,6 +4,7 @@ package com.xrproxy.app.ui.files
 
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -15,6 +16,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -95,6 +97,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -111,7 +114,9 @@ import com.xrproxy.app.model.explorerLevel
 import kotlinx.coroutines.launch
 import java.io.File
 import java.text.DateFormat
+import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.Locale
 
 /**
  * Files tab (LLD-19, XR-031): a list of shares ("drives") and an Explorer that
@@ -119,8 +124,9 @@ import java.util.Date
  * queues a download, the running row shows progress with a cancel, the minus
  * removes the local copy, a broken download keeps its progress under a red tint
  * with a retry. The row tap only opens a downloaded file. Folders are tri-state
- * like selective sync in Drive/Dropbox. Долгое нажатие открывает карточку файла,
- * и в ней же живёт удаление из самой шары (XR-250), доступное с правом записи.
+ * like selective sync in Drive/Dropbox. Долгое нажатие открывает экран
+ * информации о файле (XR-257), и на нём же живут действия над файлом, включая
+ * удаление из самой шары (XR-250), доступное с правом записи.
  * Привычки файлового менеджера (XR-251): порядок строк переключается в шапке
  * проводника, строка файла несёт дату из манифеста, открытый файл помечается
  * просмотренным, а ютуб-идентификатор в хвосте имени на экране не показывается.
@@ -211,9 +217,21 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
         }
     }
 
+    // Экран информации о файле (XR-257) лежит поверх проводника той же шары и
+    // берёт строку из живого манифеста: удалённый из шары файл его закрывает
+    // сам, а не показывает то, чего уже нет.
+    val detailsEntry = ui.detailsPath?.let { p -> ui.manifest.firstOrNull { it.path == p } }
+    LaunchedEffect(ui.detailsPath, detailsEntry) {
+        if (ui.detailsPath != null && detailsEntry == null) vm.closeDetails()
+    }
+
     Box(modifier = modifier) {
         if (openConfig != null) {
-            ExplorerView(vm, ui, openConfig, context, Modifier)
+            if (detailsEntry != null) {
+                FileInfoScreen(vm, ui, openConfig, detailsEntry, Modifier)
+            } else {
+                ExplorerView(vm, ui, openConfig, context, Modifier)
+            }
         } else {
             ShareListView(vm, ui, configs, hubUrl, inviteToken, deleteWithUndo, Modifier)
         }
@@ -592,10 +610,6 @@ private fun ExplorerView(
     context: Context,
     modifier: Modifier,
 ) {
-    var detailsFor by remember { mutableStateOf<ManifestEntry?>(null) }
-    // Файл, который просят убрать из самой шары (XR-250). Держим отдельно от
-    // detailsFor: карточка файла закрывается, а подтверждение остаётся.
-    var deleteFromShare by remember { mutableStateOf<ManifestEntry?>(null) }
     // Открытие шары поднимает manifestLoading само, индикатор жеста поэтому
     // держим на локальном флаге ручных обновлений, как в списке шар (XR-232).
     var manualRefresh by remember { mutableStateOf(false) }
@@ -640,7 +654,7 @@ private fun ExplorerView(
             TextButton(
                 onClick = { vm.navigateUp() },
                 contentPadding = PaddingValues(horizontal = 8.dp),
-            ) { Text("‹ Назад") }
+            ) { Text(BACK_LABEL) }
             Spacer(Modifier.weight(1f))
             // URL import (LLD-29): the agent downloads the page into the open
             // folder. Shown only when the grant carries share:import.
@@ -758,7 +772,7 @@ private fun ExplorerView(
                                     failed = failedByPath[node.entry.path],
                                     viewed = node.entry.path in ui.viewedPaths,
                                     dateFormat = dateFormat,
-                                ) { detailsFor = it }
+                                ) { vm.openDetails(it.path) }
                             }
                             HorizontalDivider()
                         }
@@ -776,54 +790,232 @@ private fun ExplorerView(
         )
     }
 
-    detailsFor?.let { e ->
-        AlertDialog(
-            onDismissRequest = { detailsFor = null },
-            confirmButton = { TextButton(onClick = { detailsFor = null }) { Text("Закрыть") } },
-            // Удаление из шары живёт в карточке файла, а не второй кнопкой в
-            // строке (XR-250): минус рядом снимает локальную копию, и две
-            // похожие кнопки бок о бок повторили бы путаницу XR-044. Действие
-            // видно только с правом записи в токене.
-            dismissButton = {
-                if (cfg.canWrite) {
-                    TextButton(onClick = { detailsFor = null; deleteFromShare = e }) {
-                        Text("Удалить из шары", color = MaterialTheme.colorScheme.error)
+}
+
+// -- Экран информации о файле (XR-257) ------------------------------
+
+/**
+ * Всё, что известно о файле, одним экраном: блок «Файл» с путём, размером,
+ * датой, признаком просмотра и началом хеша, блок «Откуда файл» со страницей
+ * импорта и каналом автора, и действия над файлом внизу.
+ *
+ * Раньше это был диалог из трёх строк по долгому тапу. Метаданные импорта
+ * (XR-255) в него не влезали, а обрезанное имя ролика в заголовке диалога не
+ * давало даже понять, о каком файле речь.
+ *
+ * Блок «Откуда файл» не прячется у файла без метаданных, а говорит, почему он
+ * пуст: спрятанный блок не отличить от «экран не умеет это показывать».
+ */
+@Composable
+private fun FileInfoScreen(
+    vm: FilesViewModel,
+    ui: FilesViewModel.UiState,
+    cfg: ShareConfig,
+    entry: ManifestEntry,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val dateFormat = remember(context) { android.text.format.DateFormat.getDateFormat(context) }
+    var confirmDelete by remember { mutableStateOf(false) }
+
+    val path = entry.path
+    val downloaded = ui.localPaths.contains(path)
+    val queued = ui.queue.any { it.matches(cfg.shareId, path) }
+    val transferring = ui.transfer?.let { it.share == cfg.shareId && it.file == path } == true
+    val viewed = path in ui.viewedPaths
+    val date = entry.mtime.takeIf { it > 0 }?.let { dateFormat.format(Date(it * 1000)) }
+    val meta = entry.meta
+
+    Column(
+        modifier = modifier.fillMaxSize().padding(horizontal = 12.dp)
+            .verticalScroll(rememberScrollState()),
+    ) {
+        Row(modifier = Modifier.fillMaxWidth().padding(top = 6.dp)) {
+            TextButton(
+                onClick = { vm.closeDetails() },
+                contentPadding = PaddingValues(horizontal = 8.dp),
+            ) { Text(BACK_LABEL) }
+        }
+        Column(modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
+            // Имя целиком: обрезать его тут нечем и незачем, ради него на экран
+            // и заходят. Ютуб-идентификатор в хвосте прячем, как в списке, но
+            // полный путь ниже показывает и его.
+            Text(
+                displayFileName(path.substringAfterLast('/')),
+                fontSize = 18.sp, fontWeight = FontWeight.SemiBold, lineHeight = 23.sp,
+            )
+            Text(
+                buildList {
+                    add(humanSize(entry.size))
+                    date?.let { add(it) }
+                    when {
+                        downloaded -> add("скачано")
+                        transferring -> add("качается")
+                        queued -> add("в очереди")
+                    }
+                }.joinToString(SEP),
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+
+            InfoCard("Файл") {
+                InfoRow("Путь", path)
+                InfoRow("Размер", humanSize(entry.size))
+                if (date != null) InfoRow("Дата", date)
+                InfoRow("Просмотр", if (viewed) "Просмотрено" else "Не просмотрено")
+                // Офлайн-листинг собран по локальным файлам и хеша не знает
+                // (XR-099), пустая строка «SHA-256: ...» врала бы.
+                if (entry.sha256.isNotBlank()) {
+                    InfoRow("SHA-256", entry.sha256.take(16) + "...", mono = true)
+                }
+            }
+
+            InfoCard("Откуда файл") {
+                if (meta == null) {
+                    Text(
+                        "Неизвестно. Файл появился в шаре раньше, чем приложение стало " +
+                            "запоминать ссылку, и восстановить её нечем.",
+                        fontSize = 12.5.sp, lineHeight = 18.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    if (meta.url.isNotBlank()) {
+                        InfoRow("Страница", meta.title, link = meta.url)
+                    }
+                    if (meta.source.isNotBlank() || meta.sourceUrl.isNotBlank()) {
+                        InfoRow("Канал", meta.source, link = meta.sourceUrl)
+                    }
+                    if (meta.published.isNotBlank()) {
+                        InfoRow("Опубликовано", humanPublished(meta.published, dateFormat))
                     }
                 }
-            },
-            title = { Text("Файл") },
-            text = {
-                Column {
-                    Text(e.path.substringAfterLast('/'), style = MaterialTheme.typography.titleSmall)
-                    Spacer(Modifier.height(6.dp))
-                    Text("Путь: ${e.path}", fontSize = 12.sp)
-                    Text("Размер: ${humanSize(e.size)}", fontSize = 12.sp)
-                    Text("SHA-256: ${e.sha256.take(16)}...", fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            },
-        )
+            }
+
+            // Скачивание уже идёт: кнопка это не действие, а состояние, второй
+            // тап по ней всё равно ничего бы не добавил.
+            Button(
+                onClick = { if (downloaded) vm.openLocal(cfg, entry) else vm.enqueue(cfg, entry) },
+                enabled = downloaded || !(queued || transferring),
+                shape = RoundedCornerShape(26.dp),
+                modifier = Modifier.fillMaxWidth().padding(top = 18.dp).height(52.dp),
+            ) {
+                Text(
+                    when {
+                        downloaded -> "Открыть"
+                        transferring -> "Качается"
+                        queued -> "В очереди"
+                        else -> "Скачать"
+                    },
+                    fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
+                )
+            }
+            if (downloaded) {
+                TextButton(
+                    onClick = { vm.removeLocal(cfg, entry) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Удалить с устройства") }
+            }
+            // Удаление из шары (XR-250) необратимо и видно только с правом
+            // записи в токене; подтверждение с него не снимаем.
+            if (cfg.canWrite) {
+                TextButton(
+                    onClick = { confirmDelete = true },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Удалить из шары", color = MaterialTheme.colorScheme.error) }
+            }
+            Spacer(Modifier.height(24.dp))
+        }
     }
 
-    deleteFromShare?.let { e ->
+    if (confirmDelete) {
         AlertDialog(
-            onDismissRequest = { deleteFromShare = null },
+            onDismissRequest = { confirmDelete = false },
             title = { Text("Удалить из шары?") },
             text = {
                 Text(
-                    "«${e.path.substringAfterLast('/')}» пропадёт у всех, у кого есть доступ " +
+                    "«${path.substringAfterLast('/')}» пропадёт у всех, у кого есть доступ " +
                         "к шаре, и с этого устройства. Вернуть файл сможет только владелец.",
                     fontSize = 13.sp,
                 )
             },
             confirmButton = {
+                // Экран закроется сам, когда строка уйдёт из манифеста: отказ
+                // агента оставляет и файл, и экран на месте.
                 TextButton(onClick = {
-                    deleteFromShare = null
-                    vm.deleteFromShare(cfg, e)
+                    confirmDelete = false
+                    vm.deleteFromShare(cfg, entry)
                 }) { Text("Удалить", color = MaterialTheme.colorScheme.error) }
             },
-            dismissButton = { TextButton(onClick = { deleteFromShare = null }) { Text("Отмена") } },
+            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Отмена") } },
         )
+    }
+}
+
+/** Карточка блока экрана информации: заголовок капслоком и строки под ним. */
+@Composable
+private fun InfoCard(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        modifier = Modifier.fillMaxWidth().padding(top = 14.dp),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+            Text(
+                title.uppercase(),
+                fontSize = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.4.sp,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+            content()
+        }
+    }
+}
+
+/**
+ * Строка «ключ, значение» карточки. С [link] под значением встаёт сам адрес и
+ * вся пара уводит в браузер: ради ссылки на канал экран и заводился, а
+ * спрятанный за названием адрес не даёт понять, куда ведёт тап.
+ */
+@Composable
+private fun InfoRow(
+    key: String,
+    value: String,
+    mono: Boolean = false,
+    link: String? = null,
+) {
+    val context = LocalContext.current
+    Row(
+        modifier = Modifier.fillMaxWidth()
+            .let { m -> if (link.isNullOrBlank()) m else m.clickable { openLink(context, link) } }
+            .padding(vertical = 4.dp),
+    ) {
+        // Колонка ключа шире макетной: «Опубликовано» в 74dp переносилось на
+        // вторую строку и растягивало строку вдвое.
+        Text(
+            key, fontSize = 12.5.sp, lineHeight = 17.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.width(96.dp).padding(end = 6.dp),
+        )
+        Column(modifier = Modifier.weight(1f)) {
+            // У ролика без заголовка в метаданных значением остаётся сам адрес,
+            // и второй раз его повторять незачем.
+            if (value.isNotBlank()) {
+                Text(
+                    value, fontSize = if (mono) 11.5.sp else 12.5.sp, lineHeight = 17.sp,
+                    fontFamily = if (mono) FontFamily.Monospace else null,
+                    color = if (mono) MaterialTheme.colorScheme.onSurfaceVariant
+                    else MaterialTheme.colorScheme.onSurface,
+                )
+            }
+            if (!link.isNullOrBlank()) {
+                Text(
+                    link, fontSize = 11.5.sp, lineHeight = 15.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(top = if (value.isBlank()) 0.dp else 3.dp),
+                )
+            }
+        }
     }
 }
 
@@ -1024,8 +1216,11 @@ private fun FileRow(
                     drawRect(primary.copy(alpha = 0.15f), size = size.copy(width = size.width * fillFrac))
                 }
             }
+            // Тап по скачанному открывает файл, тап по остальному ведёт на
+            // экран информации (XR-257): раньше он не делал ничего, а всё, что
+            // о файле известно, пряталось за долгим нажатием.
             .combinedClickable(
-                onClick = { if (downloaded) vm.openLocal(cfg, node.entry) },
+                onClick = { if (downloaded) vm.openLocal(cfg, node.entry) else onDetails(node.entry) },
                 onLongClick = { onDetails(node.entry) },
             )
             .padding(vertical = 3.dp),
@@ -1273,6 +1468,11 @@ private val DownloadGreen = Color(0xFF4CAF50)
  *  пускают правила проекта. */
 private const val SEP = " \u00B7 "
 
+/** Надпись кнопки возврата: одинаковая в проводнике и на экране информации о
+ *  файле. Угловая кавычка задана escape-последовательностью по той же причине,
+ *  что и средняя точка выше. */
+private const val BACK_LABEL = "\u2039 Назад"
+
 private fun openLocalFile(context: Context, file: File) {
     try {
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
@@ -1286,6 +1486,28 @@ private fun openLocalFile(context: Context, file: File) {
         Toast.makeText(context, "Нет приложения, чтобы открыть этот файл", Toast.LENGTH_SHORT).show()
     }
 }
+
+/** Ссылка с экрана информации о файле (XR-257): страница ролика и канал автора
+ *  уходят в браузер. Обработчика может не найтись только на устройстве без
+ *  браузера вовсе, но падать из-за этого экран не должен. */
+private fun openLink(context: Context, url: String) {
+    try {
+        context.startActivity(
+            Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+        )
+    } catch (_: Exception) {
+        Toast.makeText(context, "Нет приложения, чтобы открыть ссылку", Toast.LENGTH_SHORT).show()
+    }
+}
+
+/** Дата публикации приезжает от агента как «ГГГГ-ММ-ДД». Показываем её тем же
+ *  системным форматом, что и дату файла, иначе на одном экране оказались бы два
+ *  разных формата даты. Неразобранную строку показываем как есть. */
+private fun humanPublished(published: String, dateFormat: DateFormat): String =
+    runCatching {
+        val iso = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { isLenient = false }
+        dateFormat.format(iso.parse(published)!!)
+    }.getOrDefault(published)
 
 /** Хвост, который импорт с ютуба дописывает к имени: идентификатор ролика в
  *  квадратных скобках, ровно 11 символов алфавита base64url. Правило узкое
