@@ -4,16 +4,23 @@ import android.content.Context
 import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import com.xrproxy.app.model.FileSort
 import com.xrproxy.app.model.ShareConfig
+import com.xrproxy.app.model.SortOrder
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * Persistence for configured shares (LLD-19). Holds, per share, the access
  * token (handed out-of-band) and the chosen SAF tree — both sensitive, so this
  * is backed by [EncryptedSharedPreferences]. Exposes the list as a [StateFlow]
  * for the UI, mirroring [ServerRepository].
+ *
+ * Здесь же живут привычки проводника (XR-251): порядок строк и отметки
+ * просмотренных файлов. Имена файлов чужой шары не менее чувствительны, чем
+ * её токен, и второго Keystore-хранилища ради двух ключей заводить незачем.
  */
 class ShareStore(private val prefs: SharedPreferences) {
 
@@ -61,8 +68,48 @@ class ShareStore(private val prefs: SharedPreferences) {
     fun enabledShares(): List<ShareConfig> =
         _shares.value.filter { it.syncEnabled && it.hasToken }
 
+    // -- Проводник (XR-251) ------------------------------------------
+
+    /** Порядок строк проводника, общий на все шары. */
+    fun sortOrder(): SortOrder {
+        val mode = runCatching { FileSort.valueOf(prefs.getString(KEY_SORT, "").orEmpty()) }
+            .getOrDefault(FileSort.NAME)
+        return SortOrder(mode, prefs.getBoolean(KEY_SORT_DESC, SortOrder.of(mode).descending))
+    }
+
+    fun setSortOrder(order: SortOrder) {
+        prefs.edit()
+            .putString(KEY_SORT, order.mode.name)
+            .putBoolean(KEY_SORT_DESC, order.descending)
+            .apply()
+    }
+
+    /** Пути шары, которые с этого устройства уже открывали. Отметка живёт по
+     *  паре (шара, путь) и держится здесь, а не в манифесте: манифест приходит
+     *  от агента и знать про наши просмотры не может, а удаление локальной
+     *  копии просмотр не отменяет. */
+    fun viewed(shareId: String): Set<String> {
+        val arr = readViewed().optJSONArray(shareId) ?: return emptySet()
+        return (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotEmpty() } }.toSet()
+    }
+
+    fun markViewed(shareId: String, path: String) {
+        val all = readViewed()
+        val arr = all.optJSONArray(shareId) ?: JSONArray()
+        for (i in 0 until arr.length()) if (arr.optString(i) == path) return
+        arr.put(path)
+        all.put(shareId, arr)
+        prefs.edit().putString(KEY_VIEWED, all.toString()).apply()
+    }
+
+    private fun readViewed(): JSONObject =
+        runCatching { JSONObject(prefs.getString(KEY_VIEWED, "").orEmpty()) }.getOrDefault(JSONObject())
+
     companion object {
         private const val KEY = "shares_v1"
+        private const val KEY_SORT = "explorer_sort"
+        private const val KEY_SORT_DESC = "explorer_sort_desc"
+        private const val KEY_VIEWED = "explorer_viewed"
 
         fun create(context: Context): ShareStore {
             val masterKey = MasterKey.Builder(context)
