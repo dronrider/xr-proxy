@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import com.xrproxy.app.model.FileGrouping
 import com.xrproxy.app.model.FileSort
 import com.xrproxy.app.model.ShareConfig
 import com.xrproxy.app.model.SortOrder
@@ -93,6 +94,15 @@ class ShareStore(private val prefs: SharedPreferences) {
             .apply()
     }
 
+    /** Режим группировки списка (XR-258), общий на все шары. */
+    fun grouping(): FileGrouping =
+        runCatching { FileGrouping.valueOf(prefs.getString(KEY_GROUPING, "").orEmpty()) }
+            .getOrDefault(FileGrouping.NONE)
+
+    fun setGrouping(mode: FileGrouping) {
+        prefs.edit().putString(KEY_GROUPING, mode.name).apply()
+    }
+
     /** Фильтр «только непросмотренные» (XR-256), общий на все шары. */
     fun unviewedOnly(): Boolean = prefs.getBoolean(KEY_UNVIEWED_ONLY, false)
 
@@ -136,6 +146,7 @@ class ShareStore(private val prefs: SharedPreferences) {
         private const val KEY_SORT_DESC = "explorer_sort_desc"
         private const val KEY_VIEWED = "explorer_viewed"
         private const val KEY_UNVIEWED_ONLY = "explorer_unviewed_only"
+        private const val KEY_GROUPING = "explorer_grouping"
 
         fun create(context: Context): ShareStore {
             val masterKey = MasterKey.Builder(context)

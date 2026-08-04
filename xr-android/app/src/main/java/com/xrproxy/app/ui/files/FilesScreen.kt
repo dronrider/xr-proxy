@@ -38,6 +38,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddLink
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckBox
 import androidx.compose.material.icons.filled.CheckBoxOutlineBlank
 import androidx.compose.material.icons.filled.Close
@@ -105,12 +106,15 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xrproxy.app.data.StorageAccess
 import com.xrproxy.app.ui.components.XrPullToRefresh
+import com.xrproxy.app.model.ExplorerRow
+import com.xrproxy.app.model.FileGrouping
 import com.xrproxy.app.model.FileSort
 import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
 import com.xrproxy.app.model.SortOrder
 import com.xrproxy.app.model.TreeNode
 import com.xrproxy.app.model.explorerLevel
+import com.xrproxy.app.model.explorerRows
 import kotlinx.coroutines.launch
 import java.io.File
 import java.text.DateFormat
@@ -632,6 +636,9 @@ private fun ExplorerView(
         if (!ui.unviewedOnly) level
         else level.filter { it !is TreeNode.FileNode || it.entry.path !in ui.viewedPaths }
     }
+    // Группы (XR-258) собираются поверх отфильтрованного уровня, поэтому
+    // счётчик в заголовке считает те строки, которые под ним и лежат.
+    val rows = remember(shown, ui.grouping) { explorerRows(shown, ui.grouping) }
     // Формат берём системный: короткая дата в том виде, в каком её показывает
     // сам телефон.
     val dateFormat = remember(context) { android.text.format.DateFormat.getDateFormat(context) }
@@ -677,7 +684,12 @@ private fun ExplorerView(
         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Breadcrumbs(cfg.name, ui.currentPath, Modifier.weight(1f)) { vm.navigateTo(it) }
             SortButton(ui.sortOrder) { vm.setSort(it) }
-            ViewMenuButton(ui.unviewedOnly) { vm.setUnviewedOnly(it) }
+            ViewMenuButton(
+                unviewedOnly = ui.unviewedOnly,
+                grouping = ui.grouping,
+                onFilter = { vm.setUnviewedOnly(it) },
+                onGroup = { vm.setGrouping(it) },
+            )
         }
         // Включённый фильтр говорит о себе сам: без этой строки короткий список
         // не отличить от пропавших файлов.
@@ -762,19 +774,25 @@ private fun ExplorerView(
                         )
                     }
                     else -> {
-                        items(shown, key = { it.path }) { node ->
-                            when (node) {
-                                is TreeNode.Folder -> FolderRow(node, folderPresence[node.path], cfg, vm)
-                                is TreeNode.FileNode -> FileRow(
-                                    node, cfg, ui, vm,
-                                    isHead = node.entry.path == headPath,
-                                    queued = node.entry.path != headPath && node.entry.path in queuedPaths,
-                                    failed = failedByPath[node.entry.path],
-                                    viewed = node.entry.path in ui.viewedPaths,
-                                    dateFormat = dateFormat,
-                                ) { vm.openDetails(it.path) }
+                        items(rows, key = { it.key }) { row ->
+                            when (row) {
+                                is ExplorerRow.Header -> GroupHeader(row.title, row.count)
+                                is ExplorerRow.Node -> {
+                                    when (val node = row.node) {
+                                        is TreeNode.Folder ->
+                                            FolderRow(node, folderPresence[node.path], cfg, vm)
+                                        is TreeNode.FileNode -> FileRow(
+                                            node, cfg, ui, vm,
+                                            isHead = node.entry.path == headPath,
+                                            queued = node.entry.path != headPath && node.entry.path in queuedPaths,
+                                            failed = failedByPath[node.entry.path],
+                                            viewed = node.entry.path in ui.viewedPaths,
+                                            dateFormat = dateFormat,
+                                        ) { vm.openDetails(it.path) }
+                                    }
+                                    HorizontalDivider()
+                                }
                             }
-                            HorizontalDivider()
                         }
                         item { Spacer(Modifier.height(24.dp)) }
                     }
@@ -1377,24 +1395,62 @@ private fun SortButton(order: SortOrder, onPick: (FileSort) -> Unit) {
 }
 
 /**
- * Меню вида (XR-256). Пока в нём один пункт, фильтр непросмотренных, а
- * группировка приедет сюда же (XR-258), поэтому это меню, а не отдельная
- * кнопка-галочка в шапке. Включённый фильтр виден и по цвету иконки: список
- * собран не как обычно, и сказать об этом надо там же, где его переключают.
+ * Меню вида (XR-256, XR-258): группировка списка и фильтр непросмотренных в
+ * одном месте. Кнопкой в шапке они не стали намеренно, иначе шапка проводника
+ * превратилась бы в полосу кнопок. Собранный не как обычно список виден по
+ * цвету иконки, и сказано об этом там же, где эти режимы переключают.
  */
 @Composable
-private fun ViewMenuButton(unviewedOnly: Boolean, onFilter: (Boolean) -> Unit) {
+private fun ViewMenuButton(
+    unviewedOnly: Boolean,
+    grouping: FileGrouping,
+    onFilter: (Boolean) -> Unit,
+    onGroup: (FileGrouping) -> Unit,
+) {
     var menuOpen by remember { mutableStateOf(false) }
+    val grouped = grouping != FileGrouping.NONE
     Box {
         IconButton(onClick = { menuOpen = true }) {
             Icon(
                 Icons.Default.Tune,
-                contentDescription = if (unviewedOnly) "Вид, фильтр включён" else "Вид",
-                tint = if (unviewedOnly) MaterialTheme.colorScheme.primary
+                // Состояние названо словами: по цвету иконки экранный сценарий
+                // и скринридер режим не прочитают.
+                contentDescription = when {
+                    grouped && unviewedOnly -> "Вид, группировка и фильтр включены"
+                    grouped -> "Вид, группировка включена"
+                    unviewedOnly -> "Вид, фильтр включён"
+                    else -> "Вид"
+                },
+                tint = if (grouped || unviewedOnly) MaterialTheme.colorScheme.primary
                 else MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
         DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+            Text(
+                "Группировка",
+                fontSize = 11.sp, letterSpacing = 0.4.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 16.dp, top = 8.dp, bottom = 2.dp),
+            )
+            FileGrouping.entries.forEach { mode ->
+                DropdownMenuItem(
+                    text = { Text(groupingLabel(mode)) },
+                    leadingIcon = {
+                        // Пустое место под галочкой держим всегда, иначе
+                        // невыбранные пункты разъезжались бы влево.
+                        if (mode == grouping) {
+                            Icon(
+                                Icons.Default.Check, contentDescription = "выбрано",
+                                tint = MaterialTheme.colorScheme.primary,
+                            )
+                        } else {
+                            Spacer(Modifier.size(24.dp))
+                        }
+                    },
+                    onClick = { menuOpen = false; onGroup(mode) },
+                )
+            }
+            HorizontalDivider()
             DropdownMenuItem(
                 text = { Text("Только непросмотренные") },
                 leadingIcon = {
@@ -1408,6 +1464,38 @@ private fun ViewMenuButton(unviewedOnly: Boolean, onFilter: (Boolean) -> Unit) {
                 onClick = { menuOpen = false; onFilter(!unviewedOnly) },
             )
         }
+    }
+}
+
+private fun groupingLabel(mode: FileGrouping): String = when (mode) {
+    FileGrouping.NONE -> "Без групп"
+    FileGrouping.DATE -> "По дате"
+    FileGrouping.SOURCE -> "По источнику"
+}
+
+/**
+ * Заголовок группы (XR-258). Счётчик рядом с названием отвечает на первый же
+ * вопрос к сгруппированному списку: сколько тут всего, ведь под заголовком
+ * видно две строки из двенадцати. Считает он показанные строки, поэтому с
+ * включённым фильтром говорит про непросмотренные.
+ */
+@Composable
+private fun GroupHeader(title: String, count: Int) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(start = 14.dp, top = 12.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            title.uppercase(), fontSize = 11.sp, letterSpacing = 0.4.sp,
+            fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary,
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f, fill = false),
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            "$count", fontSize = 10.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

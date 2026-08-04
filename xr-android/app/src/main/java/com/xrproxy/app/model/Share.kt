@@ -2,6 +2,10 @@ package com.xrproxy.app.model
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
+import java.util.Locale
 
 /**
  * Data model + JSON parsing for the file-sharing feature (LLD-19). The
@@ -443,6 +447,127 @@ fun explorerLevel(
     sortRows(files, order) { it.entry.mtime }.forEach { out.add(it) }
     return out
 }
+
+/** Чем список проводника разбит на группы (XR-258). */
+enum class FileGrouping { NONE, DATE, SOURCE }
+
+/**
+ * Строка списка проводника: заголовок группы либо сам узел дерева. Заголовки
+ * едут в том же списке, что и строки: ленивый список рисует их так же лениво,
+ * а вложенные списки на группу ему пришлось бы разворачивать целиком.
+ */
+sealed interface ExplorerRow {
+    /** Ключ строки для ленивого списка. */
+    val key: String
+
+    data class Header(val title: String, val count: Int) : ExplorerRow {
+        // Нулевой байт в пути файла не встречается, поэтому заголовок не
+        // столкнётся ключом даже с файлом по имени «Сегодня».
+        override val key: String get() = "\u0000$title"
+    }
+
+    data class Node(val node: TreeNode) : ExplorerRow {
+        override val key: String get() = node.path
+    }
+}
+
+/**
+ * Разложить готовый уровень проводника по группам (XR-258). Порядок внутри
+ * группы приходит заданным ([explorerLevel] и фильтр непросмотренных), а
+ * группировка задаёт только порядок самих групп: и по дате, и по источнику они
+ * идут от свежего к старому, файлы без даты и без источника собираются своей
+ * группой в конце.
+ *
+ * Папки в группы не ложатся: даты у папки своей нет, источника тем более, а
+ * потерять их нельзя, иначе в папку не зайти. Они идут своим блоком сверху, как
+ * и в списке без групп.
+ */
+fun explorerRows(
+    nodes: List<TreeNode>,
+    grouping: FileGrouping,
+    now: Long = System.currentTimeMillis(),
+): List<ExplorerRow> {
+    if (grouping == FileGrouping.NONE) return nodes.map { ExplorerRow.Node(it) }
+    val rows = ArrayList<ExplorerRow>(nodes.size + 4)
+    val folders = nodes.filterIsInstance<TreeNode.Folder>()
+    if (folders.isNotEmpty()) {
+        rows.add(ExplorerRow.Header("Папки", folders.size))
+        folders.forEach { rows.add(ExplorerRow.Node(it)) }
+    }
+    val members = LinkedHashMap<String, MutableList<TreeNode.FileNode>>()
+    val titles = HashMap<String, String>()
+    val ranks = HashMap<String, Long>()
+    for (file in nodes.filterIsInstance<TreeNode.FileNode>()) {
+        val group = when (grouping) {
+            FileGrouping.SOURCE -> sourceGroup(file.entry)
+            else -> dateGroup(file.entry.mtime, now)
+        }
+        members.getOrPut(group.key) { ArrayList() }.add(file)
+        titles[group.key] = group.title
+        // Группу по источнику двигает наверх её самый свежий файл, у группы по
+        // дате вес один на всю группу, поэтому максимум годится обеим.
+        ranks[group.key] = maxOf(ranks[group.key] ?: Long.MIN_VALUE, group.rank)
+    }
+    val order = members.keys.sortedWith(
+        compareByDescending<String> { ranks[it] ?: Long.MIN_VALUE }.thenBy { titles[it] },
+    )
+    for (key in order) {
+        val files = members[key] ?: continue
+        rows.add(ExplorerRow.Header(titles[key] ?: key, files.size))
+        files.forEach { rows.add(ExplorerRow.Node(it)) }
+    }
+    return rows
+}
+
+/** Группа файла: ключ, заголовок и вес, которым группы расставляются. */
+private data class FileGroup(val key: String, val title: String, val rank: Long)
+
+/** Источник файла как его назвал агент (XR-255): у ролика это канал. Файл без
+ *  источника не прячется, а собирается в свою группу последней. */
+private fun sourceGroup(entry: ManifestEntry): FileGroup {
+    val source = entry.meta?.source?.trim().orEmpty()
+    return if (source.isEmpty()) FileGroup("none", "Без источника", Long.MIN_VALUE)
+    else FileGroup(source, source, entry.mtime)
+}
+
+/** Корзина даты: сегодня, текущая неделя, дальше по месяцам. Дата это mtime из
+ *  манифеста, то есть когда файл появился у агента; запись без даты уходит в
+ *  свою группу последней. */
+private fun dateGroup(mtime: Long, now: Long): FileGroup {
+    if (mtime <= 0L) return FileGroup("none", "Без даты", Long.MIN_VALUE)
+    val stamp = mtime * 1000
+    val cal = Calendar.getInstance()
+    cal.timeInMillis = now
+    cal.startOfDay()
+    val dayStart = cal.timeInMillis
+    // Неделю начинаем тем днём, каким её начинает локаль телефона.
+    cal.set(Calendar.DAY_OF_WEEK, cal.firstDayOfWeek)
+    val weekStart = minOf(cal.timeInMillis, dayStart)
+    return when {
+        stamp >= dayStart -> FileGroup("today", "Сегодня", Long.MAX_VALUE)
+        stamp >= weekStart -> FileGroup("week", "На этой неделе", Long.MAX_VALUE - 1)
+        else -> {
+            val month = Calendar.getInstance()
+            month.timeInMillis = stamp
+            month.set(Calendar.DAY_OF_MONTH, 1)
+            month.startOfDay()
+            val start = month.timeInMillis
+            FileGroup("month$start", monthLabel(month.time), start)
+        }
+    }
+}
+
+private fun Calendar.startOfDay() {
+    set(Calendar.HOUR_OF_DAY, 0)
+    set(Calendar.MINUTE, 0)
+    set(Calendar.SECOND, 0)
+    set(Calendar.MILLISECOND, 0)
+}
+
+/** «Июль 2026»: месяц в именительном падеже, иначе получается «июля 2026». */
+private fun monthLabel(date: Date): String =
+    SimpleDateFormat("LLLL yyyy", Locale.forLanguageTag("ru")).format(date)
+        .replaceFirstChar { it.uppercase() }
 
 private fun <T : TreeNode> sortRows(rows: List<T>, order: SortOrder, mtime: (T) -> Long): List<T> {
     val byName = compareBy<T> { it.name.lowercase() }

@@ -10,6 +10,7 @@ import com.xrproxy.app.data.ShareRepository
 import com.xrproxy.app.data.ShareStore
 import com.xrproxy.app.data.StorageAccess
 import com.xrproxy.app.jni.NativeBridge
+import com.xrproxy.app.model.FileGrouping
 import com.xrproxy.app.model.FileSort
 import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
@@ -122,6 +123,9 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         /** Фильтр «только непросмотренные» (XR-256): общий на все шары и живёт
          *  между запусками, как и порядок строк, поэтому едет из стора. */
         val unviewedOnly: Boolean = false,
+        /** Режим группировки списка (XR-258): соседняя привычка проводника,
+         *  живёт там же, где порядок строк и фильтр. */
+        val grouping: FileGrouping = FileGrouping.NONE,
         /** FIFO of files queued with the per-row plus (XR-044); the head is the
          *  one being downloaded (or waiting out the background mirror's lock). */
         val queue: List<QueueItem> = emptyList(),
@@ -207,6 +211,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     storeReady = true,
                     sortOrder = store.sortOrder(),
                     unviewedOnly = store.unviewedOnly(),
+                    grouping = store.grouping(),
                 )
             }
             store.shares.collect { _configs.value = it }
@@ -759,6 +764,13 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     fun setUnviewedOnly(on: Boolean) {
         _ui.update { it.copy(unviewedOnly = on) }
         viewModelScope.launch { store().setUnviewedOnly(on) }
+    }
+
+    /** Режим группировки из того же меню вида (XR-258). Порядка строк он не
+     *  трогает: сортировка работает внутри группы и живёт своей кнопкой. */
+    fun setGrouping(mode: FileGrouping) {
+        _ui.update { it.copy(grouping = mode) }
+        viewModelScope.launch { store().setGrouping(mode) }
     }
 
     /** Кнопка «Назад» и системный жест: сначала закрывается экран информации о
