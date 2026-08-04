@@ -14,8 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use ed25519_dalek::SigningKey;
 use xr_proto::share::{
-    sign_share_token, verify_share_token, ShareManifest, ShareManifestEntry, ShareRecord,
-    ShareToken,
+    sign_share_token, verify_share_token, FileMeta, ShareManifest, ShareManifestEntry,
+    ShareRecord, ShareToken,
 };
 
 fn now_unix() -> u64 {
@@ -68,12 +68,22 @@ fn main() {
                 size: 2_481_152,
                 mtime: 1_750_000_000,
                 sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+                meta: None,
             },
             ShareManifestEntry {
                 path: "notes/readme.txt".into(),
                 size: 142,
                 mtime: 1_750_100_000,
                 sha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".into(),
+                // Origin of a file the agent imported by URL (XR-255); a photo
+                // uploaded by hand has none.
+                meta: Some(FileMeta {
+                    url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+                    source: "Канал автора".into(),
+                    source_url: "https://www.youtube.com/@avtor".into(),
+                    published: "2026-07-31".into(),
+                    title: "Настоящий заголовок".into(),
+                }),
             },
         ],
     };

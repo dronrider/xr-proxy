@@ -27,23 +27,73 @@
 
 use serde::{Deserialize, Serialize};
 
-/// One file in a share, as listed by the agent. Carries **metadata only** — the
-/// bytes are fetched directly from the agent over a range request, never from
-/// the hub.
+/// Where a file came from (XR-255): what the agent knows about the page it was
+/// imported from. Every field is optional, because a file uploaded by hand
+/// carries no origin at all and a plugin that says nothing still publishes its
+/// file. The consumer shows what is filled and honest emptiness for the rest.
+///
+/// The vocabulary is deliberately not video-specific: `source` is the channel
+/// for a video, the site or the author elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FileMeta {
+    /// The page the file was imported from (the job's own link, or a more
+    /// precise one from the plugin).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// Name of the source: the channel for a video, the site otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    /// Address of the source's own page (a channel page), for a link out.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_url: String,
+    /// Publication date as `YYYY-MM-DD`; the agent normalizes what the plugin
+    /// gives it. Not the file's mtime, which says when it was downloaded.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub published: String,
+    /// Title from the page metadata. The file name is derived from it but
+    /// sanitized and truncated, so the two differ.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+}
+
+impl FileMeta {
+    /// Nothing is known about the file's origin. Such metadata is neither
+    /// stored by the agent nor put on the wire.
+    pub fn is_empty(&self) -> bool {
+        self.url.is_empty()
+            && self.source.is_empty()
+            && self.source_url.is_empty()
+            && self.published.is_empty()
+            && self.title.is_empty()
+    }
+}
+
+/// One file in a share, as listed by the agent. Carries **metadata only**, and
+/// the bytes are fetched directly from the agent over a range request, never
+/// from the hub.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareManifestEntry {
     /// Path relative to the share root, forward-slash separated, no leading
-    /// slash and no `..` (the agent guarantees this — see anti-traversal in
-    /// `xr-share`). This is the identity used by the sync diff.
+    /// slash and no `..`. The agent guarantees the shape with the
+    /// anti-traversal in `xr-share`. This is the identity used by the sync
+    /// diff.
     pub path: String,
     /// Size in bytes.
     pub size: u64,
     /// Last-modified time, unix seconds. Used as a cheap pre-filter before the
     /// SHA-256 comparison in the sync planner.
     pub mtime: i64,
-    /// Lowercase hex SHA-256 of the file contents — the integrity anchor for
-    /// downloads and the change signal for sync.
+    /// Lowercase hex SHA-256 of the file contents. It anchors the integrity of
+    /// a download and signals a change to sync.
     pub sha256: String,
+    /// Origin of the file (XR-255), when the agent knows it. Rides inside the
+    /// listing on purpose: the manifest is the only artifact the consumer
+    /// verifies against the pinned agent key, so a separate endpoint would need
+    /// its own signature domain and its own failure mode for no gain. Absent
+    /// for every file nobody imported, so a share of hand-uploaded files is
+    /// byte-identical to what it was before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<FileMeta>,
 }
 
 /// The full listing the agent serves for a share. No bytes — `xr-core`'s sync
@@ -1079,6 +1129,71 @@ mod tests {
         assert_eq!(
             verify_share_manifest(&short, &vk, "share-1", 7000, body),
             Err(ManifestSigError::MalformedSignature)
+        );
+    }
+
+    #[test]
+    fn manifest_entry_meta_is_optional_on_wire() {
+        // XR-255. A listing row without origin must serialize exactly as it did
+        // before the field existed (a share nobody imported into is untouched),
+        // and a row written by an older agent must still parse.
+        let plain = ShareManifestEntry {
+            path: "a.txt".into(),
+            size: 5,
+            mtime: 1,
+            sha256: "aa".into(),
+            meta: None,
+        };
+        let json = serde_json::to_string(&plain).unwrap();
+        assert_eq!(json, r#"{"path":"a.txt","size":5,"mtime":1,"sha256":"aa"}"#);
+        let back: ShareManifestEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, plain);
+
+        // A filled row carries only what is known: empty fields stay off the
+        // wire, so the consumer sees absence, not an empty string it must guess
+        // about.
+        let filled = ShareManifestEntry {
+            meta: Some(FileMeta {
+                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+                source: "Канал".into(),
+                ..FileMeta::default()
+            }),
+            ..plain.clone()
+        };
+        let json = serde_json::to_string(&filled).unwrap();
+        assert!(json.contains(r#""meta":{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ","source":"Канал"}"#), "{json}");
+        assert!(!json.contains("published"), "пустые поля не едут: {json}");
+        assert_eq!(serde_json::from_str::<ShareManifestEntry>(&json).unwrap(), filled);
+    }
+
+    #[test]
+    fn file_meta_empty_is_nothing_known() {
+        assert!(FileMeta::default().is_empty());
+        for m in [
+            FileMeta { url: "u".into(), ..FileMeta::default() },
+            FileMeta { source: "s".into(), ..FileMeta::default() },
+            FileMeta { source_url: "s".into(), ..FileMeta::default() },
+            FileMeta { published: "2026-08-04".into(), ..FileMeta::default() },
+            FileMeta { title: "t".into(), ..FileMeta::default() },
+        ] {
+            assert!(!m.is_empty(), "{m:?}");
+        }
+    }
+
+    #[test]
+    fn manifest_signature_covers_the_origin_too() {
+        // The origin is the point of XR-255 and it must be as unforgeable as
+        // the hash: it rides inside the signed body, so rewriting a channel or
+        // a link in flight breaks the signature.
+        let agent = SigningKey::from_bytes(&[3u8; 32]);
+        let vk = agent.verifying_key();
+        let body = r#"{"entries":[{"path":"a.mp4","size":5,"mtime":1,"sha256":"aa","meta":{"source":"Канал"}}]}"#.as_bytes();
+        let sig = sign_share_manifest(&agent, "share-1", 7000, body);
+        assert!(verify_share_manifest(&sig, &vk, "share-1", 7000, body).is_ok());
+        let forged = r#"{"entries":[{"path":"a.mp4","size":5,"mtime":1,"sha256":"aa","meta":{"source":"Чужой"}}]}"#.as_bytes();
+        assert_eq!(
+            verify_share_manifest(&sig, &vk, "share-1", 7000, forged),
+            Err(ManifestSigError::BadSignature)
         );
     }
 
