@@ -2400,6 +2400,7 @@ mod tests {
             size: 10,
             mtime: 1,
             sha256: sha.into(),
+            meta: None,
         }
     }
     fn local(path: &str, sha: &str) -> LocalFile {
@@ -2984,6 +2985,36 @@ mod tests {
             .unwrap();
         assert_eq!(m.entries.len(), 1);
         assert_eq!(m.entries[0].path, "a.txt");
+    }
+
+    #[tokio::test]
+    async fn fetch_manifest_carries_file_origin() {
+        // XR-255: the origin of a file rides inside the signed listing, so the
+        // consumer gets it under the same pin as the hash and a MITM cannot
+        // rewrite the channel behind a valid signature. What the agent left
+        // empty stays absent rather than becoming an empty string.
+        let (key, pub_b64) = agent_key();
+        let body = r#"{"entries":[{"path":"Ролик.mp4","size":5,"mtime":1,"sha256":"aa","meta":{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ","source":"Канал","source_url":"https://www.youtube.com/@kanal","published":"2026-07-31"}},{"path":"руками.txt","size":1,"mtime":1,"sha256":"bb"}]}"#;
+        let url = serve_once(http_response(body, &signed_headers(&key, "s1", 1234, body))).await;
+        let m = fetch_manifest(&url, &test_token("s1"), &pub_b64, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let origin = m.entries[0].meta.as_ref().expect("источник импортированного");
+        assert_eq!(origin.source, "Канал");
+        assert_eq!(origin.source_url, "https://www.youtube.com/@kanal");
+        assert_eq!(origin.published, "2026-07-31");
+        assert_eq!(origin.title, "", "чего агент не знает, то пусто");
+        assert!(m.entries[1].meta.is_none(), "у файла руками источника нет");
+
+        // The same body with the channel swapped in flight fails the pin.
+        let forged = body.replace("Канал", "Чужой");
+        let url =
+            serve_once(http_response(&forged, &signed_headers(&key, "s1", 1234, body))).await;
+        let err = fetch_manifest(&url, &test_token("s1"), &pub_b64, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("manifest_signature"), "{err}");
     }
 
     #[tokio::test]
