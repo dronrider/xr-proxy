@@ -1717,6 +1717,80 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeImportCancel(
     jstring_into_raw(&mut env, json)
 }
 
+/// The file a delete asks for. An empty name is refused before the network: no
+/// agent route matches it, and the `not_found` that would come back reads as
+/// "the file is already gone" and hides the caller's slip.
+fn check_delete_path(raw: String) -> Result<String, String> {
+    if raw.trim().is_empty() {
+        return Err("bad_path: не указан файл".into());
+    }
+    Ok(raw)
+}
+
+/// The manifest row's hash for `If-Match`. An empty string (an offline row has
+/// no hash) means no condition at all, not the hash of an empty file.
+fn optional_hash(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// Delete `path` from the share (LLD-28, XR-250): the agent drops the file, so
+/// it leaves every holder of the share, not just this device. `expected_sha` is
+/// the hash of the manifest row the user acted on and travels as `If-Match`, so
+/// a file the owner replaced meanwhile answers `412` instead of being wiped; an
+/// empty string deletes whatever is there now. Returns `{"ok":true}` or
+/// `{"error":".."}`; the scope check runs before any network, so a read-only
+/// grant fails fast with a human message.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeDeleteFile(
+    mut env: JNIEnv,
+    _class: JClass,
+    addr: JString,
+    port: jint,
+    token_json: JString,
+    agent_pubkey: JString,
+    relay_json: JString,
+    path: JString,
+    expected_sha: JString,
+    timeout_ms: jlong,
+) -> jstring {
+    type DeleteArgs = (String, ShareToken, String, Option<RelayGrant>, String, Option<String>);
+    let parts = (|| -> Result<DeleteArgs, String> {
+        let addr = read_jstring(&mut env, &addr)?;
+        let token = read_jstring(&mut env, &token_json).and_then(|s| parse_token(&s))?;
+        let pubkey = read_jstring(&mut env, &agent_pubkey)?;
+        let relay = read_jstring(&mut env, &relay_json).ok().and_then(|s| parse_relay(&s));
+        let path = read_jstring(&mut env, &path).and_then(check_delete_path)?;
+        let expected = read_jstring(&mut env, &expected_sha).ok().and_then(|s| optional_hash(&s));
+        Ok((addr, token, pubkey, relay, path, expected))
+    })();
+    let (addr, token, pubkey, relay, path, expected) = match parts {
+        Ok(p) => p,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let share_id = token.share_id.clone();
+    let grant = grant_from_parts(addr, port.max(0) as u16, token, pubkey, relay);
+    let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+
+    let json = match with_onboarding_runtime(sync::delete_file(
+        &grant, &path, expected.as_deref(), timeout,
+    )) {
+        Ok(Ok(())) => {
+            journal_log("INFO", "files", &format!("удалён из шары {share_id}: {path}"));
+            serde_json::json!({ "ok": true }).to_string()
+        }
+        Ok(Err(e)) | Err(e) => {
+            journal_log("WARN", "files", &format!("удаление {path} из шары {share_id}: {e}"));
+            json_error(&e)
+        }
+    };
+    jstring_into_raw(&mut env, json)
+}
+
 /// Move a share's downloaded files from `src_dir` to `dst_dir` after a storage-
 /// directory change (XR-043), without re-downloading. Holds the single-transfer
 /// lock so it can't race the mirror engine (`"busy"` if one is running) and feeds
@@ -1913,6 +1987,77 @@ domains = ["youtube.com", "*.youtube.com"]"#;
         let t = parse_token(v2).unwrap();
         assert_eq!(t.share_id, "abc");
         assert_eq!(t.scope, "share:read");
+    }
+
+    /// Грант импорта и удаления собирается из строки адресов в порядке обхода
+    /// (XR-050): последний это публичный адрес гранта, всё раньше это кандидаты
+    /// LAN, которые пробуются первыми. Токен уезжает блобом и разбирается назад.
+    #[test]
+    fn grant_from_parts_keeps_walk_order() {
+        let token = ShareToken {
+            share_id: "s1".into(),
+            scope: "share:read share:write".into(),
+            exp: 4102444800,
+            signature: "AAAA".into(),
+        };
+        let grant = grant_from_parts(
+            " 192.168.1.5\n10.0.0.7\nagent.example ".into(),
+            8080,
+            token.clone(),
+            "pub".into(),
+            None,
+        );
+        assert_eq!(grant.addr, "agent.example");
+        assert_eq!(grant.addrs, vec!["192.168.1.5", "10.0.0.7"]);
+        assert_eq!(grant.port, 8080);
+        assert_eq!(grant.share_id, "s1");
+        assert_eq!(grant.exp, token.exp);
+
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(grant.token.as_bytes())
+            .unwrap();
+        let back: ShareToken = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(back.share_id, "s1");
+        assert_eq!(back.scope, "share:read share:write");
+    }
+
+    /// Шара с одним адресом: он же и есть основной, запасных нет.
+    #[test]
+    fn grant_from_parts_single_address() {
+        let token = ShareToken {
+            share_id: "s2".into(),
+            scope: "share:read".into(),
+            exp: 4102444800,
+            signature: "AAAA".into(),
+        };
+        let grant = grant_from_parts("agent.example".into(), 9000, token, "pub".into(), None);
+        assert_eq!(grant.addr, "agent.example");
+        assert!(grant.addrs.is_empty());
+    }
+
+    /// Пустое имя файла до сети отвергается: иначе агентский `not_found`
+    /// прочитался бы как «файл уже удалён» (XR-250).
+    #[test]
+    fn delete_path_must_not_be_blank() {
+        assert!(check_delete_path(String::new()).is_err());
+        assert!(check_delete_path("   ".into()).is_err());
+    }
+
+    /// Имя файла уходит как есть: пробелы внутри и по краям это часть имени,
+    /// подрезать его нельзя, иначе удаление промахнётся мимо цели.
+    #[test]
+    fn delete_path_passes_name_through() {
+        assert_eq!(check_delete_path("видео с пробелом.mp4".into()).unwrap(), "видео с пробелом.mp4");
+        assert_eq!(check_delete_path(" a.txt".into()).unwrap(), " a.txt");
+    }
+
+    /// Строка манифеста без хеша (офлайн-листинг) значит «без If-Match», а не
+    /// хеш пустого файла: с ним агент отвечал бы 412 на любое удаление.
+    #[test]
+    fn optional_hash_blank_is_none() {
+        assert_eq!(optional_hash(""), None);
+        assert_eq!(optional_hash("  "), None);
+        assert_eq!(optional_hash(" abc123 "), Some("abc123".to_string()));
     }
 
     #[test]
