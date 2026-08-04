@@ -195,8 +195,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     init {
         viewModelScope.launch {
             val store = store()
-            val order = withContext(Dispatchers.IO) { store.sortOrder() }
-            _ui.update { it.copy(storeReady = true, sortOrder = order) }
+            _ui.update { it.copy(storeReady = true, sortOrder = store.sortOrder()) }
             store.shares.collect { _configs.value = it }
         }
         (app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)?.let { cm ->
@@ -393,13 +392,23 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // Отметки просмотра снятой шары (XR-251): из хранилища они уходят вместе с
+    // ней, иначе копились бы там от каждой ротации инвайтов, но до истечения
+    // undo-снекбара лежат здесь, чтобы отмена возвращала шару целиком.
+    private var droppedViewed: Pair<String, Set<String>>? = null
+
     /** Отмена удаления из undo-снекбара: вернуть придержанный конфиг как был,
-     *  вместе с выбором и тумблером синка (локальные файлы удаление не трогает).
-     *  removeShare успел отменить живую закачку, поэтому включённый синк
-     *  продолжает сразу, не дожидаясь периодического слота WorkManager. */
+     *  вместе с выбором, тумблером синка и отметками просмотра (локальные файлы
+     *  удаление не трогает). removeShare успел отменить живую закачку, поэтому
+     *  включённый синк продолжает сразу, не дожидаясь периодического слота
+     *  WorkManager. */
     fun restoreShare(cfg: ShareConfig) {
         viewModelScope.launch {
             store().upsert(cfg)
+            droppedViewed?.let { (id, paths) ->
+                if (id == cfg.shareId) store().setViewed(id, paths)
+            }
+            droppedViewed = null
             rescheduleIfNeeded()
             if (cfg.syncEnabled) {
                 withContext(Dispatchers.IO) { ShareSyncScheduler.syncNow(getApplication()) }
@@ -409,6 +418,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
     fun removeShare(shareId: String) {
         viewModelScope.launch {
+            droppedViewed = shareId to store().viewed(shareId)
             store().remove(shareId)
             // Кэш манифеста шары больше не нужен. Undo (XR-055) вернёт запись,
             // а полный список подтянется при следующем онлайн-заходе.
@@ -448,7 +458,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             // Отметки просмотра нужны первой же отрисовке строк, поэтому едут
             // раньше и кэша, и манифеста.
-            val viewed = withContext(Dispatchers.IO) { store().viewed(config.shareId) }
+            val viewed = store().viewed(config.shareId)
             _ui.update { st ->
                 if (st.openShareId != config.shareId) st else st.copy(viewedPaths = viewed)
             }
@@ -721,7 +731,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         val order = if (current.mode == mode) current.copy(descending = !current.descending)
         else SortOrder.of(mode)
         _ui.update { it.copy(sortOrder = order) }
-        viewModelScope.launch { withContext(Dispatchers.IO) { store().setSortOrder(order) } }
+        viewModelScope.launch { store().setSortOrder(order) }
     }
 
     fun navigateUp() {
@@ -734,12 +744,14 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
      *  vanished from disk (deleted via a file manager) flips its row back to
      *  the plus instead of ignoring the tap. Отданный вьюеру файл считается
      *  просмотренным (XR-251): отметка ложится в стор до показа, потому что
-     *  дальше файл уходит в чужое приложение и чем там кончилось, мы не узнаем. */
+     *  дальше файл уходит в чужое приложение и чем там кончилось, мы не узнаем.
+     *  Пишем с главного потока, как и остальные мутации стора: отметки лежат
+     *  одним блобом, и два открытия подряд с пула потоков потеряли бы одну. */
     fun openLocal(config: ShareConfig, entry: ManifestEntry) {
         viewModelScope.launch {
             val existing = withContext(Dispatchers.IO) { localFile(config, entry.path) }
             if (existing != null) {
-                withContext(Dispatchers.IO) { store().markViewed(config.shareId, entry.path) }
+                store().markViewed(config.shareId, entry.path)
                 _ui.update { st ->
                     st.copy(
                         openFileEvent = existing,

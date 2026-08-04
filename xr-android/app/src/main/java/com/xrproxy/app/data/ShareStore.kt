@@ -60,7 +60,12 @@ class ShareStore(private val prefs: SharedPreferences) {
         get(shareId)?.let { upsert(transform(it)) }
     }
 
+    /** Убирает шару вместе с её отметками просмотра: иначе они копились бы в
+     *  хранилище от каждой снятой шары и ротации инвайтов. Придержать их на
+     *  время undo-снекбара это дело вызывающего ([viewed] до удаления,
+     *  [setViewed] на возврат). */
     fun remove(shareId: String) {
+        setViewed(shareId, emptySet())
         persist(_shares.value.filterNot { it.shareId == shareId })
     }
 
@@ -69,6 +74,10 @@ class ShareStore(private val prefs: SharedPreferences) {
         _shares.value.filter { it.syncEnabled && it.hasToken }
 
     // -- Проводник (XR-251) ------------------------------------------
+    //
+    // Зовётся всё это с главного потока, как и остальные методы класса: отметки
+    // просмотра лежат одним JSON-блобом на все шары, и read-modify-write с пула
+    // потоков терял бы отметку, когда два файла открывают подряд.
 
     /** Порядок строк проводника, общий на все шары. */
     fun sortOrder(): SortOrder {
@@ -99,6 +108,15 @@ class ShareStore(private val prefs: SharedPreferences) {
         for (i in 0 until arr.length()) if (arr.optString(i) == path) return
         arr.put(path)
         all.put(shareId, arr)
+        prefs.edit().putString(KEY_VIEWED, all.toString()).apply()
+    }
+
+    /** Переписать отметки шары целиком: пустой набор их снимает (удаление
+     *  шары), непустой возвращает придержанные (отмена удаления). */
+    fun setViewed(shareId: String, paths: Set<String>) {
+        val all = readViewed()
+        if (paths.isEmpty()) all.remove(shareId)
+        else all.put(shareId, JSONArray().apply { paths.forEach { put(it) } })
         prefs.edit().putString(KEY_VIEWED, all.toString()).apply()
     }
 
