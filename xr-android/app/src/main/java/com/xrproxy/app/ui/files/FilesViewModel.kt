@@ -798,7 +798,9 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     withContext(Dispatchers.IO) { NativeBridge.nativeCancelTransfer() }
                 }
             }
-            awaitWriterLeft(config.shareId, prefix)
+            awaitWriterLeft(config.shareId) { file, filesTotal ->
+                file.startsWith(prefix) || filesTotal > 1
+            }
             deselectPath(config.shareId, path)
             // Offline the selection may keep covering the folder (see
             // deselectPath); warn like the file minus does.
@@ -848,6 +850,12 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
      * дописала бы `.part` уже удалённого файла), потом удаляем у агента, и
      * только по успеху убираем локальную копию и строку из списка. Отказ
      * оставляет всё как было, файл остаётся и в шаре, и на устройстве.
+     *
+     * Карточка файла открывается и для строки, которая качается прямо сейчас,
+     * поэтому одной отмены мало: `nativeCancelTransfer` просит писателя встать
+     * на следующем чанке, и без ожидания он допишет и переименует файл уже
+     * после нашей чистки, оставив на диске копию удалённого из шары файла.
+     * Дожидаемся ухода писателя ровно так же, как это делает [removeFolder].
      */
     fun deleteFromShare(config: ShareConfig, entry: ManifestEntry) {
         viewModelScope.launch {
@@ -859,6 +867,11 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             result.fold(
                 onSuccess = {
                     deselectPath(config.shareId, entry.path)
+                    // Пока шёл сетевой запрос, за файл мог взяться фоновый синк
+                    // (его план строился по манифесту, где файл ещё был), так
+                    // что отмену повторяем и только потом ждём.
+                    maybeCancelNative(config.shareId, entry.path)
+                    awaitWriterLeft(config.shareId) { file, _ -> file == entry.path }
                     withContext(Dispatchers.IO) { repo.deleteLocal(config, entry.path) }
                     _ui.update { st ->
                         st.copy(
@@ -931,15 +944,20 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Bounded wait until the native writer can no longer touch [prefix]: not
-     *  inside it and not a multi-file pass of this share (a cancelled download
-     *  flushes its partial at the next chunk, so this is quick). */
-    private suspend fun awaitWriterLeft(shareId: String, prefix: String) = withContext(Dispatchers.IO) {
+    /** Bounded wait until the native writer can no longer touch what is about to
+     *  be deleted locally: [touches] judges the running transfer by its file and
+     *  its file count (a multi-file pass of the same share may still reach the
+     *  target). A cancelled download flushes its partial at the next chunk, so
+     *  this is quick. */
+    private suspend fun awaitWriterLeft(
+        shareId: String,
+        touches: (String, Long) -> Boolean,
+    ) = withContext(Dispatchers.IO) {
         repeat(30) {
             val o = runCatching { JSONObject(NativeBridge.nativeTransferProgress()) }.getOrNull()
                 ?: return@withContext
             if (!o.optBoolean("active") || o.optString("share") != shareId ||
-                (!o.optString("file").startsWith(prefix) && o.optLong("files_total") <= 1)
+                !touches(o.optString("file"), o.optLong("files_total"))
             ) {
                 return@withContext
             }
