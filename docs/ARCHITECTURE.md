@@ -359,8 +359,13 @@ Kotlin + Jetpack Compose, Material3, MVVM без DI-фреймворка.
   `LocalBinder`, `StateFlow<ServiceState>` (`Phase` + `StatsSnapshot?`),
   `CoroutineScope` с `SupervisorJob`. `startVpn` живёт в `scope` как suspend,
   после успешного `nativeStart` запускает `pollLoop()` (раз в секунду читает
-  `nativeGetStats`, публикует snapshot, обновляет notification). `stopFromUi()`
-  — единая команда стопа для VM через binder; `clearLog()` — тоже. `onBind`
+  `nativeGetStats`, публикует snapshot, обновляет notification). `stopFromUi()`,
+  единая команда стопа для VM через binder, и `clearLog()` тоже. `stopFromUi()`
+  и `onRevoke()` (системный отзыв VPN: тумблер в настройках Android или
+  перехват другим VPN-клиентом) ведут в общий приватный `stopTunnel(reason:
+  VpnStopReason)`, но с разной причиной: `VpnStopReason` задаёт текст записи в
+  журнале, и `onRevoke()` больше не пишет «остановлен пользователем», когда
+  пользователь в приложении ничего не нажимал (XR-221). `onBind`
   разветвляет: `ACTION_BIND_INTERNAL` → `LocalBinder`, иначе `super.onBind()`
   (штатный `BIND_VPN_SERVICE`). `onStartCommand(intent = null, ...)` делает
   `stopSelf()` → `START_NOT_STICKY`, чтобы не воскрешать зомби-сервис после
