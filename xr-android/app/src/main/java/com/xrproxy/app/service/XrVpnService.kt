@@ -311,27 +311,34 @@ class XrVpnService : VpnService() {
         return START_STICKY
     }
 
+    // Android дёргает revoke не только на явный отзыв разрешения в настройках,
+    // но и когда наш VPN-слот забирает другой клиент (система разрешает
+    // активной быть только одному VPN). stopFromUi() тут звать нельзя: она
+    // пишет в журнал «остановлен пользователем», а пользователь в приложении
+    // ничего не нажимал (XR-221).
     override fun onRevoke() {
-        stopFromUi()
+        stopTunnel(VpnStopReason.SYSTEM_REVOKE)
         super.onRevoke()
     }
 
-    // ── Public API used by VpnViewModel through the binder ────────────
+    // Public API used by VpnViewModel through the binder.
 
-    fun stopFromUi() {
+    fun stopFromUi() = stopTunnel(VpnStopReason.UI)
+
+    private fun stopTunnel(reason: VpnStopReason) {
         val current = _stateFlow.value.phase
         if (current == Phase.Idle || current == Phase.Stopping) return
         scope.launch {
             transitionMutex.withLock {
                 if (_stateFlow.value.phase == Phase.Idle) return@withLock
-                NativeBridge.nativeJournalLog("INFO", "vpn", "туннель остановлен пользователем")
+                NativeBridge.nativeJournalLog("INFO", "vpn", reason.journalMessage)
                 publish(Phase.Stopping)
                 updateNotification()
                 stopInternal()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 // Публикуем Idle ПОСЛЕ stopForeground: VM увидит Idle через
                 // stateFlow и сделает `unbindService`, что наконец-то позволит
-                // сервису реально умереть (stopSelf на bound-сервисе — no-op).
+                // сервису реально умереть (stopSelf на bound-сервисе это no-op).
                 // Без этого следующий Connect приходит на тот же instance,
                 // где native engine уже остановлен, и туннель не поднимается.
                 publish(Phase.Idle, snapshot = null)
