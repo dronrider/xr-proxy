@@ -7,6 +7,12 @@
 //! Both carry the same semantic pair `(hub_url, token)`. The custom scheme
 //! exists only for hand-built links; QR codes from xr-hub always use HTTPS
 //! so that users without the app get a sensible browser landing.
+//!
+//! `http://` is accepted too, but only when the host is private/loopback
+//! (XR-259): a local dev stand runs xr-hub without TLS on a LAN address or
+//! `localhost`, and a plain http link is the only thing it can hand out. A
+//! public host still requires https, so this does not open a downgrade path
+//! for a real deployment.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -46,6 +52,7 @@ pub enum InviteLinkError {
     UnsupportedScheme,
     EmptyHost,
     PrivateOrLoopbackHost,
+    HttpRequiresPrivateHost,
     InvalidPath,
     InvalidToken,
     UnexpectedQuery,
@@ -56,9 +63,12 @@ impl fmt::Display for InviteLinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Parse(e) => write!(f, "invalid URL: {e}"),
-            Self::UnsupportedScheme => write!(f, "unsupported scheme (expected https or xr)"),
+            Self::UnsupportedScheme => write!(f, "unsupported scheme (expected https, http or xr)"),
             Self::EmptyHost => write!(f, "host is empty"),
             Self::PrivateOrLoopbackHost => write!(f, "host is a private or loopback IP literal"),
+            Self::HttpRequiresPrivateHost => {
+                write!(f, "http scheme is only allowed for a private or loopback host")
+            }
             Self::InvalidPath => write!(f, "path must be /invite/<token>"),
             Self::InvalidToken => write!(f, "token must be 22 base64url characters"),
             Self::UnexpectedQuery => write!(f, "unexpected query parameters"),
@@ -74,7 +84,7 @@ pub fn parse_invite_link(s: &str) -> Result<InviteLink, InviteLinkError> {
     let url = Url::parse(s.trim()).map_err(|e| InviteLinkError::Parse(e.to_string()))?;
 
     match url.scheme() {
-        "https" => parse_https(&url),
+        "https" | "http" => parse_https(&url),
         "xr" => parse_custom(&url),
         _ => Err(InviteLinkError::UnsupportedScheme),
     }
@@ -85,7 +95,20 @@ fn parse_https(url: &Url) -> Result<InviteLink, InviteLinkError> {
     if host.is_empty() {
         return Err(InviteLinkError::EmptyHost);
     }
-    if is_private_or_loopback(host) {
+    let scheme = url.scheme();
+    let private = is_private_or_loopback(host);
+    // http допускается только для приватного/loopback хоста (XR-259):
+    // локальный стенд поднимает xr-hub без TLS на LAN-адресе (или доступен
+    // через `adb reverse` на localhost), настоящего CA-сертификата там
+    // взяться неоткуда. Публичный хост по http остаётся под запретом, иначе
+    // снятый downgrade'ом TLS выглядел бы валидной ссылкой.
+    if scheme == "http" && !private {
+        return Err(InviteLinkError::HttpRequiresPrivateHost);
+    }
+    // https на приватный/loopback хост остаётся под старым запретом: это
+    // страховка от случайного приёма чьего-то LAN-хаба за production
+    // (LLD-04, раздел 3.1), а не путь для локального стенда, тот идёт через http.
+    if scheme == "https" && private {
         return Err(InviteLinkError::PrivateOrLoopbackHost);
     }
     if url.query().is_some() {
@@ -94,7 +117,7 @@ fn parse_https(url: &Url) -> Result<InviteLink, InviteLinkError> {
 
     let token = extract_token_from_invite_path(url.path())?;
 
-    let mut hub_url = format!("https://{host}");
+    let mut hub_url = format!("{scheme}://{host}");
     if let Some(port) = url.port() {
         hub_url.push(':');
         hub_url.push_str(&port.to_string());
@@ -169,6 +192,12 @@ fn validate_token(token: &str) -> Result<(), InviteLinkError> {
 }
 
 fn is_private_or_loopback(host: &str) -> bool {
+    // Голое имя хоста, не IP-литерал: `adb reverse tcp:PORT tcp:PORT`
+    // прокидывает порт хаба с хост-машины на устройство/эмулятор именно
+    // под этим именем, IP там взять неоткуда (XR-259).
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
     let Ok(ip) = host.parse::<IpAddr>() else {
         return false;
     };
@@ -247,9 +276,40 @@ mod tests {
     }
 
     #[test]
-    fn rejects_http_scheme() {
+    fn rejects_http_on_public_host() {
         let err = parse_invite_link(&format!("http://hub.example.com/invite/{TOKEN}")).unwrap_err();
+        assert_eq!(err, InviteLinkError::HttpRequiresPrivateHost);
+    }
+
+    #[test]
+    fn rejects_unknown_scheme() {
+        let err = parse_invite_link(&format!("ftp://hub.example.com/invite/{TOKEN}")).unwrap_err();
         assert_eq!(err, InviteLinkError::UnsupportedScheme);
+    }
+
+    // XR-259: локальный стенд поднимает xr-hub без TLS на LAN-адресе или
+    // localhost, ссылка на него всегда http. Регрессия бага: раньше падало
+    // на UnsupportedScheme ещё до проверки хоста.
+    #[test]
+    fn accepts_http_on_private_host() {
+        for host in ["127.0.0.1", "10.0.2.2", "192.168.1.50", "localhost"] {
+            let link = parse_invite_link(&format!("http://{host}/invite/{TOKEN}")).unwrap();
+            assert_eq!(link.hub_url(), format!("http://{host}"), "host={host}");
+            assert_eq!(link.token(), TOKEN, "host={host}");
+        }
+    }
+
+    #[test]
+    fn accepts_http_on_private_host_with_port() {
+        let link = parse_invite_link(&format!("http://192.168.1.50:8080/invite/{TOKEN}")).unwrap();
+        assert_eq!(link.hub_url(), "http://192.168.1.50:8080");
+        assert_eq!(link.token(), TOKEN);
+    }
+
+    #[test]
+    fn rejects_https_on_localhost() {
+        let err = parse_invite_link(&format!("https://localhost/invite/{TOKEN}")).unwrap_err();
+        assert_eq!(err, InviteLinkError::PrivateOrLoopbackHost);
     }
 
     #[test]
