@@ -110,6 +110,36 @@ enum Commands {
         #[arg(long)]
         out: Option<String>,
     },
+    /// Verify a release manifest the way the phone does it (XR-109): detached
+    /// ed25519 signature over the exact manifest bytes. Takes either the whole
+    /// `/api/v1/app/latest` answer (--signed) or the local manifest+sig pair.
+    VerifyRelease {
+        /// Signed manifest JSON (`{manifest, signature}`), file or `-` for stdin.
+        #[arg(long)]
+        signed: Option<String>,
+        /// Manifest file (use together with --sig).
+        #[arg(long)]
+        manifest: Option<String>,
+        /// Detached signature file, base64 (use together with --manifest).
+        #[arg(long)]
+        sig: Option<String>,
+        /// Release PUBLIC key (base64), the one pinned into the app.
+        #[arg(long)]
+        pubkey: Option<String>,
+        /// Release PRIVATE key file; the public half is derived from it, so a
+        /// live manifest that verifies proves the key is the one in use.
+        #[arg(long)]
+        key: Option<String>,
+        /// Fail unless the manifest names this version.
+        #[arg(long = "expect-version")]
+        expect_version: Option<String>,
+        /// Fail unless the manifest carries this versionCode.
+        #[arg(long = "expect-version-code")]
+        expect_version_code: Option<u64>,
+        /// Fail unless the manifest carries this APK sha256.
+        #[arg(long = "expect-sha256")]
+        expect_sha256: Option<String>,
+    },
 }
 
 /// `xr-hub reset-password`: захешировать новый пароль и хирургически
@@ -353,6 +383,30 @@ async fn main() -> Result<()> {
             notes: notes.clone(),
             released_at,
             out: out.clone(),
+        })?;
+        return Ok(());
+    }
+
+    if let Some(Commands::VerifyRelease {
+        signed,
+        manifest,
+        sig,
+        pubkey,
+        key,
+        expect_version,
+        expect_version_code,
+        expect_sha256,
+    }) = &cli.command
+    {
+        release::verify_release(release::VerifyReleaseArgs {
+            signed: signed.clone(),
+            manifest: manifest.clone(),
+            sig: sig.clone(),
+            pubkey: pubkey.clone(),
+            key: key.clone(),
+            expect_version: expect_version.clone(),
+            expect_version_code: *expect_version_code,
+            expect_sha256: expect_sha256.clone(),
         })?;
         return Ok(());
     }
