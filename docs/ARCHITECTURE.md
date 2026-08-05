@@ -207,7 +207,10 @@ Cargo-workspace + Android-модуль:
   `parse_invite_link`, `build_https_url`. Принимает `https://<hub>/invite/<token>`
   (основной формат QR) и `xr://invite/<token>?hub=<host>` (кастомная схема
   для deep link). Валидирует токен (base64url 22 chars), отсекает
-  loopback/private хосты.
+  loopback/private хосты для https. `http://` тоже принимается, но только
+  для loopback/private хоста или `localhost` (XR-259) - так проходит
+  онбординг с локального стенда, у которого нет TLS; публичный хост по
+  http все равно отклоняется.
 
 ### 4.2 xr-core — ядро персонального клиента
 
