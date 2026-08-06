@@ -243,7 +243,7 @@ server {
         proxy_set_header Host $host;                 # имя публикации едет в Host
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;      # понадобится фазе 3
+        proxy_set_header Upgrade $http_upgrade;      # WebSocket живой ленты
         proxy_set_header Connection $connection_upgrade;
         proxy_read_timeout 3600s;
     }
@@ -264,9 +264,44 @@ curl -s -H 'Accept: application/json' https://dash.web.example.com/
 curl -sI https://dash.web.example.com/ | grep -i set-cookie      # пусто до входа
 ```
 
-В логе сервиса (`journalctl -u xr-web`) видно вход, выбор маршрута и строку
+В логе сервиса (`journalctl -u xr-web`) видно вход, выбор маршрута, начало
+апгрейда со сроком штатного закрытия, обрыв туннеля и строку
 `метод-статус-длительность` на каждый запрос; тела, query-строки и cookie туда
 не попадают.
+
+Живая лента (WebSocket) идёт через вход насквозь, но не дольше, чем ей позволяет
+relay: `[relay] splice_lifetime_secs` (по умолчанию час) рубит сплайс жёстко.
+Чтобы обрыв не выглядел зависанием, `xr-web` закрывает такое соединение сам,
+штатным `1001 going away`, за минуту до потолка, а приложение обязано
+переподключиться само. Потолок фронт берёт из маршрута, поэтому значение в
+конфигах relay и хаба должно совпадать: разъедутся, и фронт будет считать срок
+не от того числа. `proxy_read_timeout` на фронте держим не меньше потолка, иначе
+соединение оборвёт nginx раньше всех.
+
+Проверить весь путь целиком (WebSocket, штатное закрытие, поведение при
+выключенной машине) можно скриптом `scripts/check-browser-entry.py`. Он ставит
+на машине владельца синтетический сервис и судит вход снаружи:
+
+```bash
+# на машине владельца: сервис и публикация на него
+python3 scripts/check-browser-entry.py echo-service --port 8765 &
+xr-share expose add --name dash --upstream 127.0.0.1:8765
+
+# откуда угодно: вход, кадры и штатное закрытие по лимиту
+python3 scripts/check-browser-entry.py ws --entry https://dash.web.example.com \
+    --host dash.web.example.com --username owner --password ... --wait 3700
+# browser entry ws: ok
+
+# машина выключена: 502 с причиной за секунды и статус публикации на хабе
+python3 scripts/check-browser-entry.py offline --entry https://dash.web.example.com \
+    --host dash.web.example.com --username owner --password ... \
+    --hub https://xr-hub.example.com --secret "$XR_WEB_SECRET" --publication dash
+# browser entry offline: ok
+```
+
+Ждать штатного закрытия час не обязательно: на время проверки
+`splice_lifetime_secs` уменьшают в конфигах relay и хаба (например до 60) и
+перезапускают оба сервиса.
 
 ## 4. Подпись пресетов (опционально)
 
