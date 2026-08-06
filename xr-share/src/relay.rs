@@ -238,8 +238,12 @@ async fn serve_reverse(
             }
         }
     });
+    // `with_upgrades`: публикация отдаёт наружу живой сервис, и его WebSocket
+    // обязан пройти насквозь (LLD-38 п. 2.4). Без этого реверс-стрим отвечал бы
+    // `101` и тут же ронял соединение, не отдав сплайса.
     hyper::server::conn::http1::Builder::new()
         .serve_connection(hyper_util::rt::TokioIo::new(tls), hyper_service)
+        .with_upgrades()
         .await
         .map_err(|e| anyhow!("serve reverse http: {e}"))
 }
@@ -596,5 +600,159 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.status().is_success(), "шара не должна пострадать: {}", resp.status());
+    }
+
+    /// LLD-38 п. 2.4 через живой relay: WebSocket-апгрейд проходит от
+    /// потребителя до локального сервиса и обратно. Реверс-стрим обязан отдать
+    /// сплайс, а не оборвать соединение сразу после `101`: живая лента
+    /// дашборда это ровно такой апгрейд.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn expose_over_relay_passes_a_websocket_upgrade() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xr_proto::share::{sign_expose_token, EXPOSE_HEADER};
+
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let identity = SigningKey::from_bytes(&[13u8; 32]);
+        let agent_pk = b64(identity.verifying_key().as_bytes());
+
+        // Локальный сервис с апгрейдом: отвечает `101` и дальше гоняет байты
+        // обратно как есть, как эхо-сервис скрипта проверки.
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match sock.read(&mut byte).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => head.push(byte[0]),
+                        }
+                    }
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                              Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                        )
+                        .await;
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap();
+        let relay_state = xr_relay::RelayState::new(hub.verifying_key(), 64, 8, Duration::from_secs(30));
+        {
+            let s = relay_state.clone();
+            tokio::spawn(async move { xr_relay::serve(listener, test_codec(), s, 64).await });
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut shares = SharesMap::new();
+        shares.insert(
+            "S".into(),
+            ShareRoot { path: dir.path().canonicalize().unwrap(), is_file: false, writable: false, import: false },
+        );
+        let cache = Arc::new(HashCache::new());
+        let state = Arc::new(AgentState {
+            shares: RwLock::new(Arc::new(shares)),
+            hub_key: hub.verifying_key(),
+            hash_cache: cache.clone(),
+            identity: Some(identity.clone()),
+            max_file_mb: None,
+            import: crate::import::ImportManager::new(None, cache),
+            expose: RwLock::new(Arc::new(vec![crate::config::ExposeEntry {
+                name: "live".into(),
+                upstream: upstream_addr.to_string(),
+            }])),
+        });
+        let cred = sign_agent_credential(&hub, &agent_pk, now() + 3600);
+        let cred_blob =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cred).unwrap());
+        spawn(
+            state,
+            RelayAgentConfig {
+                addr: relay_addr.ip().to_string(),
+                port: relay_addr.port(),
+                obf: test_obf(),
+            },
+            cred_blob,
+            identity.clone(),
+        )
+        .unwrap();
+        let mut registered = false;
+        for _ in 0..100 {
+            if relay_state.registry.get(&agent_pk).await.is_some() {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(registered, "агент обязан зарегистрироваться на relay");
+
+        // Потребитель говорит сырым HTTP поверх своего pinned-TLS: апгрейд это
+        // не тот запрос, который отдаст reqwest.
+        let relay_token = sign_relay_token(&hub, "S", &agent_pk, now() + 3600);
+        let grant = RelayGrant {
+            addr: relay_addr.ip().to_string(),
+            port: relay_addr.port(),
+            obf: test_obf(),
+            relay_token,
+        };
+        let endpoint = Arc::new(RelayEndpoint::from_grant(&grant).unwrap());
+        let fwd = LoopbackForwarder::spawn(endpoint).await.unwrap();
+        let tcp = tokio::net::TcpStream::connect(fwd.local_addr()).await.unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(pinned_client_config(&agent_pk).unwrap()));
+        let name = tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls = connector.connect(name, tcp).await.expect("pinned TLS до агента");
+
+        let mandate = sign_expose_token(&hub, "live", &agent_pk, now() + 3600);
+        let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&mandate).unwrap());
+        tls.write_all(
+            format!(
+                "GET /live HTTP/1.1\r\nHost: live.web.test\r\n{EXPOSE_HEADER}: live\r\n\
+                 Authorization: Bearer {blob}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+                 Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = tokio::time::timeout(Duration::from_secs(10), tls.read(&mut byte))
+                .await
+                .expect("ответ агента")
+                .unwrap();
+            assert_ne!(n, 0, "агент закрыл соединение: {}", String::from_utf8_lossy(&head));
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head).into_owned();
+        assert!(head.starts_with("HTTP/1.1 101 Switching Protocols"), "{head}");
+
+        // Кадры идут в обе стороны сквозь relay: он по-прежнему сплайсит
+        // шифртекст и о WebSocket не знает ничего.
+        tls.write_all(b"\x81\x83\x01\x02\x03\x04hey").await.unwrap();
+        let mut back = [0u8; 9];
+        tokio::time::timeout(Duration::from_secs(10), tls.read_exact(&mut back))
+            .await
+            .expect("эхо сервиса")
+            .unwrap();
+        assert_eq!(&back, b"\x81\x83\x01\x02\x03\x04hey");
     }
 }

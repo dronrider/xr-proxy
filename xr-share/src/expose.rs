@@ -46,9 +46,9 @@ const FORWARDED_HOST_HEADER: &str = "x-forwarded-host";
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Заголовки, которые кончаются на этом соединении и дальше не едут (RFC 9110).
-/// `upgrade` и `connection` в этом же списке: апгрейд до WebSocket пробрасывает
-/// фаза 3 (XR-264), и до неё честнее не пустить его вовсе, чем отдать
-/// полусплайс.
+/// `upgrade` и `connection` тоже: на запросе апгрейда они ставятся заново своим
+/// значением (см. [`proxy`]), потому что дальше едет ровно тот протокол,
+/// который агент берётся сплайсить.
 const HOP_BY_HOP: [header::HeaderName; 7] = [
     header::CONNECTION,
     header::PROXY_AUTHENTICATE,
@@ -166,8 +166,20 @@ fn mandate_from_headers(headers: &HeaderMap) -> Option<ExposeToken> {
 /// приложение, строящее абсолютные ссылки из `Host`, увидит локальный адрес:
 /// внешнее имя ему полагается брать из `X-Forwarded-Host`, как у любого
 /// сервиса за прокси.
+///
+/// Апгрейд (WebSocket живой ленты) едет насквозь: `Upgrade` и `Connection`
+/// объявляются апстриму заново, а после его `101` агент перестаёт быть
+/// HTTP-посредником и гоняет байты в обе стороны. Кадры он не разбирает и
+/// своего срока жизни соединению не назначает: потолок сплайса знает `xr-web`
+/// из маршрута, он же закрывает апгрейд штатно (LLD-38 п. 2.4).
 async fn proxy(upstream: &str, req: Request) -> Response {
     let (mut parts, body) = req.into_parts();
+    // Ручку на переключение своего конца забираем до правки заголовков:
+    // расширения запроса до апстрима не едут, а без неё сплайсить нечего.
+    let upgrade = upgrade_proto(&parts.headers);
+    let from_consumer = upgrade
+        .as_ref()
+        .and_then(|_| parts.extensions.remove::<hyper::upgrade::OnUpgrade>());
     parts.headers.remove(EXPOSE_HEADER);
     parts.headers.remove(header::AUTHORIZATION);
     if let Some(v) = parts.headers.remove(FORWARDED_AUTH_HEADER) {
@@ -175,6 +187,14 @@ async fn proxy(upstream: &str, req: Request) -> Response {
     }
     for name in HOP_BY_HOP {
         parts.headers.remove(name);
+    }
+    // Апгрейд объявляем апстриму только тогда, когда есть чем его сплайсить:
+    // обещать `101` и не суметь переключиться хуже, чем не обещать.
+    if let (Some(proto), true) = (upgrade.as_deref(), from_consumer.is_some()) {
+        if let Ok(value) = HeaderValue::from_str(proto) {
+            parts.headers.insert(header::UPGRADE, value);
+            parts.headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+        }
     }
     if let Some(outer) = parts.headers.remove(header::HOST) {
         if !parts.headers.contains_key(FORWARDED_HOST_HEADER) {
@@ -209,14 +229,18 @@ async fn proxy(upstream: &str, req: Request) -> Response {
         Err(e) => return upstream_down(upstream, &e.to_string()),
     };
     // Соединение живёт своим таском, пока по нему течёт тело ответа: без него
-    // ответ не поедет дальше первой порции.
+    // ответ не поедет дальше первой порции. `with_upgrades` отдаёт таск
+    // сплайсу, когда апстрим отвечает `101`.
     tokio::spawn(async move {
-        if let Err(e) = conn.await {
+        if let Err(e) = conn.with_upgrades().await {
             tracing::debug!("соединение с апстримом закрылось: {e}");
         }
     });
 
     match sender.send_request(axum::http::Request::from_parts(parts, body)).await {
+        Ok(resp) if resp.status() == StatusCode::SWITCHING_PROTOCOLS => {
+            switch_protocols(upstream, resp, from_consumer)
+        }
         Ok(resp) => {
             let (mut parts, body) = resp.into_parts();
             for name in HOP_BY_HOP {
@@ -226,6 +250,54 @@ async fn proxy(upstream: &str, req: Request) -> Response {
         }
         Err(e) => upstream_down(upstream, &e.to_string()),
     }
+}
+
+/// Какой протокол просит запрос. `None` это обычный HTTP: апгрейд объявляют оба
+/// заголовка сразу, одного `Upgrade` без `Connection` мало.
+fn upgrade_proto(headers: &HeaderMap) -> Option<String> {
+    let asked = headers
+        .get(header::CONNECTION)?
+        .to_str()
+        .ok()?
+        .split(',')
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+    if !asked {
+        return None;
+    }
+    let proto = headers.get(header::UPGRADE)?.to_str().ok()?.trim();
+    (!proto.is_empty()).then(|| proto.to_string())
+}
+
+/// Апстрим переключил протокол: с этой секунды агент гоняет байты в обе
+/// стороны, а закрытие с одной стороны доезжает до другой.
+fn switch_protocols(
+    upstream: &str,
+    mut resp: hyper::Response<hyper::body::Incoming>,
+    from_consumer: Option<hyper::upgrade::OnUpgrade>,
+) -> Response {
+    let Some(consumer) = from_consumer else {
+        // Апстрим переключился на запрос, которому переключаться нечем: отдать
+        // такое посреднику нельзя, он обещает браузеру рабочий сплайс.
+        return upstream_down(upstream, "переключил протокол на запрос без апгрейда");
+    };
+    let upstream_side = hyper::upgrade::on(&mut resp);
+    let addr = upstream.to_string();
+    tokio::spawn(async move {
+        match tokio::try_join!(consumer, upstream_side) {
+            Ok((consumer, up)) => {
+                let mut consumer = hyper_util::rt::TokioIo::new(consumer);
+                let mut up = hyper_util::rt::TokioIo::new(up);
+                if let Err(e) = tokio::io::copy_bidirectional(&mut consumer, &mut up).await {
+                    tracing::debug!("апгрейд к {addr} закрылся: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("апгрейд к {addr} не переключился: {e}"),
+        }
+    });
+    // Ответ рукопожатия едет посреднику как есть: `Sec-WebSocket-Accept` и
+    // выбранные расширения это разговор сторон.
+    let (parts, _no_body) = resp.into_parts();
+    Response::from_parts(parts, Body::empty())
 }
 
 /// Апстрим не отозвался. Причину называем и в ответе, и в логе: молчаливая
@@ -734,6 +806,108 @@ mod tests {
         // Имя из чужих рук: путь в заголовке не должен стать именем.
         h.insert(EXPOSE_HEADER, HeaderValue::from_static("../../etc/passwd"));
         assert_eq!(requested_publication(&h), None);
+    }
+
+    /// Синтетический сервис с апгрейдом: отвечает `101` и дальше гоняет байты
+    /// обратно как есть. Так же ведёт себя эхо-сервис скрипта проверки, только
+    /// он ещё считает `Sec-WebSocket-Accept`, а тесту сверять его не с чем.
+    async fn upgrading_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let h = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match sock.read(&mut byte).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => head.push(byte[0]),
+                        }
+                    }
+                    let asked = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                    if !asked.contains("upgrade: websocket") {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 426 Upgrade Required\r\ncontent-length: 0\r\n\r\n")
+                            .await;
+                        return;
+                    }
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                              Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                        )
+                        .await;
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (addr.to_string(), h)
+    }
+
+    /// Апгрейд проходит от посредника до локального сервиса и обратно: `101`
+    /// доезжает, байты идут в обе стороны, закрытие с одной стороны доходит до
+    /// другой. Гоняется через харнесс, потому что ручку на переключение своего
+    /// конца кладёт в запрос только настоящий HTTP-сервер, а у реверс-стрима он
+    /// такой же.
+    #[tokio::test]
+    async fn expose_passes_the_upgrade_through() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (addr, _h) = upgrading_upstream().await;
+        let g = gate(&addr);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = listener.local_addr().unwrap();
+        let harness = tokio::spawn(serve_harness(listener, g, "dash".into(), Some(mandate("dash"))));
+
+        let mut sock = tokio::net::TcpStream::connect(local).await.unwrap();
+        sock.write_all(
+            format!(
+                "GET /live HTTP/1.1\r\nHost: {local}\r\nConnection: Upgrade\r\n\
+                 Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+                 Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = sock.read(&mut byte).await.unwrap();
+            assert_ne!(n, 0, "агент закрыл соединение: {}", String::from_utf8_lossy(&head));
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head).into_owned();
+        assert!(head.starts_with("HTTP/1.1 101 Switching Protocols"), "{head}");
+        assert!(head.contains("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="), "{head}");
+
+        sock.write_all(b"\x81\x83\x01\x02\x03\x04hey").await.unwrap();
+        let mut back = [0u8; 9];
+        sock.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"\x81\x83\x01\x02\x03\x04hey", "байты идут в обе стороны");
+
+        // Закрытие со стороны посредника доезжает до сервиса, и тот отпускает
+        // соединение: чтения после его конца больше нет.
+        sock.shutdown().await.unwrap();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut rest))
+            .await
+            .expect("сервис обязан закрыться следом")
+            .unwrap();
+        assert!(rest.is_empty(), "{rest:?}");
+        harness.abort();
     }
 
     /// Харнесс целиком, как его гоняет проверка задачи: сервис, форвардер,
