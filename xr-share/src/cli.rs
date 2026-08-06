@@ -231,6 +231,7 @@ pub fn install(config_path: &Path, args: InstallArgs) -> Result<()> {
         max_file_mb: None,
         import: None,
         shares: Vec::new(),
+        exposes: Vec::new(),
         dir: None,
         share_id: None,
     };
@@ -896,7 +897,7 @@ fn exchange(
     Ok((cred, relay))
 }
 
-fn hub_post(url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+pub(crate) fn hub_post(url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
     match ureq::post(url)
         .timeout(Duration::from_secs(15))
         .set("content-type", "application/json")
@@ -918,7 +919,7 @@ fn hub_post(url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
     }
 }
 
-fn str_field(v: &serde_json::Value, key: &str) -> Result<String> {
+pub(crate) fn str_field(v: &serde_json::Value, key: &str) -> Result<String> {
     v.get(key)
         .and_then(|x| x.as_str())
         .map(|s| s.to_string())
@@ -927,7 +928,7 @@ fn str_field(v: &serde_json::Value, key: &str) -> Result<String> {
 
 // ── config read/write ───────────────────────────────────────────────
 
-fn read_config(path: &Path) -> Result<AgentConfig> {
+pub(crate) fn read_config(path: &Path) -> Result<AgentConfig> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("чтение {} (запусти `xr-share install`?)", path.display()))?;
     toml::from_str(&text).with_context(|| format!("разбор {}", path.display()))
@@ -936,7 +937,7 @@ fn read_config(path: &Path) -> Result<AgentConfig> {
 /// Write the config 0600. Legacy `dir`/`share_id` must already be folded into
 /// `shares` (see [`normalize_legacy`]) so the TOML stays valid (no scalar key
 /// after an array-of-tables).
-fn write_config(path: &Path, cfg: &AgentConfig) -> Result<()> {
+pub(crate) fn write_config(path: &Path, cfg: &AgentConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("создание {}", parent.display()))?;
     }
@@ -1066,6 +1067,7 @@ mod tests {
             max_file_mb: None,
             import: None,
             shares: vec![ShareEntry { share_id: "s1".into(), path: "/srv/x".into(), name: None, writable: false, import: false, attached: false }],
+            exposes: Vec::new(),
             dir: None,
             share_id: None,
         }
@@ -1311,6 +1313,7 @@ mod share_upsert_tests {
             max_file_mb: None,
             import: None,
             shares: Vec::new(),
+            exposes: Vec::new(),
             dir: None,
             share_id: None,
         }

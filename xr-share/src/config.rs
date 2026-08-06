@@ -64,6 +64,12 @@ pub struct AgentConfig {
     /// The shares this agent serves. Each `[[share]]` is a `share_id` + path.
     #[serde(default, rename = "share")]
     pub shares: Vec<ShareEntry>,
+    /// Публикации локальных HTTP-сервисов (LLD-38 п. 2.1). Каждый `[[expose]]`
+    /// это имя (оно же поддомен браузерного входа) и локальный адрес, куда
+    /// проксировать. Пустой список означает, что наружу не открыто ничего:
+    /// публикации заводятся поимённо, а не «весь агент наружу».
+    #[serde(default, rename = "expose", skip_serializing_if = "Vec::is_empty")]
+    pub exposes: Vec<ExposeEntry>,
 
     // ── legacy single-share (v1) ──────────────────────────────────────
     /// Legacy single served directory. Folded into [`AgentConfig::resolved_shares`].
@@ -103,6 +109,19 @@ pub struct ShareEntry {
     /// поля читается как «не привязывалась».
     #[serde(default)]
     pub attached: bool,
+}
+
+/// Одна публикация: имя и локальный адрес сервиса. Апстрим живёт только здесь
+/// и в хаб не уезжает (LLD-38 п. 2.1), а приходящий запрос адрес не выбирает
+/// никогда: иначе браузерный вход стал бы плечом внутрь домашней сети.
+/// Публикация без записи в этом списке не обслуживается, даже когда запись в
+/// хабе есть.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExposeEntry {
+    /// Имя публикации, оно же поддомен: DNS-метка.
+    pub name: String,
+    /// Куда проксировать внутри машины, например `127.0.0.1:8765`.
+    pub upstream: String,
 }
 
 /// Job limits and the plugin registry for URL import (LLD-29 п. 2.3). The block
@@ -327,6 +346,41 @@ impl AgentConfig {
         }
         Ok(())
     }
+
+    /// Проверки публикаций на старте (LLD-38 п. 2.1). Кривое имя или апстрим
+    /// это отказ запуска, а не 502 на первом же запросе из браузера: до
+    /// публикации доходят редко, и молчаливо неработающая она хуже, чем
+    /// невзлетевший агент.
+    pub fn validate_expose(&self) -> Result<()> {
+        let mut seen: Vec<&str> = Vec::new();
+        for e in &self.exposes {
+            if !xr_proto::share::valid_publication_name(&e.name) {
+                anyhow::bail!(
+                    "публикация {:?}: имя это DNS-метка (строчные буквы, цифры, дефис, 1..63 \
+                     символа, дефис не с краю), потому что оно же поддомен",
+                    e.name
+                );
+            }
+            if seen.contains(&e.name.as_str()) {
+                anyhow::bail!("публикация {:?} заведена в конфиге дважды", e.name);
+            }
+            seen.push(&e.name);
+            // Апстрим разбирается как `host:port`: пустой порт или лишний
+            // мусор дал бы отказ соединения на каждом запросе.
+            let (host, port) = e
+                .upstream
+                .rsplit_once(':')
+                .with_context(|| format!("публикация {:?}: upstream пишется как host:port", e.name))?;
+            if host.trim().is_empty() || port.parse::<u16>().map(|p| p == 0).unwrap_or(true) {
+                anyhow::bail!(
+                    "публикация {:?}: upstream {:?} не разбирается как host:port",
+                    e.name,
+                    e.upstream
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -434,6 +488,7 @@ mod tests {
             max_file_mb: Some(100),
             import: None,
             shares: vec![ShareEntry { share_id: "a".into(), path: "/srv/x".into(), name: Some("X".into()), writable: true, import: true, attached: true }],
+            exposes: vec![ExposeEntry { name: "dash".into(), upstream: "127.0.0.1:8765".into() }],
             dir: None,
             share_id: None,
         };
@@ -446,6 +501,47 @@ mod tests {
         assert_eq!(back.hub_url.as_deref(), Some("https://hub"));
         assert_eq!(back.default_invite.as_deref(), Some("inv123"));
         assert!(back.dir.is_none());
+        assert_eq!(back.exposes.len(), 1, "публикация обязана пережить перезапись конфига");
+        assert_eq!(back.exposes[0].upstream, "127.0.0.1:8765");
+    }
+
+    #[test]
+    fn parses_and_validates_expose_block() {
+        // LLD-38 п. 2.1: имя плюс локальный адрес, апстрим только здесь.
+        let text = r#"
+            listen = "0.0.0.0:8443"
+            hub_pubkey = "QQ=="
+            [[expose]]
+            name = "dash"
+            upstream = "127.0.0.1:8765"
+        "#;
+        let cfg: AgentConfig = toml::from_str(text).unwrap();
+        cfg.validate_expose().unwrap();
+        assert_eq!(cfg.exposes[0].name, "dash");
+
+        // Конфиг без блока это агент без единой публикации.
+        let bare: AgentConfig =
+            toml::from_str("listen = \"0.0.0.0:8443\"\nhub_pubkey = \"QQ==\"").unwrap();
+        assert!(bare.exposes.is_empty());
+        bare.validate_expose().unwrap();
+
+        // Имя не метка, апстрим без порта, дубль имени: каждый случай валит
+        // старт, а не первый запрос из браузера.
+        let mut broken = cfg.clone();
+        broken.exposes[0].name = "Dash".into();
+        assert!(broken.validate_expose().is_err());
+
+        let mut broken = cfg.clone();
+        broken.exposes[0].upstream = "127.0.0.1".into();
+        assert!(broken.validate_expose().is_err());
+
+        let mut broken = cfg.clone();
+        broken.exposes[0].upstream = "127.0.0.1:0".into();
+        assert!(broken.validate_expose().is_err());
+
+        let mut broken = cfg.clone();
+        broken.exposes.push(broken.exposes[0].clone());
+        assert!(broken.validate_expose().is_err());
     }
 
     #[test]

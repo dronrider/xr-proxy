@@ -6,6 +6,7 @@
 mod auth;
 mod cli;
 mod config;
+mod expose;
 mod import;
 mod manifest;
 mod meta;
@@ -74,6 +75,12 @@ enum Commands {
     /// Start a URL-import job on a writable share and poll it to completion
     /// (LLD-29): the agent downloads the page's content with its plugin.
     Import(cli::ImportArgs),
+    /// Открыть наружу локальный HTTP-сервис этой машины (LLD-38): завести
+    /// публикацию, снять её, посмотреть список или проверить путь локально.
+    Expose {
+        #[command(subcommand)]
+        command: expose::ExposeCommand,
+    },
     /// Manage OS autostart (systemd on Linux, Scheduled Task on Windows).
     Service {
         #[command(subcommand)]
@@ -114,6 +121,7 @@ fn main() -> Result<()> {
         Some(Commands::Push(args)) => return push::push(args),
         Some(Commands::Rm(args)) => return push::rm(args),
         Some(Commands::Import(args)) => return cli::import(args),
+        Some(Commands::Expose { command }) => return expose::run(&config_path, command),
         Some(Commands::Service { action }) => {
             return match action {
                 ServiceAction::Install => setup::service_install(&config_path),
@@ -176,6 +184,9 @@ async fn run(path: &Path) -> Result<()> {
     // A broken import surface (bad plugin template, import without writable)
     // stops the agent here, not at the first job (LLD-29).
     cfg.validate_import()?;
+    // То же для публикаций (LLD-38): кривое имя или апстрим валят старт, а не
+    // первый запрос из браузера.
+    cfg.validate_expose()?;
 
     // Resolve the configured shares. An empty set is allowed (the agent runs and
     // waits for `xr-share share <path>` to add one, picked up by hot-reload).
@@ -207,7 +218,13 @@ async fn run(path: &Path) -> Result<()> {
         identity,
         max_file_mb: cfg.max_file_mb,
         import: import_mgr,
+        expose: RwLock::new(Arc::new(cfg.exposes.clone())),
     });
+    // Публикации видно в логе на старте: молчание тут неотличимо от «наружу не
+    // открыто ничего», а это разные вещи.
+    for e in &cfg.exposes {
+        tracing::info!("публикация {} -> {}", e.name, e.upstream);
+    }
 
     // Hot reload: pick up `share`/`unshare` edits to the config without restart.
     spawn_config_watcher(state.clone(), path.to_path_buf());
@@ -313,7 +330,12 @@ fn spawn_config_watcher(state: Arc<AgentState>, path: PathBuf) {
                     // `share --import` bootstraps the [import] block into the
                     // config while the agent runs; pick it up the same way.
                     state.import.set_config(cfg.import);
-                    tracing::info!("config changed, {n} share(s) now served");
+                    let publications = cfg.exposes.len();
+                    *state.expose.write().expect("expose lock poisoned") =
+                        Arc::new(cfg.exposes.clone());
+                    tracing::info!(
+                        "config changed, {n} share(s) and {publications} publication(s) now served"
+                    );
                 }
                 Err(e) => tracing::warn!("config reload failed, keeping current shares: {e:#}"),
             }
@@ -346,6 +368,7 @@ fn reload_config(path: &Path) -> Result<AgentConfig> {
     // The same fail-fast as startup: a hot-edited broken import block keeps the
     // previous config instead of half-applying.
     cfg.validate_import()?;
+    cfg.validate_expose()?;
     Ok(cfg)
 }
 

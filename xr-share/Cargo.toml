@@ -21,8 +21,6 @@ tls = ["dep:axum-server"]
 relay = [
     "dep:rcgen",
     "dep:tokio-rustls",
-    "dep:hyper",
-    "dep:hyper-util",
     "xr-proto/relay-tls",
     "ed25519-dalek/pkcs8",
 ]
@@ -38,6 +36,12 @@ tower-http = { version = "0.6", features = ["fs"] }
 # a multi-GB file in memory. Pure Rust, already in the tree via axum/hyper, so it
 # does not weigh down the Windows/musl cross-build.
 http-body-util = "0.1"
+# Прокси публикации на локальный апстрим (LLD-38): клиент hyper на одно
+# соединение, тело идёт потоком в обе стороны. Не за фичей `relay`: hyper и так
+# в графе через axum, а харнесс `expose open` и разбор мандата нужны и в
+# обычной сборке агента.
+hyper = { version = "1", features = ["server", "http1", "client"] }
+hyper-util = { version = "0.1", features = ["server", "tokio", "service"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -59,8 +63,6 @@ anyhow = "1"
 # реверс-стримами mux. ring-бэкенд, чтобы кросс-сборка не тянула aws-lc.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"], optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
-hyper = { version = "1", features = ["server", "http1"], optional = true }
-hyper-util = { version = "0.1", features = ["server", "tokio", "service"], optional = true }
 
 # Убить группу процессов плагина импорта (LLD-29): yt-dlp порождает ffmpeg, и
 # child.kill() оставил бы его сиротой качать дальше. Только unix, на Windows

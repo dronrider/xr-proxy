@@ -57,6 +57,18 @@ name = "Dropbox"
 writable = true
 import = true
 
+# Публикация локального HTTP-сервиса наружу (LLD-38): имя, оно же поддомен
+# браузерного входа, и локальный адрес, куда проксировать внутри машины.
+# Заводится командой `xr-share expose add --name dash --upstream 127.0.0.1:8765`,
+# она же кладёт имя в хаб. Апстрим в хаб не уезжает и приходящим запросом не
+# выбирается: наружу открыто ровно то, что перечислено здесь поимённо.
+# Запрос к публикации пускает только мандат хаба, поэтому одного relay-токена
+# на шару того же агента для доступа к сервису мало.
+# Проверить путь до сервиса без VPS: `xr-share expose open --name dash`.
+# [[expose]]
+# name = "dash"
+# upstream = "127.0.0.1:8765"
+
 # -- URL import: job limits + plugin registry (LLD-29) ---------------------
 # Agent-global; each share still opts in with `import = true` above. No [import]
 # block (or no plugins) means the import routes answer 403 everywhere. This very

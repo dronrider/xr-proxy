@@ -147,12 +147,31 @@ pub struct AgentState {
     /// URL-import job registry + plugin config (LLD-29). Always present; with no
     /// `[import]` block it just answers that import is off.
     pub import: Arc<ImportManager>,
+    /// Публикации локальных сервисов (LLD-38 п. 2.1). Меняется горячо тем же
+    /// перечитыванием конфига, что и шары: `expose add` не должен требовать
+    /// перезапуска агента.
+    pub expose: RwLock<Arc<Vec<crate::config::ExposeEntry>>>,
 }
 
 impl AgentState {
     /// Cheap snapshot of the current share table (clones the `Arc`, not the map).
     fn snapshot(&self) -> Arc<SharesMap> {
         self.shares.read().expect("shares lock poisoned").clone()
+    }
+
+    /// Гейт публикаций на текущем состоянии: пришпиленный ключ хаба, свой
+    /// identity и живой список `[[expose]]`. Нужен только обслуживанию
+    /// реверс-стримов: харнесс собирает свой гейт прямо из конфига.
+    #[cfg(feature = "relay")]
+    pub fn expose_gate(&self) -> crate::expose::ExposeGate {
+        use base64::Engine as _;
+        crate::expose::ExposeGate {
+            hub_key: self.hub_key,
+            agent_pubkey: self.identity.as_ref().map(|k| {
+                base64::engine::general_purpose::STANDARD.encode(k.verifying_key().as_bytes())
+            }),
+            publications: self.expose.read().expect("expose lock poisoned").clone(),
+        }
     }
 
     /// Build every share's manifest to prime the hash cache, so a later
@@ -830,6 +849,7 @@ mod tests {
             identity: Some(SigningKey::from_bytes(&[77u8; 32])),
             max_file_mb,
             import: ImportManager::new(None, cache),
+            expose: RwLock::new(Arc::new(Vec::new())),
         })
     }
 
@@ -997,6 +1017,7 @@ mod tests {
             identity: None,
             max_file_mb: None,
             import: ImportManager::new(None, cache),
+            expose: RwLock::new(Arc::new(Vec::new())),
         });
         let app = router(state);
 
@@ -1361,6 +1382,7 @@ mod tests {
             identity: Some(SigningKey::from_bytes(&[77u8; 32])),
             max_file_mb,
             import: ImportManager::new(cfg, cache),
+            expose: RwLock::new(Arc::new(Vec::new())),
         });
         state.import.spawn_runner();
         let tok = sign_share_token(key, "I", &rwi_scope(), now_unix() + 1000);
@@ -1669,6 +1691,7 @@ mod tests {
             identity: None,
             max_file_mb: None,
             import: ImportManager::new(Some(cfg), cache),
+            expose: RwLock::new(Arc::new(Vec::new())),
         }));
         let (status, _) = post_import(&no_flag, Some(&tok), "/I/import", body.clone()).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -1936,6 +1959,7 @@ mod tests {
             identity: None,
             max_file_mb: None,
             import: ImportManager::new(Some(one_plugin(&script, &["{url}"], &["*"], 1080)), cache),
+            expose: RwLock::new(Arc::new(Vec::new())),
         });
         state.import.spawn_runner();
         let app = router(state);

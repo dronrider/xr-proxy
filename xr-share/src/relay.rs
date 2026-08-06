@@ -155,9 +155,9 @@ async fn connect_and_serve(
                 }
                 let mux = mux.clone();
                 let acceptor = acceptor.clone();
-                let router = crate::server::router(state.clone());
+                let state = state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_reverse(mux, stream_id, acceptor, router).await {
+                    if let Err(e) = serve_reverse(mux, stream_id, acceptor, state).await {
                         tracing::debug!("reverse stream {stream_id} ended: {e}");
                     }
                 });
@@ -212,7 +212,7 @@ async fn serve_reverse(
     mux: Arc<Multiplexer>,
     stream_id: u32,
     acceptor: TlsAcceptor,
-    router: axum::Router,
+    state: Arc<AgentState>,
 ) -> Result<()> {
     let stream = mux.register_stream(stream_id).await;
     mux.send_frame(stream_id, Command::ConnectAck, vec![0])
@@ -224,12 +224,18 @@ async fn serve_reverse(
         .map_err(|_| anyhow!("identity TLS handshake timed out"))?
         .context("identity TLS accept")?;
 
+    // Обработчик выбирается по заголовку публикации (LLD-38 п. 2.3): назвали
+    // публикацию - запрос идёт через её гейт и мандат, не назвали - его
+    // обслуживает прежний роутер шары, как и до LLD-38.
     use tower::ServiceExt;
     let hyper_service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-        let router = router.clone();
+        let state = state.clone();
         async move {
             let req = req.map(axum::body::Body::new);
-            router.oneshot(req).await
+            match crate::expose::requested_publication(req.headers()) {
+                Some(name) => Ok(crate::expose::serve(&state.expose_gate(), &name, req).await),
+                None => crate::server::router(state).oneshot(req).await,
+            }
         }
     });
     hyper::server::conn::http1::Builder::new()
@@ -365,6 +371,7 @@ mod tests {
             identity: Some(identity.clone()),
             max_file_mb: None,
             import: crate::import::ImportManager::new(None, cache),
+            expose: RwLock::new(Arc::new(Vec::new())),
         });
         let cred = sign_agent_credential(&hub, &agent_pk, now() + 3600);
         let cred_blob =
@@ -441,5 +448,153 @@ mod tests {
             .send()
             .await;
         assert!(res.is_err(), "wrong pin must break the E2E handshake");
+    }
+
+    /// LLD-38 фаза 1 целиком через живой relay: локальный сервис, публикация в
+    /// конфиге агента, реверс-стрим. Мандат публикации пускает до сервиса, а
+    /// держатель одного лишь relay-токена на шару того же агента, подставивший
+    /// заголовок публикации, получает 403 и до сервиса не доходит.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn expose_over_relay_needs_the_publication_mandate() {
+        use xr_proto::share::{sign_expose_token, EXPOSE_HEADER};
+
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let identity = SigningKey::from_bytes(&[11u8; 32]);
+        let agent_pk = b64(identity.verifying_key().as_bytes());
+
+        // Локальный сервис владельца: отвечает своим телом и считает попадания.
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        {
+            let hits = hits.clone();
+            let app = axum::Router::new().fallback(axum::routing::any(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    "живой сервис владельца"
+                }
+            }));
+            tokio::spawn(async move {
+                let _ = axum::serve(upstream_listener, app).await;
+            });
+        }
+
+        // Relay.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap();
+        let relay_state = xr_relay::RelayState::new(hub.verifying_key(), 64, 8, Duration::from_secs(30));
+        {
+            let s = relay_state.clone();
+            tokio::spawn(async move { xr_relay::serve(listener, test_codec(), s, 64).await });
+        }
+
+        // Агент: одна шара (чтобы relay-токен было на что выписать) и одна
+        // публикация.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), b"x").unwrap();
+        let mut shares = SharesMap::new();
+        shares.insert(
+            "S".into(),
+            ShareRoot { path: dir.path().canonicalize().unwrap(), is_file: false, writable: false, import: false },
+        );
+        let cache = Arc::new(HashCache::new());
+        let state = Arc::new(AgentState {
+            shares: RwLock::new(Arc::new(shares)),
+            hub_key: hub.verifying_key(),
+            hash_cache: cache.clone(),
+            identity: Some(identity.clone()),
+            max_file_mb: None,
+            import: crate::import::ImportManager::new(None, cache),
+            expose: RwLock::new(Arc::new(vec![crate::config::ExposeEntry {
+                name: "dash".into(),
+                upstream: upstream_addr.to_string(),
+            }])),
+        });
+        let cred = sign_agent_credential(&hub, &agent_pk, now() + 3600);
+        let cred_blob =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cred).unwrap());
+        let relay_cfg = RelayAgentConfig {
+            addr: relay_addr.ip().to_string(),
+            port: relay_addr.port(),
+            obf: test_obf(),
+        };
+        spawn(state, relay_cfg, cred_blob, identity.clone()).unwrap();
+
+        let mut registered = false;
+        for _ in 0..100 {
+            if relay_state.registry.get(&agent_pk).await.is_some() {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(registered, "агент обязан зарегистрироваться на relay");
+
+        // Потребитель с валидным relay-токеном: транзит до машины ему открыт.
+        let relay_token = sign_relay_token(&hub, "S", &agent_pk, now() + 3600);
+        let grant = RelayGrant {
+            addr: relay_addr.ip().to_string(),
+            port: relay_addr.port(),
+            obf: test_obf(),
+            relay_token,
+        };
+        let endpoint = Arc::new(RelayEndpoint::from_grant(&grant).unwrap());
+        let fwd = LoopbackForwarder::spawn(endpoint).await.unwrap();
+        let base = format!("https://{}", fwd.local_addr());
+        let client = reqwest::Client::builder()
+            .use_preconfigured_tls(pinned_client_config(&agent_pk).unwrap())
+            .build()
+            .unwrap();
+
+        // Одного транзита мало: заголовок публикации без мандата это 403.
+        let resp = client
+            .get(format!("{base}/"))
+            .header(EXPOSE_HEADER, "dash")
+            .send()
+            .await
+            .expect("запрос до агента доходит");
+        assert_eq!(resp.status(), 403, "без мандата публикация закрыта");
+
+        // Токен шары в роли мандата тоже не проходит.
+        let share_token = sign_share_token(&hub, "S", "share:read", now() + 3600);
+        let resp = client
+            .get(format!("{base}/"))
+            .header(EXPOSE_HEADER, "dash")
+            .bearer_auth(token_blob(&share_token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "токен шары не открывает публикацию");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "до локального сервиса ни один отвергнутый запрос не дошёл"
+        );
+
+        // Мандат хаба на эту публикацию и этого агента: сервис отвечает.
+        let mandate = sign_expose_token(&hub, "dash", &agent_pk, now() + 3600);
+        let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&mandate).unwrap());
+        let resp = client
+            .get(format!("{base}/"))
+            .header(EXPOSE_HEADER, "dash")
+            .bearer_auth(blob)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "живой сервис владельца");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Шара на том же реверс-стриме работает как работала: заголовка
+        // публикации нет, значит запрос обслуживает прежний роутер.
+        let resp = client
+            .get(format!("{base}/S/manifest"))
+            .bearer_auth(token_blob(&share_token))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "шара не должна пострадать: {}", resp.status());
     }
 }
