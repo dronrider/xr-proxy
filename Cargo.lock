@@ -3691,6 +3691,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "xr-web"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "clap",
+ "ed25519-dalek",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rand 0.8.5",
+ "reqwest",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "toml 0.8.23",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "xr-proto",
+]
+
+[[package]]
 name = "yasna"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
