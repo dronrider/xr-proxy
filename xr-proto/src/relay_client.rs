@@ -96,6 +96,11 @@ pub struct RelayEndpoint {
     codec: Codec,
     token: RelayToken,
     mux: Mutex<Option<Arc<Multiplexer>>>,
+    /// Пиннинг-конфиг rustls строится один раз на эндпоинт: разбор ключа и
+    /// сборка конфига стоят заметно дороже самого хендшейка, а пин у эндпоинта
+    /// один на все соединения.
+    #[cfg(feature = "relay-tls")]
+    tls: std::sync::OnceLock<Arc<rustls::ClientConfig>>,
 }
 
 impl RelayEndpoint {
@@ -107,7 +112,16 @@ impl RelayEndpoint {
             codec: grant.obf.codec()?,
             token: grant.relay_token.clone(),
             mux: Mutex::new(None),
+            #[cfg(feature = "relay-tls")]
+            tls: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Ключ агента, к которому этот транзит привязан (он же пин для TLS): берётся
+    /// из relay-токена, а не из соседнего поля, поэтому пин и разрешение на
+    /// транзит не могут разъехаться.
+    pub fn agent_pubkey(&self) -> &str {
+        &self.token.agent_pubkey
     }
 
     /// A live mux to the relay, redialing if the previous one died.
@@ -124,6 +138,64 @@ impl RelayEndpoint {
     pub async fn stream(&self) -> io::Result<MuxStream> {
         let mux = self.live_mux().await?;
         open_relay_stream(&mux, &self.token).await
+    }
+}
+
+/// Готовое к HTTP соединение до агента через relay: pinned-TLS поверх
+/// mux-стрима (LLD-38 п. 2.3). Реализует `AsyncRead + AsyncWrite`, поэтому
+/// отдаётся hyper как обычный транспорт.
+#[cfg(feature = "relay-tls")]
+pub type RelayTlsStream = tokio_rustls::client::TlsStream<crate::mux::MuxStreamIo>;
+
+/// Соединение до агента одним вызовом: relay-стрим по токену эндпоинта плюс
+/// pinned-TLS с проверкой `SPKI == agent_pubkey` (LLD-38 п. 2.3). Это тот же
+/// путь, что у loopback-форвардера, но без loopback-сокета: посреднику
+/// (`xr-web`) он не нужен, а сокет на каждое соединение стоил бы лишнего файла
+/// и лишнего копирования.
+///
+/// Имя в SNI до агента едет фиктивное: пин стоит на ключе, а не на имени
+/// (см. [`PinnedAgentVerifier`](crate::relay_tls::PinnedAgentVerifier)), и
+/// адреса у агента нет вовсе.
+#[cfg(feature = "relay-tls")]
+pub async fn relay_tls_connect(endpoint: &RelayEndpoint) -> io::Result<RelayTlsStream> {
+    use rustls::pki_types::ServerName;
+    use tokio_rustls::TlsConnector;
+
+    let cfg = match endpoint.tls.get() {
+        Some(cfg) => cfg.clone(),
+        None => {
+            let built = Arc::new(
+                crate::relay_tls::pinned_client_config(endpoint.agent_pubkey())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+            );
+            endpoint.tls.get_or_init(|| built).clone()
+        }
+    };
+    let stream = endpoint.stream().await?;
+    let name = ServerName::try_from("xr-share-agent")
+        .expect("literal SNI name is valid");
+    TlsConnector::from(cfg)
+        .connect(name, stream.into_io())
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("pinned TLS: {e}")))
+}
+
+/// На связи ли агент с relay прямо сейчас: открыть стрим по токену и сразу его
+/// закрыть, не начиная TLS. Relay отвечает отказом с
+/// [`CLOSE_REASON_AGENT_OFFLINE`] за один RTT, если агент не в реестре, поэтому
+/// хабу не приходится ни менять relay, ни держать своего состояния о живости
+/// (LLD-38 п. 2.5).
+///
+/// Всё, что не отказ «агента нет», это ошибка транзита, а не вердикт: она едет
+/// наверх как есть, чтобы «relay недоступен» не выглядело как «машина выключена».
+pub async fn probe_agent_online(endpoint: &RelayEndpoint) -> io::Result<bool> {
+    match endpoint.stream().await {
+        Ok(stream) => {
+            drop(stream);
+            Ok(true)
+        }
+        Err(e) if e.to_string() == RELAY_ERR_AGENT_OFFLINE => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -302,22 +374,26 @@ mod tests {
             run_test_relay(tcp, relay_codec, reject_first).await;
         });
 
-        let key_b64 = base64::engine::general_purpose::STANDARD
-            .encode(b"test-key-32-bytes-long-enough!!!");
-        let grant = RelayGrant {
+        let endpoint = Arc::new(RelayEndpoint::from_grant(&test_grant(relay_addr, dummy_token())).unwrap());
+        LoopbackForwarder::spawn(endpoint).await.unwrap()
+    }
+
+    /// Грант на тестовый relay: адрес слушателя плюс обфускация из
+    /// `test_codec`.
+    fn test_grant(relay_addr: SocketAddr, token: RelayToken) -> RelayGrant {
+        RelayGrant {
             addr: relay_addr.ip().to_string(),
             port: relay_addr.port(),
             obf: RelayObf {
-                key: key_b64,
+                key: base64::engine::general_purpose::STANDARD
+                    .encode(b"test-key-32-bytes-long-enough!!!"),
                 salt: 0xDEADBEEF,
                 modifier: "positional_xor_rotate".into(),
                 padding_min: 0,
                 padding_max: 0,
             },
-            relay_token: dummy_token(),
-        };
-        let endpoint = Arc::new(RelayEndpoint::from_grant(&grant).unwrap());
-        LoopbackForwarder::spawn(endpoint).await.unwrap()
+            relay_token: token,
+        }
     }
 
     use crate::mux::{mux_handshake_server, MuxCaps};
@@ -445,5 +521,133 @@ mod tests {
         client.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"ok");
         assert!(!fwd.agent_offline());
+    }
+
+    /// Живость агента: relay отвечает `OK` на hello, значит агент в реестре, а
+    /// отказ с причиной agent-offline это честное «машины нет на связи», а не
+    /// ошибка транзита (LLD-38 п. 2.5).
+    #[tokio::test]
+    async fn test_probe_agent_online_reads_hello_verdict() {
+        let codec = test_codec();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let relay_codec = codec.clone();
+        // Первый стрим отвергается agent-offline, второй обслуживается.
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            run_test_relay(tcp, relay_codec, true).await;
+        });
+
+        let endpoint = RelayEndpoint::from_grant(&test_grant(addr, dummy_token())).unwrap();
+        assert!(!probe_agent_online(&endpoint).await.unwrap(), "агент не в реестре relay");
+        assert!(probe_agent_online(&endpoint).await.unwrap(), "агент на связи");
+
+        // Мёртвый relay это не вердикт о живости агента, а ошибка транзита.
+        let dead = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        let endpoint = RelayEndpoint::from_grant(&test_grant(dead_addr, dummy_token())).unwrap();
+        assert!(probe_agent_online(&endpoint).await.is_err(), "relay недоступен");
+    }
+
+    /// Тестовый relay, за сплайсом которого стоит настоящий TLS-агент: hello
+    /// подтверждается, дальше стрим отдаётся rustls-серверу с сертификатом
+    /// агента, и он эхает расшифрованное.
+    #[cfg(feature = "relay-tls")]
+    async fn run_tls_relay(tcp: TcpStream, codec: Codec, server_cfg: rustls::ServerConfig) {
+        use tokio_rustls::TlsAcceptor;
+        let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+        let mut tcp = tcp;
+        let mut buf = vec![0u8; 512];
+        let mut filled = 0;
+        let init = loop {
+            let n = tcp.read(&mut buf[filled..]).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            filled += n;
+            if let Some((frame, _)) = codec.decode_frame(&buf[..filled]).unwrap() {
+                break frame;
+            }
+        };
+        let Some(caps) = mux_handshake_server(&mut tcp, &codec, &init).await.unwrap() else {
+            return;
+        };
+        let mux = Multiplexer::new_server(tcp, codec, caps);
+        let mut rx = mux.take_new_stream_rx().await.unwrap();
+        while let Some(ns) = rx.recv().await {
+            let mux = mux.clone();
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let mut stream = mux.register_stream(ns.stream_id).await;
+                mux.send_frame(ns.stream_id, Command::ConnectAck, vec![0]).await.unwrap();
+                let _hello = stream.recv().await;
+                stream.send(&[RELAY_HELLO_OK]).await.unwrap();
+                let Ok(mut tls) = acceptor.accept(stream.into_io()).await else {
+                    return;
+                };
+                let mut got = [0u8; 4];
+                if tls.read_exact(&mut got).await.is_ok() {
+                    let _ = tls.write_all(b"pong").await;
+                    let _ = tls.flush().await;
+                }
+            });
+        }
+    }
+
+    /// Коннектор под hyper: пин стоит на ключе агента из relay-токена, поэтому
+    /// соединение до правильного агента поднимается и несёт байты, а токен на
+    /// чужой ключ (подменённый сертификат в сплайсе) хендшейк не проходит
+    /// (LLD-38 п. 2.3, LLD-23 п. 3.3).
+    #[cfg(feature = "relay-tls")]
+    #[tokio::test]
+    async fn test_relay_tls_connect_pins_agent_key() {
+        use crate::relay_tls::{cert_ed25519_spki, identity_server_config};
+        use rustls::pki_types::PrivateKeyDer;
+
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["xr-share-agent".to_string()]).unwrap();
+        let cert_der = params.self_signed(&kp).unwrap().der().to_vec();
+        let spki = cert_ed25519_spki(&cert_der).unwrap();
+        let key_der = PrivateKeyDer::try_from(kp.serialize_der()).unwrap();
+        let server_cfg = identity_server_config(cert_der, key_der).unwrap();
+
+        let codec = test_codec();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let relay_codec = codec.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let cfg = server_cfg.clone();
+                let codec = relay_codec.clone();
+                tokio::spawn(run_tls_relay(tcp, codec, cfg));
+            }
+        });
+
+        let mut token = dummy_token();
+        token.agent_pubkey = base64::engine::general_purpose::STANDARD.encode(spki);
+        let endpoint = RelayEndpoint::from_grant(&test_grant(addr, token.clone())).unwrap();
+        let mut tls = relay_tls_connect(&endpoint).await.expect("пин совпал");
+        tls.write_all(b"ping").await.unwrap();
+        let mut got = [0u8; 4];
+        tls.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"pong");
+
+        // Тот же relay и тот же агент за сплайсом, но маршрут называет чужой
+        // ключ: подменённый сертификат обязан ронять хендшейк, а не молча
+        // работать.
+        let mut wrong = spki;
+        wrong[0] ^= 0xFF;
+        let mut alien = token;
+        alien.agent_pubkey = base64::engine::general_purpose::STANDARD.encode(wrong);
+        let endpoint = RelayEndpoint::from_grant(&test_grant(addr, alien)).unwrap();
+        let err = match relay_tls_connect(&endpoint).await {
+            Ok(_) => panic!("чужой SPKI не должен проходить пин"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("pinned TLS"), "{err}");
     }
 }

@@ -16,7 +16,7 @@ share = ["dep:ed25519-dalek", "dep:serde_json"]
 # (SPKI == agent_pubkey) и билдеры rustls-конфигов. rustls на ring уже в дереве
 # через reqwest (xr-core/xr-client), кросс-компилируется везде; rcgen (генерация
 # сертификата на агенте) сюда НЕ тащим, он живёт в xr-share за фичей `relay`.
-relay-tls = ["share", "dep:rustls", "dep:x509-cert"]
+relay-tls = ["share", "dep:rustls", "dep:x509-cert", "dep:tokio-rustls"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -30,6 +30,10 @@ maxminddb = { version = "0.24", optional = true }
 ed25519-dalek = { version = "2", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 x509-cert = { version = "0.2", optional = true }
+# Клиентская обвязка TLS для коннектора relay-стрима под hyper (LLD-38 п. 2.3).
+# Это тонкая склейка над уже подтянутым rustls, кросс-сборку не утяжеляет; тяжёлый
+# rcgen по-прежнему живёт только в xr-share.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros", "sync"] }
 url = "2"
 
