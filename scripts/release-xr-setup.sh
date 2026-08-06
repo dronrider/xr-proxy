@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Сборка и выкладка setup-dist на хаб (XR-015/XR-177, LLD-13): статические
-# musl бинари xr-setup, xr-server, xr-hub и xr-client под обе арки плюс
+# musl бинари xr-setup, xr-server, xr-hub, xr-web и xr-client под обе арки плюс
 # install.sh и SHA256SUMS. С этой раздачи ставится чистый VPS или роутер
 # одной командой:
 #
@@ -19,7 +19,7 @@ HUB_DIR="${HUB_DIR:-/var/lib/xr-hub/setup-dist}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SSH="ssh -p $HUB_PORT $HUB_USER@$HUB_HOST"
 SCP="scp -P $HUB_PORT"
-CRATES=(xr-setup xr-server xr-hub xr-client)
+CRATES=(xr-setup xr-server xr-hub xr-web xr-client)
 
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
@@ -59,7 +59,7 @@ done
 cp "$ROOT/scripts/install.sh" "$stage/install.sh"
 
 echo "== SHA256SUMS =="
-( cd "$stage" && sums xr-setup-* xr-server-* xr-hub-* xr-client-* > SHA256SUMS && cat SHA256SUMS )
+( cd "$stage" && sums xr-setup-* xr-server-* xr-hub-* xr-web-* xr-client-* > SHA256SUMS && cat SHA256SUMS )
 
 echo "== upload to hub $HUB_HOST:$HUB_DIR =="
 $SSH "mkdir -p $HUB_DIR"

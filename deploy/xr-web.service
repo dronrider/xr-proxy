@@ -1,0 +1,22 @@
+[Unit]
+Description=XR Web (browser entry to agent publications, LLD-38)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xr-web --config /etc/xr-web/config.toml
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+# Security hardening. Здесь живёт плейнтекст браузерных сессий (LLD-38 п. 3.1),
+# поэтому отдельный юнит и отдельные права: на диск сервис не пишет ничего,
+# сессии и кеш маршрутов держит в памяти.
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+ReadOnlyPaths=/etc/xr-web
+
+[Install]
+WantedBy=multi-user.target

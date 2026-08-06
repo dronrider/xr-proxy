@@ -373,6 +373,48 @@ impl Step for HubBackup {
     }
 }
 
+/// Дописать раздел в чужой существующий конфиг, если его там ещё нет
+/// (LLD-38: блок `[web]` в конфиг хаба). Целиком такой конфиг не
+/// перерисовывается: из него не восстановить ни хеш пароля, ни ключи, поэтому
+/// установщик добавляет своё в конец и ничего не трогает.
+pub struct AppendBlock {
+    pub label: String,
+    pub path: PathBuf,
+    /// По чему судим, что раздел уже есть.
+    pub marker: String,
+    pub block: String,
+    pub restart: Option<Restart>,
+}
+
+impl Step for AppendBlock {
+    fn name(&self) -> String {
+        format!("config:{}", self.label)
+    }
+
+    fn check(&self) -> Result<bool> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(text) => Ok(text.lines().any(|l| l.trim_start().starts_with(&self.marker))),
+            // Конфига нет вовсе: дописывать некуда, и заводить его этим шагом
+            // мы не станем. Шаг ставится в план только к живому конфигу.
+            Err(_) => Ok(true),
+        }
+    }
+
+    fn apply(&self) -> Result<()> {
+        let text = std::fs::read_to_string(&self.path)
+            .with_context(|| format!("чтение {}", self.path.display()))?;
+        let mode = std::fs::metadata(&self.path)
+            .map(|m| {
+                use std::os::unix::fs::PermissionsExt;
+                m.permissions().mode() & 0o777
+            })
+            .unwrap_or(0o600);
+        let joined = format!("{}{}", text.trim_end_matches('\n'), self.block);
+        write_atomic(&self.path, joined.as_bytes(), mode)?;
+        restart_if_active(self.restart.as_ref())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,6 +649,37 @@ mod tests {
         // Пропавший cron-файл возвращает шаг в работу.
         std::fs::remove_file(&next.cron).unwrap();
         assert!(!next.check().unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn append_block_adds_the_section_once_and_keeps_the_rest() {
+        let dir = tmpdir("append");
+        let path = dir.join("hub.toml");
+        std::fs::write(&path, "[server]\nbind = \"127.0.0.1:8080\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let step = AppendBlock {
+            label: "hub-web".into(),
+            path: path.clone(),
+            marker: "[web]".into(),
+            block: "\n[web]\ndomain = \"web.example.com\"\n".into(),
+            restart: None,
+        };
+
+        assert!(!step.check().unwrap());
+        step.apply().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("bind = \"127.0.0.1:8080\""), "чужое содержимое цело: {text}");
+        assert!(text.contains("domain = \"web.example.com\""), "{text}");
+        assert!(text.parse::<toml::Value>().is_ok(), "склейка обязана быть TOML: {text}");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "права конфига хаба не расширяются"
+        );
+
+        // Повторный запуск ничего не дублирует.
+        assert!(step.check().unwrap());
         std::fs::remove_dir_all(&dir).ok();
     }
 

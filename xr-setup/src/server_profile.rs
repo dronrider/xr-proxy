@@ -3,14 +3,15 @@
 //! одноразовым инвайтом - швом с онбордингом LLD-04.
 
 use crate::actions::{
-    HubBackup, InstallBinary, Restart, SigningKey, Sysctl, SystemdUnit, WriteConfig,
+    AppendBlock, HubBackup, InstallBinary, Restart, SigningKey, Sysctl, SystemdUnit, WriteConfig,
 };
 use crate::arch::Arch;
 use crate::fetch::BinSource;
 use crate::hub_api::HubClient;
 use crate::render::{
-    render_hub_toml, render_server_toml, HubTomlParams, ServerTomlParams, HUB_BACKUP,
-    HUB_BACKUP_CRON, HUB_BACKUP_ENV, HUB_UNIT, SERVER_UNIT, SYSCTL_CONF,
+    render_hub_toml, render_hub_web_block, render_server_toml, render_web_toml, HubTomlParams,
+    ServerTomlParams, WebTomlParams, HUB_BACKUP, HUB_BACKUP_CRON, HUB_BACKUP_ENV, HUB_UNIT,
+    SERVER_UNIT, SYSCTL_CONF, WEB_UNIT,
 };
 use crate::secrets;
 use crate::steps::Step;
@@ -29,6 +30,12 @@ const SIGNING_KEY_FILE: &str = "/var/lib/xr-hub/signing.key";
 const HUB_BACKUP_BIN: &str = "/usr/local/bin/xr-hub-backup.sh";
 const HUB_BACKUP_CRON_FILE: &str = "/etc/cron.d/xr-hub-backup";
 const HUB_BACKUP_ENV_FILE: &str = "/etc/xr-hub/backup.env";
+const WEB_BIN: &str = "/usr/local/bin/xr-web";
+const WEB_CONF: &str = "/etc/xr-web/config.toml";
+const WEB_UNIT_NAME: &str = "xr-web";
+/// Локальный порт браузерного входа: наружу его выводит тот же фронт, что и
+/// хаб, разводя их по `Host`.
+const WEB_BIND: &str = "127.0.0.1:8090";
 const SYSCTL_FILE: &str = "/etc/sysctl.d/99-xr-proxy.conf";
 const SERVER_UNIT_NAME: &str = "xr-proxy-server";
 const HUB_UNIT_NAME: &str = "xr-hub";
@@ -36,6 +43,12 @@ const HUB_UNIT_NAME: &str = "xr-hub";
 pub struct ServerOpts {
     pub with_hub: bool,
     pub hub_domain: Option<String>,
+    /// Поставить рядом браузерный вход (LLD-38 фаза 2).
+    pub with_web: bool,
+    /// Домен публикаций: `<имя>.<домен>`. В коде его нет, он приходит сюда.
+    pub web_domain: Option<String>,
+    /// База хаба для фронта, если хаб живёт не на этой машине.
+    pub hub_url: Option<String>,
     pub key: Option<String>,
     pub server_addr: Option<String>,
     pub port: u16,
@@ -59,12 +72,28 @@ pub struct HubPlan {
     pub native_tls: bool,
 }
 
+/// План браузерного входа: домен, база хаба и общий секрет, который обязан
+/// совпасть с хабовым. Секрет генерируется один раз и кладётся в оба конфига,
+/// поэтому руками его переносить не приходится (LLD-38 п. 2.5).
+pub struct WebPlan {
+    pub domain: String,
+    pub hub_url: String,
+    pub shared_secret: String,
+    /// В конфигах фронта и хаба уже стоят разные секреты: сам установщик
+    /// такое не чинит (перезаписывать чужие конфиги он не вправе), но и молчать
+    /// об этом нельзя.
+    pub secret_conflict: bool,
+    /// Конфиг хаба лежит на этой машине: блок `[web]` дописывается сюда.
+    pub hub_conf_here: bool,
+}
+
 pub struct Resolved {
     pub arch: Arch,
     pub source: Option<Arc<BinSource>>,
     pub force: bool,
     pub server: ServerTomlParams,
     pub hub: Option<HubPlan>,
+    pub web: Option<WebPlan>,
 }
 
 pub fn resolve(opts: ServerOpts) -> Result<Resolved> {
@@ -101,13 +130,71 @@ pub fn resolve(opts: ServerOpts) -> Result<Resolved> {
         None
     };
 
+    let web = if opts.with_web {
+        Some(resolve_web(&opts, hub.as_ref())?)
+    } else {
+        None
+    };
+
     Ok(Resolved {
         arch,
         source: opts.source.map(Arc::new),
         force: opts.force,
         server,
         hub,
+        web,
     })
+}
+
+fn resolve_web(opts: &ServerOpts, hub: Option<&HubPlan>) -> Result<WebPlan> {
+    let domain = opts
+        .web_domain
+        .as_deref()
+        .context("--with-web требует --web-domain")?
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    if domain.is_empty() {
+        anyhow::bail!("--web-domain пуст: публикация живёт на <имя>.<домен>");
+    }
+
+    let hub_url = match (&opts.hub_url, hub) {
+        (Some(url), _) => url.clone(),
+        // Хаб на этой же машине: фронт ходит в него локально, TLS и фронт на
+        // этом пути ни к чему.
+        (None, Some(plan)) => plan.local_base.clone(),
+        (None, None) => anyhow::bail!("--with-web без --with-hub требует --hub-url"),
+    };
+
+    let in_web = shared_secret_of(&std::fs::read_to_string(WEB_CONF).unwrap_or_default());
+    let in_hub = shared_secret_of(&std::fs::read_to_string(HUB_CONF).unwrap_or_default());
+    let secret_conflict = match (&in_web, &in_hub) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    };
+    let shared_secret = in_web
+        .or(in_hub)
+        .unwrap_or_else(secrets::gen_shared_secret);
+
+    Ok(WebPlan {
+        domain,
+        hub_url,
+        shared_secret,
+        secret_conflict,
+        hub_conf_here: std::path::Path::new(HUB_CONF).exists(),
+    })
+}
+
+/// Секрет из блока `[web]` конфига (хаба или фронта), если он там уже стоит.
+pub fn shared_secret_of(text: &str) -> Option<String> {
+    let parsed: toml::Value = text.parse().ok()?;
+    let secret = parsed
+        .get("web")?
+        .get("shared_secret")?
+        .as_str()?
+        .trim()
+        .to_string();
+    (!secret.is_empty()).then_some(secret)
 }
 
 fn resolve_hub(opts: &ServerOpts, server: &ServerTomlParams) -> Result<HubPlan> {
@@ -250,7 +337,78 @@ pub fn plan(r: &Resolved) -> Vec<Box<dyn Step>> {
         }));
     }
 
+    if let Some(web) = &r.web {
+        steps.push(Box::new(InstallBinary {
+            file: format!("xr-web-{}", r.arch.dist_suffix()),
+            dest: PathBuf::from(WEB_BIN),
+            source: r.source.clone(),
+            restart: Some(Restart::Unit(WEB_UNIT_NAME.into())),
+        }));
+        steps.push(Box::new(WriteConfig {
+            label: "web".into(),
+            path: PathBuf::from(WEB_CONF),
+            content: render_web_toml(&WebTomlParams {
+                bind: WEB_BIND.into(),
+                domain: web.domain.clone(),
+                hub_url: web.hub_url.clone(),
+                shared_secret: web.shared_secret.clone(),
+            }),
+            mode: 0o600,
+            overwrite: r.force,
+            restart: Some(Restart::Unit(WEB_UNIT_NAME.into())),
+            extra: None,
+        }));
+        // Секрет и домен нужны обеим сторонам. Конфиг хаба целиком не
+        // перерисовывается (хеш пароля из него не восстановить), поэтому блок
+        // дописывается в конец, и только если его там ещё нет.
+        if web.hub_conf_here {
+            steps.push(Box::new(AppendBlock {
+                label: "hub-web".into(),
+                path: PathBuf::from(HUB_CONF),
+                marker: "[web]".into(),
+                block: render_hub_web_block(&web.domain, &web.shared_secret),
+                restart: Some(Restart::Unit(HUB_UNIT_NAME.into())),
+            }));
+        }
+        steps.push(Box::new(SystemdUnit {
+            unit: WEB_UNIT_NAME.into(),
+            content: WEB_UNIT.into(),
+        }));
+    }
+
     steps
+}
+
+/// Что установщик не может сделать сам за браузерный вход. Каждая находка
+/// называет точную команду: молчаливо неработающий вход неотличим от рабочего,
+/// пока в него не постучится браузер.
+pub fn web_findings(web: &WebPlan) -> Vec<String> {
+    let mut out = Vec::new();
+    if web.secret_conflict {
+        out.push(format!(
+            "Находка: в {WEB_CONF} и {HUB_CONF} стоят разные [web] shared_secret.\n  \
+             Служебные ручки хаба ответят фронту 401, и вход отдаст 502.\n  \
+             Приведи их к одному значению и перезапусти оба:\n  \
+             systemctl restart xr-hub xr-web"
+        ));
+    }
+    if !web.hub_conf_here {
+        out.push(format!(
+            "Находка: хаб не на этой машине, блок [web] дописать некуда.\n  \
+             Добавь в его конфиг и перезапусти хаб:{}",
+            render_hub_web_block(&web.domain, &web.shared_secret)
+                .replace('\n', "\n  ")
+        ));
+    }
+    out.push(format!(
+        "Осталось вне установщика: DNS-запись *.{domain} на этот VPS, \
+         wildcard-сертификат и правило фронта (*.{domain} -> {bind}).\n  \
+         Подробности в docs/HUB-DEPLOY.md, раздел 3. Проверка после этого:\n  \
+         curl -s https://<публикация>.{domain}/.xr-web/healthz   # ждём ok",
+        domain = web.domain,
+        bind = WEB_BIND,
+    ));
+    out
 }
 
 /// Финал установки: инвайт через хаб (LLD-13 п. 3.5) либо, без хаба,
@@ -263,10 +421,12 @@ pub fn finish(r: &Resolved) -> Result<()> {
         println!("Параметры для инвайта на своём хабе:");
         println!("  obfuscation_key = {}", r.server.key);
         println!("  salt = 0x{:08X}", r.server.salt);
+        print_web_findings(r);
         return Ok(());
     };
 
     let outcome = finish_hub(hub);
+    print_web_findings(r);
     if let Some(finding) =
         backup_env_finding(std::fs::read_to_string(HUB_BACKUP_ENV_FILE).ok().as_deref())
     {
@@ -274,6 +434,16 @@ pub fn finish(r: &Resolved) -> Result<()> {
         println!("{finding}");
     }
     outcome
+}
+
+fn print_web_findings(r: &Resolved) {
+    let Some(web) = &r.web else { return };
+    println!();
+    println!("Браузерный вход: публикации открываются на https://<имя>.{}", web.domain);
+    for finding in web_findings(web) {
+        println!();
+        println!("{finding}");
+    }
 }
 
 /// Незаполненный backup.env: бэкап хаба собирается по cron, но никуда не
@@ -425,6 +595,16 @@ pub fn pick_public_ip(hostname_i: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn web_plan(hub_conf_here: bool, secret_conflict: bool) -> WebPlan {
+        WebPlan {
+            domain: "web.example.com".into(),
+            hub_url: "http://127.0.0.1:8080".into(),
+            shared_secret: "s3cret".into(),
+            secret_conflict,
+            hub_conf_here,
+        }
+    }
+
     fn resolved(with_hub: bool, force: bool) -> Resolved {
         let server = ServerTomlParams {
             port: 8443,
@@ -446,6 +626,7 @@ mod tests {
             force,
             server,
             hub,
+            web: None,
         }
     }
 
@@ -505,6 +686,70 @@ mod tests {
             .is_none(),
             "заполненный env находкой не считается"
         );
+    }
+
+    #[test]
+    fn server_plan_with_web_appends_front_steps() {
+        let mut r = resolved(true, false);
+        r.web = Some(web_plan(true, false));
+        assert_eq!(
+            names(&r),
+            [
+                "binary:xr-server",
+                "config:server",
+                "sysctl",
+                "service:xr-proxy-server",
+                "binary:xr-hub",
+                "hub:signing-key",
+                "config:hub",
+                "service:xr-hub",
+                "hub:backup",
+                "binary:xr-web",
+                "config:web",
+                "config:hub-web",
+                "service:xr-web"
+            ]
+        );
+
+        // Хаб на другой машине: дописывать блок [web] некуда, и шага нет.
+        r.web = Some(web_plan(false, false));
+        assert!(
+            !names(&r).contains(&"config:hub-web".to_string()),
+            "чужой конфиг хаба этой машине не принадлежит"
+        );
+    }
+
+    #[test]
+    fn web_findings_name_every_manual_step() {
+        // DNS и сертификат установщик не заводит: про них он обязан сказать
+        // всегда, иначе вход молча не работает.
+        let always = web_findings(&web_plan(true, false));
+        assert_eq!(always.len(), 1, "лишних находок на здоровой установке нет: {always:?}");
+        assert!(always[0].contains("*.web.example.com"), "{always:?}");
+        assert!(always[0].contains("/.xr-web/healthz"), "в находке нужна точная проверка");
+
+        // Хаб на другой машине: находка несёт готовый блок с секретом.
+        let remote = web_findings(&web_plan(false, false));
+        assert!(remote.iter().any(|f| f.contains("shared_secret = \"s3cret\"")), "{remote:?}");
+
+        // Разъехавшиеся секреты: сам установщик их не чинит, но называет оба
+        // файла и команду.
+        let clash = web_findings(&web_plan(true, true));
+        assert!(clash.iter().any(|f| f.contains(WEB_CONF) && f.contains(HUB_CONF)), "{clash:?}");
+        assert!(clash.iter().any(|f| f.contains("systemctl restart xr-hub xr-web")), "{clash:?}");
+    }
+
+    #[test]
+    fn shared_secret_is_reused_from_either_side() {
+        // Секрет живёт в двух конфигах, и повторная установка обязана взять
+        // уже стоящий, а не выписать третий.
+        assert_eq!(
+            shared_secret_of("[web]\nshared_secret = \"abc\"\n").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(shared_secret_of("[web]\nshared_secret = \"\"\n"), None);
+        assert_eq!(shared_secret_of("[server]\nbind = \"x\"\n"), None);
+        assert_eq!(shared_secret_of("это не toml ["), None);
     }
 
     #[test]

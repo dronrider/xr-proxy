@@ -5,6 +5,8 @@
 /// Юнит xr-server; имя сервиса историческое, xr-proxy-server.
 pub const SERVER_UNIT: &str = include_str!("../../deploy/xr-proxy-server.service");
 pub const HUB_UNIT: &str = include_str!("../../deploy/xr-hub.service");
+/// Юнит браузерного входа (LLD-38 фаза 2, профиль --with-web).
+pub const WEB_UNIT: &str = include_str!("../../deploy/xr-web.service");
 
 /// Обвязка роутера, те же файлы, что раскладываются вручную по хэндоффу:
 /// procd init (в нём же fd-limit через procd limits), watchdog-cron и
@@ -208,9 +210,78 @@ priority = 0
     )
 }
 
+pub struct WebTomlParams {
+    pub bind: String,
+    /// Домен публикаций: в коде его нет, он приходит флагом установки.
+    pub domain: String,
+    pub hub_url: String,
+    pub shared_secret: String,
+}
+
+pub fn render_web_toml(p: &WebTomlParams) -> String {
+    format!(
+        r#"# xr-web config (сгенерирован xr-setup, LLD-38)
+# Наружу сервис выводит тот же фронт, что и хаб, разводя их по Host:
+# *.{domain} на этот порт. DNS-запись и wildcard-сертификат заводятся один раз
+# (docs/HUB-DEPLOY.md, раздел 3).
+
+[web]
+bind = "{bind}"
+domain = "{domain}"
+hub_url = "{hub_url}"
+shared_secret = "{secret}"
+session_ttl_secs = 604800
+log_level = "info"
+"#,
+        bind = p.bind,
+        domain = p.domain,
+        hub_url = p.hub_url,
+        secret = p.shared_secret,
+    )
+}
+
+/// Блок `[web]` для конфига хаба: тот же секрет и тот же домен, что у фронта.
+/// Дописывается к существующему конфигу, потому что перезаписать его нельзя
+/// (хеш пароля админки из него не восстановить).
+pub fn render_hub_web_block(domain: &str, secret: &str) -> String {
+    format!(
+        "\n# Браузерный вход (LLD-38, добавил xr-setup --with-web).\n\
+         [web]\n\
+         domain = \"{domain}\"\n\
+         shared_secret = \"{secret}\"\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_toml_is_valid_and_carries_domain_and_secret() {
+        let text = render_web_toml(&WebTomlParams {
+            bind: "127.0.0.1:8090".into(),
+            domain: "web.example.com".into(),
+            hub_url: "http://127.0.0.1:8080".into(),
+            shared_secret: "s3cret".into(),
+        });
+        let v: toml::Value = text.parse().expect("рендер обязан быть валидным TOML");
+        assert_eq!(v["web"]["domain"].as_str(), Some("web.example.com"));
+        assert_eq!(v["web"]["shared_secret"].as_str(), Some("s3cret"));
+        assert_eq!(v["web"]["hub_url"].as_str(), Some("http://127.0.0.1:8080"));
+        assert_eq!(v["web"]["bind"].as_str(), Some("127.0.0.1:8090"));
+    }
+
+    #[test]
+    fn hub_web_block_appends_to_a_live_hub_config() {
+        // Конфиг хаба не перерисовывается, блок дописывается в конец: разбор
+        // склейки обязан дать оба раздела.
+        let existing = "[server]\nbind = \"127.0.0.1:8080\"\n";
+        let joined = format!("{existing}{}", render_hub_web_block("web.example.com", "s3cret"));
+        let v: toml::Value = joined.parse().expect("склейка обязана остаться валидным TOML");
+        assert_eq!(v["server"]["bind"].as_str(), Some("127.0.0.1:8080"));
+        assert_eq!(v["web"]["domain"].as_str(), Some("web.example.com"));
+        assert_eq!(v["web"]["shared_secret"].as_str(), Some("s3cret"));
+    }
 
     #[test]
     fn server_toml_is_valid_and_carries_params() {

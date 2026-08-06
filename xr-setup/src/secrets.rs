@@ -30,6 +30,15 @@ pub fn gen_password() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Общий секрет служебных ручек хаба для браузерного входа (LLD-38 п. 3.5):
+/// 32 случайных байта в base64url. Он едет в два конфига сразу, поэтому без
+/// спецсимволов, чтобы одинаково читался и там, и там.
+pub fn gen_shared_secret() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
 /// Ключ подписи хаба: 32 сырых байта в base64, формат SigningContext.
 pub fn gen_signing_key() -> String {
     let mut bytes = [0u8; 32];

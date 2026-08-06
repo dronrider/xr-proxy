@@ -28,7 +28,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Поднять xr-server на этом VPS, при --with-hub вместе с xr-hub
+    /// Поднять xr-server на этом VPS, при --with-hub вместе с xr-hub,
+    /// при --with-web ещё и с браузерным входом
     Server(ServerArgs),
     /// Настроить этот OpenWRT-роутер на готовый xr-server
     Router(RouterArgs),
@@ -42,6 +43,15 @@ struct ServerArgs {
     /// Поставить рядом xr-hub и выдать инвайт по завершении
     #[arg(long, requires = "hub_domain")]
     with_hub: bool,
+    /// Поставить рядом xr-web: браузерный вход к публикациям агентов
+    #[arg(long, requires = "web_domain")]
+    with_web: bool,
+    /// Домен публикаций: они открываются на https://<имя>.<домен>
+    #[arg(long)]
+    web_domain: Option<String>,
+    /// База хаба для браузерного входа, если хаб на другой машине
+    #[arg(long)]
+    hub_url: Option<String>,
     /// Ключ обфускации base64 (без флага сгенерируется)
     #[arg(long)]
     key: Option<String>,
@@ -177,6 +187,9 @@ fn run_server(args: ServerArgs) -> Result<()> {
     let opts = server_profile::ServerOpts {
         with_hub: args.with_hub,
         hub_domain: args.hub_domain,
+        with_web: args.with_web,
+        web_domain: args.web_domain,
+        hub_url: args.hub_url,
         key: args.key,
         server_addr: args.server_addr,
         port: args.port,
