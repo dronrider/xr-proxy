@@ -212,6 +212,62 @@ curl -s -H "Authorization: Bearer $XR_WEB_SECRET" \
 # список публикаций с полем online; без заголовка тут 401
 ```
 
+### Сервис xr-web (браузерный вход)
+
+Ставится профилем установщика вместе с хабом или к уже стоящему:
+
+```bash
+xr-setup server --with-hub --hub-domain xr-hub.example.com \
+                --with-web --web-domain web.example.com
+# хаб на другой машине: --with-web --web-domain ... --hub-url https://xr-hub.example.com
+```
+
+Установщик кладёт бинарь `/usr/local/bin/xr-web`, конфиг
+`/etc/xr-web/config.toml` (образец в `configs/web.toml`), юнит
+`deploy/xr-web.service` и генерирует общий секрет, дописывая его блоком `[web]`
+в конфиг хаба на этой же машине. Повторный запуск ничего не перетирает: уже
+стоящий секрет берётся из того конфига, где он есть. По завершении печатаются
+находки про то, чего установщик сделать не может: DNS-запись, сертификат и
+правило фронта.
+
+Фронт разводит хаб и публикации по `Host` (nginx на VPS):
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name *.web.example.com;
+    ssl_certificate     /etc/nginx/ssl/web-example-com.pem;      # wildcard
+    ssl_certificate_key /etc/nginx/ssl/web-example-com.key;
+    location / {
+        proxy_pass http://127.0.0.1:8090;
+        proxy_set_header Host $host;                 # имя публикации едет в Host
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;      # понадобится фазе 3
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 3600s;
+    }
+}
+```
+
+`Host` обязан доехать до `xr-web` неизменным: по нему выбирается публикация.
+`X-Forwarded-For` нужен логу входа и лимиту попыток, дальше VPS он не едет.
+
+Проверка после раскладки (публикация `dash` заведена на машине владельца
+командой `xr-share expose add --name dash`):
+
+```bash
+systemctl status xr-web
+curl -s https://dash.web.example.com/.xr-web/healthz            # ждём ok
+curl -s -H 'Accept: application/json' https://dash.web.example.com/
+# {"error":"unauthenticated"}, код 401
+curl -sI https://dash.web.example.com/ | grep -i set-cookie      # пусто до входа
+```
+
+В логе сервиса (`journalctl -u xr-web`) видно вход, выбор маршрута и строку
+`метод-статус-длительность` на каждый запрос; тела, query-строки и cookie туда
+не попадают.
+
 ## 4. Подпись пресетов (опционально)
 
 ```bash
