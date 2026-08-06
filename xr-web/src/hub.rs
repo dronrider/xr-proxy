@@ -270,6 +270,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn https_client_builds_and_reports_a_dead_hub() {
+        // Клиент к хабу строится с ring-провайдером, как и пиннинг агента:
+        // второй крипто-бэкенд в процессе уронил бы сервис на старте, ещё до
+        // первого запроса. Хаб тут заведомо мёртвый порт, сеть не нужна.
+        let hub = HttpHub::new("https://127.0.0.1:1/", "секрет").expect("клиент строится");
+        let err = hub.route("dash".into()).await.unwrap_err();
+        assert!(
+            matches!(err, HubError::Unavailable(_)) && err.to_string().contains("хаб не ответил"),
+            "{err:?}"
+        );
+        assert!(hub.probe().await.is_err());
+    }
+
+    #[tokio::test]
     async fn hub_failure_is_named_and_not_cached() {
         let (cache, hub) = cache(10_000, true);
         let err = cache.get("dash", 1_000).await.unwrap_err();
