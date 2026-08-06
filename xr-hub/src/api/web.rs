@@ -286,10 +286,10 @@ pub async fn mandate(
 }
 
 /// base64url-no-pad JSON мандата: та же форма блоба, что у токенов шар, и
-/// агент разбирает её тем же способом.
+/// агент разбирает её тем же способом. Сама форма живёт рядом с типом в
+/// `xr-proto`, чтобы минт и предъявление фронтом не разъехались.
 pub fn encode_mandate(token: &ExposeToken) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(token).expect("serialize expose token"))
+    xr_proto::share::encode_expose_mandate(token)
 }
 
 // Служебные ручки браузерного фронта (LLD-38 п. 3.5).

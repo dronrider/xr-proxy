@@ -413,6 +413,17 @@ pub struct ExposeToken {
     pub signature: String,
 }
 
+/// Мандат публикации в том виде, в каком его ждёт агент: base64url-no-pad
+/// JSON в `Authorization: Bearer`. Та же форма блоба, что у токенов шар,
+/// поэтому агент разбирает его тем же способом. Живёт рядом с самим типом,
+/// чтобы минт (хаб) и предъявление (`xr-web`) не разъехались по форме.
+#[cfg(any(feature = "share", test))]
+pub fn encode_expose_mandate(token: &ExposeToken) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(token).expect("serialize expose token"))
+}
+
 /// Заголовок, которым посредник (`xr-web`, харнесс `expose open`) называет
 /// публикацию на реверс-стриме. Без него запрос обслуживает роутер шары, как и
 /// до LLD-38.
@@ -1747,6 +1758,20 @@ mod tests {
             verify_expose_token(&posing, &key.verifying_key(), "dash", "QUJD", 4999),
             Err(ExposeTokenError::BadSignature)
         );
+    }
+
+    #[test]
+    fn mandate_blob_is_what_the_agent_parses() {
+        // Форма блоба общая у минта (хаб) и у предъявления (`xr-web`), а
+        // разбирает его агент: base64url-no-pad JSON, как и токены шар.
+        let token = sign_expose_token(&hub_key(), "dash", "QUJD", 5000);
+        let blob = encode_expose_mandate(&token);
+        assert!(!blob.contains('='), "форма без паддинга: {blob}");
+        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&blob)
+            .expect("блоб обязан быть base64url");
+        let back: ExposeToken = serde_json::from_slice(&json).expect("и JSON мандата");
+        assert_eq!(back, token);
     }
 
     #[test]
