@@ -7,9 +7,11 @@
 //!
 //! Аренда (`Lease`) кончается не с ответом, а с концом его тела: пока тело
 //! течёт, соединение занято, и вернуть его в пул раньше значило бы отдать
-//! другому запросу середину чужого ответа. Апгрейд (фаза 3) забирает аренду
-//! насовсем через [`Lease::detach`]: после `101` соединение перестаёт быть
-//! HTTP, и в пул ему возвращаться некуда.
+//! другому запросу середину чужого ответа. Апгрейд забирает аренду насовсем
+//! через [`Lease::detach`]: после `101` соединение перестаёт быть HTTP, и в пул
+//! ему возвращаться некуда. Возраст соединения ([`Lease::age`]) переживает
+//! лежание в пуле, потому что потолок жизни сплайса relay отсчитывает от
+//! открытия стрима, а не от начала апгрейда.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -104,6 +106,10 @@ impl Dialer for RelayDialer {
 struct Idle {
     sender: SendRequest<axum::body::Body>,
     since: Instant,
+    /// Когда это соединение открылось. Потолок жизни сплайса relay считает от
+    /// открытия стрима, а не от начала апгрейда, поэтому взятое из пула
+    /// соединение приносит апгрейду свой прожитый срок.
+    opened_at: Instant,
 }
 
 /// Пул соединений: своя очередь на публикацию.
@@ -123,22 +129,23 @@ impl AgentPool {
     /// Готовое к запросу соединение: из пула, если там есть живое, иначе новое.
     pub async fn checkout(self: &Arc<Self>, route: Arc<WebRoute>) -> io::Result<Lease> {
         let publication = route.publication.clone();
-        if let Some(sender) = self.take_idle(&publication) {
-            return Ok(self.lease(publication, sender));
+        if let Some((sender, opened_at)) = self.take_idle(&publication) {
+            return Ok(self.lease(publication, sender, opened_at));
         }
+        let opened_at = Instant::now();
         let io = self.dialer.connect(route).await?;
         let (sender, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io))
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("HTTP до агента: {e}")))?;
         // Соединение живёт своим таском, пока по нему течёт тело: без него
-        // ответ не поедет дальше первой порции. `with_upgrades` тут не для
-        // фазы 2, а для того, чтобы апгрейд лёг сверху без правки пула.
+        // ответ не поедет дальше первой порции. `with_upgrades` отдаёт таск
+        // апгрейду, когда агент отвечает `101`.
         tokio::spawn(async move {
             if let Err(e) = conn.with_upgrades().await {
                 tracing::debug!("соединение до агента закрылось: {e}");
             }
         });
-        Ok(self.lease(publication, sender))
+        Ok(self.lease(publication, sender, opened_at))
     }
 
     /// Сколько простаивающих соединений держит публикация: диагностика и тесты.
@@ -151,27 +158,33 @@ impl AgentPool {
             .unwrap_or(0)
     }
 
-    fn lease(self: &Arc<Self>, publication: String, sender: SendRequest<axum::body::Body>) -> Lease {
+    fn lease(
+        self: &Arc<Self>,
+        publication: String,
+        sender: SendRequest<axum::body::Body>,
+        opened_at: Instant,
+    ) -> Lease {
         Lease {
             pool: self.clone(),
             publication,
             sender: Some(sender),
+            opened_at,
         }
     }
 
-    fn take_idle(&self, publication: &str) -> Option<SendRequest<axum::body::Body>> {
+    fn take_idle(&self, publication: &str) -> Option<(SendRequest<axum::body::Body>, Instant)> {
         let mut guard = self.idle.lock().expect("pool lock");
         let queue = guard.get_mut(publication)?;
         // С конца: свежее лежит последним, а протухшее по дороге отбрасывается.
         while let Some(idle) = queue.pop() {
             if idle.since.elapsed() < IDLE_TTL && idle.sender.is_ready() {
-                return Some(idle.sender);
+                return Some((idle.sender, idle.opened_at));
             }
         }
         None
     }
 
-    fn put_idle(&self, publication: &str, sender: SendRequest<axum::body::Body>) {
+    fn put_idle(&self, publication: &str, sender: SendRequest<axum::body::Body>, opened_at: Instant) {
         if !sender.is_ready() {
             return;
         }
@@ -182,6 +195,7 @@ impl AgentPool {
             queue.push(Idle {
                 sender,
                 since: Instant::now(),
+                opened_at,
             });
         }
     }
@@ -193,6 +207,7 @@ pub struct Lease {
     pool: Arc<AgentPool>,
     publication: String,
     sender: Option<SendRequest<axum::body::Body>>,
+    opened_at: Instant,
 }
 
 impl Lease {
@@ -200,8 +215,15 @@ impl Lease {
         self.sender.as_mut().expect("аренда без соединения")
     }
 
-    /// Забрать соединение насовсем: после апгрейда (фаза 3) оно перестаёт быть
-    /// HTTP, и место в пуле ему уже не полагается.
+    /// Сколько это соединение живёт. Апгрейд считает от него свой срок штатного
+    /// закрытия: потолок сплайса relay отмеряет от открытия стрима, а
+    /// соединение могло полежать в пуле.
+    pub fn age(&self) -> Duration {
+        self.opened_at.elapsed()
+    }
+
+    /// Забрать соединение насовсем: после апгрейда оно перестаёт быть HTTP, и
+    /// место в пуле ему уже не полагается (п. 3.6).
     pub fn detach(mut self) -> SendRequest<axum::body::Body> {
         self.sender.take().expect("аренда без соединения")
     }
@@ -210,7 +232,7 @@ impl Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         if let Some(sender) = self.sender.take() {
-            self.pool.put_idle(&self.publication, sender);
+            self.pool.put_idle(&self.publication, sender, self.opened_at);
         }
     }
 }
@@ -354,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn detached_lease_never_returns_to_the_pool() {
-        // Шов под фазу 3: апгрейд забирает соединение насовсем.
+        // Апгрейд забирает соединение насовсем: HTTP на нём больше не живёт.
         let dialer = Arc::new(DuplexDialer::serving());
         let pool = AgentPool::new(dialer.clone());
         let route = Arc::new(route_for("dash", 10_000));
@@ -362,6 +384,26 @@ mod tests {
         let sender = lease.detach();
         assert_eq!(pool.idle_count("dash"), 0);
         drop(sender);
+    }
+
+    #[tokio::test]
+    async fn pooled_connection_remembers_when_it_was_opened() {
+        // Потолок жизни сплайса relay отмеряет от открытия стрима. Считай
+        // апгрейд свой срок от момента, когда его взяли из пула, соединение,
+        // полежавшее там минуту, закрывалось бы штатно уже после обрыва.
+        let dialer = Arc::new(DuplexDialer::serving());
+        let pool = AgentPool::new(dialer.clone());
+        let route = Arc::new(route_for("dash", 10_000));
+
+        assert!(get(&pool, route.clone()).await.contains("agent ok"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let lease = pool.checkout(route).await.expect("соединение из пула");
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 1, "взяли готовое");
+        assert!(
+            lease.age() >= Duration::from_millis(50),
+            "возраст соединения обязан пережить лежание в пуле: {:?}",
+            lease.age()
+        );
     }
 
     #[tokio::test]

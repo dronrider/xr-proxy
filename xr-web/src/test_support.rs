@@ -38,6 +38,12 @@ pub fn agent_pubkey() -> String {
 
 /// Маршрут публикации, как его отдал бы хаб.
 pub fn route_for(publication: &str, exp: u64) -> WebRoute {
+    route_with_cap(publication, exp, 3600)
+}
+
+/// Тот же маршрут с назначенным потолком жизни сплайса: на боевом relay это
+/// час, а проверке штатного закрытия нужен лимит покороче.
+pub fn route_with_cap(publication: &str, exp: u64, splice_lifetime_secs: u64) -> WebRoute {
     use base64::Engine;
     let agent = agent_pubkey();
     WebRoute {
@@ -57,7 +63,7 @@ pub fn route_for(publication: &str, exp: u64) -> WebRoute {
         relay_token: sign_relay_token(&hub_key(), &web_share_id(publication), &agent, exp),
         expose_token: sign_expose_token(&hub_key(), publication, &agent, exp),
         exp,
-        splice_lifetime_secs: 3600,
+        splice_lifetime_secs,
     }
 }
 
@@ -79,6 +85,9 @@ pub struct FakeHub {
     pub route_calls: AtomicUsize,
     pub verify_calls: AtomicUsize,
     pub hub_down_for_password: bool,
+    /// Потолок жизни сплайса в маршруте: тест штатного закрытия ставит свой,
+    /// как проверка ставит его конфигом relay.
+    pub splice_lifetime_secs: u64,
 }
 
 impl FakeHub {
@@ -89,6 +98,7 @@ impl FakeHub {
             route_calls: AtomicUsize::new(0),
             verify_calls: AtomicUsize::new(0),
             hub_down_for_password: false,
+            splice_lifetime_secs: 3600,
         }
     }
 }
@@ -97,9 +107,10 @@ impl HubApi for FakeHub {
     fn route(&self, publication: String) -> Boxed<Result<WebRoute, HubError>> {
         self.route_calls.fetch_add(1, Ordering::SeqCst);
         let mode = self.mode;
+        let cap = self.splice_lifetime_secs;
         Box::pin(async move {
             match mode {
-                HubMode::Route(exp) => Ok(route_for(&publication, exp)),
+                HubMode::Route(exp) => Ok(route_with_cap(&publication, exp, cap)),
                 HubMode::Missing => Err(HubError::NotFound),
                 HubMode::Down => Err(HubError::Unavailable("хаб не ответил: connect refused".into())),
             }
@@ -124,6 +135,9 @@ impl HubApi for FakeHub {
 /// судятся по телу ответа.
 pub struct DuplexDialer {
     pub dials: AtomicUsize,
+    /// Сколько апгрейдов агент увидел закрытыми со стороны фронта: так тест
+    /// судит, доехало ли до агента закрытие браузера.
+    pub ws_closed: Arc<AtomicUsize>,
     offline: bool,
     /// Отвечать `403`, как агент с отвергнутым мандатом.
     refuse_mandate: bool,
@@ -136,6 +150,7 @@ impl DuplexDialer {
     pub fn serving() -> Self {
         Self {
             dials: AtomicUsize::new(0),
+            ws_closed: Arc::default(),
             offline: false,
             refuse_mandate: false,
             agents: Arc::default(),
@@ -156,6 +171,7 @@ impl DuplexDialer {
     pub fn offline() -> Self {
         Self {
             dials: AtomicUsize::new(0),
+            ws_closed: Arc::default(),
             offline: true,
             refuse_mandate: false,
             agents: Arc::default(),
@@ -165,6 +181,7 @@ impl DuplexDialer {
     pub fn refusing_mandate() -> Self {
         Self {
             dials: AtomicUsize::new(0),
+            ws_closed: Arc::default(),
             offline: false,
             refuse_mandate: true,
             agents: Arc::default(),
@@ -185,11 +202,15 @@ impl Dialer for DuplexDialer {
         }
         let refuse = self.refuse_mandate;
         let agents = self.agents.clone();
+        let ws_closed = self.ws_closed.clone();
         Box::pin(async move {
             let (ours, theirs) = tokio::io::duplex(64 * 1024);
             let task = tokio::spawn(async move {
-                let service = hyper::service::service_fn(move |req: hyper::Request<Incoming>| async move {
-                    Ok::<_, std::convert::Infallible>(echo(req, refuse).await)
+                let service = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                    let ws_closed = ws_closed.clone();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(handle(req, refuse, ws_closed).await)
+                    }
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(hyper_util::rt::TokioIo::new(theirs), service)
@@ -200,6 +221,53 @@ impl Dialer for DuplexDialer {
             Ok(Box::new(ours) as Box<dyn AgentIo>)
         })
     }
+}
+
+/// Что агент стенда делает с запросом: апгрейд он принимает и эхом гоняет
+/// байты, обычный запрос отдаёт эхом заголовков.
+async fn handle(
+    req: hyper::Request<Incoming>,
+    refuse_mandate: bool,
+    ws_closed: Arc<AtomicUsize>,
+) -> hyper::Response<http_body_util::Full<Bytes>> {
+    if !refuse_mandate && crate::upgrade::requested(req.headers()).is_some() {
+        return ws_echo(req, ws_closed).await;
+    }
+    echo(req, refuse_mandate).await
+}
+
+/// Агент, принявший апгрейд: отвечает `101` и дальше гоняет байты обратно как
+/// есть. Кадры он не разбирает, потому что эхо-сервису это и не нужно: тест
+/// сверяет байты, а закрытие со стороны фронта считает `ws_closed`.
+async fn ws_echo(
+    mut req: hyper::Request<Incoming>,
+    ws_closed: Arc<AtomicUsize>,
+) -> hyper::Response<http_body_util::Full<Bytes>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let upgraded = hyper::upgrade::on(&mut req);
+    tokio::spawn(async move {
+        let Ok(io) = upgraded.await else { return };
+        let mut io = hyper_util::rt::TokioIo::new(io);
+        let mut buf = vec![0u8; 4096];
+        loop {
+            match io.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if io.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        ws_closed.fetch_add(1, Ordering::SeqCst);
+    });
+    hyper::Response::builder()
+        .status(101)
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+        .body(http_body_util::Full::default())
+        .expect("ответ апгрейда")
 }
 
 /// Ответ агента стенда: строка-маркер, метод с полным URI, отсортированные

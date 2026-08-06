@@ -36,7 +36,9 @@ pub const SHARE_LABEL: &str = "s";
 
 /// Заголовки, которые не переезжают через посредника: они про соединение, а не
 /// про запрос. `Connection: close` от браузера иначе рубил бы соединение из
-/// пула, а `Upgrade` без поддержки апгрейда обещал бы то, чего фаза 2 не умеет.
+/// пула. На запросе апгрейда `Connection` и `Upgrade` ставятся заново своими
+/// значениями (п. 2.4): дальше едет ровно тот протокол, который фронт умеет
+/// сплайсить.
 const HOP_BY_HOP: [&str; 8] = [
     "connection",
     "keep-alive",
@@ -235,7 +237,7 @@ async fn serve_publication(
     state: &Arc<WebState>,
     publication: &str,
     host: &str,
-    req: Request,
+    mut req: Request,
 ) -> Response {
     let session = session_token(req.headers())
         .and_then(|token| state.sessions.touch(&token, publication, now_unix()));
@@ -292,8 +294,19 @@ async fn serve_publication(
         }
     };
 
-    let outgoing = upstream_request(req, &route, host, publication);
+    // Апгрейд объявляется до отправки: ручку на переключение своего конца
+    // (`OnUpgrade`) кладёт в запрос листенер, и уехать вместе с запросом она не
+    // может, потому что расширения до агента не едут.
+    let asked_upgrade = crate::upgrade::requested(req.headers());
+    let browser_upgrade = asked_upgrade
+        .as_ref()
+        .and_then(|_| req.extensions_mut().remove::<hyper::upgrade::OnUpgrade>());
+
+    let outgoing = upstream_request(req, &route, host, publication, asked_upgrade.as_deref());
     match lease.sender().send_request(outgoing).await {
+        Ok(resp) if resp.status() == StatusCode::SWITCHING_PROTOCOLS => {
+            switch_protocols(publication, &route, lease, resp, browser_upgrade)
+        }
         Ok(resp) => {
             let (mut parts, body) = resp.into_parts();
             for name in HOP_BY_HOP {
@@ -321,9 +334,82 @@ async fn serve_publication(
     }
 }
 
+/// Агент переключил протокол: с этой секунды фронт больше не HTTP-посредник, а
+/// сплайс (LLD-38 п. 2.4). Соединение уходит из пула насовсем (п. 3.6), а срок
+/// штатного закрытия считается от рождения соединения, потому что потолок
+/// сплайса relay отмеряет от него же.
+fn switch_protocols(
+    publication: &str,
+    route: &WebRoute,
+    lease: crate::pool::Lease,
+    mut resp: hyper::Response<hyper::body::Incoming>,
+    browser_upgrade: Option<hyper::upgrade::OnUpgrade>,
+) -> Response {
+    let Some(browser) = browser_upgrade else {
+        // Агент переключил протокол на запрос, который апгрейда не просил.
+        // Отдавать браузеру `101` тут нельзя, а соединение уже не HTTP: оно
+        // уходит из пула и закрывается.
+        tracing::warn!("апгрейд {publication}: агент ответил 101 на запрос без апгрейда");
+        drop(lease.detach());
+        return html(
+            StatusCode::BAD_GATEWAY,
+            crate::pages::failure(
+                "Соединение переключилось не туда",
+                "агент переключил протокол на запрос, который об этом не просил",
+            ),
+        );
+    };
+    let proto = resp
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let agent = hyper::upgrade::on(&mut resp);
+    let close_in = crate::upgrade::close_after(route.splice_lifetime_secs, lease.age());
+    drop(lease.detach());
+
+    match close_in {
+        Some(left) => tracing::info!(
+            "апгрейд {publication} ({proto}): сплайс пошёл, штатное закрытие через {} с при потолке {} с",
+            left.as_secs(),
+            route.splice_lifetime_secs
+        ),
+        None => tracing::info!("апгрейд {publication} ({proto}): сплайс пошёл, потолка сплайса нет"),
+    }
+
+    let name = publication.to_string();
+    tokio::spawn(async move {
+        match tokio::try_join!(browser, agent) {
+            Ok((browser, agent)) => {
+                crate::upgrade::splice(
+                    hyper_util::rt::TokioIo::new(browser),
+                    hyper_util::rt::TokioIo::new(agent),
+                    name,
+                    proto,
+                    close_in,
+                )
+                .await
+            }
+            Err(e) => tracing::warn!("апгрейд {name}: соединение не переключилось ({e})"),
+        }
+    });
+
+    // `101` уезжает браузеру как его отдал агент: `Sec-WebSocket-Accept` и
+    // выбранные расширения это разговор сторон, посреднику в нём делать нечего.
+    let (parts, _no_body) = resp.into_parts();
+    Response::from_parts(parts, Body::empty())
+}
+
 /// Собрать запрос к агенту: пришедший как есть плюс служебные заголовки
 /// публикации (LLD-38 п. 2.3).
-fn upstream_request(req: Request, route: &WebRoute, host: &str, publication: &str) -> Request {
+fn upstream_request(
+    req: Request,
+    route: &WebRoute,
+    host: &str,
+    publication: &str,
+    upgrade: Option<&str>,
+) -> Request {
     let (mut parts, body) = req.into_parts();
     let headers = &mut parts.headers;
 
@@ -332,6 +418,14 @@ fn upstream_request(req: Request, route: &WebRoute, host: &str, publication: &st
     }
     for name in CLIENT_ADDR_HEADERS {
         headers.remove(name);
+    }
+    // Апгрейд объявляем агенту сами: снятое как hop-by-hop возвращается ровно
+    // тем протоколом, который назвал браузер.
+    if let Some(proto) = upgrade {
+        if let Ok(value) = HeaderValue::from_str(proto) {
+            headers.insert(header::UPGRADE, value);
+            headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+        }
     }
     // Свой Authorization браузера уступает место мандату, но не пропадает:
     // приложению за апстримом он может быть нужен, и агент вернёт его назад.
@@ -517,7 +611,21 @@ pub struct Stand {
 
 #[cfg(test)]
 pub fn stand(mode: crate::test_support::HubMode, dialer: crate::test_support::DuplexDialer) -> Stand {
-    let hub = Arc::new(crate::test_support::FakeHub::new(mode));
+    stand_capped(mode, dialer, 3600)
+}
+
+/// Тот же стенд с назначенным потолком жизни сплайса: проверка штатного
+/// закрытия уменьшает его конфигом relay, тест ответом стенд-хаба.
+#[cfg(test)]
+pub fn stand_capped(
+    mode: crate::test_support::HubMode,
+    dialer: crate::test_support::DuplexDialer,
+    splice_lifetime_secs: u64,
+) -> Stand {
+    let hub = Arc::new(crate::test_support::FakeHub {
+        splice_lifetime_secs,
+        ..crate::test_support::FakeHub::new(mode)
+    });
     let dialer = Arc::new(dialer);
     let state = Arc::new(WebState::new(
         "web.example.com".into(),
@@ -913,6 +1021,152 @@ mod tests {
             1,
             "отвергнут мандат, а не транспорт: соединение из пула переиспользуется"
         );
+    }
+
+    /// Браузерное соединение к фронту целиком, сырым HTTP/1.1 по duplex: без
+    /// настоящего листенера апгрейда не бывает вовсе, ручку `OnUpgrade` в
+    /// запрос кладёт hyper.
+    #[cfg(test)]
+    fn browser_socket(state: &Arc<WebState>) -> tokio::io::DuplexStream {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let peer: std::net::SocketAddr = "198.51.100.9:40000".parse().unwrap();
+        tokio::spawn(crate::listen::serve_conn(server, peer, router(state.clone())));
+        client
+    }
+
+    /// Запрос апгрейда, как его шлёт браузер.
+    fn upgrade_request(token: &str, path: &str) -> Vec<u8> {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: {HOST}\r\nCookie: xrweb={token}\r\n\
+             Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    /// Прочитать заголовки ответа до пустой строки.
+    async fn read_head(client: &mut tokio::io::DuplexStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = client.read(&mut byte).await.expect("ответ фронта");
+            assert_ne!(n, 0, "фронт закрыл соединение: {}", String::from_utf8_lossy(&head));
+            head.push(byte[0]);
+        }
+        String::from_utf8_lossy(&head).into_owned()
+    }
+
+    #[tokio::test]
+    async fn test_web_websocket_upgrade() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // LLD-38 п. 2.4: `101` проходит насквозь, байты идут в обе стороны,
+        // закрытие с одной стороны доезжает до другой.
+        let s = stand(HubMode::Route(far_future()), DuplexDialer::serving());
+        let token = s.state.sessions.open("dash", "owner", now_unix());
+        let mut client = browser_socket(&s.state);
+
+        client.write_all(&upgrade_request(&token, "/live")).await.unwrap();
+        let head = read_head(&mut client).await;
+        assert!(head.starts_with("HTTP/1.1 101 Switching Protocols"), "{head}");
+        assert!(head.to_ascii_lowercase().contains("upgrade: websocket"), "{head}");
+        assert!(
+            head.contains("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+            "ответ агента едет как есть, посредник в рукопожатие не лезет: {head}"
+        );
+        assert_eq!(s.state.pool.idle_count("dash"), 0, "апгрейд забрал соединение из пула");
+
+        // Кадр браузера доезжает до агента, эхо возвращается: сплайс идёт в обе
+        // стороны, и содержимое кадра посредник не трогает.
+        client.write_all(b"\x81\x83\x01\x02\x03\x04hey").await.unwrap();
+        let mut back = [0u8; 9];
+        client.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"\x81\x83\x01\x02\x03\x04hey");
+
+        // Браузер ушёл: агент обязан увидеть конец, а не остаться с висящим
+        // сплайсом до потолка relay.
+        drop(client);
+        for _ in 0..200 {
+            if s.dialer.ws_closed.load(Ordering::SeqCst) == 1 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("закрытие браузера до агента не доехало");
+    }
+
+    #[tokio::test]
+    async fn test_web_upgrade_closes_before_splice_cap() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Потолок сплайса рубит соединение жёстко и молча, и для живой ленты
+        // это неотличимо от зависания. Фронт закрывает апгрейд сам и раньше,
+        // штатным `1001 going away`, чтобы приложение переподключилось.
+        let s = stand_capped(HubMode::Route(far_future()), DuplexDialer::serving(), 1);
+        let token = s.state.sessions.open("dash", "owner", now_unix());
+        let mut client = browser_socket(&s.state);
+
+        client.write_all(&upgrade_request(&token, "/live")).await.unwrap();
+        let head = read_head(&mut client).await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+
+        let started = std::time::Instant::now();
+        let mut close = [0u8; 4];
+        tokio::time::timeout(std::time::Duration::from_secs(10), client.read_exact(&mut close))
+            .await
+            .expect("штатное закрытие обязано прийти само")
+            .expect("кадр закрытия");
+        assert_eq!(
+            close,
+            crate::upgrade::SERVER_CLOSE_GOING_AWAY,
+            "закрытие штатное: код 1001, а не обрыв"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "закрытие обязано опередить потолок в секунду, а пришло за {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_to_an_offline_agent_is_refused_by_name() {
+        use tokio::io::AsyncWriteExt;
+        // Машина выключена: апгрейд отказывают страницей с причиной за один
+        // заход, а не подвешивают до таймаута. Браузер увидит на этом месте
+        // отказ рукопожатия, скрипт проверки 502.
+        let s = stand(HubMode::Route(far_future()), DuplexDialer::offline());
+        let token = s.state.sessions.open("dash", "owner", now_unix());
+        let mut client = browser_socket(&s.state);
+
+        client.write_all(&upgrade_request(&token, "/live")).await.unwrap();
+        let head = tokio::time::timeout(std::time::Duration::from_secs(5), read_head(&mut client))
+            .await
+            .expect("отказ обязан прийти сразу");
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+        assert_eq!(s.dialer.dials.load(Ordering::SeqCst), 1, "ретрай-шторма нет");
+    }
+
+    #[tokio::test]
+    async fn upgrade_that_the_browser_did_not_ask_for_is_refused() {
+        // Агент ответил `101` на обычный запрос: отдать такое браузеру нельзя,
+        // а соединение уже не HTTP. Оно уходит из пула, браузер получает 502.
+        let s = stand(HubMode::Route(far_future()), DuplexDialer::serving());
+        let cookie = cookie_value(&sign_in(&s.state, HOST).await);
+        // Стенд отвечает `101` на любой запрос с апгрейдом, а ручку на
+        // переключение своего конца даёт только настоящий листенер: роутер
+        // напрямую её не кладёт, чем этот случай и воспроизводится.
+        let resp = call(
+            &s.state,
+            get(HOST, "/live")
+                .header(header::COOKIE, &cookie)
+                .header("connection", "Upgrade")
+                .header("upgrade", "websocket")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(text(resp).await.contains("переключил протокол"));
+        assert_eq!(s.state.pool.idle_count("dash"), 0, "не-HTTP соединение в пул не возвращается");
     }
 
     #[tokio::test]
