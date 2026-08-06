@@ -379,6 +379,61 @@ pub struct RelayToken {
     pub signature: String,
 }
 
+/// Публикация локального HTTP-сервиса, как её помнит хаб (LLD-38 п. 2.1):
+/// имя, агент и момент заведения. Апстрим сюда не едет: это внутренний адрес
+/// машины владельца, посреднику он не нужен, а проксирует агент по своему
+/// конфигу. Имя уникально в пределах хаба, потому что оно же поддомен, а
+/// поддомен адресует ровно одну машину.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExposeRecord {
+    /// Имя публикации, оно же поддомен: DNS-метка (см. [`valid_publication_name`]).
+    pub name: String,
+    /// Base64 (standard) ed25519 ключ агента, которому принадлежит публикация.
+    pub agent_pubkey: String,
+    /// Когда завели, RFC 3339.
+    #[serde(default)]
+    pub created: String,
+}
+
+/// Мандат публикации (LLD-38 п. 3.4): хаб подписывает, агент проверяет офлайн
+/// тем же ключом, которым проверяет токены шар. Отдельный тип, а не скоуп
+/// внутри [`ShareToken`]: держатель relay-токена на шару того же агента иначе
+/// дотянулся бы до локального сервиса, подставив заголовок публикации.
+/// Relay-токен разрешает транзит к машине, но не выбор того, что на ней
+/// открыто.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExposeToken {
+    /// Имя публикации, к которой мандат допускает.
+    pub publication: String,
+    /// Base64 (standard) ed25519 ключ агента, на котором эта публикация живёт.
+    pub agent_pubkey: String,
+    /// Срок, unix-секунды.
+    pub exp: u64,
+    /// Base64 (standard) 64-байтной подписи ed25519.
+    pub signature: String,
+}
+
+/// Заголовок, которым посредник (`xr-web`, харнесс `expose open`) называет
+/// публикацию на реверс-стриме. Без него запрос обслуживает роутер шары, как и
+/// до LLD-38.
+pub const EXPOSE_HEADER: &str = "x-xr-expose";
+
+/// Куда переезжает `Authorization` браузера: сам `Authorization` на запросе к
+/// публикации занят мандатом, а приложению за апстримом свой заголовок может
+/// быть нужен. Агент возвращает его на место перед тем, как проксировать.
+pub const FORWARDED_AUTH_HEADER: &str = "x-xr-forwarded-authorization";
+
+/// Годится ли имя публикации в поддомен: DNS-метка из строчных букв, цифр и
+/// дефисов, 1..=63 символа, дефис не с краю. Проверяют оба конца, хаб и агент:
+/// имя едет в `Host`, и всё, что не метка, до агента просто не доберётся.
+pub fn valid_publication_name(name: &str) -> bool {
+    let ok_len = (1..=63).contains(&name.len());
+    let ok_chars = name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    ok_len && ok_chars && !name.starts_with('-') && !name.ends_with('-')
+}
+
 /// The agent's answer to the relay's registration challenge (LLD-23 §2.1): its
 /// hub-signed [`AgentCredential`] plus an ed25519 signature over the relay's
 /// nonce made with the **identity key**. Together they prove both "the hub
@@ -440,6 +495,15 @@ pub fn agent_credential_signing_bytes(agent_pubkey: &str, exp: u64) -> Vec<u8> {
 /// replayed as a share token or agent credential.
 pub fn relay_token_signing_bytes(share_id: &str, agent_pubkey: &str, exp: u64) -> Vec<u8> {
     format!("xr-relay-token\nv1\n{share_id}\n{agent_pubkey}\n{exp}").into_bytes()
+}
+
+/// Байты, которые накрывает подпись [`ExposeToken`] (LLD-38 п. 3.4). Тот же
+/// newline-разделённый вид, что у остальных мандатов, со своим доменом
+/// (`xr-expose-token`) и вплавленным ключом агента: мандат привязан и к имени
+/// публикации, и к машине, поэтому его нельзя переиграть ни как токен шары, ни
+/// как relay-токен, ни как мандат на чужого агента.
+pub fn expose_token_signing_bytes(publication: &str, agent_pubkey: &str, exp: u64) -> Vec<u8> {
+    format!("xr-expose-token\nv1\n{publication}\n{agent_pubkey}\n{exp}").into_bytes()
 }
 
 /// The exact bytes an agent signs to answer the relay's registration challenge
@@ -596,6 +660,37 @@ impl core::fmt::Display for RelayTokenError {
 
 impl std::error::Error for RelayTokenError {}
 
+/// Почему агент отверг мандат публикации. Варианты разведены, чтобы отказ был
+/// разбираем по логу без самого мандата в нём.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExposeTokenError {
+    /// Подпись не base64 или не 64 байта.
+    MalformedSignature,
+    /// Подпись не сошлась с пришпиленным ключом хаба.
+    BadSignature,
+    /// Срок вышел.
+    Expired,
+    /// Мандат выписан на другую публикацию.
+    WrongPublication,
+    /// Мандат выписан на другого агента.
+    WrongAgent,
+}
+
+impl core::fmt::Display for ExposeTokenError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = match self {
+            Self::MalformedSignature => "malformed expose-token signature",
+            Self::BadSignature => "expose-token signature does not verify",
+            Self::Expired => "expose-token has expired",
+            Self::WrongPublication => "expose-token is for a different publication",
+            Self::WrongAgent => "expose-token is for a different agent",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::error::Error for ExposeTokenError {}
+
 /// Why a [`verify_relay_register`] check failed (LLD-23 §2.1). The relay logs the
 /// variant and drops the connection; every variant means "do not admit".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -628,10 +723,10 @@ impl std::error::Error for RelayRegisterError {}
 #[cfg(any(feature = "share", test))]
 mod crypto {
     use super::{
-        agent_credential_signing_bytes, manifest_signing_bytes, relay_register_signing_bytes,
-        relay_token_signing_bytes, token_signing_bytes, AgentCredential, AgentCredentialError,
-        ManifestSigError, RelayRegister, RelayRegisterError, RelayToken, RelayTokenError,
-        ShareToken, ShareTokenError,
+        agent_credential_signing_bytes, expose_token_signing_bytes, manifest_signing_bytes,
+        relay_register_signing_bytes, relay_token_signing_bytes, token_signing_bytes,
+        AgentCredential, AgentCredentialError, ExposeToken, ExposeTokenError, ManifestSigError,
+        RelayRegister, RelayRegisterError, RelayToken, RelayTokenError, ShareToken, ShareTokenError,
     };
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
@@ -778,6 +873,59 @@ mod crypto {
             .map_err(|_| RelayTokenError::BadSignature)
     }
 
+    /// Выписать мандат публикации (LLD-38 п. 3.4): хаб подписывает
+    /// `(publication, agent_pubkey, exp)` своим ключом. Зовётся только хабом,
+    /// проверяется только агентом.
+    pub fn sign_expose_token(
+        key: &SigningKey,
+        publication: &str,
+        agent_pubkey: &str,
+        exp: u64,
+    ) -> ExposeToken {
+        let sig = key.sign(&expose_token_signing_bytes(publication, agent_pubkey, exp));
+        ExposeToken {
+            publication: publication.to_string(),
+            agent_pubkey: agent_pubkey.to_string(),
+            exp,
+            signature: base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()),
+        }
+    }
+
+    /// Проверить мандат публикации офлайн пришпиленным ключом хаба: для
+    /// публикации `expected_publication` на агенте `expected_agent_pubkey` в
+    /// момент `now_unix`. Дешёвые привязки и срок раньше подписи, но отвергают
+    /// все ветки: пропустить мандат мимо проверки нельзя ни одной из них.
+    pub fn verify_expose_token(
+        token: &ExposeToken,
+        hub_key: &VerifyingKey,
+        expected_publication: &str,
+        expected_agent_pubkey: &str,
+        now_unix: u64,
+    ) -> Result<(), ExposeTokenError> {
+        if token.publication != expected_publication {
+            return Err(ExposeTokenError::WrongPublication);
+        }
+        if token.agent_pubkey != expected_agent_pubkey {
+            return Err(ExposeTokenError::WrongAgent);
+        }
+        if token.exp <= now_unix {
+            return Err(ExposeTokenError::Expired);
+        }
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(token.signature.trim())
+            .map_err(|_| ExposeTokenError::MalformedSignature)?;
+        let sig_arr: [u8; 64] = sig_bytes
+            .try_into()
+            .map_err(|_| ExposeTokenError::MalformedSignature)?;
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        hub_key
+            .verify(
+                &expose_token_signing_bytes(&token.publication, &token.agent_pubkey, token.exp),
+                &signature,
+            )
+            .map_err(|_| ExposeTokenError::BadSignature)
+    }
+
     /// Answer a relay registration challenge (LLD-23 §2.1): sign the relay's
     /// `nonce` with the **identity key** and bundle it with the hub-issued
     /// `credential`. The agent calls this on the register stream.
@@ -871,9 +1019,10 @@ mod crypto {
 
 #[cfg(any(feature = "share", test))]
 pub use crypto::{
-    parse_agent_pubkey, sign_agent_credential, sign_relay_register, sign_relay_token,
-    sign_share_manifest, sign_share_token, verify_agent_credential, verify_relay_register,
-    verify_relay_token, verify_share_manifest, verify_share_token,
+    parse_agent_pubkey, sign_agent_credential, sign_expose_token, sign_relay_register,
+    sign_relay_token, sign_share_manifest, sign_share_token, verify_agent_credential,
+    verify_expose_token, verify_relay_register, verify_relay_token, verify_share_manifest,
+    verify_share_token,
 };
 
 #[cfg(test)]
@@ -1468,5 +1617,117 @@ mod tests {
         assert_eq!(g.candidate_addrs(), vec!["1.2.3.4"]);
         let back = serde_json::to_string(&g).unwrap();
         assert!(!back.contains("addrs"), "no extra addresses must not emit the field: {back}");
+    }
+
+    #[test]
+    fn test_expose_token_sign_verify() {
+        // LLD-38 п. 3.4: мандат публикации привязан и к имени, и к агенту, и к
+        // сроку. Годен ровно один набор, всё остальное отвергается.
+        let key = hub_key();
+        let vk = key.verifying_key();
+        let agent = "QUJD";
+        let token = sign_expose_token(&key, "dash", agent, 5000);
+
+        assert!(verify_expose_token(&token, &vk, "dash", agent, 4999).is_ok());
+
+        // Чужой ключ подписи.
+        let other = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+        assert_eq!(
+            verify_expose_token(&token, &other, "dash", agent, 4999),
+            Err(ExposeTokenError::BadSignature)
+        );
+
+        // Протух (момент срока уже поздно).
+        assert_eq!(
+            verify_expose_token(&token, &vk, "dash", agent, 5000),
+            Err(ExposeTokenError::Expired)
+        );
+
+        // Мандат на другую публикацию и на другого агента.
+        assert_eq!(
+            verify_expose_token(&token, &vk, "notes", agent, 4999),
+            Err(ExposeTokenError::WrongPublication)
+        );
+        assert_eq!(
+            verify_expose_token(&token, &vk, "dash", "WFla", 4999),
+            Err(ExposeTokenError::WrongAgent)
+        );
+
+        // Подмена полей без ключа ломает подпись: имя внутри подписи, а не
+        // рядом с ней.
+        let mut forged = token.clone();
+        forged.exp = 9999;
+        assert_eq!(
+            verify_expose_token(&forged, &vk, "dash", agent, 4999),
+            Err(ExposeTokenError::BadSignature)
+        );
+
+        // Мусор вместо подписи это отказ, а не паника.
+        let mut bad = token.clone();
+        bad.signature = "@@@".into();
+        assert_eq!(
+            verify_expose_token(&bad, &vk, "dash", agent, 4999),
+            Err(ExposeTokenError::MalformedSignature)
+        );
+        bad.signature = base64::engine::general_purpose::STANDARD.encode([0u8; 10]);
+        assert_eq!(
+            verify_expose_token(&bad, &vk, "dash", agent, 4999),
+            Err(ExposeTokenError::MalformedSignature)
+        );
+    }
+
+    #[test]
+    fn expose_token_domain_separated_from_share_and_relay() {
+        // Ради этого мандат и заведён отдельным типом (LLD-38 п. 3.4): подписи
+        // шары и транзита не должны открывать публикацию, даже если поля
+        // совпали по форме. Домены разные, значит и байты разные, значит ни
+        // одна подпись не переигрывается в другую.
+        assert_ne!(
+            expose_token_signing_bytes("dash", "QUJD", 1),
+            relay_token_signing_bytes("dash", "QUJD", 1)
+        );
+        assert_ne!(
+            expose_token_signing_bytes("dash", "QUJD", 1),
+            token_signing_bytes("dash", "share:read", 1)
+        );
+        assert_ne!(
+            expose_token_signing_bytes("dash", "QUJD", 1),
+            agent_credential_signing_bytes("QUJD", 1)
+        );
+
+        // И проверка это подтверждает на живых подписях: relay-токен с теми же
+        // полями не проходит как мандат публикации.
+        let key = hub_key();
+        let relay = sign_relay_token(&key, "dash", "QUJD", 5000);
+        let posing = ExposeToken {
+            publication: relay.share_id.clone(),
+            agent_pubkey: relay.agent_pubkey.clone(),
+            exp: relay.exp,
+            signature: relay.signature.clone(),
+        };
+        assert_eq!(
+            verify_expose_token(&posing, &key.verifying_key(), "dash", "QUJD", 4999),
+            Err(ExposeTokenError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn publication_name_must_be_a_dns_label() {
+        for good in ["dash", "d", "notes-2", "a1234567890"] {
+            assert!(valid_publication_name(good), "{good}");
+        }
+        for bad in [
+            "",
+            "Dash",
+            "da_sh",
+            "-dash",
+            "dash-",
+            "da.sh",
+            "dash sh",
+            &"a".repeat(64),
+        ] {
+            assert!(!valid_publication_name(bad), "{bad}");
+        }
+        assert!(valid_publication_name(&"a".repeat(63)));
     }
 }
