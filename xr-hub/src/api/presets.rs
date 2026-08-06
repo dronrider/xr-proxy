@@ -282,6 +282,7 @@ mod tests {
             presets: RwLock::new(presets),
             invites: RwLock::new(HashMap::new()),
             shares: RwLock::new(HashMap::new()),
+            exposes: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             config,
             signing: None,

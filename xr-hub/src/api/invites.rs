@@ -640,6 +640,7 @@ mod tests {
             presets: RwLock::new(HashMap::new()),
             invites: RwLock::new(invites),
             shares: RwLock::new(HashMap::new()),
+            exposes: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             config,
             signing: None,

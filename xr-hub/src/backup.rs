@@ -48,6 +48,10 @@ pub struct Manifest {
     pub presets: usize,
     pub invites: usize,
     pub shares: usize,
+    /// Публикации локальных сервисов (LLD-38). Поле дописано позже остальных,
+    /// поэтому старый архив читается без него.
+    #[serde(default)]
+    pub exposes: usize,
 }
 
 /// Собранный архив вместе с тем, что стоит сказать оператору вслух.
@@ -182,6 +186,7 @@ pub fn build_archive(
         presets: count_records(data, "presets"),
         invites: count_records(data, "invites"),
         shares: count_records(data, "shares"),
+        exposes: count_records(data, "expose"),
     };
     let manifest_json = serde_json::to_vec_pretty(&manifest).context("сериализация манифеста")?;
 
@@ -644,6 +649,7 @@ mod tests {
             "presets",
             "invites",
             "shares",
+            "expose",
             "releases",
             "setup-dist",
             "share-dist",
@@ -657,6 +663,7 @@ mod tests {
         std::fs::write(data_dir.join("invites/tok1.json"), r#"{"token":"tok1"}"#).unwrap();
         std::fs::write(data_dir.join("shares/sh1.json"), r#"{"share_id":"sh1"}"#).unwrap();
         std::fs::write(data_dir.join("shares/sh2.json"), r#"{"share_id":"sh2"}"#).unwrap();
+        std::fs::write(data_dir.join("expose/dash.json"), r#"{"name":"dash"}"#).unwrap();
         std::fs::write(data_dir.join("releases/0.9.0.apk"), vec![0u8; 4096]).unwrap();
         std::fs::write(data_dir.join("setup-dist/xr-server-linux-x86_64"), b"bin").unwrap();
         std::fs::write(data_dir.join("share-dist/xr-share-linux-x86_64"), vec![0u8; 4096]).unwrap();
@@ -712,6 +719,7 @@ mod tests {
             "presets/russia.json",
             "invites/tok1.json",
             "shares/sh1.json",
+            "expose/dash.json",
         ] {
             assert!(names.contains(&expected.to_string()), "нет {expected} в {names:?}");
         }
@@ -742,7 +750,10 @@ mod tests {
         // Ключ лежит внутри data_dir, но в архиве он ровно один раз.
         assert_eq!(names.iter().filter(|n| n.ends_with("signing.key")).count(), 1);
 
-        assert_eq!((manifest.presets, manifest.invites, manifest.shares), (2, 1, 2));
+        assert_eq!(
+            (manifest.presets, manifest.invites, manifest.shares, manifest.exposes),
+            (2, 1, 2, 1)
+        );
         assert_eq!(manifest.host, "hub-test");
         assert_eq!(manifest.created_at, "2026-07-31T04:17:00Z");
         assert_eq!(
@@ -772,7 +783,7 @@ mod tests {
         };
         let report = restore(&bytes, &targets, false, "1").unwrap();
 
-        assert_eq!(report.data_files, 5);
+        assert_eq!(report.data_files, 6);
         assert_eq!(report.key_state, KeyState::Fresh);
         assert_eq!(report.signing_key.as_deref(), Some(fresh.join("data/signing.key").as_path()));
         assert_eq!(

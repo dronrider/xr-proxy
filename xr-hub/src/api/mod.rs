@@ -6,6 +6,7 @@ pub mod presets;
 pub mod register;
 pub mod share_v2;
 pub mod shares;
+pub mod web;
 
 use std::sync::Arc;
 
@@ -74,7 +75,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         // XR-031: shares attach to invites; consumer lists its shares by invite.
         .route("/share/attach", post(share_v2::attach))
         .route("/share/detach", post(share_v2::detach))
-        .route("/invite/{token}/shares", get(share_v2::invite_shares));
+        .route("/invite/{token}/shares", get(share_v2::invite_shares))
+        // LLD-38: реестр публикаций локальных сервисов, тот же мандат агента.
+        .route("/expose/add", post(web::add))
+        .route("/expose", get(web::list))
+        .route("/expose/{name}", delete(web::remove))
+        .route("/expose/{name}/mandate", post(web::mandate));
 
     // Auth (no session required).
     let auth_routes = Router::new()
@@ -185,6 +191,7 @@ mod tests {
             presets: RwLock::new(HashMap::new()),
             invites: RwLock::new(HashMap::new()),
             shares: RwLock::new(HashMap::new()),
+            exposes: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             config,
             signing: None,

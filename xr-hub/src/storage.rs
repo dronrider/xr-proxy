@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use xr_proto::preset::{Invite, Preset};
-use xr_proto::share::ShareRecord;
+use xr_proto::share::{ExposeRecord, ShareRecord};
 
 /// Load all presets from `<data_dir>/presets/`.
 pub fn load_all_presets(data_dir: &Path) -> Result<HashMap<String, Preset>> {
@@ -121,6 +121,49 @@ pub fn save_share(data_dir: &Path, share: &ShareRecord) -> Result<()> {
 /// Delete a share's record file.
 pub fn delete_share_file(data_dir: &Path, share_id: &str) -> Result<()> {
     let path = data_dir.join("shares").join(format!("{share_id}.json"));
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
+    Ok(())
+}
+
+/// Прочитать публикации из `<data_dir>/expose/` (LLD-38 п. 2.1). Как и у шар,
+/// хаб держит только адресную запись: имя, агент, момент заведения. Апстрима в
+/// ней нет и быть не может, он остаётся в конфиге агента.
+pub fn load_all_exposes(data_dir: &Path) -> Result<HashMap<String, ExposeRecord>> {
+    let dir = data_dir.join("expose");
+    let mut map = HashMap::new();
+    if !dir.exists() {
+        return Ok(map);
+    }
+    for entry in std::fs::read_dir(&dir).context("reading expose dir")? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let data = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let rec: ExposeRecord = serde_json::from_str(&data)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        map.insert(rec.name.clone(), rec);
+    }
+    Ok(map)
+}
+
+/// Сохранить публикацию атомарно. Имя уже проверено как DNS-метка, поэтому в
+/// имя файла оно едет как есть: ни слеша, ни точки в метке не бывает.
+pub fn save_expose(data_dir: &Path, rec: &ExposeRecord) -> Result<()> {
+    let dir = data_dir.join("expose");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let target = dir.join(format!("{}.json", rec.name));
+    let data = serde_json::to_string_pretty(rec)?;
+    atomic_write(&target, data.as_bytes())
+}
+
+/// Убрать файл публикации.
+pub fn delete_expose_file(data_dir: &Path, name: &str) -> Result<()> {
+    let path = data_dir.join("expose").join(format!("{name}.json"));
     if path.exists() {
         std::fs::remove_file(&path)?;
     }
