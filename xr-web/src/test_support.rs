@@ -127,6 +127,9 @@ pub struct DuplexDialer {
     offline: bool,
     /// Отвечать `403`, как агент с отвергнутым мандатом.
     refuse_mandate: bool,
+    /// Таски агентских половинок: тест гасит их, когда ему нужно оборвать
+    /// транзит под уже открытым соединением.
+    agents: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl DuplexDialer {
@@ -135,6 +138,17 @@ impl DuplexDialer {
             dials: AtomicUsize::new(0),
             offline: false,
             refuse_mandate: false,
+            agents: Arc::default(),
+        }
+    }
+
+    /// Оборвать транзит всех выданных соединений: агентская половинка `duplex`
+    /// исчезает, как при обрыве сплайса на relay или уходе агента в
+    /// переподключение. Соединение при этом уже открыто и лежит в пуле, чем
+    /// этот случай и отличается от отказа на дозвоне.
+    pub fn kill_agents(&self) {
+        for task in self.agents.lock().expect("agents lock").drain(..) {
+            task.abort();
         }
     }
 
@@ -144,6 +158,7 @@ impl DuplexDialer {
             dials: AtomicUsize::new(0),
             offline: true,
             refuse_mandate: false,
+            agents: Arc::default(),
         }
     }
 
@@ -152,6 +167,7 @@ impl DuplexDialer {
             dials: AtomicUsize::new(0),
             offline: false,
             refuse_mandate: true,
+            agents: Arc::default(),
         }
     }
 }
@@ -168,9 +184,10 @@ impl Dialer for DuplexDialer {
             });
         }
         let refuse = self.refuse_mandate;
+        let agents = self.agents.clone();
         Box::pin(async move {
             let (ours, theirs) = tokio::io::duplex(64 * 1024);
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let service = hyper::service::service_fn(move |req: hyper::Request<Incoming>| async move {
                     Ok::<_, std::convert::Infallible>(echo(req, refuse).await)
                 });
@@ -179,6 +196,7 @@ impl Dialer for DuplexDialer {
                     .with_upgrades()
                     .await;
             });
+            agents.lock().expect("agents lock").push(task);
             Ok(Box::new(ours) as Box<dyn AgentIo>)
         })
     }

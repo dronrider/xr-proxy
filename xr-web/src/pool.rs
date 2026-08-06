@@ -317,6 +317,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn broken_connection_is_not_returned_to_the_pool() {
+        // Транзит оборвался под уже открытым соединением (relay срубил сплайс,
+        // агент ушёл в переподключение): дозвон при этом состоялся, а запрос
+        // упал. Мёртвому соединению в пуле не место, иначе следующий запрос
+        // получил бы отказ на ровном месте. Отказ на дозвоне и ответ агента
+        // `403` это другие пути, их держат свои тесты.
+        let dialer = Arc::new(DuplexDialer::serving());
+        let pool = AgentPool::new(dialer.clone());
+        let route = Arc::new(route_for("dash", 10_000));
+
+        assert!(get(&pool, route.clone()).await.contains("agent ok"));
+        assert_eq!(pool.idle_count("dash"), 1);
+
+        let mut lease = pool.checkout(route.clone()).await.expect("соединение из пула");
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 1, "взяли готовое, не дозванивались");
+        assert_eq!(pool.idle_count("dash"), 0, "аренда забрала соединение из пула");
+
+        dialer.kill_agents();
+        let req = hyper::Request::builder()
+            .uri("/")
+            .header("host", "dash.web.example.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(
+            lease.sender().send_request(req).await.is_err(),
+            "оборванный транзит обязан провалить запрос, а не подвесить его"
+        );
+        drop(lease);
+        assert_eq!(pool.idle_count("dash"), 0, "мёртвое соединение в пул не возвращается");
+
+        // Следующий запрос дозванивается заново и работает.
+        assert!(get(&pool, route).await.contains("agent ok"));
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn detached_lease_never_returns_to_the_pool() {
         // Шов под фазу 3: апгрейд забирает соединение насовсем.
         let dialer = Arc::new(DuplexDialer::serving());
