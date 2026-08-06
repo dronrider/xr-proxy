@@ -312,6 +312,19 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
 
+    /// Сколько тест ждёт байтов, прежде чем считать сплайс сломанным. Всё, что
+    /// он ждёт от другой стороны, ждётся с этим потолком: сплайс, разучившийся
+    /// пробрасывать конец потока, иначе подвешивает прогон вместо падения, и
+    /// регрессия выглядит не краснотой, а зависшим `cargo test`.
+    const TEST_WAIT: Duration = Duration::from_secs(5);
+
+    async fn within<F: std::future::Future>(what: &str, f: F) -> F::Output {
+        match tokio::time::timeout(TEST_WAIT, f).await {
+            Ok(v) => v,
+            Err(_) => panic!("{what}: не дождались за {} с", TEST_WAIT.as_secs()),
+        }
+    }
+
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (k, v) in pairs {
@@ -433,17 +446,18 @@ mod tests {
 
         browser.write_all(b"\x81\x03abc").await.unwrap();
         let mut got = [0u8; 5];
-        agent.read_exact(&mut got).await.unwrap();
+        within("кадр браузера до агента", agent.read_exact(&mut got)).await.unwrap();
         assert_eq!(&got, b"\x81\x03abc");
 
         agent.write_all(b"\x81\x03xyz").await.unwrap();
-        browser.read_exact(&mut got).await.unwrap();
+        within("кадр агента до браузера", browser.read_exact(&mut got)).await.unwrap();
         assert_eq!(&got, b"\x81\x03xyz");
 
-        // Браузер ушёл: агент обязан увидеть конец, а не ждать вечно.
+        // Браузер ушёл: агент обязан увидеть конец, а не ждать вечно. Ждём с
+        // потолком именно поэтому: без проброса конца это ожидание вечное.
         drop(browser);
         let mut rest = Vec::new();
-        agent.read_to_end(&mut rest).await.unwrap();
+        within("конец потока до агента", agent.read_to_end(&mut rest)).await.unwrap();
         assert!(rest.is_empty());
     }
 
@@ -462,22 +476,22 @@ mod tests {
         // Кадр начат, но не дописан: срок наступает ровно посреди него.
         agent.write_all(b"\x81\x05ab").await.unwrap();
         let mut head = [0u8; 4];
-        browser.read_exact(&mut head).await.unwrap();
+        within("начало кадра", browser.read_exact(&mut head)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(250)).await;
         agent.write_all(b"cde").await.unwrap();
 
         // Сначала доезжает хвост начатого кадра, и только потом наш close:
         // всунутый в середину, он приехал бы браузеру мусором.
         let mut tail = [0u8; 3];
-        browser.read_exact(&mut tail).await.unwrap();
+        within("хвост начатого кадра", browser.read_exact(&mut tail)).await.unwrap();
         assert_eq!(&tail, b"cde");
         let mut close = [0u8; 4];
-        browser.read_exact(&mut close).await.unwrap();
+        within("закрытие браузеру", browser.read_exact(&mut close)).await.unwrap();
         assert_eq!(close, SERVER_CLOSE_GOING_AWAY);
 
         // Агент получает своё закрытие тем же сроком, маскированное.
         let mut theirs = [0u8; 8];
-        agent.read_exact(&mut theirs).await.unwrap();
+        within("закрытие агенту", agent.read_exact(&mut theirs)).await.unwrap();
         assert_eq!(theirs[0], 0x88);
         assert_eq!(theirs[6] ^ theirs[2], 0x03);
         assert_eq!(theirs[7] ^ theirs[3], 0xE9);
