@@ -57,9 +57,22 @@ hub_url = "https://xr-hub.example.com"
 # [relay]
 # addr = "relay.example.com"        # адрес xr-relay (обычно тот же VPS)
 # port = 8444
+# splice_lifetime_secs = 3600       # то же, что в конфиге самого relay: хаб не
+#                                   # применяет это, а передаёт браузерному фронту,
+#                                   # чтобы тот закрывал долгие соединения штатно
 # [relay.obfuscation]
 # key = "YOUR_BASE64_KEY"
 # modifier = "positional_xor_rotate"
 # salt = 0xDEADBEEF
 # padding_min = 16
 # padding_max = 128
+
+# Браузерный вход к публикациям (LLD-38). Блок включает служебные ручки для
+# фронта xr-web: маршрут публикации, вердикт по паролю владельца и статус
+# публикаций. Секрет общий с конфигом xr-web, прав админки он не даёт, ключа
+# подписи фронт не видит вовсе. Без блока ручки отвечают 503, а реестр
+# публикаций (expose add/rm/ls на агенте) работает как работал.
+#
+# [web]
+# domain = "web.example.com"        # публикация открывается на <имя>.<domain>
+# shared_secret = "LONG_RANDOM"     # openssl rand -base64 32
