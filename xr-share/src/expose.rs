@@ -35,6 +35,11 @@ use xr_proto::share::{
 
 use crate::config::{AgentConfig, ExposeEntry};
 
+/// Куда уезжает внешнее имя, под которым публикацию открыл браузер, когда
+/// `Host` переписывается на апстрим. Имя обычное, его понимает всякий фреймворк
+/// за прокси; ставит его посредник, а агент лишь заполняет, если тот смолчал.
+const FORWARDED_HOST_HEADER: &str = "x-forwarded-host";
+
 /// Сколько ждём соединения с апстримом. Апстрим это локальный порт, и если он
 /// не отвечает за секунды, значит сервиса нет: браузеру лучше получить внятный
 /// отказ, чем висеть на минутном таймауте.
@@ -149,8 +154,18 @@ fn mandate_from_headers(headers: &HeaderMap) -> Option<ExposeToken> {
 /// Проксировать запрос на локальный апстрим: тело идёт потоком в обе стороны,
 /// служебные заголовки снимаются, `X-Xr-Forwarded-Authorization` возвращается
 /// на место `Authorization` (свой заголовок приложения занят был мандатом).
-/// `X-Forwarded-*` едут как их поставил посредник: агент не знает, по какой
-/// схеме пришёл браузер, и выдумывать её не должен.
+/// `X-Forwarded-Proto` едет как его поставил посредник: агент не знает, по
+/// какой схеме пришёл браузер, и выдумывать её не должен.
+///
+/// `Host` переписывается на адрес апстрима, а внешнее имя уезжает в
+/// `X-Forwarded-Host` (если посредник не назвал его сам). Так делает обычный
+/// reverse-proxy, и без этого публикация упирается ровно в те сервисы, ради
+/// которых заведена: webpack-dev-server, Vite и CRA сверяют `Host` со своим
+/// списком разрешённых и на внешнее имя отвечают `Invalid Host header`, то
+/// есть гейт пройден, а страница не открывается. Цена решения в том, что
+/// приложение, строящее абсолютные ссылки из `Host`, увидит локальный адрес:
+/// внешнее имя ему полагается брать из `X-Forwarded-Host`, как у любого
+/// сервиса за прокси.
 async fn proxy(upstream: &str, req: Request) -> Response {
     let (mut parts, body) = req.into_parts();
     parts.headers.remove(EXPOSE_HEADER);
@@ -160,6 +175,19 @@ async fn proxy(upstream: &str, req: Request) -> Response {
     }
     for name in HOP_BY_HOP {
         parts.headers.remove(name);
+    }
+    if let Some(outer) = parts.headers.remove(header::HOST) {
+        if !parts.headers.contains_key(FORWARDED_HOST_HEADER) {
+            parts.headers.insert(FORWARDED_HOST_HEADER, outer);
+        }
+    }
+    match HeaderValue::from_str(upstream) {
+        Ok(v) => {
+            parts.headers.insert(header::HOST, v);
+        }
+        // Апстрим проверен разбором конфига, сюда попасть неоткуда; если всё
+        // же попали, лучше уйти без Host, чем с чужим.
+        Err(e) => tracing::warn!("апстрим {upstream} не годится в Host: {e}"),
     }
 
     let stream = match tokio::time::timeout(
@@ -631,6 +659,44 @@ mod tests {
         );
         assert!(text.contains("x-forwarded-proto=https"), "{text}");
         assert!(text.contains("x-forwarded-host=dash.web.example.com"), "{text}");
+        // Host это адрес апстрима, а не внешнее имя: dev-серверы сверяют его
+        // со своим списком разрешённых и на чужое имя не отвечают вовсе.
+        assert!(text.contains(&format!("host={addr}")), "{text}");
+    }
+
+    #[tokio::test]
+    async fn host_is_rewritten_and_the_outer_name_survives() {
+        // Посредник назвал внешнее имя одним лишь Host (так придёт браузерный
+        // запрос, пока фронт не поставил X-Forwarded-Host): апстрим обязан
+        // получить свой адрес в Host, а внешнее имя в X-Forwarded-Host, иначе
+        // приложению неоткуда узнать, под каким именем его открыли.
+        let (addr, _h) = upstream().await;
+        let g = gate(&addr);
+        let req = axum::http::Request::builder()
+            .uri("/")
+            .header(header::HOST, "dash.web.example.com")
+            .header(EXPOSE_HEADER, "dash")
+            .header(header::AUTHORIZATION, format!("Bearer {}", mandate("dash")))
+            .body(Body::empty())
+            .unwrap();
+        let text = body_text(serve(&g, "dash", req).await).await;
+        assert!(text.contains(&format!("host={addr}")), "{text}");
+        assert!(text.contains("x-forwarded-host=dash.web.example.com"), "{text}");
+
+        // Посредник назвал имя сам: его слово и остаётся, второй строки не
+        // появляется.
+        let req = axum::http::Request::builder()
+            .uri("/")
+            .header(header::HOST, "127.0.0.1:9")
+            .header("x-forwarded-host", "dash.web.example.com")
+            .header(EXPOSE_HEADER, "dash")
+            .header(header::AUTHORIZATION, format!("Bearer {}", mandate("dash")))
+            .body(Body::empty())
+            .unwrap();
+        let text = body_text(serve(&g, "dash", req).await).await;
+        assert!(text.contains(&format!("host={addr}")), "{text}");
+        assert!(text.contains("x-forwarded-host=dash.web.example.com"), "{text}");
+        assert!(!text.contains("x-forwarded-host=127.0.0.1:9"), "{text}");
     }
 
     #[tokio::test]
