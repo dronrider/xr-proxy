@@ -98,6 +98,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ ttl_seconds: ttlSeconds }),
     }),
+
+  // Публикации локальных сервисов (LLD-38): реестр общий на хаб, поэтому
+  // владелец видит и снимает их из админки, не поднимая агента.
+  listExposes: () => request<ExposeRecord[]>('/admin/exposes'),
+  deleteExpose: (name: string) =>
+    request<void>(`/admin/exposes/${name}`, { method: 'DELETE' }),
 }
 
 // Types
@@ -198,6 +204,12 @@ export interface ShareRecord {
   agent_pubkey: string
   created_at: string
   comment: string
+}
+
+export interface ExposeRecord {
+  name: string
+  agent_pubkey: string
+  created: string
 }
 
 export interface CreateShareRequest {

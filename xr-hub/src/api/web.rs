@@ -22,8 +22,8 @@ use axum::Json;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use xr_proto::share::{
-    sign_expose_token, valid_publication_name, verify_agent_credential, AgentCredential,
-    ExposeRecord, ExposeToken,
+    sign_expose_token, sign_relay_token, valid_publication_name, verify_agent_credential,
+    web_share_id, AgentCredential, ExposeRecord, ExposeToken, WebRoute,
 };
 
 use crate::api::register::now_unix;
@@ -211,6 +211,33 @@ pub async fn remove(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /api/v1/admin/exposes` - все публикации хаба для админки. Владелец
+/// смотрит их разделом «Публикации», не поднимая агента: реестр общий, а мандат
+/// агента у админа под рукой не всегда.
+pub async fn admin_list(State(state): State<Arc<AppState>>) -> Json<Vec<ExposeResp>> {
+    let exposes = state.exposes.read().await;
+    let mut out: Vec<ExposeResp> = exposes.values().map(ExposeResp::from).collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Json(out)
+}
+
+/// `DELETE /api/v1/admin/exposes/{name}` - снять любую публикацию из админки.
+/// Это дверь владельца хаба: агента может не быть на связи вовсе, а поддомен
+/// освободить надо.
+pub async fn admin_remove(
+    State(state): State<Arc<AppState>>,
+    AxPath(name): AxPath<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let mut exposes = state.exposes.write().await;
+    if exposes.remove(&name).is_none() {
+        return Err((StatusCode::NOT_FOUND, "публикация не найдена".into()));
+    }
+    drop(exposes);
+    crate::storage::delete_expose_file(Path::new(&state.config.server.data_dir), &name)
+        .map_err(|e| crate::api::persist_failed("снятие публикации", e))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // Мандат публикации.
 
 #[derive(Debug, Deserialize)]
@@ -265,6 +292,301 @@ pub fn encode_mandate(token: &ExposeToken) -> String {
         .encode(serde_json::to_vec(token).expect("serialize expose token"))
 }
 
+// Служебные ручки браузерного фронта (LLD-38 п. 3.5).
+//
+// Это единственная дверь `xr-web` в хаб, и она умышленно узкая: маршрут
+// публикации, вердикт по паролю и состояние публикаций. Прав админки у фронта
+// нет (сессию ему не дают), приватного ключа хаба тоже, поэтому взломанный
+// фронт не выпишет себе мандат на агента, которого хаб ему не отдавал.
+
+/// Сколько живёт выданный фронту маршрут: час. Кеш маршрута на фронте живёт до
+/// `exp` минус запас, поэтому чаще раза в час хаб об одной публикации не
+/// спрашивают, а окно у утёкшего маршрута остаётся коротким.
+const WEB_ROUTE_TTL: u64 = 3600;
+
+/// Сколько неверных паролей подряд проходят без задержки. Владелец промахивается
+/// раскладкой, перебор упирается в задержку с четвёртой попытки.
+const PASSWORD_FREE_ATTEMPTS: u32 = 3;
+/// Потолок задержки: пять минут. Дальше расти незачем, перебор при таком шаге
+/// уже мёртв, а владелец с честной опечаткой не заперт на сутки.
+const PASSWORD_MAX_DELAY_MS: u64 = 5 * 60 * 1000;
+
+/// Проверить общий секрет служебных ручек: `Authorization: Bearer <секрет>`.
+/// Сравнение постоянного времени, отказ без подробностей о том, что именно не
+/// сошлось. Блок `[web]` не задан значит браузерный вход выключен, и ручка
+/// говорит это прямо, а не притворяется отказом авторизации.
+fn require_web_secret(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+    use subtle::ConstantTimeEq;
+    let web = state.config.web.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "браузерный вход не настроен: нет блока [web]".to_string(),
+    ))?;
+    let presented = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or("");
+    let ok: bool = presented
+        .as_bytes()
+        .ct_eq(web.shared_secret.as_bytes())
+        .into();
+    if ok && !web.shared_secret.is_empty() {
+        Ok(())
+    } else {
+        Err((StatusCode::UNAUTHORIZED, "нужен общий секрет [web]".into()))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RouteReq {
+    /// Имя публикации из `Host` браузерного запроса.
+    pub publication: String,
+}
+
+/// `POST /api/v1/web/route` - собрать маршрут публикации для браузерного
+/// фронта: агент, relay с транзитным токеном, мандат публикации и потолок жизни
+/// сплайса. Минт делает хаб, потому что только у него есть ключ подписи.
+pub async fn route(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<RouteReq>,
+) -> Result<Json<WebRoute>, (StatusCode, String)> {
+    require_web_secret(&state, &headers)?;
+    let signing = signing_or_503(&state)?;
+    let relay = state.config.relay.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "у хаба нет relay: браузерному входу не через что идти".to_string(),
+    ))?;
+    let name = checked_name(&req.publication)?;
+
+    let agent_pubkey = {
+        let exposes = state.exposes.read().await;
+        exposes
+            .get(&name)
+            .ok_or((StatusCode::NOT_FOUND, "публикация не найдена".into()))?
+            .agent_pubkey
+            .clone()
+    };
+
+    let exp = now_unix().saturating_add(WEB_ROUTE_TTL);
+    Ok(Json(WebRoute {
+        publication: name.clone(),
+        agent_pubkey: agent_pubkey.clone(),
+        relay: relay.descriptor(),
+        relay_token: sign_relay_token(
+            &signing.signing_key,
+            &web_share_id(&name),
+            &agent_pubkey,
+            exp,
+        ),
+        expose_token: sign_expose_token(&signing.signing_key, &name, &agent_pubkey, exp),
+        exp,
+        splice_lifetime_secs: relay.splice_lifetime_secs,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyPasswordReq {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VerifyPasswordResp {
+    /// Только вердикт: своей учётной базы у фронта нет, а подробности отказа
+    /// ему знать незачем.
+    pub ok: bool,
+}
+
+/// `POST /api/v1/web/verify-password` - вердикт по паролю владельца для входа
+/// на публикацию (LLD-38 п. 3.2). Второго пароля владельцу не заводим, хэши
+/// живут там же, где жили, а фронт получает `true`/`false`.
+pub async fn verify_password(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<VerifyPasswordReq>,
+) -> Result<Json<VerifyPasswordResp>, (StatusCode, String)> {
+    verify_password_at(&state, &headers, &req, now_ms())
+}
+
+/// Та же проверка с явным «сейчас» в миллисекундах: лимит попыток проверяется
+/// временем, и тест обязан двигать его сам, а не спать.
+pub fn verify_password_at(
+    state: &AppState,
+    headers: &HeaderMap,
+    req: &VerifyPasswordReq,
+    now_ms: u64,
+) -> Result<Json<VerifyPasswordResp>, (StatusCode, String)> {
+    require_web_secret(state, headers)?;
+    if let Some(wait_ms) = state.web_attempts.blocked_for(&req.username, now_ms) {
+        let secs = wait_ms.div_ceil(1000);
+        tracing::warn!(
+            "вход на браузерный фронт: попытки {} упёрлись в задержку, ещё {secs} с",
+            req.username
+        );
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("слишком много попыток, повторить через {secs} с"),
+        ));
+    }
+    if crate::api::auth::password_matches(&state.config, &req.username, &req.password) {
+        state.web_attempts.succeeded(&req.username);
+        Ok(Json(VerifyPasswordResp { ok: true }))
+    } else {
+        state.web_attempts.failed(&req.username, now_ms);
+        tracing::warn!("вход на браузерный фронт: неверный пароль для {}", req.username);
+        Ok(Json(VerifyPasswordResp { ok: false }))
+    }
+}
+
+/// Состояние одной публикации: кто её держит и на связи ли он сейчас.
+#[derive(Debug, Serialize)]
+pub struct PublicationStatus {
+    pub name: String,
+    pub agent_pubkey: String,
+    pub created: String,
+    /// Полное имя, по которому публикация открывается в браузере. Пусто, если
+    /// web-домен в конфиге не задан.
+    pub host: String,
+    /// `true` агент в реестре relay, `false` его там нет, `null` спросить не
+    /// вышло (см. `probe_error`): «не знаю» и «выключен» это разные ответы.
+    pub online: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_error: Option<String>,
+}
+
+/// `GET /api/v1/web/status` - публикации и их живость (LLD-38 п. 2.5).
+/// Неработающая публикация отличима от работающей без чтения логов.
+pub async fn status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<PublicationStatus>>, (StatusCode, String)> {
+    require_web_secret(&state, &headers)?;
+    let probe = |name: String, agent: String| {
+        let state = state.clone();
+        async move { probe_via_relay(&state, &name, &agent).await }
+    };
+    status_with(&state, probe).await.map(Json)
+}
+
+/// Та же сборка статуса с внешней проверкой живости: тест подставляет свой
+/// вердикт, а настоящий поход на relay проверяется в `xr-proto`.
+pub async fn status_with<F, Fut>(state: &AppState, probe: F) -> Result<Vec<PublicationStatus>, (StatusCode, String)>
+where
+    F: Fn(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, String>>,
+{
+    let domain = state.config.web.as_ref().map(|w| w.domain.clone()).unwrap_or_default();
+    let records: Vec<ExposeRecord> = {
+        let exposes = state.exposes.read().await;
+        let mut v: Vec<ExposeRecord> = exposes.values().cloned().collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    };
+    let mut out = Vec::with_capacity(records.len());
+    for rec in records {
+        let (online, probe_error) = match probe(rec.name.clone(), rec.agent_pubkey.clone()).await {
+            Ok(v) => (Some(v), None),
+            Err(e) => (None, Some(e)),
+        };
+        out.push(PublicationStatus {
+            host: if domain.is_empty() { String::new() } else { format!("{}.{}", rec.name, domain) },
+            name: rec.name,
+            agent_pubkey: rec.agent_pubkey,
+            created: rec.created,
+            online,
+            probe_error,
+        });
+    }
+    Ok(out)
+}
+
+/// Сколько ждём вердикта relay о живости агента. Статус это диагностика, и
+/// висеть на ней дольше пары секунд незачем: неответивший relay честно уходит в
+/// «спросить не вышло».
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Спросить relay, на связи ли агент: открыть транзитный стрим по свежему
+/// токену и сразу закрыть. Своего состояния о живости хаб не держит и кода
+/// relay не трогает (LLD-38 п. 2.5).
+async fn probe_via_relay(state: &AppState, name: &str, agent_pubkey: &str) -> Result<bool, String> {
+    let signing = state.signing.as_ref().ok_or("у хаба нет ключа подписи")?;
+    let relay = state.config.relay.as_ref().ok_or("у хаба не настроен relay")?;
+    let token = sign_relay_token(
+        &signing.signing_key,
+        &web_share_id(name),
+        agent_pubkey,
+        now_unix() + 60,
+    );
+    let grant = xr_proto::share::RelayGrant {
+        addr: relay.addr.clone(),
+        port: relay.port,
+        obf: relay.obf.clone(),
+        relay_token: token,
+    };
+    let endpoint = xr_proto::relay_client::RelayEndpoint::from_grant(&grant)?;
+    match tokio::time::timeout(PROBE_TIMEOUT, xr_proto::relay_client::probe_agent_online(&endpoint))
+        .await
+    {
+        Ok(Ok(online)) => Ok(online),
+        Ok(Err(e)) => Err(format!("relay недоступен: {e}")),
+        Err(_) => Err("relay не ответил вовремя".into()),
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Счётчик неверных паролей на имя владельца с растущей задержкой (LLD-38
+/// п. 3.2). Живёт в памяти хаба: рестарт сбрасывает счётчики, и это осознанно,
+/// перебор через рестарт чужого процесса не ускоряется.
+#[derive(Default)]
+pub struct PasswordAttempts {
+    inner: std::sync::Mutex<std::collections::HashMap<String, Attempt>>,
+}
+
+#[derive(Default)]
+struct Attempt {
+    failures: u32,
+    /// Когда истекает задержка после последнего промаха, мс от эпохи.
+    blocked_until_ms: u64,
+}
+
+impl PasswordAttempts {
+    /// Сколько ещё миллисекунд имя под задержкой; `None` значит проверка
+    /// разрешена прямо сейчас.
+    pub fn blocked_for(&self, username: &str, now_ms: u64) -> Option<u64> {
+        let map = self.inner.lock().expect("attempts lock");
+        let a = map.get(username)?;
+        (a.blocked_until_ms > now_ms).then(|| a.blocked_until_ms - now_ms)
+    }
+
+    /// Промах: счётчик растёт, задержка удваивается после первых свободных
+    /// попыток.
+    pub fn failed(&self, username: &str, now_ms: u64) {
+        let mut map = self.inner.lock().expect("attempts lock");
+        let a = map.entry(username.to_string()).or_default();
+        a.failures = a.failures.saturating_add(1);
+        let over = a.failures.saturating_sub(PASSWORD_FREE_ATTEMPTS);
+        let delay = if over == 0 {
+            0
+        } else {
+            (1000u64 << (over - 1).min(20)).min(PASSWORD_MAX_DELAY_MS)
+        };
+        a.blocked_until_ms = now_ms.saturating_add(delay);
+    }
+
+    /// Верный пароль снимает и счётчик, и задержку.
+    pub fn succeeded(&self, username: &str) {
+        self.inner.lock().expect("attempts lock").remove(username);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,10 +609,31 @@ mod tests {
     }
 
     fn state_with(dir: &Path, hub: SigningKey) -> Arc<AppState> {
-        let text = format!(
-            "[server]\ndata_dir = {:?}\n[admin]\nusers = []\n",
-            dir.display().to_string()
-        );
+        state_from(dir, hub, "[admin]\nusers = []\n")
+    }
+
+    /// Состояние с настроенным браузерным входом: общий секрет, web-домен,
+    /// relay и учётка владельца (пароль `owner-secret`).
+    fn state_web(dir: &Path, hub: SigningKey) -> Arc<AppState> {
+        let hash = crate::api::auth::hash_password("owner-secret").unwrap();
+        state_from(
+            dir,
+            hub,
+            &format!(
+                concat!(
+                    "[admin]\n[[admin.users]]\nusername = \"owner\"\npassword_hash = {hash:?}\n",
+                    "[web]\ndomain = \"web.example.com\"\nshared_secret = \"s3cret\"\n",
+                    "[relay]\naddr = \"relay.example.com\"\nport = 8444\n",
+                    "splice_lifetime_secs = 900\n",
+                    "[relay.obfuscation]\nkey = \"dGVzdC1rZXktMzItYnl0ZXMtbG9uZy1lbm91Z2ghISE=\"\n",
+                ),
+                hash = hash
+            ),
+        )
+    }
+
+    fn state_from(dir: &Path, hub: SigningKey, extra: &str) -> Arc<AppState> {
+        let text = format!("[server]\ndata_dir = {:?}\n{extra}", dir.display().to_string());
         let config: HubConfig = toml::from_str(&text).unwrap();
         Arc::new(AppState {
             presets: RwLock::new(HashMap::new()),
@@ -301,6 +644,7 @@ mod tests {
             config,
             signing: Some(SigningContext { signing_key: hub }),
             preset_gen: tokio::sync::watch::Sender::new(0),
+            web_attempts: Default::default(),
         })
     }
 
@@ -470,5 +814,199 @@ mod tests {
             assert_eq!(err.0, StatusCode::BAD_REQUEST, "{name}");
         }
         assert!(crate::storage::load_all_exposes(dir.path()).unwrap().is_empty());
+    }
+
+    fn secret(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", format!("Bearer {value}").parse().unwrap());
+        h
+    }
+
+    /// Завести публикацию `dash` на агенте с ключом `agent_pk(7)`.
+    async fn with_dash(state: &Arc<AppState>, hub: &SigningKey) {
+        let cred = cred_blob(hub, &agent_pk(7));
+        let _ = add(
+            State(state.clone()),
+            Json(AddExposeReq { credential: cred, name: "dash".into() }),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Маршрут это дверь фронта в хаб, и открывает её только общий секрет:
+    /// без заголовка и с чужим секретом ручка не отдаёт ничего, а с верным
+    /// собирает транзит на `web:<имя>` и мандат ровно на эту публикацию
+    /// (LLD-38 п. 2.3, п. 3.5).
+    #[tokio::test]
+    async fn web_route_is_gated_by_shared_secret() {
+        use xr_proto::share::verify_relay_token;
+        let dir = tempfile::tempdir().unwrap();
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let state = state_web(dir.path(), hub.clone());
+        with_dash(&state, &hub).await;
+
+        for headers in [HeaderMap::new(), secret("wrong"), secret("s3cre")] {
+            let err = route(
+                State(state.clone()),
+                headers,
+                Json(RouteReq { publication: "dash".into() }),
+            )
+            .await
+            .expect_err("без общего секрета маршрут не выдаётся");
+            assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        }
+
+        let Json(r) = route(
+            State(state.clone()),
+            secret("s3cret"),
+            Json(RouteReq { publication: "dash".into() }),
+        )
+        .await
+        .expect("с верным секретом маршрут собирается");
+        assert_eq!(r.agent_pubkey, agent_pk(7));
+        assert_eq!(r.relay.dial(), "relay.example.com:8444");
+        assert_eq!(r.splice_lifetime_secs, 900);
+        assert_eq!(r.relay_token.share_id, "web:dash", "расход виден отдельной строкой");
+        let now = now_unix();
+        assert!(verify_relay_token(
+            &r.relay_token,
+            &hub.verifying_key(),
+            "web:dash",
+            &agent_pk(7),
+            now
+        )
+        .is_ok());
+        assert!(
+            verify_expose_token(&r.expose_token, &hub.verifying_key(), "dash", &agent_pk(7), now)
+                .is_ok()
+        );
+        // Мандат бьётся ровно с этой публикацией: на соседнюю он не годится.
+        assert!(
+            verify_expose_token(&r.expose_token, &hub.verifying_key(), "notes", &agent_pk(7), now)
+                .is_err()
+        );
+
+        // Публикации нет в реестре: 404, а не маршрут в никуда.
+        let err = route(
+            State(state.clone()),
+            secret("s3cret"),
+            Json(RouteReq { publication: "ghost".into() }),
+        )
+        .await
+        .expect_err("публикации нет");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        // Без блока [web] браузерный вход выключен целиком, и ручка говорит
+        // это прямо, а не отказом авторизации.
+        let plain = state_with(dir.path(), hub);
+        let err = route(
+            State(plain),
+            secret("s3cret"),
+            Json(RouteReq { publication: "dash".into() }),
+        )
+        .await
+        .expect_err("браузерный вход не настроен");
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Перебор пароля упирается в задержку на стороне хаба, а верный пароль
+    /// после её истечения проходит: владелец с опечаткой не заперт (LLD-38
+    /// п. 3.2). Время двигаем сами, спать тесту незачем.
+    #[tokio::test]
+    async fn web_verify_password_rate_limits_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let state = state_web(dir.path(), hub);
+        let wrong = VerifyPasswordReq { username: "owner".into(), password: "nope".into() };
+        let right = VerifyPasswordReq { username: "owner".into(), password: "owner-secret".into() };
+        let mut t = 1_000_000u64;
+
+        // Первые промахи это просто вердикт «нет», без задержки.
+        for _ in 0..PASSWORD_FREE_ATTEMPTS {
+            let Json(v) = verify_password_at(&state, &secret("s3cret"), &wrong, t).unwrap();
+            assert!(!v.ok);
+        }
+        // Следующий промах взводит задержку, и в неё упирается даже верный пароль.
+        let Json(v) = verify_password_at(&state, &secret("s3cret"), &wrong, t).unwrap();
+        assert!(!v.ok);
+        let err = verify_password_at(&state, &secret("s3cret"), &right, t)
+            .expect_err("серия неверных упирается в задержку");
+        assert_eq!(err.0, StatusCode::TOO_MANY_REQUESTS);
+
+        // Задержка прошла: верный пароль пускает и сбрасывает счётчик.
+        t += 2_000;
+        let Json(v) = verify_password_at(&state, &secret("s3cret"), &right, t).unwrap();
+        assert!(v.ok, "после задержки верный пароль проходит");
+        let Json(v) = verify_password_at(&state, &secret("s3cret"), &right, t).unwrap();
+        assert!(v.ok, "успех снимает счётчик, второй вход не ждёт");
+
+        // Чужой секрет не пускает к ручке вовсе, вердикта не видно.
+        let err = verify_password_at(&state, &secret("wrong"), &right, t)
+            .expect_err("нужен общий секрет");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Статус показывает публикацию и её живость: вердикт проверки едет в
+    /// `online`, а неудавшаяся проверка это `null` с причиной, а не «выключен»
+    /// (LLD-38 п. 2.5).
+    #[tokio::test]
+    async fn web_status_shows_publications_and_liveness() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let state = state_web(dir.path(), hub.clone());
+        with_dash(&state, &hub).await;
+        let _ = add(
+            State(state.clone()),
+            Json(AddExposeReq { credential: cred_blob(&hub, &agent_pk(9)), name: "notes".into() }),
+        )
+        .await
+        .unwrap();
+
+        let out = status_with(&state, |name, _agent| async move {
+            match name.as_str() {
+                "dash" => Ok(true),
+                _ => Err("relay недоступен".to_string()),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["dash", "notes"]);
+        assert_eq!(out[0].online, Some(true));
+        assert_eq!(out[0].host, "dash.web.example.com");
+        assert_eq!(out[0].agent_pubkey, agent_pk(7));
+        assert_eq!(out[1].online, None, "спросить не вышло это не «выключен»");
+        assert_eq!(out[1].probe_error.as_deref(), Some("relay недоступен"));
+
+        // Агента нет в реестре relay: публикация видна и честно помечена.
+        let out = status_with(&state, |_n, _a| async { Ok(false) }).await.unwrap();
+        assert_eq!(out[0].online, Some(false));
+
+        // Ручка закрыта тем же общим секретом, что и маршрут.
+        let err = status(State(state), HeaderMap::new()).await.expect_err("нужен секрет");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Раздел «Публикации» в админке снимает публикацию и без агента: реестр
+    /// общий, а поддомен освобождать надо и с выключенной машины.
+    #[tokio::test]
+    async fn admin_sees_and_removes_any_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let state = state_web(dir.path(), hub.clone());
+        with_dash(&state, &hub).await;
+
+        let Json(list) = admin_list(State(state.clone())).await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "dash");
+
+        assert_eq!(
+            admin_remove(State(state.clone()), AxPath("dash".into())).await.unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(crate::storage::load_all_exposes(dir.path()).unwrap().is_empty());
+        let err = admin_remove(State(state), AxPath("dash".into()))
+            .await
+            .expect_err("снятой публикации нет");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 }

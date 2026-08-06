@@ -104,6 +104,7 @@ mod tests {
             config,
             signing: None,
             preset_gen: tokio::sync::watch::Sender::new(0),
+            web_attempts: Default::default(),
         })
     }
 

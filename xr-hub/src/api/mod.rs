@@ -80,7 +80,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/expose/add", post(web::add))
         .route("/expose", get(web::list))
         .route("/expose/{name}", delete(web::remove))
-        .route("/expose/{name}/mandate", post(web::mandate));
+        .route("/expose/{name}/mandate", post(web::mandate))
+        // LLD-38 п. 3.5: служебные ручки браузерного фронта под общим секретом
+        // [web]. Прав админки у фронта нет, ключа подписи он не видит.
+        .route("/web/route", post(web::route))
+        .route("/web/verify-password", post(web::verify_password))
+        .route("/web/status", get(web::status));
 
     // Auth (no session required).
     let auth_routes = Router::new()
@@ -99,6 +104,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/shares", post(shares::create_share))
         .route("/shares/{id}", delete(shares::delete_share))
         .route("/shares/{id}/token", post(shares::mint_token))
+        .route("/exposes", get(web::admin_list))
+        .route("/exposes/{name}", delete(web::admin_remove))
         .route("/shares/reg-token", post(register::create_reg_token))
         .route("/shares/setup-token", post(register::create_setup_token))
         .layer(middleware::from_fn_with_state(
@@ -196,6 +203,7 @@ mod tests {
             config,
             signing: None,
             preset_gen: tokio::sync::watch::Sender::new(0),
+            web_attempts: Default::default(),
         })
     }
 

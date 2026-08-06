@@ -15,6 +15,24 @@ pub struct HubConfig {
     /// on their direct address, they just get no relay fallback in the grant.
     #[serde(default)]
     pub relay: Option<HubRelayConfig>,
+    /// Браузерный вход (LLD-38 п. 3.5): общий секрет служебных ручек и домен,
+    /// на поддоменах которого живут публикации. Блока нет это выключенный
+    /// браузерный вход: служебные ручки отвечают `503`, реестр публикаций при
+    /// этом работает как работал.
+    #[serde(default)]
+    pub web: Option<WebConfig>,
+}
+
+/// Общий секрет и web-домен браузерного входа. Секрет разделён с `xr-web` и
+/// заменяет ему права админки: у транзитного сервиса их быть не должно, а
+/// приватного ключа хаба он не видит вовсе (LLD-38 п. 3.5).
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebConfig {
+    /// Домен, на поддоменах которого живут публикации: `<имя>.<domain>`.
+    /// Значение выбирает владелец, в коде оно нигде не зашито.
+    #[serde(default)]
+    pub domain: String,
+    pub shared_secret: String,
 }
 
 /// The relay descriptor the hub hands to agents (in `exchange`/`add`) and to
@@ -28,6 +46,12 @@ pub struct HubRelayConfig {
     /// `obf` on the wire descriptor.
     #[serde(rename = "obfuscation")]
     pub obf: xr_proto::share::RelayObf,
+    /// Потолок жизни одного сплайса на relay, секунды: то же значение, что в
+    /// `[relay] splice_lifetime_secs` самого relay. Хаб его не применяет, а
+    /// передаёт браузерному фронту в маршруте, чтобы тот закрывал долгие
+    /// соединения штатно до обрыва (LLD-38 п. 2.4).
+    #[serde(default = "default_splice_lifetime")]
+    pub splice_lifetime_secs: u64,
 }
 
 impl HubRelayConfig {
@@ -173,6 +197,9 @@ fn default_max_ttl() -> u64 {
 }
 fn default_server_port() -> u16 {
     8443
+}
+fn default_splice_lifetime() -> u64 {
+    3600
 }
 fn default_modifier() -> String {
     "positional_xor_rotate".into()

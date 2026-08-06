@@ -609,6 +609,7 @@ mod tests {
             config,
             signing: Some(SigningContext { signing_key: hub }),
             preset_gen: tokio::sync::watch::Sender::new(0),
+            web_attempts: Default::default(),
         })
     }
 

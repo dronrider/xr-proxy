@@ -326,6 +326,7 @@ mod tests {
                 signing_key: SigningKey::from_bytes(&[42u8; 32]),
             }),
             preset_gen: tokio::sync::watch::Sender::new(0),
+            web_attempts: Default::default(),
         })
     }
 
@@ -386,6 +387,7 @@ mod tests {
                 signing_key: SigningKey::from_bytes(&[42u8; 32]),
             }),
             preset_gen: tokio::sync::watch::Sender::new(0),
+            web_attempts: Default::default(),
         })
     }
 

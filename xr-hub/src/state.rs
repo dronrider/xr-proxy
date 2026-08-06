@@ -26,6 +26,9 @@ pub struct AppState {
     /// все пресеты: разбудить лишних дешевле, чем вести канал на имя, чужой
     /// подписчик сверит свою версию и перевзведётся.
     pub preset_gen: watch::Sender<u64>,
+    /// Счётчик неверных паролей на ручке браузерного входа (LLD-38 п. 3.2):
+    /// перебор гасится задержкой на стороне хаба, а не только на фронте.
+    pub web_attempts: crate::api::web::PasswordAttempts,
 }
 
 /// Load state from disk and build AppState.
@@ -67,5 +70,6 @@ pub fn hydrate(config: HubConfig) -> Result<Arc<AppState>> {
         config,
         signing,
         preset_gen: watch::Sender::new(0),
+        web_attempts: Default::default(),
     }))
 }

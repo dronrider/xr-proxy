@@ -19,6 +19,7 @@ function logout() {
         <router-link to="/presets">Presets</router-link>
         <router-link to="/invites">Invites</router-link>
         <router-link to="/shares">Shares</router-link>
+        <router-link to="/exposes">Публикации</router-link>
       </nav>
       <div class="header-right">
         <span class="username">{{ auth.username }}</span>
