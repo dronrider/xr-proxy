@@ -35,10 +35,22 @@ use xr_proto::share::{
 // [`transfer_cancel`] to abort. The download loop checks the cancel flag between
 // chunks and reports bytes, so a multi-GB transfer can be stopped promptly. Kept
 // global to avoid threading a handle through every signature.
+//
+// Отмена адресная: у каждой передачи свой номер, и отменяется передача по
+// номеру, а не «та, что сейчас идёт» (XR-217). Пока флаг отмены был один на
+// весь процесс, отмена долетала до чужой передачи: UI смотрит снимок, решает,
+// что отменять надо, и зовёт отмену следующим вызовом, а между этими двумя
+// шагами прежняя передача успевает закончиться и стартует следующая. Так
+// отмена шары A обрывала только что начатое скачивание шары B. Номер снимается
+// из того же снимка, по которому принято решение, поэтому опоздавшая отмена
+// просто никуда не попадает.
 
 struct TransferControl {
     active: AtomicBool,
-    cancel: AtomicBool,
+    /// Номер текущей передачи, 0 когда никто не передаёт.
+    id: AtomicU64,
+    /// Номер передачи, которую попросили остановить.
+    cancel: AtomicU64,
     bytes_done: AtomicU64,
     bytes_total: AtomicU64,
     files_done: AtomicU64,
@@ -55,7 +67,8 @@ impl TransferControl {
     const fn new() -> Self {
         Self {
             active: AtomicBool::new(false),
-            cancel: AtomicBool::new(false),
+            id: AtomicU64::new(0),
+            cancel: AtomicU64::new(0),
             bytes_done: AtomicU64::new(0),
             bytes_total: AtomicU64::new(0),
             files_done: AtomicU64::new(0),
@@ -68,6 +81,10 @@ impl TransferControl {
 
 static TRANSFER: TransferControl = TransferControl::new();
 
+/// Номера передач не переиспользуются: следующий всегда больше выданных, и
+/// отмена с номером прошлой передачи не совпадёт ни с одной будущей.
+static NEXT_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
+
 /// RAII lock for the single active transfer. [`acquire`](TransferGuard::acquire)
 /// resets the counters and marks a transfer running; dropping it releases the
 /// lock. It returns `None` when a transfer is already in flight, so concurrent
@@ -76,7 +93,7 @@ static TRANSFER: TransferControl = TransferControl::new();
 /// progress bar overshoots (two streams add into one counter) and the partial
 /// files corrupt each other.
 #[must_use]
-pub struct TransferGuard(());
+pub struct TransferGuard(u64);
 
 impl TransferGuard {
     /// `share_id` names the owner in [`transfer_snapshot`]; a storage
@@ -89,14 +106,22 @@ impl TransferGuard {
         {
             return None;
         }
-        TRANSFER.cancel.store(false, Ordering::Relaxed);
+        let id = NEXT_TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
+        TRANSFER.id.store(id, Ordering::Relaxed);
+        TRANSFER.cancel.store(0, Ordering::Relaxed);
         TRANSFER.bytes_done.store(0, Ordering::Relaxed);
         TRANSFER.bytes_total.store(bytes_total, Ordering::Relaxed);
         TRANSFER.files_done.store(0, Ordering::Relaxed);
         TRANSFER.files_total.store(files_total as u64, Ordering::Relaxed);
         *TRANSFER.file.lock().expect("transfer lock") = String::new();
         *TRANSFER.share.lock().expect("transfer lock") = share_id.to_string();
-        Some(Self(()))
+        Some(Self(id))
+    }
+
+    /// Номер этой передачи: он же приходит в [`transfer_snapshot`] и его же
+    /// ждёт [`transfer_cancel`].
+    pub fn id(&self) -> u64 {
+        self.0
     }
 }
 
@@ -105,6 +130,12 @@ impl Drop for TransferGuard {
         // Clear the counters so a poll between this transfer and the next acquire
         // does not surface stale bytes (the "256 MB / 0 B" preparing artifact).
         // `active` is released last.
+        //
+        // Номер и просьба об отмене снимаются здесь же: следующая передача
+        // получит новый номер, но снимок между двумя передачами не должен
+        // показывать чужую отмену (XR-217).
+        TRANSFER.id.store(0, Ordering::Relaxed);
+        TRANSFER.cancel.store(0, Ordering::Relaxed);
         TRANSFER.bytes_done.store(0, Ordering::Relaxed);
         TRANSFER.bytes_total.store(0, Ordering::Relaxed);
         TRANSFER.files_done.store(0, Ordering::Relaxed);
@@ -121,13 +152,24 @@ pub fn transfer_file(path: &str, index: usize) {
     TRANSFER.files_done.store(index as u64, Ordering::Relaxed);
 }
 
-/// Request cancellation of the running transfer.
-pub fn transfer_cancel() {
-    TRANSFER.cancel.store(true, Ordering::Relaxed);
+/// Остановить передачу с номером `id` (номер берётся из [`transfer_snapshot`]
+/// или у самого гварда). Возвращает `true`, если просьба попала в идущую
+/// передачу, и `false`, когда та уже закончилась или сейчас идёт другая:
+/// вызывающий на этом останавливается, а не отменяет что попало.
+pub fn transfer_cancel(id: u64) -> bool {
+    if id == 0 || TRANSFER.id.load(Ordering::Relaxed) != id {
+        return false;
+    }
+    TRANSFER.cancel.store(id, Ordering::Relaxed);
+    // Передача могла закончиться между проверкой и записью. Следующей такая
+    // запись не мешает, номера не повторяются, но ответ вызывающему был бы
+    // ложным, поэтому номер перечитывается.
+    TRANSFER.id.load(Ordering::Relaxed) == id
 }
 
 fn transfer_cancelled() -> bool {
-    TRANSFER.cancel.load(Ordering::Relaxed)
+    let id = TRANSFER.id.load(Ordering::Relaxed);
+    id != 0 && TRANSFER.cancel.load(Ordering::Relaxed) == id
 }
 
 fn transfer_add_bytes(n: u64) {
@@ -138,6 +180,11 @@ fn transfer_add_bytes(n: u64) {
 #[derive(Debug, Clone, Serialize)]
 pub struct TransferSnapshot {
     pub active: bool,
+    /// Номер идущей передачи, 0 когда никто не передаёт. С ним и только с ним
+    /// зовётся [`transfer_cancel`]: решение об отмене принимается по этому
+    /// снимку, и номер держит решение привязанным к той передаче, которую
+    /// увидел вызывающий (XR-217).
+    pub id: u64,
     pub cancelled: bool,
     /// Owner share of the transfer, `""` for a storage migration. Lets the UI
     /// attribute progress (and a cancel) to the right share's row when two
@@ -153,7 +200,8 @@ pub struct TransferSnapshot {
 pub fn transfer_snapshot() -> TransferSnapshot {
     TransferSnapshot {
         active: TRANSFER.active.load(Ordering::Relaxed),
-        cancelled: TRANSFER.cancel.load(Ordering::Relaxed),
+        id: TRANSFER.id.load(Ordering::Relaxed),
+        cancelled: transfer_cancelled(),
         share: TRANSFER.share.lock().expect("transfer lock").clone(),
         file: TRANSFER.file.lock().expect("transfer lock").clone(),
         files_done: TRANSFER.files_done.load(Ordering::Relaxed),
@@ -3486,6 +3534,8 @@ mod tests {
 
     #[tokio::test]
     async fn sync_with_index_records_download_and_skips_rehash() {
+        // Синк берёт тот же единственный гвард передачи, что и тесты отмены.
+        let _lock = transfer_lock();
         let dest = tempfile::tempdir().unwrap();
         let aux = tempfile::tempdir().unwrap();
         let ix_path = aux.path().join("share.json");
@@ -3519,5 +3569,93 @@ mod tests {
         .await
         .unwrap();
         assert!(res2.plan.is_empty(), "warm sync must plan nothing: {:?}", res2.plan);
+    }
+
+    // -- адресная отмена передачи (XR-217) ----------------------------
+
+    /// Контроллер передачи один на процесс, поэтому тесты, которые берут гвард,
+    /// идут по очереди: иначе чужой гвард отдаёт `busy` соседнему тесту.
+    static TRANSFER_TESTS: Mutex<()> = Mutex::new(());
+
+    fn transfer_lock() -> std::sync::MutexGuard<'static, ()> {
+        TRANSFER_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Регрессия XR-217: отмена шары A, долетевшая уже после старта передачи
+    /// шары B, обрывала B. Пока флаг отмены был один на весь процесс, порядок
+    /// «снимок -> решение -> вызов» ничем не защищал: между чтением снимка и
+    /// отменой передача A успевала закончиться.
+    #[test]
+    fn late_cancel_does_not_abort_the_next_transfer() {
+        let _lock = transfer_lock();
+
+        let a = TransferGuard::acquire("A", 1, 100).expect("первая передача");
+        let id_a = a.id();
+        // UI успел снять состояние передачи A и решил её остановить.
+        assert_eq!(transfer_snapshot().id, id_a);
+        drop(a);
+
+        let b = TransferGuard::acquire("B", 1, 100).expect("вторая передача");
+        assert_ne!(b.id(), id_a, "номера передач не повторяются");
+
+        assert!(!transfer_cancel(id_a), "отмена законченной передачи никуда не попадает");
+        assert!(!transfer_cancelled(), "передача B продолжается");
+        assert!(!transfer_snapshot().cancelled);
+
+        // И своя отмена по-прежнему доходит.
+        assert!(transfer_cancel(b.id()));
+        assert!(transfer_cancelled());
+    }
+
+    #[test]
+    fn cancel_hits_the_named_transfer_only() {
+        let _lock = transfer_lock();
+
+        let g = TransferGuard::acquire("A", 2, 100).expect("передача");
+        // Ни ноль, ни номер из будущего, ни номер соседа отмену не дают.
+        assert!(!transfer_cancel(0));
+        assert!(!transfer_cancel(g.id() + 1));
+        assert!(!transfer_cancelled());
+
+        assert!(transfer_cancel(g.id()));
+        assert!(transfer_cancelled());
+        assert!(transfer_snapshot().cancelled);
+    }
+
+    #[test]
+    fn drop_clears_cancel_and_id() {
+        let _lock = transfer_lock();
+
+        let g = TransferGuard::acquire("A", 1, 100).expect("передача");
+        let id = g.id();
+        assert!(transfer_cancel(id));
+        drop(g);
+
+        // Между передачами состояние чистое: ни номера, ни чужой отмены.
+        let snap = transfer_snapshot();
+        assert!(!snap.active);
+        assert_eq!(snap.id, 0);
+        assert!(!snap.cancelled);
+        assert!(!transfer_cancelled(), "отмена не должна пережить свой гвард");
+        assert!(!transfer_cancel(id), "гвард уже отпущен, отменять нечего");
+
+        // Следующая передача стартует неотменённой.
+        let next = TransferGuard::acquire("B", 1, 100).expect("следующая передача");
+        assert!(!transfer_cancelled());
+        assert_eq!(transfer_snapshot().id, next.id());
+    }
+
+    #[test]
+    fn second_acquire_is_refused_and_leaves_the_running_transfer_alone() {
+        let _lock = transfer_lock();
+
+        let g = TransferGuard::acquire("A", 1, 100).expect("передача");
+        assert!(TransferGuard::acquire("B", 5, 500).is_none(), "вторая передача не заводится");
+        // Отказ не сбил ни номер, ни счётчики владельца.
+        let snap = transfer_snapshot();
+        assert_eq!(snap.id, g.id());
+        assert_eq!(snap.share, "A");
+        assert_eq!(snap.bytes_total, 100);
+        assert!(transfer_cancel(g.id()));
     }
 }
