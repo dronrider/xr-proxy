@@ -108,6 +108,11 @@ pub struct RouterTomlParams {
     pub salt: u32,
     /// Хаб с пресетом маршрутизации; без него правил нет и всё идёт Direct.
     pub hub: Option<(String, String)>,
+    /// Исключения перехвата, снятые со старого конфига машины (XR-248): из
+    /// флагов их не восстановить, а перегенерация конфига под `--force`
+    /// иначе стирает их вместе с устройствами, которые на них держатся.
+    pub bypass_ips: Vec<String>,
+    pub bypass_rules: Vec<String>,
 }
 
 pub fn render_router_toml(p: &RouterTomlParams) -> String {
@@ -131,10 +136,26 @@ pub fn render_router_toml(p: &RouterTomlParams) -> String {
     out.push_str(
         "[client]\nlisten_port = 1080\nauto_redirect = true\non_server_down = \"block\"\nlog_level = \"info\"\n",
     );
+    if !p.bypass_ips.is_empty() {
+        out.push_str(&format!("bypass_ips = {}\n", toml_string_array(&p.bypass_ips)));
+    }
+    if !p.bypass_rules.is_empty() {
+        out.push_str(&format!(
+            "bypass_rules = {}\n",
+            toml_string_array(&p.bypass_rules)
+        ));
+    }
     if let Some((url, preset)) = &p.hub {
         out.push_str(&format!("\n[hub]\nurl = \"{url}\"\npreset = \"{preset}\"\n"));
     }
     out
+}
+
+/// Массив строк TOML в одну строку. Кавычки внутри значений не экранируем,
+/// а отбрасываем такое значение раньше, в `carry_bypass`.
+fn toml_string_array(values: &[String]) -> String {
+    let items: Vec<String> = values.iter().map(|v| format!("\"{v}\"")).collect();
+    format!("[{}]", items.join(", "))
 }
 
 /// Секция `[control]` после enroll (шов с LLD-17): per-router идентичность
@@ -345,7 +366,7 @@ mod tests {
 /// на роутер этими же строками, поэтому гоняем вшитый текст, а не копию.
 #[cfg(all(test, unix))]
 mod router_script_tests {
-    use super::{ROUTER_INIT, UDP_TPROXY_SETUP};
+    use super::{KILLSWITCH_SETUP, ROUTER_INIT, UDP_TPROXY_SETUP};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -435,14 +456,35 @@ echo "$*" >> "$STAND/syslog.log"
         }
 
         fn write_config(&self, source_ips: &str) -> PathBuf {
+            self.write_config_with_bypass(source_ips, &[])
+        }
+
+        /// Тот же конфиг машины плюс машинные исключения перехвата (XR-248):
+        /// они живут в конфиге, а не в init-скрипте, и раскладка их не видит.
+        fn write_config_with_bypass(&self, source_ips: &str, bypass_rules: &[&str]) -> PathBuf {
             let path = self.at("config.toml");
+            let rules: Vec<String> = bypass_rules.iter().map(|r| format!("\"{r}\"")).collect();
             fs::write(
                 &path,
                 format!(
-                    "[udp_relay]\nenabled = true\nlisten_port = 1081\nsource_ips = [{source_ips}]\nflow_timeout_sec = 120\n"
+                    "[client]\nlisten_port = 1080\nbypass_ips = []\nbypass_rules = [\n{}\n]\n\n\
+                     [udp_relay]\nenabled = true\nlisten_port = 1081\nsource_ips = [{source_ips}]\nflow_timeout_sec = 120\n",
+                    rules.join(",\n")
                 ),
             )
             .expect("конфиг стенда");
+            path
+        }
+
+        /// Вшитый kill-switch, у которого подменён только поиск nft.
+        fn killswitch_script(&self) -> PathBuf {
+            let body = replace_once(
+                KILLSWITCH_SETUP,
+                "for p in /usr/sbin/nft /sbin/nft /usr/bin/nft; do",
+                &format!("for p in {}; do", self.at("bin").join("nft").display()),
+            );
+            let path = self.at("killswitch-setup.sh");
+            write_exec(&path, &body);
             path
         }
 
@@ -450,6 +492,16 @@ echo "$*" >> "$STAND/syslog.log"
         /// PATH переставляем после подключения файла: сам init ставит впереди
         /// системные sbin, а нам нужны заглушки.
         fn init_driver(&self, setup_script: &Path, config: &Path) -> PathBuf {
+            let missing = self.at("no-such-file");
+            self.init_driver_with_killswitch(setup_script, config, &missing)
+        }
+
+        fn init_driver_with_killswitch(
+            &self,
+            setup_script: &Path,
+            config: &Path,
+            killswitch: &Path,
+        ) -> PathBuf {
             let path = self.at("driver.sh");
             let missing = self.at("no-such-file");
             write_exec(
@@ -461,7 +513,7 @@ echo "$*" >> "$STAND/syslog.log"
                      CONFIG='{config}'\n\
                      UDP_TPROXY='{setup}'\n\
                      WATCHDOG='{missing}'\n\
-                     KILLSWITCH_SETUP='{missing}'\n\
+                     KILLSWITCH_SETUP='{killswitch}'\n\
                      KILLSWITCH_CLEANUP='{missing}'\n\
                      procd_open_instance() {{ :; }}\n\
                      procd_set_param() {{ :; }}\n\
@@ -471,6 +523,7 @@ echo "$*" >> "$STAND/syslog.log"
                     path_env = self.path_env(),
                     config = config.display(),
                     setup = setup_script.display(),
+                    killswitch = killswitch.display(),
                     missing = missing.display(),
                 ),
             );
@@ -637,6 +690,44 @@ echo "$*" >> "$STAND/syslog.log"
                 String::from_utf8_lossy(&out.stdout)
             );
         }
+    }
+
+    /// Регрессия XR-248: машинные исключения перехвата жили правкой
+    /// init-скрипта на живой машине, и раскладка обвязки стирала их молча.
+    /// Теперь они приходят из конфига, поэтому переживают раскладку: init
+    /// берётся репозиторный, а исключение всё равно доезжает до kill-switch.
+    /// Без этого устройство остаётся и без прокси, и без прямого выхода.
+    #[test]
+    fn machine_bypass_survives_init_redeploy() {
+        let stand = Stand::new();
+        let config = stand.write_config_with_bypass(
+            "\"192.0.2.10\"",
+            &["ip saddr 192.168.1.164 tcp dport != { 80, 443 }"],
+        );
+        let setup = stand.setup_script(&config);
+        let killswitch = stand.killswitch_script();
+        let driver = stand.init_driver_with_killswitch(&setup, &config, &killswitch);
+
+        let out = stand.run_without_stdout(&driver, "");
+        assert!(
+            out.status.success(),
+            "init отвалился: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let calls = stand.read("calls.log");
+        let accept = "nft add rule ip xr_killswitch forward \
+                      ip saddr 192.168.1.164 tcp dport != { 80, 443 } accept";
+        assert!(
+            calls.contains(accept),
+            "исключение не доехало до kill-switch: {calls}"
+        );
+        // Порядок решает: после общего drop правило уже никого не выпустит.
+        let at_accept = calls.find("192.168.1.164").expect("исключение в вызовах nft");
+        let at_drop = calls
+            .find("tcp dport != { 22, 25")
+            .expect("общий drop в вызовах nft");
+        assert!(at_accept < at_drop, "исключение встало после общего drop");
     }
 
     /// Отказ настройки обязан доезжать до logread с причиной: без неё

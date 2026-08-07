@@ -39,6 +39,13 @@ SERVERS=$(grep -E '^address = ' "$CONFIG" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+
 # bypass_ips = ["a","b"] это устройства, всегда идущие Direct, их не резать.
 BYPASS=$(grep -E '^bypass_ips' "$CONFIG" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
 
+# bypass_rules = [...] это машинные условия перехвата (XR-248), готовые условия
+# nftables без вердикта. Что перехват выпустил из прокси через return, тут
+# обязано пройти через accept: иначе устройство не идёт ни в туннель, ни мимо
+# него, и вместо обхода получает тишину.
+BYPASS_RULES=$(sed -n '/^bypass_rules[[:space:]]*=/,/]/p' "$CONFIG" 2>/dev/null \
+    | grep -oE '"[^"]*"' | tr -d '"')
+
 "$NFT" delete table ip xr_killswitch 2>/dev/null
 
 "$NFT" add table ip xr_killswitch
@@ -63,6 +70,22 @@ done
 for b in $BYPASS; do
     "$NFT" add rule ip xr_killswitch forward ip saddr "$b" accept
 done
+# Машинные исключения перехвата тем же условием, но с вердиктом accept.
+# Условие идёт в nft словами без кавычек нарочно: это готовое выражение
+# nftables, а не одно значение.
+echo "$BYPASS_RULES" | while IFS= read -r rule; do
+    [ -n "$rule" ] || continue
+    case "$rule" in
+        *';'*|*'$'*|*'`'*)
+            logger -t xr-killswitch "bypass_rules: пропускаем '$rule', разделитель или подстановка"
+            continue
+            ;;
+    esac
+    # shellcheck disable=SC2086
+    "$NFT" add rule ip xr_killswitch forward $rule accept 2>/dev/null \
+        || logger -t xr-killswitch "bypass_rules: nft не принял '$rule'"
+done
+
 # Всё, что забрал бы redirect (весь TCP кроме Direct-портов), плюс QUIC, режем.
 "$NFT" add rule ip xr_killswitch forward meta l4proto tcp tcp dport != "{ $EXCLUDE_PORTS }" drop
 "$NFT" add rule ip xr_killswitch forward meta l4proto udp udp dport 443 drop

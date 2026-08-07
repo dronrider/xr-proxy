@@ -63,6 +63,12 @@ pub fn resolve(opts: RouterOpts) -> Result<Resolved> {
         .decode(&opts.key)
         .context("--key должен быть валидным base64")?;
 
+    let old_config = std::fs::read_to_string(CLIENT_CONF);
+    let (bypass_ips, bypass_rules) = match &old_config {
+        Ok(old) => carry_bypass(old),
+        Err(_) => (vec![], vec![]),
+    };
+
     let params = RouterTomlParams {
         servers: opts
             .servers
@@ -72,9 +78,11 @@ pub fn resolve(opts: RouterOpts) -> Result<Resolved> {
         key: opts.key,
         salt: opts.salt,
         hub: opts.hub_url.clone().map(|url| (url, opts.preset)),
+        bypass_ips,
+        bypass_rules,
     };
     let mut config = render_router_toml(&params);
-    match std::fs::read_to_string(CLIENT_CONF) {
+    match old_config {
         Ok(_) if !opts.force => {
             println!(
                 "  внимание: {CLIENT_CONF} уже существует и останется как есть (нужен --force)"
@@ -111,6 +119,31 @@ pub fn resolve(opts: RouterOpts) -> Result<Resolved> {
         enroll,
         ssid: opts.ssid.map(|s| (s, opts.wifi_pass)),
     })
+}
+
+/// Перенести исключения перехвата из старого конфига машины (XR-248).
+/// Ставятся они по месту, под конкретный NAS или шару в этой LAN, и ни из
+/// каких флагов установщика не выводятся: не перенести их значит выключить
+/// на машине то, ради чего их заводили. Значение с кавычкой внутри дальше не
+/// едет, иначе оно развалит сгенерированный TOML.
+pub fn carry_bypass(old_config: &str) -> (Vec<String>, Vec<String>) {
+    let list = |v: &toml::Value, key: &str| -> Vec<String> {
+        v.get("client")
+            .and_then(|c| c.get(key))
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .filter(|s| !s.contains('"') && !s.contains('\\'))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    match old_config.parse::<toml::Value>() {
+        Ok(v) => (list(&v, "bypass_ips"), list(&v, "bypass_rules")),
+        Err(_) => (vec![], vec![]),
+    }
 }
 
 /// Перенести `[control]` из старого конфига в новый как есть. Секция
@@ -352,6 +385,8 @@ mod tests {
                 key: "QUJD".into(),
                 salt: 0x1234_5678,
                 hub: Some(("https://hub.test".into(), "russia".into())),
+                bypass_ips: vec![],
+                bypass_rules: vec![],
             }),
             enroll: enroll.then(|| EnrollParams {
                 hub_url: "https://hub.test".into(),
@@ -419,6 +454,8 @@ mod tests {
             key: "QUJD".into(),
             salt: 1,
             hub: None,
+            bypass_ips: vec![],
+            bypass_rules: vec![],
         });
         let parsed: xr_proto::config::ClientConfig = toml::from_str(&cfg).unwrap();
         assert!(parsed.hub.is_none());
@@ -445,6 +482,8 @@ mod tests {
                 key: "QUJD".into(),
                 salt: 7,
                 hub: None,
+                bypass_ips: vec![],
+                bypass_rules: vec![],
             }),
             render_control_section("https://hub.test", "r1", "s3cr3t", "cGs=")
         );
@@ -455,6 +494,51 @@ mod tests {
 
         assert!(carry_control("[client]\nlisten_port = 1080\n").is_none());
         assert!(carry_control("[control]\nhub_url = \"x\"\n").is_none(), "неполная секция не переносится");
+    }
+
+    /// XR-248: исключения перехвата заводят под конкретную машину, из флагов
+    /// установщика их не собрать. Перегенерация конфига под `--force` обязана
+    /// переносить их, иначе NAS или шара теряют выход на первом же прогоне.
+    #[test]
+    fn force_carries_machine_bypass_over() {
+        let old = format!(
+            "{}{}",
+            render_router_toml(&RouterTomlParams {
+                servers: vec![RouterServer { address: "203.0.113.9".into(), port: 8443 }],
+                key: "QUJD".into(),
+                salt: 7,
+                hub: None,
+                bypass_ips: vec!["192.168.1.50".into()],
+                bypass_rules: vec!["ip saddr 192.168.1.164 tcp dport != { 80, 443 }".into()],
+            }),
+            render_control_section("https://hub.test", "r1", "s3cr3t", "cGs=")
+        );
+        let (ips, rules) = carry_bypass(&old);
+        assert_eq!(ips, vec!["192.168.1.50".to_string()]);
+        assert_eq!(
+            rules,
+            vec!["ip saddr 192.168.1.164 tcp dport != { 80, 443 }".to_string()]
+        );
+
+        let fresh = render_router_toml(&RouterTomlParams {
+            servers: vec![RouterServer { address: "203.0.113.9".into(), port: 8443 }],
+            key: "QUJD".into(),
+            salt: 7,
+            hub: None,
+            bypass_ips: ips,
+            bypass_rules: rules,
+        });
+        let parsed: xr_proto::config::ClientConfig = toml::from_str(&fresh).unwrap();
+        assert_eq!(parsed.client.bypass_ips, vec!["192.168.1.50".to_string()]);
+        assert_eq!(
+            parsed.client.bypass_rules,
+            vec!["ip saddr 192.168.1.164 tcp dport != { 80, 443 }".to_string()]
+        );
+
+        // Кавычка внутри значения развалила бы сгенерированный TOML, такое
+        // значение до нового конфига не доезжает.
+        let with_quote = "[client]\nbypass_rules = [\"ip saddr 192.168.1.165 \\\" \"]\n";
+        assert!(carry_bypass(with_quote).1.is_empty());
     }
 
     #[test]
