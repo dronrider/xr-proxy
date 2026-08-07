@@ -47,7 +47,13 @@ import threading
 import time
 import urllib.parse
 
-WS_GUID = "258EAFA5-E914-47DA-95CA-5AB0DC85B11F"
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def ws_accept(key):
+    """Sec-WebSocket-Accept по ключу клиента by RFC 6455 (раздел 1.3):
+    SHA-1 от ключа со склеенным магическим GUID, дальше base64."""
+    return base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
 
 
 def fail(message):
@@ -194,7 +200,7 @@ def ws_connect(args, cookie):
     if "101" not in status:
         sock.close()
         fail(f"апгрейд не прошёл: {status}\n{head}")
-    expected = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+    expected = ws_accept(key)
     if expected.lower() not in head.lower():
         sock.close()
         fail(f"рукопожатие не сошлось, Sec-WebSocket-Accept не тот:\n{head}")
@@ -353,7 +359,7 @@ def serve_client(sock):
     for line in head.split("\r\n"):
         if line.lower().startswith("sec-websocket-key:"):
             key = line.split(":", 1)[1].strip()
-    accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+    accept = ws_accept(key)
     sock.sendall(
         (
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
