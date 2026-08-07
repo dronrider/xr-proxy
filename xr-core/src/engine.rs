@@ -169,7 +169,7 @@ impl VpnEngine {
             Router::new(&self.config.routing, self.config.geoip_path.as_deref())
         };
         let on_server_down = Action::on_server_down_from_str(&self.config.on_server_down);
-        let fake_dns = Arc::new(FakeDns::new());
+        let fake_dns = Arc::new(FakeDns::with_stats(self.stats.clone()));
 
         // Пул серверов профиля (LLD-10): `servers` по приоритету, при пустом
         // списке legacy-одиночный адрес как пул из одного слота.
