@@ -775,6 +775,52 @@ echo "$*" >> "$STAND/syslog.log"
         !words.is_empty() && stand.read("calls.log").contains(&expected)
     }
 
+    /// Проверка XR-248 на проде: в живом конфиге массив bypass_rules записан
+    /// одной строкой, а следом идут ключи с кавычёнными значениями. Диапазон
+    /// sed закрывался только со следующей строки, поэтому в кандидаты уезжали
+    /// on_server_down и log_level, и киллсвитч пробовал ставить 'block' с
+    /// 'debug' как условия. Судим по вызовам nft: чужим значениям в цепочке
+    /// не место, а само условие доезжает.
+    #[test]
+    fn single_line_bypass_rules_take_no_neighbours() {
+        let stand = Stand::new();
+        let config = stand.at("config.toml");
+        fs::write(
+            &config,
+            "[client]\n\
+             bypass_rules = [\"ip daddr 198.51.100.7 tcp dport 8443\"]\n\
+             listen_port = 1080\n\
+             on_server_down = \"block\"   # \"direct\" = bypass, \"block\" = block\n\
+             log_level = \"debug\"\n\
+             bypass_ips = []\n\
+             # [geoip]\n\
+             [udp_relay]\nenabled = true\nlisten_port = 1081\nsource_ips = [\"192.0.2.10\"]\n",
+        )
+        .expect("конфиг стенда");
+
+        let script = stand.killswitch_script();
+        let out = stand.run(&format!("exec '{}' '{}'", script.display(), config.display()));
+        assert!(
+            out.status.success(),
+            "kill-switch отвалился: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let calls = stand.read("calls.log");
+        assert!(
+            calls.contains(
+                "nft add rule ip xr_killswitch forward ip daddr 198.51.100.7 tcp dport 8443 accept"
+            ),
+            "условие не доехало до kill-switch: {calls}"
+        );
+        for stray in ["forward block accept", "forward debug accept", "forward direct accept"] {
+            assert!(
+                !calls.contains(stray),
+                "чужое значение конфига уехало в киллсвитч ({stray}): {calls}"
+            );
+        }
+    }
+
     /// Ревью XR-248: критерий отбраковки у перехвата и у киллсвитча обязан
     /// быть один. Перехват режет чужие вердикты, киллсвитч резал подстановки,
     /// и условие с `$` вставало в цепочку перехвата с `return`, но не
