@@ -93,6 +93,18 @@ log_level = "info"                    # error, warn, info, debug
 # bypass_ips: LAN devices whose traffic should NOT go through the proxy.
 # Useful for game consoles, smart TVs, etc. Use their static DHCP IP.
 # bypass_ips = ["192.168.1.50", "192.168.1.51"]
+# bypass_rules: машинные исключения перехвата, когда целого устройства мало
+# (XR-248). Каждая строка это условие nftables без вердикта: перехват
+# дописывает ему `return` и ставит первым в свою цепочку, kill-switch
+# дописывает `accept`, поэтому выпущенное из прокси не режется на forward.
+# Место им именно тут: раскладка обвязки конфиг машины не переписывает, а
+# init-скрипт переписывает целиком, и правки в нём пропадают на первом выкате.
+# bypass_rules = [
+#   # NAS: в прокси уходят только веб-порты, остальное напрямую
+#   "ip saddr 192.168.1.164 tcp dport != { 80, 443, 5277, 8080 }",
+#   # шара на своём же WAN-адресе: изнутри LAN ходим мимо перехвата
+#   "ip daddr 203.0.113.10 tcp dport 8443",
+# ]
 # mux_pool_size: number of parallel TCP tunnels to the server (default 4).
 # Multiple tunnels eliminate head-of-line blocking — a packet loss on one
 # TCP no longer stalls every other stream. Set to 2 on small networks,

@@ -87,11 +87,14 @@ fn web_port_tunnels(servers: &[ServerEndpoint]) -> Vec<&ServerEndpoint> {
 /// порт на случай, когда туннель сидит на web-порту. Сайты на том же VPS
 /// обязаны уходить через прокси, иначе их SNI видит провайдер.
 /// `bypass_ips` are source IPs that should not be redirected (game consoles, etc.)
+/// `bypass_rules` это машинные условия nftables без вердикта (XR-248): они
+/// уходят в начало цепочки перехвата с `return`.
 pub fn setup_redirect(
     backend: FirewallBackend,
     listen_port: u16,
     servers: &[ServerEndpoint],
     bypass_ips: &[String],
+    bypass_rules: &[String],
     block_quic: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for server in web_port_tunnels(servers) {
@@ -103,8 +106,17 @@ pub fn setup_redirect(
     }
 
     match backend {
-        FirewallBackend::Nftables => setup_nftables(listen_port, servers, bypass_ips, block_quic),
-        FirewallBackend::Iptables => setup_iptables(listen_port, servers, bypass_ips, block_quic),
+        FirewallBackend::Nftables => {
+            setup_nftables(listen_port, servers, bypass_ips, bypass_rules, block_quic)
+        }
+        FirewallBackend::Iptables => {
+            if !bypass_rules.is_empty() {
+                tracing::warn!(
+                    "bypass_rules заданы, но перехват идёт через iptables: условия nftables там не применяются"
+                );
+            }
+            setup_iptables(listen_port, servers, bypass_ips, block_quic)
+        }
     }
 }
 
@@ -122,6 +134,7 @@ fn setup_nftables(
     listen_port: u16,
     servers: &[ServerEndpoint],
     bypass_ips: &[String],
+    bypass_rules: &[String],
     block_quic: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let nft = find_nft().ok_or("nft binary not found")?;
@@ -129,17 +142,22 @@ fn setup_nftables(
     // Clean up any existing rules first
     let _ = cleanup_nftables();
 
-    let ruleset = build_nft_ruleset(listen_port, servers, bypass_ips, block_quic);
+    let accepted = sanitize_bypass_rules(bypass_rules);
+    let ruleset = build_nft_ruleset(listen_port, servers, bypass_ips, &accepted, block_quic);
 
-    // Use sh -c with pipe to feed ruleset via stdin
-    let status = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(format!(
-            "echo '{}' | {} -f -",
-            ruleset.replace('\'', "'\\''"),
-            nft
-        ))
-        .status()?;
+    let mut status = load_ruleset(&nft, &ruleset)?;
+
+    // Опечатка в машинном условии не должна оставлять LAN без перехвата
+    // вовсе: с kill-switch это тишина на весь дом. Роняем только сами
+    // условия и говорим об этом в лог.
+    if !status.success() && !accepted.is_empty() {
+        tracing::error!(
+            "nft не принял набор правил с bypass_rules, ставим перехват без них: {:?}",
+            accepted
+        );
+        let plain = build_nft_ruleset(listen_port, servers, bypass_ips, &[], block_quic);
+        status = load_ruleset(&nft, &plain)?;
+    }
 
     if !status.success() {
         return Err(format!("nft command failed (binary: {})", nft).into());
@@ -149,10 +167,69 @@ fn setup_nftables(
     Ok(())
 }
 
+/// Скормить набор правил nft через stdin. Отдельной функцией, потому что
+/// набор загружается дважды: с машинными условиями и без них.
+fn load_ruleset(nft: &str, ruleset: &str) -> Result<std::process::ExitStatus, std::io::Error> {
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "echo '{}' | {} -f -",
+            ruleset.replace('\'', "'\\''"),
+            nft
+        ))
+        .status()
+}
+
+/// Вердикты nftables: своё условие потребитель дописывает сам, поэтому
+/// строка с чужим вердиктом внутри уводила бы трафик куда угодно.
+const NFT_VERDICTS: &[&str] = &[
+    "return",
+    "accept",
+    "drop",
+    "reject",
+    "redirect",
+    "tproxy",
+    "dnat",
+    "snat",
+    "masquerade",
+    "jump",
+    "goto",
+    "queue",
+    "log",
+];
+
+/// Отсеять машинные условия, которые нельзя дописывать в набор правил:
+/// пустые, с кавычкой или разделителем команд (набор идёт через `sh -c`) и
+/// с готовым вердиктом. Отброшенное называется в логе, молча не теряется.
+fn sanitize_bypass_rules(rules: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(rules.len());
+    for raw in rules {
+        let rule = raw.trim();
+        let reason = if rule.is_empty() {
+            Some("пустая строка")
+        } else if rule.contains(['\'', '"', ';', '\n', '\\', '#']) {
+            Some("кавычка, комментарий или разделитель команд")
+        } else if rule
+            .split_whitespace()
+            .any(|w| NFT_VERDICTS.contains(&w.to_ascii_lowercase().as_str()))
+        {
+            Some("вердикт внутри условия")
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => tracing::warn!("bypass_rules: пропускаем {raw:?}, {reason}"),
+            None => out.push(rule.to_string()),
+        }
+    }
+    out
+}
+
 fn build_nft_ruleset(
     listen_port: u16,
     servers: &[ServerEndpoint],
     bypass_ips: &[String],
+    machine_rules: &[String],
     block_quic: bool,
 ) -> String {
     // Build bypass rules for excluded source IPs
@@ -166,6 +243,21 @@ fn build_nft_ruleset(
         String::new()
     } else {
         format!("\n        # Bypass devices (game consoles, etc.)\n{}\n", bypass_rules)
+    };
+
+    // Машинные исключения (XR-248) идут первыми, как их и ставили руками
+    // через `nft insert`: ниже по цепочке стоит catch-all redirect, и после
+    // него условие уже никого не выпустит. Тот же список читает kill-switch,
+    // поэтому выпущенное перехватом не режется на forward.
+    let local_section = if machine_rules.is_empty() {
+        String::new()
+    } else {
+        let lines: String = machine_rules
+            .iter()
+            .map(|r| format!("        {r} return"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("\n        # Machine-local bypass (bypass_rules)\n{lines}\n")
     };
 
     // QUIC (UDP/443) от LAN дропаем, чтобы браузер fallback'нул на TCP/443
@@ -211,7 +303,7 @@ fn build_nft_ruleset(
 table ip {table} {{
     chain prerouting {{
         type nat hook prerouting priority dstnat; policy accept;
-{bypass_section}
+{local_section}{bypass_section}
 {server_returns}
         ip daddr 10.0.0.0/8 return
         ip daddr 172.16.0.0/12 return
@@ -239,6 +331,7 @@ table ip {table} {{
         table = NFT_TABLE,
         server_returns = server_returns,
         listen_port = listen_port,
+        local_section = local_section,
         bypass_section = bypass_section,
         quic_section = quic_section,
     )
@@ -386,7 +479,7 @@ mod tests {
 
     #[test]
     fn nft_server_exclusion_covers_tunnel_port_only() {
-        let ruleset = build_nft_ruleset(1080, &pool(), &[], true);
+        let ruleset = build_nft_ruleset(1080, &pool(), &[], &[], true);
 
         assert!(ruleset.contains("ip daddr 203.0.113.10 tcp dport 8443 return"));
         assert!(ruleset.contains("ip daddr 198.51.100.7 tcp dport 9443 return"));
@@ -398,7 +491,7 @@ mod tests {
 
     #[test]
     fn nft_server_keeps_everything_but_web_ports_direct() {
-        let ruleset = build_nft_ruleset(1080, &pool(), &[], true);
+        let ruleset = build_nft_ruleset(1080, &pool(), &[], &[], true);
 
         // Под перехват у адреса сервера попадают только 80 и 443, всё
         // остальное (ssh, служебные ручки) идёт мимо прокси, как и раньше.
@@ -408,7 +501,7 @@ mod tests {
 
     #[test]
     fn nft_ruleset_survives_empty_pool() {
-        let ruleset = build_nft_ruleset(1080, &[], &[], false);
+        let ruleset = build_nft_ruleset(1080, &[], &[], &[], false);
 
         // Без серверов остаются только приватные сети, серверных строк нет.
         assert!(!ruleset.contains("tcp dport != { 80, 443 }"));
@@ -424,7 +517,7 @@ mod tests {
             ServerEndpoint { address: "203.0.113.10".into(), port: 8443 },
             ServerEndpoint { address: "203.0.113.10".into(), port: 443 },
         ];
-        let ruleset = build_nft_ruleset(1080, &servers, &[], false);
+        let ruleset = build_nft_ruleset(1080, &servers, &[], &[], false);
 
         assert_eq!(ruleset.matches("tcp dport != { 80, 443 } return").count(), 1);
         assert!(ruleset.contains("ip daddr 203.0.113.10 tcp dport 8443 return"));
@@ -450,14 +543,59 @@ mod tests {
     #[test]
     fn nft_keeps_bypass_private_nets_and_quic_block() {
         let bypass = vec!["192.168.1.50".to_string()];
-        let ruleset = build_nft_ruleset(1080, &pool(), &bypass, true);
+        let ruleset = build_nft_ruleset(1080, &pool(), &bypass, &[], true);
 
         assert!(ruleset.contains("ip saddr 192.168.1.50 return"));
         assert!(ruleset.contains("ip daddr 192.168.0.0/16 return"));
         assert!(ruleset.contains("redirect to :1080"));
         assert!(ruleset.contains("udp dport 443 drop"));
 
-        assert!(!build_nft_ruleset(1080, &pool(), &bypass, false).contains("udp dport 443 drop"));
+        assert!(!build_nft_ruleset(1080, &pool(), &bypass, &[], false).contains("udp dport 443 drop"));
+    }
+
+    /// XR-248: машинные исключения жили правкой init-скрипта и умирали на
+    /// первой же раскладке обвязки. Теперь они приходят из конфига машины и
+    /// встают первыми в цепочку, до catch-all redirect.
+    #[test]
+    fn nft_machine_rules_come_first_with_return() {
+        let rules = vec![
+            "ip saddr 192.168.1.164 tcp dport != { 80, 443, 5277 }".to_string(),
+            "ip daddr 203.0.113.10 tcp dport 8443".to_string(),
+        ];
+        let ruleset = build_nft_ruleset(1080, &pool(), &["192.168.1.50".to_string()], &rules, true);
+
+        assert!(ruleset
+            .contains("ip saddr 192.168.1.164 tcp dport != { 80, 443, 5277 } return"));
+        assert!(ruleset.contains("ip daddr 203.0.113.10 tcp dport 8443 return"));
+
+        let first = ruleset.find("192.168.1.164").unwrap();
+        let bypass_ip = ruleset.find("ip saddr 192.168.1.50 return").unwrap();
+        let redirect = ruleset.find("redirect to :1080").unwrap();
+        assert!(first < bypass_ip && bypass_ip < redirect);
+    }
+
+    /// Без исключений набор правил обязан остаться прежним: машинная секция
+    /// не должна появляться пустой строкой посреди цепочки.
+    #[test]
+    fn nft_without_machine_rules_ruleset_is_unchanged() {
+        let ruleset = build_nft_ruleset(1080, &pool(), &[], &[], true);
+        assert!(!ruleset.contains("Machine-local bypass"));
+    }
+
+    /// Строка из конфига едет в `nft -f -` через `sh -c`, а вердикт ей
+    /// дописываем мы: с чужим вердиктом или разделителем команд внутри она
+    /// уводит трафик мимо перехвата, поэтому дальше не идёт.
+    #[test]
+    fn nft_machine_rules_reject_verdicts_and_shell_breakouts() {
+        let rules = vec![
+            "ip saddr 192.168.1.164 accept".to_string(),
+            "ip saddr 192.168.1.165 tcp dport 80'; rm -rf /".to_string(),
+            "  ".to_string(),
+            "ip saddr 192.168.1.166".to_string(),
+        ];
+        let accepted = sanitize_bypass_rules(&rules);
+
+        assert_eq!(accepted, vec!["ip saddr 192.168.1.166".to_string()]);
     }
 
     #[test]

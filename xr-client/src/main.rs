@@ -172,6 +172,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     config.client.listen_port,
                     &server_endpoints,
                     &config.client.bypass_ips,
+                    &config.client.bypass_rules,
                     config.client.block_quic,
                 )?;
                 Some(backend)

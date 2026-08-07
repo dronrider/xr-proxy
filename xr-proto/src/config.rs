@@ -140,6 +140,14 @@ pub struct ClientSettings {
     /// Useful for game consoles, smart TVs, etc.
     #[serde(default)]
     pub bypass_ips: Vec<String>,
+    /// Машинные исключения перехвата (XR-248): готовые условия nftables без
+    /// вердикта, например `ip saddr 192.168.1.10 tcp dport != { 80, 443 }`.
+    /// Вердикт дописывает потребитель: перехват ставит `return`, kill-switch
+    /// ставит `accept`, поэтому одна строка держит обе половины в согласии.
+    /// Живут в конфиге машины, а не в init-скрипте: раскладка обвязки конфиг
+    /// не переписывает, а init переписывает целиком.
+    #[serde(default)]
+    pub bypass_rules: Vec<String>,
     /// Number of parallel mux tunnels to keep open to the server.
     /// 0 falls back to the pool's default (4). Multiple tunnels remove
     /// head-of-line blocking when one TCP enters slow-start or recovery.
@@ -160,6 +168,7 @@ impl Default for ClientSettings {
             on_server_down: default_on_server_down(),
             log_level: default_log_level(),
             bypass_ips: vec![],
+            bypass_rules: vec![],
             mux_pool_size: default_mux_pool_size(),
             block_quic: true,
         }
