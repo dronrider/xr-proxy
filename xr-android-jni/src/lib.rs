@@ -1855,12 +1855,19 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeTransferProgr
 
 /// Request cancellation of the running sync/download. It aborts at the next
 /// chunk and discards any half-written file.
+///
+/// `id` это номер передачи из последнего снимка прогресса, и отмена доходит
+/// только до неё: пока номера не было, решение UI («идёт то, что я хочу
+/// остановить») успевало устареть между чтением снимка и вызовом, и отмена
+/// обрывала уже следующую передачу (XR-217). Возвращает `false`, когда просьба
+/// никуда не попала, то есть названная передача уже закончилась.
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeCancelTransfer(
     _env: JNIEnv,
     _class: JClass,
-) {
-    sync::transfer_cancel();
+    id: jlong,
+) -> jboolean {
+    u8::from(sync::transfer_cancel(id.max(0) as u64))
 }
 
 #[cfg(test)]

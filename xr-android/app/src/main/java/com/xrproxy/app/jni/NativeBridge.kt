@@ -357,11 +357,14 @@ object NativeBridge {
         target: String,
     ): String
 
-    /** Poll the running transfer's progress: `{active,cancelled,share,file,
+    /** Poll the running transfer's progress: `{active,id,cancelled,share,file,
      *  files_done,files_total,bytes_done,bytes_total}` (`active:false` when
-     *  idle; `share` is empty for a storage migration). */
+     *  idle; `share` is empty for a storage migration; `id` это номер передачи
+     *  для отмены). */
     external fun nativeTransferProgress(): String
 
-    /** Cancel the running sync/download (aborts at the next chunk). */
-    external fun nativeCancelTransfer()
+    /** Cancel the sync/download с номером [id] из снимка прогресса (aborts at
+     *  the next chunk). Отмена адресная: чужую или уже законченную передачу
+     *  она не трогает и отвечает `false` (XR-217). */
+    external fun nativeCancelTransfer(id: Long): Boolean
 }

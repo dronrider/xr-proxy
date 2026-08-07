@@ -453,7 +453,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             // hour and hold the single-transfer lock the whole time.
             freshSnapshot()?.let { o ->
                 if (o.optString("share") == shareId) {
-                    withContext(Dispatchers.IO) { NativeBridge.nativeCancelTransfer() }
+                    cancelNative(o)
                 }
             }
             if (_ui.value.openShareId == shareId) closeShare()
@@ -892,7 +892,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                 if (o.optString("share") == config.shareId &&
                     (o.optString("file").startsWith(prefix) || o.optLong("files_total") > 1)
                 ) {
-                    withContext(Dispatchers.IO) { NativeBridge.nativeCancelTransfer() }
+                    cancelNative(o)
                 }
             }
             awaitWriterLeft(config.shareId) { file, filesTotal ->
@@ -1036,9 +1036,18 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun maybeCancelNative(shareId: String, path: String) {
         freshSnapshot()?.let { o ->
             if (o.optString("share") == shareId && o.optString("file") == path) {
-                withContext(Dispatchers.IO) { NativeBridge.nativeCancelTransfer() }
+                cancelNative(o)
             }
         }
+    }
+
+    /** Отменить ровно ту передачу, которую показал снимок [o]. Номер отмены
+     *  берётся из него же: пока решение шло до нативной стороны, та передача
+     *  могла закончиться, и безадресная отмена обрывала уже следующую (XR-217).
+     *  Опоздавшая отмена теперь никуда не попадает и отвечает `false`. */
+    private suspend fun cancelNative(o: JSONObject): Boolean {
+        val id = o.optLong("id")
+        return withContext(Dispatchers.IO) { NativeBridge.nativeCancelTransfer(id) }
     }
 
     /** Bounded wait until the native writer can no longer touch what is about to
@@ -1258,9 +1267,12 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Cancel the running native transfer (the storage-migration card's stop). */
+    /** Cancel the running native transfer (the storage-migration card's stop).
+     *  Номер берётся из свежего снимка, иначе останавливать нечего. */
     fun cancelTransfer() {
-        viewModelScope.launch { withContext(Dispatchers.IO) { NativeBridge.nativeCancelTransfer() } }
+        viewModelScope.launch {
+            freshSnapshot()?.let { cancelNative(it) }
+        }
         _ui.update { it.copy(message = "Останавливаю...") }
     }
 
