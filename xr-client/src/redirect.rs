@@ -180,46 +180,15 @@ fn load_ruleset(nft: &str, ruleset: &str) -> Result<std::process::ExitStatus, st
         .status()
 }
 
-/// Вердикты nftables: своё условие потребитель дописывает сам, поэтому
-/// строка с чужим вердиктом внутри уводила бы трафик куда угодно.
-const NFT_VERDICTS: &[&str] = &[
-    "return",
-    "accept",
-    "drop",
-    "reject",
-    "redirect",
-    "tproxy",
-    "dnat",
-    "snat",
-    "masquerade",
-    "jump",
-    "goto",
-    "queue",
-    "log",
-];
-
-/// Отсеять машинные условия, которые нельзя дописывать в набор правил:
-/// пустые, с кавычкой или разделителем команд (набор идёт через `sh -c`) и
-/// с готовым вердиктом. Отброшенное называется в логе, молча не теряется.
+/// Отсеять машинные условия, которые нельзя дописывать в набор правил.
+/// Критерий берётся из `xr_proto`, общий с киллсвитчем: свой список тут
+/// разошёлся бы с его списком молча. Отброшенное называется в логе.
 fn sanitize_bypass_rules(rules: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(rules.len());
     for raw in rules {
-        let rule = raw.trim();
-        let reason = if rule.is_empty() {
-            Some("пустая строка")
-        } else if rule.contains(['\'', '"', ';', '\n', '\\', '#']) {
-            Some("кавычка, комментарий или разделитель команд")
-        } else if rule
-            .split_whitespace()
-            .any(|w| NFT_VERDICTS.contains(&w.to_ascii_lowercase().as_str()))
-        {
-            Some("вердикт внутри условия")
-        } else {
-            None
-        };
-        match reason {
+        match xr_proto::config::bypass_rule_reject_reason(raw) {
             Some(reason) => tracing::warn!("bypass_rules: пропускаем {raw:?}, {reason}"),
-            None => out.push(rule.to_string()),
+            None => out.push(raw.trim().to_string()),
         }
     }
     out

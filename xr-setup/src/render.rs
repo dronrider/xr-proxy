@@ -730,6 +730,85 @@ echo "$*" >> "$STAND/syslog.log"
         assert!(at_accept < at_drop, "исключение встало после общего drop");
     }
 
+    /// Набор условий, на котором сверяются обе половины отбраковки. Кавычки
+    /// сюда не берём: значение с кавычкой не пережило бы даже запись в TOML,
+    /// и сверялась бы разметка стенда, а не фильтры. Кавычки закрыты юнитом
+    /// `xr_proto::config::bypass_rule_reject_reason`.
+    const FILTER_CORPUS: &[&str] = &[
+        "ip saddr 192.0.2.10 tcp dport != { 80, 443 }",
+        "ip daddr 198.51.100.7 tcp dport 8443",
+        "iifname br-lan ip saddr 192.0.2.11",
+        // Ревью XR-248: подстановка переменной проходила перехват и
+        // отбраковывалась киллсвитчем, то есть давала return без accept.
+        "ip saddr $nas tcp dport 80",
+        "ip saddr 192.0.2.10 accept",
+        "ip saddr 192.0.2.10 ACCEPT",
+        "ip saddr 192.0.2.10 return",
+        "ip saddr 192.0.2.10 tcp dport 80; reboot",
+        "ip saddr 192.0.2.10 && reboot",
+        "ip saddr 192.0.2.10 | tee /tmp/x",
+        "ip saddr 192.0.2.10 > /tmp/x",
+        "ip saddr 192.0.2.10 # хвост",
+        "ip saddr 192.0.2.10 \\",
+        "   ",
+    ];
+
+    /// Прогнать условие через отбраковку киллсвитча: встало ли оно в цепочку.
+    fn killswitch_accepts(rule: &str) -> bool {
+        let stand = Stand::new();
+        let config = stand.write_config_with_bypass("\"192.0.2.10\"", &[rule]);
+        let script = stand.killswitch_script();
+        let out = stand.run(&format!("exec '{}' '{}'", script.display(), config.display()));
+        assert!(
+            out.status.success(),
+            "kill-switch отвалился на {rule:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Заглушка пишет вызов уже после разбиения на слова, поэтому и
+        // ожидание собираем по словам.
+        let words: Vec<&str> = rule.split_whitespace().collect();
+        let expected = format!(
+            "nft add rule ip xr_killswitch forward {} accept",
+            words.join(" ")
+        );
+        !words.is_empty() && stand.read("calls.log").contains(&expected)
+    }
+
+    /// Ревью XR-248: критерий отбраковки у перехвата и у киллсвитча обязан
+    /// быть один. Перехват режет чужие вердикты, киллсвитч резал подстановки,
+    /// и условие с `$` вставало в цепочку перехвата с `return`, но не
+    /// доезжало до киллсвитча с `accept`. Устройство при этом уходит из-под
+    /// редиректа и падает в общий drop, то есть получает ровно тот блэкхол,
+    /// который задача и чинит. Гоняем один набор через обе половины.
+    #[test]
+    fn bypass_rule_filters_agree_on_both_sides() {
+        for rule in FILTER_CORPUS {
+            let by_client = xr_proto::config::bypass_rule_reject_reason(rule).is_none();
+            let by_killswitch = killswitch_accepts(rule);
+            assert_eq!(
+                by_client, by_killswitch,
+                "фильтры разошлись на {rule:?}: перехват принимает {by_client}, \
+                 kill-switch принимает {by_killswitch}"
+            );
+        }
+    }
+
+    /// Тот же разрыв, названный по имени: подстановка либо не проходит
+    /// никуда, либо проходит везде, но `return` без `accept` невозможен.
+    #[test]
+    fn rule_with_shell_substitution_never_gets_return_without_accept() {
+        let rule = "ip saddr $nas tcp dport 80";
+        assert!(
+            xr_proto::config::bypass_rule_reject_reason(rule).is_some(),
+            "подстановка обязана отбраковываться перехватом"
+        );
+        assert!(
+            !killswitch_accepts(rule),
+            "подстановка обязана отбраковываться киллсвитчем"
+        );
+    }
+
     /// Отказ настройки обязан доезжать до logread с причиной: без неё
     /// предупреждение в логе не отличить от любого другого отказа.
     #[test]

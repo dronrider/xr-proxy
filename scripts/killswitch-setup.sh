@@ -46,6 +46,37 @@ BYPASS=$(grep -E '^bypass_ips' "$CONFIG" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\
 BYPASS_RULES=$(sed -n '/^bypass_rules[[:space:]]*=/,/]/p' "$CONFIG" 2>/dev/null \
     | grep -oE '"[^"]*"' | tr -d '"')
 
+# Отбраковка машинных условий. Тот же критерий, что у перехвата
+# (xr_proto::config::bypass_rule_reject_reason): условие читают обе половины,
+# и разойдись они в том, что считать негодным, устройство встанет с return в
+# перехвате и без accept тут, то есть упрётся в общий drop ниже. Паритет двух
+# половин закреплён тестом стенда в xr-setup, менять список надо в обеих.
+NFT_VERDICTS="return accept drop reject redirect tproxy dnat snat masquerade jump goto queue log"
+
+# Печатает причину и возвращает 0, когда условие негодное.
+bypass_rule_reject_reason() {
+    if [ -z "$(printf '%s' "$1" | tr -d '[:space:]')" ]; then
+        echo "пустая строка"
+        return 0
+    fi
+    case "$1" in
+        *"'"*|*'"'*|*';'*|*'\'*|*'#'*|*'$'*|*'`'*|*'&'*|*'|'*|*'<'*|*'>'*)
+            echo "кавычка, подстановка или разделитель команд"
+            return 0
+            ;;
+    esac
+    for word in $1; do
+        lower=$(printf '%s' "$word" | tr 'A-Z' 'a-z')
+        for verdict in $NFT_VERDICTS; do
+            if [ "$lower" = "$verdict" ]; then
+                echo "вердикт внутри условия"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
 "$NFT" delete table ip xr_killswitch 2>/dev/null
 
 "$NFT" add table ip xr_killswitch
@@ -74,13 +105,10 @@ done
 # Условие идёт в nft словами без кавычек нарочно: это готовое выражение
 # nftables, а не одно значение.
 echo "$BYPASS_RULES" | while IFS= read -r rule; do
-    [ -n "$rule" ] || continue
-    case "$rule" in
-        *';'*|*'$'*|*'`'*)
-            logger -t xr-killswitch "bypass_rules: пропускаем '$rule', разделитель или подстановка"
-            continue
-            ;;
-    esac
+    if reason=$(bypass_rule_reject_reason "$rule"); then
+        logger -t xr-killswitch "bypass_rules: пропускаем '$rule', $reason"
+        continue
+    fi
     # shellcheck disable=SC2086
     "$NFT" add rule ip xr_killswitch forward $rule accept 2>/dev/null \
         || logger -t xr-killswitch "bypass_rules: nft не принял '$rule'"
