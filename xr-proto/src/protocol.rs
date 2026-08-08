@@ -71,6 +71,11 @@ pub const CLOSE_REASON_AGENT_OFFLINE: u8 = 3;
 /// Relay -> потребитель: транзитных слотов нет (`max_streams` исчерпан). Отдельный
 /// код, чтобы перегруз relay в логах и диагностике не выглядел как агент-офлайн.
 pub const CLOSE_REASON_RELAY_BUSY: u8 = 4;
+/// Сервер -> клиент: стримов в mux больше, чем разрешает кап VPS (`max_streams`
+/// либо `max_streams_per_mux`, XR-199). Приходит вместо `ConnectAck`, сессия при
+/// этом живёт. В здоровье сервера не считается: сервер исправен, это клиент
+/// вышел за свою долю, и failover на backup от такого отказа не нужен.
+pub const CLOSE_REASON_STREAM_LIMIT: u8 = 5;
 
 impl Command {
     fn from_byte(b: u8) -> Option<Self> {

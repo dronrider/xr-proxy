@@ -73,6 +73,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connection limiter
     let semaphore = Arc::new(Semaphore::new(max_conns));
+    // Кап стримов внутри mux-сессий (XR-199): семафор коннектов их не видит.
+    let stream_limits = mux_handler::StreamLimits::new(
+        config.limits.max_streams as usize,
+        config.limits.max_streams_per_mux as usize,
+    );
+    // Кап называется в логе на старте: иначе о нём узнают только по отказу, а
+    // молчание неотличимо от сервера, где лимита нет вовсе.
+    tracing::info!(
+        "Limits: {} connections, {} streams total, {} streams per mux session",
+        max_conns,
+        config.limits.max_streams,
+        config.limits.max_streams_per_mux
+    );
 
     // Start UDP relay if configured
     if let Some(udp_config) = config.udp_relay {
@@ -109,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let codec = codec.clone();
             let fallback = fallback_response.clone();
             let sem = semaphore.clone();
+            let limits = stream_limits.clone();
 
             tokio::spawn(async move {
                 let _permit = match sem.try_acquire() {
@@ -119,7 +133,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
-                if let Err(e) = handler::handle_client(stream, addr, codec, timeout, fallback).await {
+                if let Err(e) =
+                    handler::handle_client(stream, addr, codec, timeout, fallback, limits).await
+                {
                     tracing::warn!("Client {} error: {}", addr, e);
                 }
             });

@@ -5,19 +5,41 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio::time::Duration;
 
 use xr_proto::mux::{mux_handshake_server, Multiplexer};
 use xr_proto::protocol::{
     Codec, Command, Frame, TargetAddr, CLOSE_REASON_CONNECT_FAIL, CLOSE_REASON_RESOLVE_FAIL,
+    CLOSE_REASON_STREAM_LIMIT,
 };
 
 const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_LIFETIME: Duration = Duration::from_secs(3600);
+
+/// Кап стримов сервера (XR-199): `max_connections` считает TCP-коннекты, а
+/// стримов в одной mux-сессии сколько угодно, и каждый стоит fd апстрима с
+/// парой тасок. Общий семафор это бюджет VPS, `per_mux` это доля одной сессии,
+/// чтобы жадный клиент не выбрал бюджет целиком.
+#[derive(Clone)]
+pub struct StreamLimits {
+    pub total: Arc<Semaphore>,
+    pub per_mux: usize,
+}
+
+impl StreamLimits {
+    pub fn new(max_streams: usize, max_streams_per_mux: usize) -> Self {
+        Self {
+            total: Arc::new(Semaphore::new(max_streams)),
+            per_mux: max_streams_per_mux,
+        }
+    }
+}
 
 /// Handle a multiplexed client connection.
 /// Called after the first frame was detected as MuxInit.
@@ -26,13 +48,14 @@ pub async fn handle_mux_client(
     client_addr: SocketAddr,
     codec: Codec,
     init_frame: &Frame,
+    limits: StreamLimits,
 ) -> io::Result<()> {
     // Стагерим лайфтайм по эфемерному порту клиента (0..15 мин поверх базы), чтобы
     // 4 слота пула, поднятые почти одновременно, не упирались в кап и не
     // переподключались лок-степом (иначе разом закрылись бы и дали секундный
     // провал открытий раз в цикл).
     let lifetime = MAX_LIFETIME + Duration::from_secs((client_addr.port() as u64) % 900);
-    handle_mux_client_lt(client, client_addr, codec, init_frame, lifetime).await
+    handle_mux_client_lt(client, client_addr, codec, init_frame, lifetime, limits).await
 }
 
 /// Тело с явным лайфтаймом accept-петли, чтобы тест мог задать короткий кап.
@@ -42,6 +65,7 @@ async fn handle_mux_client_lt(
     codec: Codec,
     init_frame: &Frame,
     lifetime: Duration,
+    limits: StreamLimits,
 ) -> io::Result<()> {
     let Some(caps) = mux_handshake_server(&mut client, &codec, init_frame).await? else {
         tracing::warn!("{} mux handshake rejected", client_addr);
@@ -56,6 +80,8 @@ async fn handle_mux_client_lt(
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "new_stream_rx already taken"))?;
 
     let mut stream_count = 0u64;
+    // Доля этой сессии в общем бюджете стримов (XR-199).
+    let session_sem = Arc::new(Semaphore::new(limits.per_mux));
 
     let result = tokio::time::timeout(lifetime, async {
         while let Some(new_stream) = new_stream_rx.recv().await {
@@ -69,6 +95,38 @@ async fn handle_mux_client_lt(
                     tracing::debug!("{} sid={} bad Connect payload: {}", client_addr, stream_id, e);
                     // Send Close for this stream.
                     let _ = mux.send_stream_close(stream_id, Vec::new()).await;
+                    continue;
+                }
+            };
+
+            // Кап стримов (XR-199): permit берётся до ConnectAck и переезжает в
+            // таску релея, освобождаясь вместе с ней. Своя квота проверяется
+            // первой: кончилась она, до общего бюджета очередь не доходит, и
+            // жадный клиент не выбирает VPS на соседей. Отказ, а не ожидание:
+            // очередь Connect'ов держала бы те же ресурсы, только незаметно.
+            let session_permit = match session_sem.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(
+                        "{} sid={} отказ: кап стримов сессии ({}) исчерпан",
+                        client_addr, stream_id, limits.per_mux
+                    );
+                    let _ = mux
+                        .send_stream_close(stream_id, vec![CLOSE_REASON_STREAM_LIMIT])
+                        .await;
+                    continue;
+                }
+            };
+            let total_permit = match limits.total.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(
+                        "{} sid={} отказ: общий кап стримов сервера исчерпан",
+                        client_addr, stream_id
+                    );
+                    let _ = mux
+                        .send_stream_close(stream_id, vec![CLOSE_REASON_STREAM_LIMIT])
+                        .await;
                     continue;
                 }
             };
@@ -93,6 +151,8 @@ async fn handle_mux_client_lt(
                 if let Err(e) = relay_stream(mux_stream, target_addr).await {
                     tracing::debug!("{} sid={} {} relay error: {}", client_addr_clone, stream_id, addr_str, e);
                 }
+                drop(session_permit);
+                drop(total_permit);
             });
         }
         Ok::<(), io::Error>(())
@@ -285,9 +345,19 @@ mod tests {
         Codec::new(obfs, 0, 0)
     }
 
+    /// Кап стримов, при котором в тесте он не мешает: интересно поведение
+    /// другой части сервера.
+    fn wide_limits() -> StreamLimits {
+        StreamLimits::new(1024, 1024)
+    }
+
     /// Поднять handle_mux_client_lt на локальном листенере и вернуть клиентский
     /// сокет с пройденным mux-handshake.
     async fn start_mux_server(codec: Codec) -> TcpStream {
+        start_mux_server_limited(codec, wide_limits()).await
+    }
+
+    async fn start_mux_server_limited(codec: Codec, limits: StreamLimits) -> TcpStream {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let scodec = codec.clone();
@@ -303,8 +373,15 @@ mod tests {
                     break f;
                 }
             };
-            let _ =
-                handle_mux_client_lt(sock, peer, scodec, &init, Duration::from_secs(60)).await;
+            let _ = handle_mux_client_lt(
+                sock,
+                peer,
+                scodec,
+                &init,
+                Duration::from_secs(60),
+                limits,
+            )
+            .await;
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
         assert!(
@@ -448,6 +525,195 @@ mod tests {
         assert_eq!(closes, 1, "стрим закрывается ровно одним Close");
     }
 
+    /// Читалка кадров туннеля с собственным буфером: тестам капа важно видеть
+    /// ответ по каждому стриму по порядку, а не только последний Close.
+    struct FrameReader {
+        buf: Vec<u8>,
+        filled: usize,
+    }
+
+    impl FrameReader {
+        fn new() -> Self {
+            Self { buf: vec![0u8; 8192], filled: 0 }
+        }
+
+        /// Следующий кадр туннеля с разобранным stream_id.
+        async fn next(&mut self, sock: &mut TcpStream, codec: &Codec) -> (u32, Frame) {
+            loop {
+                if let Some((frame, consumed)) = codec.decode_frame(&self.buf[..self.filled]).unwrap() {
+                    self.buf.copy_within(consumed..self.filled, 0);
+                    self.filled -= consumed;
+                    let (sid, _) = decode_mux_payload(&frame.payload).unwrap();
+                    return (sid, frame);
+                }
+                if self.filled == self.buf.len() {
+                    self.buf.resize(self.buf.len() * 2, 0);
+                }
+                let n = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    sock.read(&mut self.buf[self.filled..]),
+                )
+                .await
+                .expect("сервер обязан ответить на Connect")
+                .unwrap();
+                assert!(n > 0, "сервер закрыл сокет, не ответив на Connect");
+                self.filled += n;
+            }
+        }
+
+        /// Ответ сервера именно по этому стриму (чужие кадры пропускаются).
+        async fn answer_for(&mut self, sock: &mut TcpStream, codec: &Codec, sid: u32) -> Frame {
+            loop {
+                let (got, frame) = self.next(sock, codec).await;
+                if got == sid {
+                    return frame;
+                }
+            }
+        }
+    }
+
+    /// Апстрим, который принимает соединения и держит их: серверу есть куда
+    /// релеить принятые стримы, и они занимают permit'ы до конца теста.
+    async fn holding_upstream() -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                if tx.send(sock).is_err() {
+                    break;
+                }
+            }
+        });
+        (addr, rx)
+    }
+
+    fn connect_wire(codec: &Codec, sid: u32, target: SocketAddr) -> Vec<u8> {
+        let payload = TargetAddr::Ip(target).encode().unwrap();
+        codec
+            .encode_frame(Command::Connect, &encode_mux_payload(sid, &payload))
+            .unwrap()
+    }
+
+    /// XR-199: `max_connections` гейтит TCP-коннекты, а стримов внутри одной
+    /// mux-сессии сервер не считал вовсе: каждый Connect безусловно уходил в
+    /// spawn с сокетом апстрима, и один клиент выбирал fd на VPS через
+    /// единственный permit коннекта. Стрим сверх капа сессии обязан получить
+    /// Close с причиной STREAM_LIMIT вместо ConnectAck, а сама сессия и
+    /// принятые до него стримы обязаны остаться живыми. На старом коде третий
+    /// стрим получает ConnectAck, и тест падает на первом же assert.
+    #[tokio::test]
+    async fn per_mux_stream_cap_refuses_extra_stream() {
+        let codec = test_codec();
+        let mut client =
+            start_mux_server_limited(codec.clone(), StreamLimits::new(1024, 2)).await;
+        let (upstream_addr, mut accepted) = holding_upstream().await;
+
+        let mut reader = FrameReader::new();
+        for sid in [1u32, 3] {
+            client.write_all(&connect_wire(&codec, sid, upstream_addr)).await.unwrap();
+            let frame = reader.answer_for(&mut client, &codec, sid).await;
+            assert_eq!(
+                frame.command,
+                Command::ConnectAck,
+                "стрим {} в пределах капа должен получить ConnectAck",
+                sid
+            );
+        }
+
+        client.write_all(&connect_wire(&codec, 5, upstream_addr)).await.unwrap();
+        let frame = reader.answer_for(&mut client, &codec, 5).await;
+        assert_eq!(
+            frame.command,
+            Command::Close,
+            "стрим сверх капа сессии обязан получить отказ, а не ConnectAck"
+        );
+        let (_, reason) = decode_mux_payload(&frame.payload).unwrap();
+        assert_eq!(
+            reason,
+            [CLOSE_REASON_STREAM_LIMIT],
+            "отказ по капу должен нести причину {}, иначе перегруз неотличим от падения апстрима",
+            CLOSE_REASON_STREAM_LIMIT
+        );
+
+        // Сессия жива, и отказ не задел принятые стримы: апстрим отвечает по
+        // первому из них, ответ доезжает до клиента.
+        let mut first = accepted.recv().await.unwrap();
+        first.write_all(b"alive").await.unwrap();
+        let frame = reader.answer_for(&mut client, &codec, 1).await;
+        assert_eq!(frame.command, Command::Data, "принятый стрим обязан продолжать релей");
+        let (_, payload) = decode_mux_payload(&frame.payload).unwrap();
+        assert_eq!(payload, b"alive");
+    }
+
+    /// XR-199: общий кап это бюджет VPS на все сессии сразу, и упереться в него
+    /// можно, не выбрав долю ни одной сессии. Кап сессии здесь заведомо шире
+    /// общего, поэтому отказ может прийти только с общего семафора.
+    #[tokio::test]
+    async fn total_stream_cap_refuses_extra_stream() {
+        let codec = test_codec();
+        let mut client =
+            start_mux_server_limited(codec.clone(), StreamLimits::new(1, 1024)).await;
+        let (upstream_addr, _accepted) = holding_upstream().await;
+
+        let mut reader = FrameReader::new();
+        client.write_all(&connect_wire(&codec, 1, upstream_addr)).await.unwrap();
+        let frame = reader.answer_for(&mut client, &codec, 1).await;
+        assert_eq!(frame.command, Command::ConnectAck, "первый стрим в пределах бюджета");
+
+        client.write_all(&connect_wire(&codec, 3, upstream_addr)).await.unwrap();
+        let frame = reader.answer_for(&mut client, &codec, 3).await;
+        assert_eq!(
+            frame.command,
+            Command::Close,
+            "стрим сверх общего бюджета сервера обязан получить отказ"
+        );
+        let (_, reason) = decode_mux_payload(&frame.payload).unwrap();
+        assert_eq!(reason, [CLOSE_REASON_STREAM_LIMIT]);
+    }
+
+    /// XR-199: permit живёт вместе с таской релея и возвращается, когда стрим
+    /// кончился. Иначе кап из защиты превращается в счётчик за всю жизнь
+    /// сессии: слоты утекают, и через час работы клиент упирается в отказ на
+    /// ровном месте.
+    #[tokio::test]
+    async fn finished_stream_returns_its_permit() {
+        let codec = test_codec();
+        let mut client =
+            start_mux_server_limited(codec.clone(), StreamLimits::new(1024, 1)).await;
+        let (upstream_addr, mut accepted) = holding_upstream().await;
+
+        let mut reader = FrameReader::new();
+        client.write_all(&connect_wire(&codec, 1, upstream_addr)).await.unwrap();
+        assert_eq!(
+            reader.answer_for(&mut client, &codec, 1).await.command,
+            Command::ConnectAck
+        );
+
+        // Апстрим закрывает соединение: relay кончается, и сервер шлёт Close.
+        let first = accepted.recv().await.unwrap();
+        drop(first);
+        assert_eq!(
+            reader.answer_for(&mut client, &codec, 1).await.command,
+            Command::Close,
+            "закрытый апстримом стрим обязан кончиться Close"
+        );
+
+        // Освободившийся слот снова принимает стрим. Пробуем несколько раз:
+        // permit дропается в таске релея сразу после Close, но планировщик
+        // может отдать нам кадр раньше, чем таска дойдёт до дропа.
+        for attempt in 1..=20u32 {
+            let sid = 2 * attempt + 1;
+            client.write_all(&connect_wire(&codec, sid, upstream_addr)).await.unwrap();
+            let frame = reader.answer_for(&mut client, &codec, sid).await;
+            if frame.command == Command::ConnectAck {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("кончившийся стрим не вернул permit: слот остался занят навсегда");
+    }
+
     /// XR-094 (инцидент 2026-07-10): resolve-сбой (мёртвый DNS на VPS) уезжает
     /// клиенту причиной 1 в Close. Домен в зарезервированном TLD .invalid не
     /// резолвится нигде; если резолвер недоступен целиком, это тот же класс
@@ -504,7 +770,15 @@ mod tests {
                 }
             };
             // Короткий кап accept-петли, чтобы он сработал раньше dead-link.
-            handle_mux_client_lt(sock, peer, scodec, &init, Duration::from_millis(300)).await
+            handle_mux_client_lt(
+                sock,
+                peer,
+                scodec,
+                &init,
+                Duration::from_millis(300),
+                wide_limits(),
+            )
+            .await
         });
 
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();

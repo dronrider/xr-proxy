@@ -310,6 +310,16 @@ pub struct LimitsConfig {
     pub max_connections: u32,
     #[serde(default = "default_timeout")]
     pub connection_timeout_sec: u64,
+    /// Кап стримов на весь сервер (XR-199). `max_connections` считает
+    /// TCP-коннекты, а в mux-сессии стримов сколько угодно, и каждый стоит fd
+    /// апстрима с парой тасок: без этого капа fd на VPS кончаются раньше, чем
+    /// сработает лимит коннектов.
+    #[serde(default = "default_max_streams")]
+    pub max_streams: u32,
+    /// Доля одной mux-сессии в общем капе: без неё первый жадный клиент
+    /// выбирает `max_streams` целиком и глушит соседние роутеры.
+    #[serde(default = "default_max_streams_per_mux")]
+    pub max_streams_per_mux: u32,
 }
 
 impl Default for LimitsConfig {
@@ -317,6 +327,8 @@ impl Default for LimitsConfig {
         Self {
             max_connections: default_max_connections(),
             connection_timeout_sec: default_timeout(),
+            max_streams: default_max_streams(),
+            max_streams_per_mux: default_max_streams_per_mux(),
         }
     }
 }
@@ -395,6 +407,12 @@ fn default_max_connections() -> u32 {
 }
 fn default_timeout() -> u64 {
     300
+}
+fn default_max_streams() -> u32 {
+    4096
+}
+fn default_max_streams_per_mux() -> u32 {
+    512
 }
 fn default_udp_listen_port() -> u16 {
     1081

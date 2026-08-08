@@ -27,6 +27,7 @@ pub async fn handle_client(
     codec: Codec,
     timeout: Duration,
     fallback_response: Option<Vec<u8>>,
+    limits: crate::mux_handler::StreamLimits,
 ) -> io::Result<()> {
     configure_socket(&client);
 
@@ -46,7 +47,7 @@ pub async fn handle_client(
     // Multiplexed or legacy single-stream?
     if connect_frame.command == Command::MuxInit {
         return crate::mux_handler::handle_mux_client(
-            client, client_addr, codec, &connect_frame,
+            client, client_addr, codec, &connect_frame, limits,
         ).await;
     }
 
@@ -339,6 +340,7 @@ mod tests {
                 server_codec,
                 Duration::from_secs(2),
                 Some(server_fallback),
+                crate::mux_handler::StreamLimits::new(1024, 1024),
             )
             .await
         });
@@ -389,7 +391,15 @@ mod tests {
         let server_codec = codec.clone();
         tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            let _ = handle_client(stream, peer, server_codec, Duration::from_secs(2), None).await;
+            let _ = handle_client(
+                stream,
+                peer,
+                server_codec,
+                Duration::from_secs(2),
+                None,
+                crate::mux_handler::StreamLimits::new(1024, 1024),
+            )
+            .await;
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();

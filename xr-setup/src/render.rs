@@ -73,6 +73,8 @@ salt = 0x{salt:08X}
 [limits]
 max_connections = 256
 connection_timeout_sec = 300
+max_streams = 4096
+max_streams_per_mux = 512
 
 [fallback]
 enabled = true

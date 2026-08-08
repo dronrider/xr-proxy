@@ -16,6 +16,10 @@ salt = 0xDEADBEEF                     # Must match client
 [limits]
 max_connections = 256                 # Max simultaneous connections
 connection_timeout_sec = 300          # Idle connection timeout (seconds)
+# Кап стримов внутри mux-сессий (XR-199): max_connections считает коннекты, а
+# стримов в одном коннекте сколько угодно, и каждый стоит fd апстрима.
+max_streams = 4096                    # бюджет стримов на весь сервер
+max_streams_per_mux = 512             # доля одной mux-сессии в этом бюджете
 
 # ─── Fallback ─────────────────────────────────────────────────────────
 # When someone connects with a browser or DPI probe sends a request,
