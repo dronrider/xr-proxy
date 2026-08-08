@@ -80,25 +80,41 @@ pub async fn run_udp_relay_server(
             continue;
         }
 
-        let packet = match udp_relay::decode_relay_packet(&state.obfuscator, &buf[..n]) {
-            Some(p) => p,
-            None => {
-                tracing::debug!("UDP relay server: invalid packet from {}", peer_addr);
-                continue;
-            }
-        };
+        handle_datagram(&state, &relay_socket, peer_addr, &buf[..n], bind_source_port).await;
+    }
+}
 
-        match packet.relay_type {
-            RelayType::Keepalive => {
-                // Reply with keepalive
-                let reply = udp_relay::encode_keepalive(&state.obfuscator);
-                let _ = relay_socket.send_to(&reply, peer_addr).await;
-            }
-            RelayType::Data => {
-                handle_data_packet(&state, &relay_socket, peer_addr, packet, bind_source_port).await;
-            }
-            _ => {}
+/// Разобрать датаграмму с relay-порта и раздать её по назначению. Ключ
+/// обфускации на VPS общий, поэтому мусор и чужие пакеты тут дело обычное:
+/// нерасшифровавшееся уходит в лог и дальше не идёт.
+async fn handle_datagram<F, Fut>(
+    state: &Arc<ServerState>,
+    relay_socket: &Arc<UdpSocket>,
+    peer: SocketAddr,
+    data: &[u8],
+    bind: F,
+) where
+    F: FnOnce(u16) -> Fut + Send + 'static,
+    Fut: Future<Output = io::Result<UdpSocket>> + Send,
+{
+    let packet = match udp_relay::decode_relay_packet(&state.obfuscator, data) {
+        Some(p) => p,
+        None => {
+            tracing::debug!("UDP relay server: invalid packet from {}", peer);
+            return;
         }
+    };
+
+    match packet.relay_type {
+        RelayType::Keepalive => {
+            // Keepalive отвечает написавшему: он и держит NAT роутера открытым.
+            let reply = udp_relay::encode_keepalive(&state.obfuscator);
+            let _ = relay_socket.send_to(&reply, peer).await;
+        }
+        RelayType::Data => {
+            handle_data_packet(state, relay_socket, peer, packet, bind).await;
+        }
+        _ => {}
     }
 }
 
@@ -699,6 +715,195 @@ mod tests {
             FLOW_QUEUE,
             "пакет обязан быть разобран, а не пропасть вместе с потоком"
         );
+    }
+
+    /// Keepalive отвечает тому, кто написал: этим ответом роутер и судит, живо
+    /// ли туннельное плечо relay.
+    #[tokio::test]
+    async fn keepalive_is_answered_to_writer() {
+        let state = test_state(Duration::from_secs(3600));
+        let relay = local_socket().await;
+        let router = local_socket().await;
+
+        handle_datagram(
+            &state,
+            &relay,
+            router.local_addr().unwrap(),
+            &udp_relay::encode_keepalive(&state.obfuscator),
+            |_port| async { unreachable!("keepalive не заводит поток") },
+        )
+        .await;
+
+        let mut wire = [0u8; 256];
+        let (n, _) = timeout(WAIT, router.recv_from(&mut wire))
+            .await
+            .expect("на keepalive обязан прийти ответ")
+            .unwrap();
+        let reply = udp_relay::decode_relay_packet(&state.obfuscator, &wire[..n]).unwrap();
+        assert_eq!(reply.relay_type, RelayType::Keepalive);
+        assert!(state.flows.lock().await.is_empty());
+    }
+
+    /// Нерасшифровавшаяся датаграмма не заводит поток и не получает ответа: на
+    /// открытый relay-порт пишут и сканеры, а поток это занятый порт на VPS.
+    #[tokio::test]
+    async fn undecodable_datagram_starts_no_flow() {
+        let state = test_state(Duration::from_secs(3600));
+        let relay = local_socket().await;
+        let stranger = local_socket().await;
+
+        handle_datagram(
+            &state,
+            &relay,
+            stranger.local_addr().unwrap(),
+            b"xx",
+            |_port| async { unreachable!("мусор не заводит поток") },
+        )
+        .await;
+
+        assert!(state.flows.lock().await.is_empty());
+
+        // Отсутствие ответа судим по порядку, а не по паузе: маркер отправлен с
+        // того же сокета позже, и приди ответ, он лежал бы в очереди первым.
+        relay
+            .send_to(b"marker", stranger.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let (n, _) = timeout(WAIT, stranger.recv_from(&mut buf))
+            .await
+            .expect("маркер обязан дойти")
+            .unwrap();
+        assert_eq!(&buf[..n], b"marker", "чужому на мусор не отвечаем");
+    }
+
+    /// Очередь потока не резиновая: пока поднимается сокет, лишние пакеты
+    /// отбрасываются, как отбросил бы их любой промежуточный узел. Порядок
+    /// принятых при этом не ломается, а поток остаётся живым.
+    #[tokio::test]
+    async fn overflowing_queue_drops_newest_packets() {
+        let state = test_state(Duration::from_secs(3600));
+        let relay = local_socket().await;
+        let peer = local_socket().await;
+        let dst = peer.local_addr().unwrap();
+        let src_port = 41010;
+        let extra = 2;
+
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let slow_bind = move |_port| async move {
+            let _ = release_rx.await;
+            bind_ephemeral().await
+        };
+
+        // Все пакеты кладём, пока bind держится: очередь никто не разгребает.
+        handle_data_packet(
+            &state,
+            &relay,
+            any_peer(),
+            data_packet(src_port, dst, &0u32.to_be_bytes()),
+            slow_bind,
+        )
+        .await;
+        for i in 1..(FLOW_QUEUE + extra) as u32 {
+            handle_data_packet(
+                &state,
+                &relay,
+                any_peer(),
+                data_packet(src_port, dst, &i.to_be_bytes()),
+                |_port| async { unreachable!("поток уже поднят") },
+            )
+            .await;
+        }
+        // Очередь заполнена до края, и лишнее в неё уже не попало: сокет ещё не
+        // поднят, забирать пакеты некому.
+        {
+            let flows = state.flows.lock().await;
+            let tx = flows.get(&(any_peer(), src_port)).unwrap().tx.clone();
+            assert_eq!(tx.capacity(), 0, "в очереди не должно остаться места");
+        }
+        release_tx.send(()).unwrap();
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        for _ in 0..FLOW_QUEUE {
+            let (n, _) = timeout(WAIT, peer.recv_from(&mut buf))
+                .await
+                .expect("принятые в очередь пакеты обязаны дойти")
+                .unwrap();
+            got.push(u32::from_be_bytes(buf[..n].try_into().unwrap()));
+        }
+        assert_eq!(got, (0..FLOW_QUEUE as u32).collect::<Vec<_>>());
+        assert!(
+            peer.try_recv_from(&mut buf).is_err(),
+            "лишние пакеты обязаны быть отброшены, а не доехать позже"
+        );
+        assert!(
+            state.flows.lock().await.contains_key(&(any_peer(), src_port)),
+            "переполнение очереди не снимает поток"
+        );
+    }
+
+    /// Занятый порт не повод потерять поток: сокет садится на соседний номер.
+    /// Точное совпадение с портом устройства нужно для NAT приставок, но своё
+    /// плечо туннеля важнее, и оно работает и на подменном номере.
+    #[tokio::test]
+    async fn busy_source_port_falls_back_to_neighbour() {
+        let occupied = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+
+        let sock = bind_source_port(port).await.unwrap();
+        let got = sock.local_addr().unwrap().port();
+        assert_ne!(got, port);
+        assert!(
+            (1..=10).contains(&got.wrapping_sub(port)),
+            "подменный номер берётся рядом с занятым, получили {} вместо {}",
+            got,
+            port
+        );
+    }
+
+    #[tokio::test]
+    async fn free_source_port_is_taken_as_is() {
+        let probe = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let sock = bind_source_port(port).await.unwrap();
+        assert_eq!(sock.local_addr().unwrap().port(), port);
+    }
+
+    /// Все соседние номера заняты: тут поток не поднимается, и таск обязан
+    /// узнать об этом ошибкой, а не сесть на случайный порт.
+    #[tokio::test]
+    async fn crowded_neighbourhood_fails_bind() {
+        // Ищем свободный отрезок из 11 портов: занимать чужие мы не вправе, а
+        // проверять нужно именно полностью занятую округу.
+        let mut held = Vec::new();
+        let mut base = None;
+        for _ in 0..64 {
+            let first = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            let port = first.local_addr().unwrap().port();
+            if port > u16::MAX - 11 {
+                continue;
+            }
+            let mut run = vec![first];
+            for offset in 1..=10 {
+                match UdpSocket::bind(("0.0.0.0", port + offset)).await {
+                    Ok(sock) => run.push(sock),
+                    Err(_) => break,
+                }
+            }
+            if run.len() == 11 {
+                held = run;
+                base = Some(port);
+                break;
+            }
+        }
+        let base = base.expect("на машине обязан найтись свободный отрезок из 11 портов");
+
+        let err = bind_source_port(base).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        drop(held);
     }
 
     /// Протухший поток уходит сам и уносит с собой сокет: порт снова свободен,
