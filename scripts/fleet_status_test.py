@@ -226,6 +226,8 @@ class Stand:
     def write_conf(self, **over):
         hub2_bin = over.get("hub2_bin", self.hub_bin)
         router_expect = over.get("router_expect", "192.0.2.30")
+        host_header = over.get("host_header", "hub.public.test")
+        crash_log = over.get("crash_log", "/etc/xr-proxy/crash.log")
         conf = f"""
 [DEFAULT]
 user = root
@@ -236,7 +238,7 @@ key = {os.path.join(self.dir, 'fake.key')}
 role = hub
 host = hub1
 url = http://hub.public.test
-host_header = hub.public.test
+host_header = {host_header}
 binaries = {self.hub_bin}
 
 [hub-second]
@@ -256,6 +258,7 @@ binaries = {self.server_bin}
 role = router
 host = router1
 expect_exit_ip = {router_expect}
+crash_log = {crash_log}
 binaries = {self.client_bin}
 """
         with open(self.conf_path, "w", encoding="utf-8") as handle:
@@ -402,7 +405,31 @@ class FleetStatusStand(unittest.TestCase):
         self.assertEqual(done.returncode, 1, done.stdout)
         self.assertIn("router-ru: exit-IP не выяснен (trace-no-answer)", done.stdout)
 
-    def test_crash_log_tail_shown(self):
+    def test_host_header_does_not_run_commands(self):
+        # Значения конфига едут в чужой шелл. Незакавыченный апостроф закрывает
+        # кавычку -H и выполняет хвост строки на удалённой машине.
+        mark = os.path.join(self.stand.dir, "pwned")
+        self.stand.write_conf(host_header=f"evil'; touch {mark}; echo '")
+        done = self.stand.run("--only", "hub-primary")
+        self.assertFalse(os.path.exists(mark), "инъекция из host_header выполнилась на машине")
+        # Кривое значение уезжает одним аргументом -H, снимок при этом целый.
+        self.assertEqual(self.stand.calls().count("curl "), 2)
+        self.assertIn("latest изнутри машины: 0.42.0 (code 42)", done.stdout)
+
+    def test_crash_log_tab_does_not_cut_message(self):
+        # В crash.log лежат dmesg и logread, где таб обычен, а строки снимка
+        # разделены как раз табом.
+        path = self.stand.write(
+            "hosts/router1/crash.log", "OOM убил xr-client\tсвободно 12MB\n"
+        )
+        self.stand.write_conf(crash_log=path)
+        done = self.stand.run("--only", "router-ru")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn(
+            "последняя запись crash.log: OOM убил xr-clientсвободно 12MB", done.stdout
+        )
+
+    def test_crash_log_absent(self):
         # Роутер стенда ходит в /etc/xr-proxy/crash.log настоящей машины, там
         # файла нет; проверяем, что отсутствие журнала не ломает снимок.
         done = self.stand.run("--only", "router-ru")

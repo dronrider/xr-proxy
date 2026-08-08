@@ -125,6 +125,7 @@ class Machine:
         self.url = (section.get("url") or "").strip()
         self.host_header = (section.get("host_header") or "").strip()
         self.exit_ip = (section.get("exit_ip") or "").strip()
+        self.crash_log = (section.get("crash_log") or "/etc/xr-proxy/crash.log").strip()
         self.expect_exit_ip = split_list(section.get("expect_exit_ip"))
         defaults = ROLE_DEFAULTS[self.role]
         self.units = split_list(section.get("units")) or list(defaults["units"])
@@ -221,14 +222,23 @@ def snapshot_script(machine):
             "  printf 'exit_ip\\terror\\ttrace-no-answer\\n'\n"
             "fi\n"
         )
+        # Табы из хвоста вычищаются на машине: в crash.log лежат dmesg и
+        # logread, где таб обычен, а строки снимка разделены как раз табом, и
+        # разбор взял бы только кусок сообщения до первого из них.
+        crash = shlex.quote(machine.crash_log)
         out.write(
-            "if [ -s /etc/xr-proxy/crash.log ]; then\n"
-            "  printf 'crash\\tok\\t%s\\n' \"$(tail -1 /etc/xr-proxy/crash.log | cut -c1-160)\"\n"
-            "fi\n"
+            f"if [ -s {crash} ]; then\n"
+            f"  printf 'crash\\tok\\t%s\\n' "
+            f"\"$(tail -1 {crash} | cut -c1-160 | tr -d '\\n\\t')\"\n"
+            f"fi\n"
         )
     if machine.role == "hub" and machine.host_header:
+        # Значения конфига едут в чужой шелл, поэтому все до одного через
+        # shlex.quote: апостроф в host_header иначе закрывает кавычку и
+        # оставшийся хвост строки выполняется на удалённой машине.
+        header = shlex.quote(f"Host: {machine.host_header}")
         out.write(
-            f"resp=$(curl -sk --max-time 15 -H 'Host: {machine.host_header}' "
+            f"resp=$(curl -sk --max-time 15 -H {header} "
             "https://127.0.0.1/api/v1/app/latest 2>/dev/null || true)\n"
             "if [ -n \"${resp:-}\" ]; then\n"
             "  printf 'latest\\tok\\t%s\\n' \"$(printf '%s' \"$resp\" | tr -d '\\n\\t')\"\n"
