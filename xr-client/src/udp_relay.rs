@@ -16,7 +16,7 @@ use xr_proto::config::UdpRelayClientConfig;
 use xr_proto::obfuscation::Obfuscator;
 use xr_proto::udp_relay::{self, RelayPacket, RelayType};
 
-// Linux socket constants — not always exported by libc on musl/cross targets
+// Linux socket constants that libc does not always export on musl/cross targets
 const SOL_IP: libc::c_int = 0;
 const IP_TRANSPARENT: libc::c_int = 19;
 const IP_RECVORIGDSTADDR: libc::c_int = 20;
@@ -30,7 +30,7 @@ use libc::SOCK_NONBLOCK;
 #[cfg(not(target_os = "linux"))]
 const SOCK_NONBLOCK: libc::c_int = 0o4000;
 
-// ── Flow tracking ──────────────────────────────────────────────────
+// -- Flow tracking ---
 
 /// Из туннеля обратно приходит только `src_port` и `dst`, адреса устройства в
 /// `RelayPacket` нет. Поэтому туннельный порт и есть весь наш NAT: он уникален
@@ -210,7 +210,7 @@ struct RelayState {
     exclude_ports: Vec<u16>,
 }
 
-// ── Main entry ─────────────────────────────────────────────────────
+// -- Main entry ---
 
 pub async fn run_udp_relay(
     config: &UdpRelayClientConfig,
@@ -244,7 +244,7 @@ pub async fn run_udp_relay(
         exclude_ports: config.exclude_dst_ports.clone(),
     });
 
-    // Bind local TPROXY listener — use AsyncFd directly (not tokio UdpSocket)
+    // Bind local TPROXY listener with AsyncFd directly (not tokio UdpSocket)
     // because we need recvmsg for IP_ORIGDSTADDR, and tokio's UdpSocket
     // would double-register the fd with the reactor.
     let listen_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, config.listen_port));
@@ -304,7 +304,7 @@ pub async fn run_udp_relay(
         }
     });
 
-    // Upstream: LAN → VPS
+    // Upstream: LAN -> VPS
     let up_state = state.clone();
     let up_local = local_async.clone();
     let up_tunnel = tunnel.clone();
@@ -325,32 +325,13 @@ pub async fn run_udp_relay(
                 continue;
             }
 
-            // Filter by source IP
-            if !up_state.source_ips.is_empty() {
-                if let SocketAddr::V4(v4) = src_addr {
-                    if !up_state.source_ips.contains(v4.ip()) {
-                        continue;
-                    }
-                } else {
-                    continue; // skip non-v4 if source_ips are v4
-                }
-            }
-
-            // Filter excluded ports
-            if up_state.exclude_ports.contains(&orig_dst.port()) {
+            if !should_relay(
+                &up_state.source_ips,
+                &up_state.exclude_ports,
+                src_addr,
+                orig_dst,
+            ) {
                 continue;
-            }
-
-            // Filter broadcast, multicast, and LAN destinations
-            if let SocketAddr::V4(v4) = orig_dst {
-                let ip = v4.ip();
-                if ip.is_broadcast() || ip.is_multicast()
-                    || *ip == Ipv4Addr::new(255, 255, 255, 255)
-                    || ip.is_loopback()
-                    || is_private_ip(ip)
-                {
-                    continue;
-                }
             }
 
             // Флоу заводится вместе со своим туннельным портом, он и уходит в
@@ -371,7 +352,7 @@ pub async fn run_udp_relay(
         Ok::<(), io::Error>(())
     };
 
-    // Downstream: VPS → LAN
+    // Downstream: VPS -> LAN
     let down_state = state.clone();
     let down_tunnel = tunnel.clone();
     let downstream = async move {
@@ -436,7 +417,7 @@ pub async fn run_udp_relay(
     }
 }
 
-// ── Socket setup ───────────────────────────────────────────────────
+// -- Socket setup ---
 
 /// Get or create a UDP socket bound to `spoof_addr` with IP_TRANSPARENT.
 /// This allows sending packets that appear to come from `spoof_addr`.
@@ -511,10 +492,7 @@ fn create_spoof_socket(bind_addr: SocketAddr) -> io::Result<std::net::UdpSocket>
         );
 
         if let SocketAddr::V4(v4) = bind_addr {
-            let mut addr: libc::sockaddr_in = std::mem::zeroed();
-            addr.sin_family = libc::AF_INET as _;
-            addr.sin_port = v4.port().to_be();
-            addr.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+            let addr = sockaddr_in_v4(&v4);
 
             let ret = libc::bind(
                 fd,
@@ -570,7 +548,7 @@ fn bind_tproxy_socket(port: u16, use_tproxy: bool) -> io::Result<std::net::UdpSo
     Ok(socket)
 }
 
-// ── recvmsg with original destination ──────────────────────────────
+// -- recvmsg with original destination ---
 
 /// Receive a UDP packet via recvmsg, extracting the original destination
 /// address from IP_ORIGDSTADDR ancillary data (set by TPROXY).
@@ -596,15 +574,31 @@ async fn recvmsg_origdst(
     }
 }
 
+/// `SocketAddr` в том виде, в каком его берёт ядро. Порядок байтов тут и есть
+/// всё содержание: перепутанный `to_be` уводит пакет к другому хосту.
+fn sockaddr_in_v4(v4: &SocketAddrV4) -> libc::sockaddr_in {
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    addr.sin_family = libc::AF_INET as _;
+    addr.sin_port = v4.port().to_be();
+    addr.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+    addr
+}
+
+/// Обратный разбор: и адрес отправителя из `msg_name`, и оригинальный адресат
+/// из cmsg приходят одним и тем же `sockaddr_in`.
+fn socket_addr_v4(addr: &libc::sockaddr_in) -> SocketAddrV4 {
+    SocketAddrV4::new(
+        Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
+        u16::from_be(addr.sin_port),
+    )
+}
+
 /// Raw sendto syscall.
 fn do_sendto(fd: i32, data: &[u8], target: SocketAddr) -> io::Result<usize> {
     unsafe {
         match target {
             SocketAddr::V4(v4) => {
-                let mut addr: libc::sockaddr_in = std::mem::zeroed();
-                addr.sin_family = libc::AF_INET as _;
-                addr.sin_port = v4.port().to_be();
-                addr.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+                let addr = sockaddr_in_v4(&v4);
 
                 let n = libc::sendto(
                     fd,
@@ -652,35 +646,92 @@ fn do_recvmsg(
             return Err(io::Error::last_os_error());
         }
 
-        // Parse source address
-        let src_ip = Ipv4Addr::from(u32::from_be(src_addr.sin_addr.s_addr));
-        let src_port = u16::from_be(src_addr.sin_port);
-        let src = SocketAddr::V4(SocketAddrV4::new(src_ip, src_port));
+        let src = SocketAddr::V4(socket_addr_v4(&src_addr));
 
-        // Parse original destination from cmsg (IP_ORIGDSTADDR)
-        let mut orig_dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-        while !cmsg.is_null() {
-            let hdr = &*cmsg;
-            if hdr.cmsg_level == SOL_IP && hdr.cmsg_type == IP_ORIGDSTADDR {
-                let dst_addr = &*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in);
-                let dst_ip = Ipv4Addr::from(u32::from_be(dst_addr.sin_addr.s_addr));
-                let dst_port = u16::from_be(dst_addr.sin_port);
-                orig_dst = SocketAddr::V4(SocketAddrV4::new(dst_ip, dst_port));
-                break;
+        // Без адресата пакет отправить некуда, и молчать об этом нельзя: так
+        // выглядит не поднятый на роутере TPROXY.
+        let orig_dst = match origdst_from_cmsg(&msg) {
+            Some(dst) => SocketAddr::V4(dst),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "no IP_ORIGDSTADDR in cmsg (is TPROXY configured?)",
+                ))
             }
-            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-        }
-
-        if orig_dst.port() == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "no IP_ORIGDSTADDR in cmsg — is TPROXY configured?",
-            ));
-        }
+        };
 
         Ok((n as usize, src, orig_dst))
     }
+}
+
+/// Оригинальный адресат из ancillary data (`IP_ORIGDSTADDR`, его кладёт TPROXY).
+/// Cmsg в буфере может лежать несколько, и нужный не обязан быть первым, поэтому
+/// список проходится до конца. Адресат без порта считается тем же отсутствующим
+/// cmsg: слать по нему всё равно некуда.
+///
+/// # Safety
+/// `msg` должен указывать на живой буфер `msg_control` длиной `msg_controllen`,
+/// заполненный `recvmsg`.
+unsafe fn origdst_from_cmsg(msg: &libc::msghdr) -> Option<SocketAddrV4> {
+    let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+    while !cmsg.is_null() {
+        let hdr = &*cmsg;
+        if hdr.cmsg_level == SOL_IP && hdr.cmsg_type == IP_ORIGDSTADDR {
+            // Данные cmsg лежат без гарантии выравнивания под sockaddr_in,
+            // поэтому читаем их копией, а не ссылкой.
+            let mut dst: libc::sockaddr_in = std::mem::zeroed();
+            std::ptr::copy_nonoverlapping(
+                libc::CMSG_DATA(cmsg),
+                &mut dst as *mut libc::sockaddr_in as *mut u8,
+                std::mem::size_of::<libc::sockaddr_in>(),
+            );
+            let dst = socket_addr_v4(&dst);
+            return if dst.port() == 0 { None } else { Some(dst) };
+        }
+        cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+    }
+    None
+}
+
+/// Уходит ли перехваченный пакет в туннель. Пустой `source_ips` значит «вся
+/// LAN», непустой это перечень устройств, ради которых relay и включали. В
+/// туннель не идут ни широковещательные и multicast-рассылки приставок, ни
+/// разговор внутри самой LAN: пакет туда вернулся бы с VPS чужим адресом.
+fn should_relay(
+    source_ips: &[Ipv4Addr],
+    exclude_ports: &[u16],
+    src_addr: SocketAddr,
+    orig_dst: SocketAddr,
+) -> bool {
+    if !source_ips.is_empty() {
+        match src_addr {
+            SocketAddr::V4(v4) => {
+                if !source_ips.contains(v4.ip()) {
+                    return false;
+                }
+            }
+            // source_ips заданы адресами v4, судить по ним v6 нечем
+            _ => return false,
+        }
+    }
+
+    if exclude_ports.contains(&orig_dst.port()) {
+        return false;
+    }
+
+    if let SocketAddr::V4(v4) = orig_dst {
+        let ip = v4.ip();
+        if ip.is_broadcast()
+            || ip.is_multicast()
+            || *ip == Ipv4Addr::new(255, 255, 255, 255)
+            || ip.is_loopback()
+            || is_private_ip(ip)
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Check if an IPv4 address is in a private range (10/8, 172.16/12, 192.168/16).
@@ -695,8 +746,19 @@ fn is_private_ip(ip: &Ipv4Addr) -> bool {
 mod tests {
     use super::*;
 
+    /// Запас на ожидание пакета. Успешный путь до него не доходит, а на
+    /// сломанном коде пакет уходит не туда, и тест обязан упасть, а не подвесить
+    /// прогон.
+    const WAIT: Duration = Duration::from_secs(5);
+
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    fn recv_socket() -> std::net::UdpSocket {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(WAIT)).unwrap();
+        sock
     }
 
     fn table() -> FlowTable {
@@ -932,6 +994,305 @@ mod tests {
         t.downstream_target(&data(3074, server, b"reply"), later);
 
         assert_eq!(t.retire_expired(timeout, later), 0);
+    }
+
+    // -- Отбор перехваченного ---
+
+    fn console() -> Ipv4Addr {
+        "192.168.1.10".parse().unwrap()
+    }
+
+    #[test]
+    fn listed_device_goes_to_tunnel() {
+        assert!(should_relay(
+            &[console()],
+            &[],
+            addr("192.168.1.10:3074"),
+            addr("203.0.113.5:3074")
+        ));
+    }
+
+    /// Пустой список это «вся LAN»: так relay включают, когда устройства заранее
+    /// не перечислены.
+    #[test]
+    fn empty_source_list_relays_whole_lan() {
+        assert!(should_relay(
+            &[],
+            &[],
+            addr("192.168.1.77:5000"),
+            addr("203.0.113.5:3074")
+        ));
+    }
+
+    /// Соседний телефон в туннель не идёт: relay заведён под приставки, и
+    /// перехват всей LAN ломает игры и VoIP остальным.
+    #[test]
+    fn unlisted_device_stays_direct() {
+        assert!(!should_relay(
+            &[console()],
+            &[],
+            addr("192.168.1.99:5000"),
+            addr("203.0.113.5:3074")
+        ));
+    }
+
+    /// `source_ips` заданы адресами v4, судить по ним v6 нечем.
+    #[test]
+    fn v6_source_stays_direct_when_devices_are_listed() {
+        assert!(!should_relay(
+            &[console()],
+            &[],
+            addr("[2001:db8::10]:3074"),
+            addr("203.0.113.5:3074")
+        ));
+    }
+
+    #[test]
+    fn excluded_destination_port_stays_direct() {
+        let listed = [console()];
+        let device = addr("192.168.1.10:5000");
+        assert!(!should_relay(&listed, &[53, 443], device, addr("203.0.113.5:53")));
+        assert!(should_relay(&listed, &[53, 443], device, addr("203.0.113.5:54")));
+    }
+
+    /// Разговор внутри LAN и рассылки в туннель не отдаём: с VPS такой пакет
+    /// вернулся бы чужим адресом, а SSDP и DHCP приставок там вообще ни к чему.
+    #[test]
+    fn lan_and_broadcast_destinations_stay_direct() {
+        let device = addr("192.168.1.10:5000");
+        for dst in [
+            "255.255.255.255:1900",
+            "239.255.255.250:1900",
+            "224.0.0.1:5353",
+            "10.0.0.5:445",
+            "172.16.0.5:445",
+            "172.31.255.5:445",
+            "192.168.1.1:53",
+            "127.0.0.1:9000",
+        ] {
+            assert!(
+                !should_relay(&[console()], &[], device, addr(dst)),
+                "{} не место в туннеле",
+                dst
+            );
+        }
+    }
+
+    /// Маска приватного диапазона это 172.16/12, а не весь 172/8: соседние
+    /// адреса живут в интернете и перехват им положен.
+    #[test]
+    fn public_neighbours_of_private_range_are_relayed() {
+        let device = addr("192.168.1.10:5000");
+        for dst in ["172.15.0.5:443", "172.32.0.5:443", "11.0.0.5:443", "192.167.1.1:443"] {
+            assert!(
+                should_relay(&[console()], &[], device, addr(dst)),
+                "{} это интернет, ему положен туннель",
+                dst
+            );
+        }
+    }
+
+    // -- Адреса ядра ---
+
+    #[test]
+    fn sockaddr_keeps_network_byte_order() {
+        let v4: SocketAddrV4 = "203.0.113.5:3074".parse().unwrap();
+        let raw = sockaddr_in_v4(&v4);
+
+        assert_eq!(libc::c_int::from(raw.sin_family), libc::AF_INET);
+        assert_eq!(raw.sin_port, 3074u16.to_be());
+        assert_eq!(raw.sin_addr.s_addr, u32::from_be_bytes([203, 0, 113, 5]).to_be());
+        assert_eq!(socket_addr_v4(&raw), v4, "разбор обязан быть обратным сборке");
+    }
+
+    /// Настоящий sendto: спуфящий сокет отдаёт ответ устройству именно этим
+    /// вызовом, и адрес в него уходит уже собранным вручную.
+    #[test]
+    fn sendto_delivers_payload_to_target() {
+        let device = recv_socket();
+        let target = device.local_addr().unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        assert_eq!(do_sendto(sender.as_raw_fd(), b"pong", target).unwrap(), 4);
+
+        let mut buf = [0u8; 64];
+        let (n, from) = device.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"pong");
+        assert_eq!(from, sender.local_addr().unwrap());
+    }
+
+    #[test]
+    fn sendto_refuses_v6_target() {
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let err = do_sendto(sender.as_raw_fd(), b"x", addr("[2001:db8::1]:443")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn sendto_on_closed_socket_reports_error() {
+        assert!(do_sendto(-1, b"x", addr("127.0.0.1:9")).is_err());
+    }
+
+    // -- Разбор cmsg IP_ORIGDSTADDR ---
+
+    fn sockaddr_bytes(s: &str) -> Vec<u8> {
+        let v4: SocketAddrV4 = s.parse().unwrap();
+        let raw = sockaddr_in_v4(&v4);
+        unsafe {
+            std::slice::from_raw_parts(
+                &raw as *const libc::sockaddr_in as *const u8,
+                std::mem::size_of::<libc::sockaddr_in>(),
+            )
+        }
+        .to_vec()
+    }
+
+    /// Собрать ancillary data так, как её кладёт ядро: заголовки и выравнивание
+    /// считаем теми же макросами `CMSG_*`, которыми потом читаем.
+    fn with_cmsgs<R>(
+        items: &[(libc::c_int, libc::c_int, Vec<u8>)],
+        f: impl FnOnce(&libc::msghdr) -> R,
+    ) -> R {
+        unsafe {
+            let total: usize = items
+                .iter()
+                .map(|(_, _, data)| libc::CMSG_SPACE(data.len() as u32) as usize)
+                .sum();
+            let mut buf = vec![0u8; total + 1];
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_control = buf.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = total as _;
+
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            for (level, ty, data) in items {
+                assert!(!cmsg.is_null(), "в буфере обязано хватить места на все cmsg");
+                (*cmsg).cmsg_level = *level;
+                (*cmsg).cmsg_type = *ty;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(data.len() as u32) as _;
+                std::ptr::copy_nonoverlapping(data.as_ptr(), libc::CMSG_DATA(cmsg), data.len());
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            }
+
+            f(&msg)
+        }
+    }
+
+    #[test]
+    fn origdst_is_read_from_cmsg() {
+        let got = with_cmsgs(
+            &[(SOL_IP, IP_ORIGDSTADDR, sockaddr_bytes("203.0.113.5:3074"))],
+            |msg| unsafe { origdst_from_cmsg(msg) },
+        );
+        assert_eq!(got, Some("203.0.113.5:3074".parse().unwrap()));
+    }
+
+    /// Нужный cmsg не обязан быть первым: рядом лежат чужие, и список надо
+    /// проходить до конца, а не судить по голове.
+    #[test]
+    fn origdst_is_found_behind_foreign_cmsg() {
+        let got = with_cmsgs(
+            &[
+                (libc::SOL_SOCKET, 1, vec![7u8; 4]),
+                (SOL_IP, IP_ORIGDSTADDR + 1, sockaddr_bytes("198.51.100.7:1")),
+                (SOL_IP, IP_ORIGDSTADDR, sockaddr_bytes("203.0.113.5:3074")),
+            ],
+            |msg| unsafe { origdst_from_cmsg(msg) },
+        );
+        assert_eq!(got, Some("203.0.113.5:3074".parse().unwrap()));
+    }
+
+    #[test]
+    fn missing_origdst_cmsg_gives_nothing() {
+        let empty: Vec<(libc::c_int, libc::c_int, Vec<u8>)> = Vec::new();
+        assert_eq!(with_cmsgs(&empty, |msg| unsafe { origdst_from_cmsg(msg) }), None);
+
+        let foreign = with_cmsgs(&[(libc::SOL_SOCKET, 1, vec![7u8; 4])], |msg| unsafe {
+            origdst_from_cmsg(msg)
+        });
+        assert_eq!(foreign, None);
+    }
+
+    /// Адресат без порта это тот же отсутствующий cmsg: слать по нему некуда, а
+    /// молча взять порт 0 значит отправить пакет в никуда.
+    #[test]
+    fn origdst_without_port_gives_nothing() {
+        let got = with_cmsgs(
+            &[(SOL_IP, IP_ORIGDSTADDR, sockaddr_bytes("203.0.113.5:0"))],
+            |msg| unsafe { origdst_from_cmsg(msg) },
+        );
+        assert_eq!(got, None);
+    }
+
+    /// Пакет без `IP_ORIGDSTADDR` отправлять некуда, и молчать про это нельзя:
+    /// ровно так выглядит не поднятый на роутере TPROXY.
+    #[test]
+    fn recvmsg_without_origdst_names_tproxy() {
+        let listener = recv_socket();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.send_to(b"hi", listener.local_addr().unwrap()).unwrap();
+
+        let mut buf = [0u8; 64];
+        let err = do_recvmsg(listener.as_raw_fd(), &mut buf).unwrap_err();
+        assert!(
+            err.to_string().contains("IP_ORIGDSTADDR"),
+            "причина обязана называть отсутствующий cmsg, получили {}",
+            err
+        );
+    }
+
+    /// Живой `recvmsg` с ancillary data от ядра. `IP_RECVORIGDSTADDR` не требует
+    /// прав, поэтому оригинальный адресат проверяется без TPROXY и без root,
+    /// зато на настоящем разборе `msghdr`, а не на собранном тестом буфере.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recvmsg_reads_origdst_from_kernel() {
+        let listener = recv_socket();
+        let listen_addr = listener.local_addr().unwrap();
+        unsafe {
+            let val: libc::c_int = 1;
+            assert_eq!(
+                libc::setsockopt(
+                    listener.as_raw_fd(),
+                    SOL_IP,
+                    IP_RECVORIGDSTADDR,
+                    &val as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                ),
+                0,
+                "IP_RECVORIGDSTADDR обязан ставиться без прав: {}",
+                io::Error::last_os_error()
+            );
+        }
+
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.send_to(b"hi", listen_addr).unwrap();
+
+        let mut buf = [0u8; 64];
+        let (n, src, orig_dst) = do_recvmsg(listener.as_raw_fd(), &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hi");
+        assert_eq!(src, sender.local_addr().unwrap());
+        assert_eq!(orig_dst, listen_addr);
+    }
+
+    /// Спуфящий сокет садится на адрес чужого хоста, и без этого ответ уходит
+    /// приставке с адреса роутера, а она такой ответ не принимает.
+    /// `IP_TRANSPARENT` требует CAP_NET_ADMIN, поэтому без прав тест судит
+    /// только отказ, а не подмену.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spoof_socket_binds_to_foreign_address() {
+        let spoofed = addr("203.0.113.5:3074");
+        match create_spoof_socket(spoofed) {
+            Ok(sock) => {
+                assert_eq!(sock.local_addr().unwrap(), spoofed);
+            }
+            Err(e) => assert_eq!(
+                e.kind(),
+                io::ErrorKind::PermissionDenied,
+                "чужой адрес отдаётся только по CAP_NET_ADMIN, других отказов тут быть не должно: {}",
+                e
+            ),
+        }
     }
 
     fn spoof_socket() -> Arc<std::net::UdpSocket> {
