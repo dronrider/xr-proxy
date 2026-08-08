@@ -486,11 +486,12 @@ Kotlin + Jetpack Compose, Material3, MVVM без DI-фреймворка.
   — единственный источник для рендера «Connect / Cancel / Disconnect» и
   крутилки. Computed `connected`/`connecting` сохранены для совместимости
   UI-кода, но внутри выводятся из `phase`.
-- `recentErrors: List<String>` — единственный источник журнала и бадджа Log.
-  Бадж/заголовок считают WARN-строки по критерию `" WARN "` (тот же, что
+- `recentErrors: List<String>` содержит единственный источник журнала и бадджа
+  Log. Бадж/заголовок считают WARN-строки по критерию `" WARN "` (тот же, что
   `colorizeLog`). `relayErrors: Long` осталась только как debug-метрика в
-  статистике, UI-бадж её не читает. Старое поле `errorLog: String` и метод
-  `refreshLog()` удалены.
+  статистике, UI-бадж её не читает. Старое поле `errorLog: String` удалено; его
+  заменило `logLines: List<String>`, содержащее хвост единого журнала (XR-042),
+  который обновляется методом `refreshLog()` через `nativeJournalTail()`.
 - `OnboardingState { ShowingWelcome, Loading(hubUrl), ConfirmInvite(...),
   InviteError(...), Completed }`
   — параллельный StateFlow (LLD-04). Рендер MainActivity до `Completed`
