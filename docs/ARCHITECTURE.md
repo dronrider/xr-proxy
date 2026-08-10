@@ -413,6 +413,15 @@ Kotlin + Jetpack Compose, Material3, MVVM без DI-фреймворка.
   `CATEGORY_SERVICE`, `VISIBILITY_PUBLIC`, `setOnlyAlertOnce`, моно-иконка
   `ic_notification`, action «Отключить» через `PendingIntent` на `ACTION_STOP`,
   цвет из `R.color.brand_primary`. `foregroundServiceType="systemExempted"`.
+  `bringTunnelUp()` перед `establish()` зовёт `Builder.addDisallowedApplication`
+  на `com.google.android.projection.gearhead` (XR-270): Android Auto проверяет
+  связь с магнитолой по локальной сети и с этим трафиком в TUN отказывается
+  стартовать, ругаясь на VPN, а проксировать его незачем, это связь с
+  магнитолой и Google, не с заблокированным ресурсом. На устройстве без пакета
+  (обычный телефон без Android Auto) метод кидает `NameNotFoundException`,
+  исключение из туннеля молча пропускается, а факт уходит строкой в журнал
+  (`excludeAndroidAuto`). Кандидат на такое же исключение при нехватке одного
+  gearhead это `com.google.android.gms`, пока не заводился.
 - [NativeBridge.kt](../xr-android/app/src/main/java/com/xrproxy/app/jni/NativeBridge.kt) —
   объект-синглтон с `external fun`. Ссылка `current: XrVpnService?`
   обновляется в `XrVpnService.onCreate/onDestroy` (не из `startVpn`), что
