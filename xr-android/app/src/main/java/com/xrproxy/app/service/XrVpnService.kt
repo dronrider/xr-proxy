@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.drawable.Icon
 import android.net.ConnectivityManager
 import android.net.Network
@@ -95,6 +96,8 @@ class XrVpnService : VpnService() {
         // на подвернувшуюся сотовую (XR-095). Переассоциация Wi-Fi после выхода
         // из авиарежима укладывается в несколько секунд.
         private const val NO_NETWORK_RESUME_GRACE_MS = 5_000L
+        // Пакет проекции Android Auto, исключаемый из туннеля (XR-270).
+        private const val ANDROID_AUTO_PACKAGE = "com.google.android.projection.gearhead"
     }
 
     enum class Phase { Idle, Preparing, Connecting, Finalizing, Connected, Paused, Stopping, Error }
@@ -446,7 +449,7 @@ class XrVpnService : VpnService() {
         prevBytesUp = 0; prevBytesDown = 0; prevTickMs = 0
         healthTracker.reset()
 
-        val iface = Builder()
+        val builder = Builder()
             .setSession("XR Proxy")
             .addAddress("10.0.0.2", 32)
             .addRoute("0.0.0.0", 0)
@@ -458,7 +461,8 @@ class XrVpnService : VpnService() {
             // on outbound sockets in xr-core session.rs.
             .setMtu(1280)
             .setBlocking(true)
-            .establish()
+        excludeAndroidAuto(builder)
+        val iface = builder.establish()
 
         if (iface == null) {
             NativeBridge.nativeJournalLog("ERROR", "vpn", "Не удалось поднять TUN")
@@ -535,6 +539,26 @@ class XrVpnService : VpnService() {
 
         scope.launch { pollLoop() }
         return true
+    }
+
+    /** Выводит Android Auto из-под туннеля (XR-270): проекция сверяет связь с
+     *  головным устройством по локальной сети напрямую и с TUN в маршруте
+     *  вообще не стартует, ругаясь на VPN. Проксировать её незачем, это связь
+     *  с магнитолой и Google, а не с заблокированным ресурсом; приложения,
+     *  которые рисуются на экране машины, работают на телефоне и остаются под
+     *  прокси. На телефоне без Android Auto пакета нет вовсе, и
+     *  `addDisallowedApplication` в этом случае кидает
+     *  `NameNotFoundException`, туннель поднимается как обычно, только в
+     *  журнал уходит информационная строка вместо тихого пропуска. */
+    private fun excludeAndroidAuto(builder: Builder) {
+        try {
+            builder.addDisallowedApplication(ANDROID_AUTO_PACKAGE)
+        } catch (_: PackageManager.NameNotFoundException) {
+            NativeBridge.nativeJournalLog(
+                "INFO", "vpn",
+                "Android Auto ($ANDROID_AUTO_PACKAGE) на устройстве не найден, исключение из туннеля пропущено",
+            )
+        }
     }
 
     /** Кэш сессии несёт user_rules на момент полного Connect, а правила
