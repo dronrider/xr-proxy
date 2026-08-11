@@ -458,12 +458,14 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     // ── Server management (LLD-08) ──────────────────────────────────
 
     fun selectServer(id: String) {
-        val s = _uiState.value
-        if (s.phase != ConnectPhase.Idle && repo.activeId.value != id) {
-            emitMessage("Сначала отключите VPN", UiSeverity.Warn)
-            return
+        when (serverSelectAction(_uiState.value.phase, repo.activeId.value, id)) {
+            SwitchAction.Ignore -> return
+            SwitchAction.SetActive -> repo.setActive(id)
+            SwitchAction.Reconnect -> {
+                repo.setActive(id)
+                reconnectActive("Переключаю сервер")
+            }
         }
-        repo.setActive(id)
     }
 
     fun upsertServer(profile: ServerProfile) {
@@ -496,13 +498,23 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         val wasActive = repo.activeId.value == profile.id
         repo.upsert(profile)
         if (wasActive && _uiState.value.phase == ConnectPhase.Connected) {
-            emitMessage("Применяю новые настройки…", UiSeverity.Info)
-            viewModelScope.launch {
-                disconnect()
-                _uiState.map { it.phase == ConnectPhase.Idle }.first { it }
-                delay(300)
-                onConnectClicked()
-            }
+            reconnectActive("Применяю новые настройки")
+        }
+    }
+
+    /** Погасить туннель и поднять его заново на текущем активном профиле.
+     *  Один путь на правку активного сервера и на переключение между
+     *  серверами (XR-088): конфигурацию движок читает на старте, поэтому
+     *  подхватить новый профиль он может только через полный цикл. Ход
+     *  виден по фазам подключения на главном экране, [notice] говорит,
+     *  почему туннель мигнул. */
+    private fun reconnectActive(notice: String) {
+        emitMessage(notice, UiSeverity.Info)
+        viewModelScope.launch {
+            disconnect()
+            _uiState.map { it.phase == ConnectPhase.Idle }.first { it }
+            delay(300)
+            onConnectClicked()
         }
     }
 
@@ -1082,10 +1094,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun onInviteConfirmed() {
         val current = _onboardingState.value as? OnboardingState.ConfirmInvite ?: return
         if (current.applyInProgress) return
-        if (_uiState.value.phase != ConnectPhase.Idle) {
-            emitMessage("Сначала отключите VPN", UiSeverity.Warn)
-            return
-        }
         _onboardingState.value = current.copy(applyInProgress = true)
 
         viewModelScope.launch {
@@ -1138,7 +1146,14 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 source = ServerSource.Invite,
             )
             repo.upsert(profile)
-            repo.setActive(profile.id)
+            // Под живым туннелем инвайт только пополняет список серверов
+            // (XR-088): активный профиль читается движком на старте, и
+            // подмена его на ходу развела бы карточку с реальным трафиком.
+            if (inviteActivatesProfile(_uiState.value.phase, repo.activeId.value != null)) {
+                repo.setActive(profile.id)
+            } else {
+                emitMessage("Профиль добавлен, активный сервер прежний", UiSeverity.Info)
+            }
 
             if (!presetCached) {
                 emitMessage("Хаб недоступен, подпись пресета не будет проверяться", UiSeverity.Warn)

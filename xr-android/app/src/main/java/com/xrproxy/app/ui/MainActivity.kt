@@ -325,7 +325,6 @@ fun MainScreen(
                         expiresAt = ob.expiresAt,
                         reclaimable = ob.reclaimable,
                         willReplaceExisting = false,
-                        applyEnabled = state.phase == ConnectPhase.Idle,
                         applyInProgress = ob.applyInProgress,
                         onApply = { viewModel.onInviteConfirmed() },
                         onCancel = {

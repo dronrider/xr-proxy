@@ -55,7 +55,6 @@ fun InviteConfirmScreen(
     expiresAt: String,
     reclaimable: Boolean = false,
     willReplaceExisting: Boolean = false,
-    applyEnabled: Boolean,
     applyInProgress: Boolean,
     onApply: () -> Unit,
     onCancel: () -> Unit,
@@ -134,7 +133,7 @@ fun InviteConfirmScreen(
 
                 Button(
                     onClick = onApply,
-                    enabled = applyEnabled && !applyInProgress && (status == "active" || reclaimable),
+                    enabled = !applyInProgress && (status == "active" || reclaimable),
                     shape = RoundedCornerShape(28.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.primary,
@@ -152,15 +151,6 @@ fun InviteConfirmScreen(
                     }
                     Text("Добавить")
                 }
-            }
-
-            if (!applyEnabled && (status == "active" || reclaimable)) {
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    "Сначала отключите VPN",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
             }
         }
     }
