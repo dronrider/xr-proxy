@@ -105,6 +105,61 @@ pub struct VpnEngine {
     /// the event loop drops all active sessions when it changes so they
     /// re-establish on the new uplink. `None` while not running.
     netgen_tx: Option<tokio::sync::watch::Sender<u64>>,
+    /// Контекст живых сессий: через него `apply_user_rules` подменяет
+    /// активный роутер. `None`, пока движок не запущен.
+    ctx: Option<Arc<SessionContext>>,
+    /// Локальные правила пользователя в общем владении с фоновым watch'ем
+    /// пресета. Отдельная копия нужна потому, что merged-роутер собирается из
+    /// двух половин: правки пользователя и правил хаба. Читай watch эту
+    /// половину из своей копии, снятой на старте, первая же новая версия
+    /// пресета откатила бы применённое на лету правило.
+    live_overrides: Option<Arc<std::sync::RwLock<RoutingConfig>>>,
+}
+
+/// Собрать роутер из локальных правил и (если он есть) пресета хаба. Одна
+/// точка сборки на все три повода: старт движка, новая версия с хаба и
+/// правка пользователя на живом туннеле.
+fn build_router(
+    overrides: &RoutingConfig,
+    preset: Option<&RoutingConfig>,
+    geoip_path: Option<&str>,
+) -> Router {
+    match preset {
+        Some(preset) => Router::from_merged(overrides, preset, geoip_path),
+        None => Router::new(overrides, geoip_path),
+    }
+}
+
+/// Подменить активный роутер живого движка пересобранным. Оба повода
+/// пересборки (новая версия пресета с хаба и правка пользователя) ходят
+/// сюда, и обоим локальную половину даёт один и тот же `overrides`: разъедься
+/// они, публикация с хаба вернула бы правила, какими они были на старте.
+fn swap_router(
+    ctx: &SessionContext,
+    overrides: &std::sync::RwLock<RoutingConfig>,
+    preset: Option<&RoutingConfig>,
+    geoip_path: Option<&str>,
+    reason: &str,
+) -> bool {
+    let overrides = match overrides.read() {
+        Ok(guard) => guard.clone(),
+        Err(e) => {
+            tracing::error!("failed to read local overrides: {}", e);
+            return false;
+        }
+    };
+    let new_router = build_router(&overrides, preset, geoip_path);
+    match ctx.router.write() {
+        Ok(mut guard) => {
+            *guard = Arc::new(new_router);
+            tracing::info!("routing rules active without restart: {}", reason);
+            true
+        }
+        Err(e) => {
+            tracing::error!("failed to acquire router write lock: {}", e);
+            false
+        }
+    }
 }
 
 impl VpnEngine {
@@ -116,6 +171,8 @@ impl VpnEngine {
             shutdown_tx: None,
             server_pool: None,
             netgen_tx: None,
+            ctx: None,
+            live_overrides: None,
         }
     }
     pub fn state(&self) -> &StateHandle { &self.state }
@@ -151,22 +208,21 @@ impl VpnEngine {
             if let Ok(handle) = rt {
                 let _ = handle.block_on(cache.fetch_if_stale(Duration::from_secs(2)));
             }
-            if let Some(preset_rules) = cache.routing_config() {
+            if cache.routing_config().is_some() {
                 tracing::info!("merging preset '{}' with local overrides", preset_name);
-                Router::from_merged(
-                    &self.config.routing,
-                    preset_rules,
-                    self.config.geoip_path.as_deref(),
-                )
             } else {
                 tracing::warn!(
                     "preset '{}' unavailable, running with local overrides only",
                     preset_name
                 );
-                Router::new(&self.config.routing, self.config.geoip_path.as_deref())
             }
+            build_router(
+                &self.config.routing,
+                cache.routing_config(),
+                self.config.geoip_path.as_deref(),
+            )
         } else {
-            Router::new(&self.config.routing, self.config.geoip_path.as_deref())
+            build_router(&self.config.routing, None, self.config.geoip_path.as_deref())
         };
         let on_server_down = Action::on_server_down_from_str(&self.config.on_server_down);
         let fake_dns = Arc::new(FakeDns::with_stats(self.stats.clone()));
@@ -247,6 +303,9 @@ impl VpnEngine {
         // without tearing down the whole engine.
         self.server_pool = Some(server_pool.clone());
 
+        let live_overrides = Arc::new(std::sync::RwLock::new(self.config.routing.clone()));
+        self.live_overrides = Some(live_overrides.clone());
+
         let ctx = Arc::new(SessionContext {
             router: std::sync::RwLock::new(Arc::new(router)),
             codec,
@@ -257,6 +316,7 @@ impl VpnEngine {
             dns_resolvers,
             system_resolver: self.config.system_resolver.clone(),
         });
+        self.ctx = Some(ctx.clone());
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
@@ -294,7 +354,7 @@ impl VpnEngine {
             self.config.hub_cache_dir.clone(),
         ) {
             let interval_secs = self.config.hub_refresh_interval_secs.unwrap_or(300);
-            let local_overrides = self.config.routing.clone();
+            let local_overrides = live_overrides.clone();
             let geoip_path_owned = self.config.geoip_path.clone();
             let ctx_bg = ctx.clone();
             let mut shutdown_rx_bg = shutdown_rx.clone();
@@ -312,23 +372,13 @@ impl VpnEngine {
                         let _ = shutdown_rx_bg.changed().await;
                     },
                     |preset_rules| {
-                        let new_router = Router::from_merged(
+                        swap_router(
+                            &ctx_bg,
                             &local_overrides,
-                            preset_rules,
+                            Some(preset_rules),
                             geoip_path_owned.as_deref(),
+                            &format!("пресет '{}' обновился", preset_name),
                         );
-                        match ctx_bg.router.write() {
-                            Ok(mut guard) => {
-                                *guard = Arc::new(new_router);
-                                tracing::info!(
-                                    "preset '{}' hot-swapped: new rules active without restart",
-                                    preset_name
-                                );
-                            }
-                            Err(e) => {
-                                tracing::error!("failed to acquire router write lock: {}", e);
-                            }
-                        }
                     },
                 )
                 .await;
@@ -383,8 +433,69 @@ impl VpnEngine {
         // stop is a no-op and the pool can be released.
         self.server_pool = None;
         self.netgen_tx = None;
+        self.ctx = None;
+        self.live_overrides = None;
     }
     pub fn is_running(&self) -> bool { self.shutdown_tx.is_some() }
+
+    /// Применить новый список правил пользователя к живому туннелю (XR-180).
+    ///
+    /// Раньше правки экрана правил ждали переподключения: движок собирал
+    /// merged-роутер только на старте и на новой версии пресета. Путь тот же,
+    /// что у пресета: пересобрать роутер из двух половин и подменить его в
+    /// `SessionContext` под write-локом. Пресет берётся из дискового кэша, в
+    /// сеть эта ручка не ходит. Живые сессии продолжают со своим `Action`,
+    /// новые решения принимаются по свежим правилам.
+    ///
+    /// Возвращает `false`, когда движок не запущен: правила тогда просто
+    /// лежат в конфиге и уедут в роутер на ближайшем старте.
+    pub fn apply_user_rules(&mut self, routing: RoutingConfig) -> bool {
+        self.config.routing = routing.clone();
+        let Some(overrides) = self.live_overrides.clone() else {
+            return false;
+        };
+        match overrides.write() {
+            Ok(mut guard) => *guard = routing,
+            Err(e) => {
+                tracing::error!("failed to update local overrides: {}", e);
+                return false;
+            }
+        }
+        let Some(ctx) = self.ctx.clone() else { return false };
+
+        let cache = match (
+            &self.config.hub_url,
+            &self.config.hub_preset,
+            &self.config.hub_cache_dir,
+        ) {
+            (Some(hub_url), Some(preset_name), Some(cache_dir)) => {
+                let mut cache = crate::presets::PresetCache::new(
+                    std::path::Path::new(cache_dir),
+                    hub_url,
+                    preset_name,
+                );
+                cache.load_from_disk();
+                Some(cache)
+            }
+            _ => None,
+        };
+        let preset = cache.as_ref().and_then(|c| c.routing_config());
+        swap_router(
+            &ctx,
+            &overrides,
+            preset,
+            self.config.geoip_path.as_deref(),
+            "правила пользователя изменены",
+        )
+    }
+
+    /// Активный роутер запущенного движка. Нужен проверке применения правил
+    /// на лету, снаружи движка решения по нему никто не принимает.
+    pub fn active_router(&self) -> Option<Arc<Router>> {
+        self.ctx
+            .as_ref()
+            .and_then(|ctx| ctx.router.read().ok().map(|guard| guard.clone()))
+    }
 
     /// Активный сервер пула: `(имя, работаем_через_резерв)`. Питает строку
     /// статуса «через X (резерв)» на главном экране (LLD-10 §2.6).
@@ -999,6 +1110,156 @@ fn ipv4_checksum(h: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Правила пользователя на живом туннеле (XR-180).
+
+    fn routing_with(rules: Vec<(&str, &str)>) -> RoutingConfig {
+        RoutingConfig {
+            default_action: "direct".into(),
+            rules: rules
+                .into_iter()
+                .map(|(action, domain)| xr_proto::config::RoutingRule {
+                    name: None,
+                    action: action.into(),
+                    domains: vec![domain.into()],
+                    ip_ranges: vec![],
+                    geoip: vec![],
+                })
+                .collect(),
+        }
+    }
+
+    fn test_config(routing: RoutingConfig) -> VpnConfig {
+        VpnConfig {
+            server_address: "127.0.0.1".into(),
+            // Порт, на котором никто не слушает: прогрев пула упадёт в
+            // отдельной задаче, роутер к этому моменту уже собран.
+            server_port: 1,
+            servers: vec![],
+            obfuscation_key: base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                [7u8; 32],
+            ),
+            modifier: "positional_xor_rotate".into(),
+            salt: 0xDEADBEEF,
+            padding_min: 16,
+            padding_max: 128,
+            routing,
+            geoip_path: None,
+            on_server_down: "direct".into(),
+            dns_resolvers: vec![],
+            hub_url: None,
+            hub_preset: None,
+            hub_cache_dir: None,
+            hub_refresh_interval_secs: None,
+            system_resolver: None,
+            mux_pool_size: 1,
+        }
+    }
+
+    /// Движок поднимается ровно так же, как его поднимает JNI: собственный
+    /// рантайм, старт под его `enter()`. Внутри `#[tokio::test]` старт с
+    /// хабом падал бы на блокирующем фетче пресета.
+    fn started_engine(config: VpnConfig) -> (tokio::runtime::Runtime, VpnEngine) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut engine = VpnEngine::new(config);
+        {
+            let _guard = rt.enter();
+            engine
+                .start(PacketQueue::new(), Arc::new(|_fd: i32| true))
+                .expect("engine must start");
+        }
+        (rt, engine)
+    }
+
+    fn action_for(engine: &VpnEngine, sni: &str) -> Action {
+        engine
+            .active_router()
+            .expect("running engine must have a router")
+            .resolve(Some(sni), IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)))
+    }
+
+    /// Добавленное правило действует на живом туннеле, без переподключения.
+    #[test]
+    fn user_rule_applies_to_the_live_tunnel() {
+        let (_rt, mut engine) = started_engine(test_config(routing_with(vec![])));
+        assert_eq!(action_for(&engine, "example.com"), Action::Direct);
+
+        assert!(engine.apply_user_rules(routing_with(vec![("proxy", "example.com")])));
+        assert_eq!(
+            action_for(&engine, "example.com"),
+            Action::Proxy,
+            "правило должно действовать сразу, а не после переподключения"
+        );
+
+        // Снятое правило тем же путём возвращает домен на прямой маршрут.
+        assert!(engine.apply_user_rules(routing_with(vec![])));
+        assert_eq!(action_for(&engine, "example.com"), Action::Direct);
+        engine.stop();
+    }
+
+    /// Правило пользователя главнее правила пресета и после применения на лету.
+    #[test]
+    fn live_user_rule_overrides_the_cached_preset() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::presets::PresetCache::write_to_disk(
+            dir.path(),
+            &xr_proto::preset::Preset {
+                name: "russia".into(),
+                version: 1,
+                updated_at: "2026-08-11T00:00:00Z".into(),
+                description: String::new(),
+                rules: routing_with(vec![("proxy", "example.com"), ("proxy", "youtube.com")]),
+                signature: None,
+            },
+        )
+        .unwrap();
+
+        let mut config = test_config(routing_with(vec![]));
+        config.hub_url = Some("http://127.0.0.1:1".into());
+        config.hub_preset = Some("russia".into());
+        config.hub_cache_dir = Some(dir.path().to_string_lossy().into_owned());
+        let (_rt, mut engine) = started_engine(config);
+        assert_eq!(action_for(&engine, "example.com"), Action::Proxy);
+
+        assert!(engine.apply_user_rules(routing_with(vec![("direct", "example.com")])));
+        assert_eq!(
+            action_for(&engine, "example.com"),
+            Action::Direct,
+            "своё правило должно перебивать пресет"
+        );
+        assert_eq!(
+            action_for(&engine, "youtube.com"),
+            Action::Proxy,
+            "остальные правила пресета обязаны остаться"
+        );
+        engine.stop();
+    }
+
+    /// Пресет, обновившийся после правки, не откатывает правила пользователя:
+    /// обе пересборки берут локальную половину из общего владения.
+    #[test]
+    fn preset_update_keeps_the_live_user_rule() {
+        let (_rt, mut engine) = started_engine(test_config(routing_with(vec![])));
+        assert!(engine.apply_user_rules(routing_with(vec![("direct", "example.com")])));
+
+        // То же, что делает фоновый watch при новой версии с хаба.
+        let ctx = engine.ctx.clone().unwrap();
+        let overrides = engine.live_overrides.clone().unwrap();
+        let preset = routing_with(vec![("proxy", "example.com")]);
+        assert!(swap_router(&ctx, &overrides, Some(&preset), None, "тест"));
+
+        assert_eq!(
+            action_for(&engine, "example.com"),
+            Action::Direct,
+            "публикация с хаба не должна откатывать правило пользователя"
+        );
+        engine.stop();
+    }
 
     /// Пул из нескольких серверов уже сам говорит, что легли все (XR-131);
     /// экран не должен сводить это к одному серверу.
