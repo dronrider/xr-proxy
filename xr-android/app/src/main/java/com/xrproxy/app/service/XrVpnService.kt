@@ -440,7 +440,7 @@ class XrVpnService : VpnService() {
      */
     private suspend fun bringTunnelUp(): Boolean {
         val configJson = lastConfigJson?.let(::withFreshUserRules) ?: run {
-            publish(Phase.Error, errorMessage = "Нет конфигурации")
+            publish(Phase.Error, errorMessage = getString(R.string.service_error_no_config))
             stopSelf()
             return false
         }
@@ -466,7 +466,7 @@ class XrVpnService : VpnService() {
 
         if (iface == null) {
             NativeBridge.nativeJournalLog("ERROR", "vpn", "Не удалось поднять TUN")
-            publish(Phase.Error, errorMessage = "Не удалось поднять TUN")
+            publish(Phase.Error, errorMessage = getString(R.string.service_error_tun_failed))
             updateNotification()
             stopInternal()
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -1421,10 +1421,10 @@ class XrVpnService : VpnService() {
         // → Sound: None.
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "XR Proxy VPN",
+            getString(R.string.notif_channel_name),
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
-            description = "VPN connection status"
+            description = getString(R.string.notif_channel_description)
             setShowBadge(false)
             setSound(null, null)
             enableVibration(false)
@@ -1445,30 +1445,33 @@ class XrVpnService : VpnService() {
         )
 
         val text = when (state.phase) {
-            Phase.Idle, Phase.Preparing -> "Запуск…"
-            Phase.Connecting -> "Подключение…"
-            Phase.Finalizing -> "Проверка маршрутов…"
-            Phase.Connected -> if (state.noNetwork) "Нет сети, VPN восстановится сам"
+            Phase.Idle, Phase.Preparing -> getString(R.string.notif_status_starting)
+            Phase.Connecting -> getString(R.string.notif_status_connecting)
+            Phase.Finalizing -> getString(R.string.notif_status_finalizing)
+            Phase.Connected -> if (state.noNetwork) getString(R.string.notif_status_connected_no_network)
             else state.snapshot?.let { s ->
-                "↑${formatBytes(s.bytesUp)} ↓${formatBytes(s.bytesDown)} • ${formatUptime(s.uptime)}"
-            } ?: "Подключено"
-            Phase.Paused -> if (state.noNetwork) "На паузе, нет сети" else {
-                val base = state.pausedSsid?.let { "На паузе · доверенная сеть «$it»" }
-                    ?: "На паузе · доверенная сеть"
-                if (state.restrictedNetwork) "$base · ⚠ в сети ограничения" else base
+                getString(
+                    R.string.notif_status_connected_stats,
+                    formatBytes(s.bytesUp), formatBytes(s.bytesDown), formatUptime(s.uptime),
+                )
+            } ?: getString(R.string.notif_status_connected)
+            Phase.Paused -> if (state.noNetwork) getString(R.string.notif_status_paused_no_network) else {
+                val base = state.pausedSsid?.let { getString(R.string.notif_status_paused_trusted_named, it) }
+                    ?: getString(R.string.notif_status_paused_trusted)
+                if (state.restrictedNetwork) getString(R.string.notif_status_restricted_suffix, base) else base
             }
-            Phase.Stopping -> "Отключение…"
-            Phase.Error -> state.errorMessage ?: "Ошибка"
+            Phase.Stopping -> getString(R.string.notif_status_stopping)
+            Phase.Error -> state.errorMessage ?: getString(R.string.service_error_default)
         }
 
         val stopAction = Notification.Action.Builder(
             Icon.createWithResource(this, R.drawable.ic_notification_stop),
-            "Отключить",
+            getString(R.string.notif_action_disconnect),
             stopIntent,
         ).build()
 
         val builder = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("XR Proxy")
+            .setContentTitle(getString(R.string.app_name))
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(contentIntent)
@@ -1489,7 +1492,7 @@ class XrVpnService : VpnService() {
             builder.addAction(
                 Notification.Action.Builder(
                     Icon.createWithResource(this, R.drawable.ic_notification),
-                    "Включить здесь",
+                    getString(R.string.notif_action_enable_here),
                     resumeIntent,
                 ).build()
             )
@@ -1504,7 +1507,7 @@ class XrVpnService : VpnService() {
             builder.addAction(
                 Notification.Action.Builder(
                     Icon.createWithResource(this, R.drawable.ic_notification),
-                    "Доверенная сеть",
+                    getString(R.string.notif_action_trusted_network),
                     pauseIntent,
                 ).build()
             )
