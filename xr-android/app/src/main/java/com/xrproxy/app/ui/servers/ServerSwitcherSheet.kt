@@ -24,7 +24,10 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import com.xrproxy.app.R
 import com.xrproxy.app.data.ServerProfile
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -43,7 +46,7 @@ fun ServerSwitcherSheet(
     ) {
         Column(modifier = Modifier.padding(horizontal = 16.dp)) {
             Text(
-                "Серверы",
+                stringResource(R.string.servers_switcher_title),
                 style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.padding(bottom = 12.dp),
             )
@@ -70,7 +73,7 @@ fun ServerSwitcherSheet(
                         Column(modifier = Modifier.weight(1f)) {
                             Text(server.name, style = MaterialTheme.typography.bodyLarge)
                             Text(
-                                server.displaySubtitle,
+                                server.displaySubtitle(LocalContext.current),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -79,7 +82,7 @@ fun ServerSwitcherSheet(
                             onDismiss()
                             onEdit(server)
                         }) {
-                            Icon(Icons.Default.Edit, "Изменить")
+                            Icon(Icons.Default.Edit, stringResource(R.string.servers_edit_action))
                         }
                     }
                 }
@@ -91,7 +94,7 @@ fun ServerSwitcherSheet(
                     onAddServer()
                 },
                 modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp),
-            ) { Text("+ Добавить сервер") }
+            ) { Text(stringResource(R.string.servers_add_button)) }
         }
     }
 }

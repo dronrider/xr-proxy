@@ -12,7 +12,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import com.xrproxy.app.R
 
 /**
  * Переключатель политики на случай, когда недоступен весь пул серверов.
@@ -35,19 +37,15 @@ fun FailurePolicySection(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text("Если все серверы недоступны", style = MaterialTheme.typography.titleMedium)
+        Text(stringResource(R.string.servers_failure_policy_title), style = MaterialTheme.typography.titleMedium)
         Switch(checked = failClosed, onCheckedChange = onToggle)
     }
 
     Text(
         if (failClosed) {
-            "Проксируемые ресурсы блокируются (не идут напрямую). Реальный IP не " +
-                "засветится, но при отказе всех серверов такие сайты просто не " +
-                "откроются. Остальной трафик работает как обычно."
+            stringResource(R.string.servers_failure_policy_closed_desc)
         } else {
-            "Проксируемые ресурсы уходят напрямую в обход прокси. Открываются, но " +
-                "светят реальный IP на заблокированных сайтах (риск блокировки " +
-                "аккаунта)."
+            stringResource(R.string.servers_failure_policy_open_desc)
         },
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,

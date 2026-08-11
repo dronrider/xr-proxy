@@ -15,7 +15,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import com.xrproxy.app.R
 import com.xrproxy.app.data.JournalSettings
 
 /**
@@ -35,17 +37,16 @@ fun JournalSection(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text("Журнал", style = MaterialTheme.typography.titleMedium)
+        Text(stringResource(R.string.journal_title), style = MaterialTheme.typography.titleMedium)
     }
     Text(
-        "Лента на вкладке Log пишется в файл и переживает перезапуски. " +
-            "Старые записи вытесняются по мере заполнения.",
+        stringResource(R.string.journal_description),
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
 
     Spacer(Modifier.height(12.dp))
-    Text("Размер файла", style = MaterialTheme.typography.bodyMedium)
+    Text(stringResource(R.string.journal_size_label), style = MaterialTheme.typography.bodyMedium)
     Spacer(Modifier.height(4.dp))
     SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
         JournalSettings.SIZE_OPTIONS_KB.forEachIndexed { i, kb ->
@@ -56,13 +57,16 @@ fun JournalSection(
                     index = i, count = JournalSettings.SIZE_OPTIONS_KB.size,
                 ),
             ) {
-                Text(if (kb >= 1024) "${kb / 1024} МБ" else "$kb КБ")
+                Text(
+                    if (kb >= 1024) stringResource(R.string.journal_size_mb, kb / 1024)
+                    else stringResource(R.string.journal_size_kb, kb),
+                )
             }
         }
     }
 
     Spacer(Modifier.height(12.dp))
-    Text("Файлов на диске", style = MaterialTheme.typography.bodyMedium)
+    Text(stringResource(R.string.journal_files_label), style = MaterialTheme.typography.bodyMedium)
     Spacer(Modifier.height(4.dp))
     SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
         JournalSettings.FILES_OPTIONS.forEachIndexed { i, n ->

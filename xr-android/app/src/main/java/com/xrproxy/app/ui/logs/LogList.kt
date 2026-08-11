@@ -23,12 +23,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.xrproxy.app.R
 import kotlinx.coroutines.launch
 
 /**
@@ -45,7 +47,8 @@ fun LogList(
     if (entries.isEmpty()) {
         Box(modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
             Text(
-                if (queryActive) "Ничего не найдено" else "No entries",
+                if (queryActive) stringResource(R.string.logs_empty_filtered)
+                else stringResource(R.string.logs_empty),
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 32.dp),
@@ -103,7 +106,10 @@ fun LogList(
                 },
                 modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
             ) {
-                Icon(Icons.Default.KeyboardArrowDown, "Прокрутить вниз")
+                Icon(
+                    Icons.Default.KeyboardArrowDown,
+                    stringResource(R.string.logs_scroll_to_bottom),
+                )
             }
         }
     }

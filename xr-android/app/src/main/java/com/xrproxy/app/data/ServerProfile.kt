@@ -1,5 +1,8 @@
 package com.xrproxy.app.data
 
+import android.content.Context
+import com.xrproxy.app.R
+
 enum class ServerSource { Manual, Invite }
 
 /**
@@ -47,15 +50,24 @@ data class ServerProfile(
             else listOf(ProfileEndpoint(address = serverAddress, port = serverPort))
         }
 
-    val displaySubtitle: String
-        get() {
-            val eps = effectiveEndpoints
-            return when {
-                eps.isEmpty() -> "$serverAddress:$serverPort"
-                eps.size == 1 -> "${eps[0].address}:${eps[0].port}"
-                else -> "${eps[0].address}:${eps[0].port} (+${eps.size - 1} резерв)"
+    /** Строка адреса и порта для карточки/шита сервера, с числом резервов в
+     *  пуле, если их больше одного. Берёт [Context] за плюрализацией
+     *  («резерв»/«резерва»/«резервов»), поэтому вызывается из UI-слоя, а не
+     *  хранится готовым полем. */
+    fun displaySubtitle(context: Context): String {
+        val eps = effectiveEndpoints
+        return when {
+            eps.isEmpty() -> "$serverAddress:$serverPort"
+            eps.size == 1 -> "${eps[0].address}:${eps[0].port}"
+            else -> {
+                val extra = eps.size - 1
+                val reserve = context.resources.getQuantityString(
+                    R.plurals.data_server_reserve_count, extra, extra,
+                )
+                "${eps[0].address}:${eps[0].port} ($reserve)"
             }
         }
+    }
 
     /** Метка правил на чипе и карточке: имя пресета хаба, пусто без хаба.
      *  Локальный хардкод пресетов удалён в XR-047, правда живёт на хабе. */

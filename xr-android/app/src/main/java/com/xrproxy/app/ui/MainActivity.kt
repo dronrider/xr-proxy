@@ -221,6 +221,9 @@ fun MainScreen(
     var rulesOpen by remember { mutableStateOf(false) }
     val activity = LocalContext.current as Activity
     val scope = rememberCoroutineScope()
+    // Снекбар показывается из корутины, а не из композиции, поэтому текст
+    // читается заранее.
+    val qrUnavailable = stringResource(R.string.main_qr_unavailable)
 
     LaunchedEffect(Unit) {
         viewModel.permissionRequest.collect { intent -> launchVpnPermission(intent) }
@@ -284,9 +287,7 @@ fun MainScreen(
                                     val raw = scanInviteQr(activity) ?: return@launch
                                     viewModel.onInviteLinkReceived(raw)
                                 } catch (_: Throwable) {
-                                    snackbarHostState.showSnackbar(
-                                        "Сканер QR недоступен, используйте \"Вставить ссылку\""
-                                    )
+                                    snackbarHostState.showSnackbar(qrUnavailable)
                                 }
                             }
                         },
@@ -353,9 +354,7 @@ fun MainScreen(
                         val raw = scanInviteQr(activity) ?: return@launch
                         viewModel.onInviteLinkReceived(raw)
                     } catch (_: Throwable) {
-                        snackbarHostState.showSnackbar(
-                            "Сканер QR недоступен, используйте \"Вставить ссылку\""
-                        )
+                        snackbarHostState.showSnackbar(qrUnavailable)
                     }
                 }
             },
@@ -405,7 +404,7 @@ fun MainScreen(
                     selected = currentTab == 0,
                     onClick = { currentTab = 0 },
                     icon = { Icon(Icons.Default.Shield, null) },
-                    label = { Text("VPN") },
+                    label = { Text(stringResource(R.string.main_tab_vpn)) },
                 )
                 NavigationBarItem(
                     selected = currentTab == 1,
@@ -433,7 +432,7 @@ fun MainScreen(
                             }
                         }) { Icon(Icons.AutoMirrored.Filled.List, null) }
                     },
-                    label = { Text("Журнал") },
+                    label = { Text(stringResource(R.string.main_tab_logs)) },
                 )
                 NavigationBarItem(
                     selected = currentTab == 2,
@@ -470,13 +469,13 @@ fun MainScreen(
                             }
                         }) { Icon(Icons.Default.Dns, null) }
                     },
-                    label = { Text("Серверы") },
+                    label = { Text(stringResource(R.string.main_tab_servers)) },
                 )
                 NavigationBarItem(
                     selected = currentTab == 3,
                     onClick = { currentTab = 3 },
                     icon = { Icon(Icons.Default.Folder, null) },
-                    label = { Text("Файлы") },
+                    label = { Text(stringResource(R.string.main_tab_files)) },
                 )
             }
         }
@@ -635,16 +634,19 @@ fun ConnectionSection(
         }
     } else ""
     val statusText = when (state.phase) {
-        ConnectPhase.Idle, ConnectPhase.NeedsPermission -> "Отключено"
-        ConnectPhase.Preparing -> "Подготовка…"
-        ConnectPhase.Connecting -> "Подключение…"
-        ConnectPhase.Finalizing -> "Проверка маршрутов…"
+        ConnectPhase.Idle, ConnectPhase.NeedsPermission ->
+            stringResource(R.string.main_status_disconnected)
+        ConnectPhase.Preparing -> stringResource(R.string.main_status_preparing)
+        ConnectPhase.Connecting -> stringResource(R.string.main_status_connecting)
+        ConnectPhase.Finalizing -> stringResource(R.string.main_status_finalizing)
         // Туннель поднят, но аплинка нет: «Подключено» тут противоречит «Нет
         // сети» под ним, поэтому сам заголовок честно говорит про ожидание
         // сети (XR-183). Движок держит туннель и оживает сам с возвратом связи.
-        ConnectPhase.Connected -> if (state.noNetwork) "Ожидание сети" else "Подключено$healthEmoji"
-        ConnectPhase.Paused -> "На паузе"
-        ConnectPhase.Stopping -> "Отключение…"
+        ConnectPhase.Connected ->
+            if (state.noNetwork) stringResource(R.string.main_status_waiting_network)
+            else stringResource(R.string.main_status_connected, healthEmoji)
+        ConnectPhase.Paused -> stringResource(R.string.main_status_paused)
+        ConnectPhase.Stopping -> stringResource(R.string.main_status_stopping)
     }
     val statusColor = when {
         // Ожидание сети это не «подключено», зелёным не красим.
@@ -659,9 +661,9 @@ fun ConnectionSection(
 
     // Phase substep
     val substep = when (state.phase) {
-        ConnectPhase.Preparing -> "1/3 \u00B7 Подготовка"
-        ConnectPhase.Connecting -> "2/3 \u00B7 Установка туннеля"
-        ConnectPhase.Finalizing -> "3/3 \u00B7 Проверка маршрутов"
+        ConnectPhase.Preparing -> stringResource(R.string.main_substep_preparing)
+        ConnectPhase.Connecting -> stringResource(R.string.main_substep_connecting)
+        ConnectPhase.Finalizing -> stringResource(R.string.main_substep_finalizing)
         else -> null
     }
     if (substep != null) {
@@ -676,7 +678,7 @@ fun ConnectionSection(
     if (state.connected && !state.noNetwork && state.backupActive && state.activeServer.isNotBlank()) {
         Spacer(Modifier.height(4.dp))
         Text(
-            "через ${state.activeServer} (резерв)",
+            stringResource(R.string.main_backup_via, state.activeServer),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.tertiary,
         )
@@ -691,12 +693,12 @@ fun ConnectionSection(
     if (state.paused && state.noNetwork) {
         Spacer(Modifier.height(4.dp))
         Text(
-            "Нет сети",
+            stringResource(R.string.main_no_network),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Text(
-            "VPN включится сам, когда связь вернётся",
+            stringResource(R.string.main_no_network_paused_hint),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.outline,
             textAlign = TextAlign.Center,
@@ -705,12 +707,13 @@ fun ConnectionSection(
     if (state.paused && !state.noNetwork) {
         Spacer(Modifier.height(4.dp))
         Text(
-            state.pausedSsid?.let { "Доверенная сеть «$it»" } ?: "Доверенная сеть",
+            state.pausedSsid?.let { stringResource(R.string.main_trusted_network_named, it) }
+                ?: stringResource(R.string.main_trusted_network),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Text(
-            "трафик идёт напрямую, VPN включится сам при уходе из сети",
+            stringResource(R.string.main_trusted_direct_hint),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.outline,
             textAlign = TextAlign.Center,
@@ -718,7 +721,7 @@ fun ConnectionSection(
         if (state.restrictedNetwork) {
             Spacer(Modifier.height(4.dp))
             Text(
-                "В этой сети есть ограничения: включите VPN, если что-то не открывается",
+                stringResource(R.string.main_restricted_hint),
                 style = MaterialTheme.typography.bodySmall,
                 color = Color(0xFFFFA726),
                 textAlign = TextAlign.Center,
@@ -730,7 +733,7 @@ fun ConnectionSection(
     if (state.connected && state.noNetwork) {
         Spacer(Modifier.height(4.dp))
         Text(
-            "VPN восстановится сам, когда связь вернётся",
+            stringResource(R.string.main_no_network_connected_hint),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.outline,
             textAlign = TextAlign.Center,
@@ -739,7 +742,7 @@ fun ConnectionSection(
     if (state.connected && state.overrideSsid != null && !state.noNetwork) {
         Spacer(Modifier.height(4.dp))
         Text(
-            "включено вручную \u00B7 доверенная сеть «${state.overrideSsid}»",
+            stringResource(R.string.main_override_on, state.overrideSsid.orEmpty()),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.tertiary,
         )
@@ -753,7 +756,8 @@ fun ConnectionSection(
     }
     if (versionName.isNotBlank() && !state.connected && !state.connecting) {
         Spacer(Modifier.height(4.dp))
-        Text("v$versionName", style = MaterialTheme.typography.bodySmall,
+        Text(stringResource(R.string.main_version, versionName),
+            style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.outline)
     }
 
@@ -801,11 +805,11 @@ fun ConnectionSection(
         colors = ButtonDefaults.buttonColors(containerColor = btnColor, contentColor = btnTextColor),
     ) {
         val btnText = when {
-            state.connecting -> "Отмена"
-            state.paused -> "Включить здесь"
-            trustedForcedOn -> "Доверенная сеть"
-            state.connected -> "Отключить"
-            else -> "Подключить"
+            state.connecting -> stringResource(R.string.main_btn_cancel)
+            state.paused -> stringResource(R.string.main_btn_enable_here)
+            trustedForcedOn -> stringResource(R.string.main_trusted_network)
+            state.connected -> stringResource(R.string.main_btn_disconnect)
+            else -> stringResource(R.string.main_btn_connect)
         }
         Text(btnText, style = MaterialTheme.typography.titleMedium)
     }
@@ -830,8 +834,7 @@ fun ConnectionSection(
                     Icon(Icons.Default.Warning, null, tint = Color(0xFFFFA726))
                     Spacer(Modifier.width(12.dp))
                     Text(
-                        "Трафик уходит, но ответа нет. Проверьте ключ, salt и " +
-                            "modifier — они должны точно совпадать с сервером.",
+                        stringResource(R.string.main_no_traffic_warning),
                         color = Color(0xFFFFA726),
                         style = MaterialTheme.typography.bodySmall,
                     )
@@ -858,7 +861,10 @@ fun ConnectionSection(
             Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Default.Warning, null, tint = MaterialTheme.colorScheme.error)
                 Spacer(Modifier.width(12.dp))
-                Text("Добавьте сервер во вкладке Servers", color = MaterialTheme.colorScheme.error)
+                Text(
+                    stringResource(R.string.main_no_server_hint),
+                    color = MaterialTheme.colorScheme.error,
+                )
             }
         }
     }

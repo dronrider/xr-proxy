@@ -22,9 +22,11 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.xrproxy.app.R
 
 /** Хост хаба для подписи под статусом: схема и хвостовой слэш это шум,
  *  человек сверяет именно адрес. */
@@ -49,7 +51,7 @@ fun InviteLoadingScreen(hubUrl: String) {
         if (hubUrl.isNotBlank()) {
             Spacer(Modifier.height(24.dp))
             Text(
-                "Проверяем приглашение",
+                stringResource(R.string.invite_loading_title),
                 style = MaterialTheme.typography.headlineSmall,
                 color = MaterialTheme.colorScheme.onSurface,
             )
@@ -124,13 +126,13 @@ fun InviteErrorScreen(
                     containerColor = MaterialTheme.colorScheme.primary,
                     contentColor = MaterialTheme.colorScheme.onPrimary,
                 ),
-            ) { Text("Повторить", style = MaterialTheme.typography.titleMedium) }
+            ) { Text(stringResource(R.string.invite_retry), style = MaterialTheme.typography.titleMedium) }
             Spacer(Modifier.height(12.dp))
         }
         OutlinedButton(
             onClick = onBack,
             modifier = Modifier.fillMaxWidth(0.7f).height(56.dp),
             shape = RoundedCornerShape(28.dp),
-        ) { Text("Назад", style = MaterialTheme.typography.titleMedium) }
+        ) { Text(stringResource(R.string.invite_back), style = MaterialTheme.typography.titleMedium) }
     }
 }

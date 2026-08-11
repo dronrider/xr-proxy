@@ -24,6 +24,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.xrproxy.app.R
 import com.xrproxy.app.ui.ConnectPhase
@@ -58,13 +59,13 @@ fun WelcomeScreen(
             ShieldArrowIcon(phase = ConnectPhase.Idle, modifier = Modifier.size(128.dp))
             Spacer(Modifier.height(24.dp))
             Text(
-                "XR Proxy",
+                stringResource(R.string.app_name),
                 style = MaterialTheme.typography.headlineMedium,
                 color = MaterialTheme.colorScheme.onSurface,
             )
             Spacer(Modifier.height(8.dp))
             Text(
-                "Безопасное подключение к интернету",
+                stringResource(R.string.invite_welcome_tagline),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -85,7 +86,7 @@ fun WelcomeScreen(
                     modifier = Modifier.size(20.dp),
                 )
                 Spacer(Modifier.width(12.dp))
-                Text("Сканировать QR-код", style = MaterialTheme.typography.titleMedium)
+                Text(stringResource(R.string.invite_welcome_scan_qr), style = MaterialTheme.typography.titleMedium)
             }
             Spacer(Modifier.height(12.dp))
 
@@ -100,7 +101,7 @@ fun WelcomeScreen(
                     modifier = Modifier.size(20.dp),
                 )
                 Spacer(Modifier.width(12.dp))
-                Text("Вставить ссылку", style = MaterialTheme.typography.titleMedium)
+                Text(stringResource(R.string.invite_welcome_paste_link), style = MaterialTheme.typography.titleMedium)
             }
             Spacer(Modifier.height(12.dp))
 
@@ -109,7 +110,7 @@ fun WelcomeScreen(
                 modifier = Modifier.fillMaxWidth(0.85f),
             ) {
                 Text(
-                    "Настроить вручную",
+                    stringResource(R.string.invite_welcome_manual),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -118,7 +119,7 @@ fun WelcomeScreen(
 
         if (versionName.isNotBlank()) {
             Text(
-                "v$versionName",
+                stringResource(R.string.invite_welcome_version, versionName),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.outline,
                 modifier = Modifier

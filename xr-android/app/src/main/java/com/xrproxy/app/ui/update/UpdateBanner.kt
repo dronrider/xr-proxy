@@ -27,7 +27,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import com.xrproxy.app.R
 import com.xrproxy.app.ui.UpdateUiState
 import com.xrproxy.app.ui.components.formatBytes
 import com.xrproxy.app.ui.updatePending
@@ -57,9 +59,13 @@ fun UpdateBanner(
                     Icon(Icons.Default.SystemUpdate, null, tint = MaterialTheme.colorScheme.primary)
                     Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
-                        Text("Доступно обновление", style = MaterialTheme.typography.titleSmall)
+                        Text(stringResource(R.string.update_available_title), style = MaterialTheme.typography.titleSmall)
                         Text(
-                            "Версия ${state.release.versionName} · ${formatBytes(state.release.sizeBytes)}",
+                            stringResource(
+                                R.string.update_version_size,
+                                state.release.versionName,
+                                formatBytes(state.release.sizeBytes),
+                            ),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -70,7 +76,7 @@ fun UpdateBanner(
                     Text(state.release.notes, style = MaterialTheme.typography.bodySmall)
                 }
                 Spacer(Modifier.height(12.dp))
-                Button(onClick = onUpdate, modifier = Modifier.fillMaxWidth()) { Text("Обновить") }
+                Button(onClick = onUpdate, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.update_button)) }
             }
         }
 
@@ -82,7 +88,7 @@ fun UpdateBanner(
         ) {
             Column(Modifier.padding(16.dp)) {
                 Text(
-                    "Загрузка обновления ${state.release.versionName}…",
+                    stringResource(R.string.update_downloading_title, state.release.versionName),
                     style = MaterialTheme.typography.titleSmall,
                 )
                 Spacer(Modifier.height(12.dp))
@@ -93,7 +99,7 @@ fun UpdateBanner(
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "${(state.progress * 100).toInt()}%",
+                        stringResource(R.string.update_progress_percent, (state.progress * 100).toInt()),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -111,16 +117,16 @@ fun UpdateBanner(
         ) {
             Column(Modifier.padding(16.dp)) {
                 Text(
-                    "Обновление ${state.release.versionName} готово",
+                    stringResource(R.string.update_ready_title, state.release.versionName),
                     style = MaterialTheme.typography.titleSmall,
                 )
                 Text(
-                    "Подпись и контрольная сумма проверены",
+                    stringResource(R.string.update_ready_verified),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Spacer(Modifier.height(12.dp))
-                Button(onClick = onInstall, modifier = Modifier.fillMaxWidth()) { Text("Установить") }
+                Button(onClick = onInstall, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.update_install_button)) }
             }
         }
 
@@ -142,8 +148,8 @@ fun UpdateNotice(
     modifier: Modifier = Modifier,
 ) {
     val text = when (state) {
-        is UpdateUiState.Available -> "Доступно обновление ${state.release.versionName}"
-        is UpdateUiState.ReadyToInstall -> "Обновление ${state.release.versionName} готово"
+        is UpdateUiState.Available -> stringResource(R.string.update_notice_available, state.release.versionName)
+        is UpdateUiState.ReadyToInstall -> stringResource(R.string.update_notice_ready, state.release.versionName)
         else -> return
     }
     Surface(
@@ -172,7 +178,7 @@ fun UpdateNotice(
             IconButton(onClick = onClose) {
                 Icon(
                     Icons.Default.Close,
-                    "Закрыть",
+                    stringResource(R.string.update_notice_close_desc),
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
@@ -200,13 +206,13 @@ fun UpdateCheckControls(
 ) {
     Column(modifier.fillMaxWidth()) {
         Text(
-            "Обновление приложения",
+            stringResource(R.string.update_section_title),
             style = MaterialTheme.typography.titleMedium,
             modifier = Modifier.padding(vertical = 8.dp),
         )
         if (currentVersionName.isNotBlank()) {
             Text(
-                "Текущая версия: $currentVersionName",
+                stringResource(R.string.update_current_version, currentVersionName),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -215,7 +221,7 @@ fun UpdateCheckControls(
         // у релиза этой информации больше не несёт (XR-041).
         if (buildInfo.isNotBlank()) {
             Text(
-                "Сборка: $buildInfo",
+                stringResource(R.string.update_build_info, buildInfo),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -233,7 +239,7 @@ fun UpdateCheckControls(
                 is UpdateUiState.UpToDate -> {
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "У вас актуальная версия",
+                        stringResource(R.string.update_up_to_date),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.primary,
                     )
@@ -260,9 +266,9 @@ fun UpdateCheckControls(
                         strokeWidth = 2.dp,
                     )
                     Spacer(Modifier.width(8.dp))
-                    Text("Проверка…")
+                    Text(stringResource(R.string.update_check_checking))
                 } else {
-                    Text("Проверить обновления")
+                    Text(stringResource(R.string.update_check_button))
                 }
             }
         }

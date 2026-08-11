@@ -21,8 +21,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.xrproxy.app.R
 
 /**
  * Sticky Log-tab toolbar (LLD-03 §3.4): title with match counter, the
@@ -50,20 +52,30 @@ fun LogToolbar(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             val header = if (query.isBlank()) {
-                "Log ($totalWarn errors)"
+                stringResource(R.string.logs_title_total, totalWarn)
             } else {
-                "Log ($matchedWarn/$totalWarn errors)"
+                stringResource(R.string.logs_title_matched, matchedWarn, totalWarn)
             }
             Text(
                 header,
                 style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.weight(1f),
             )
-            IconButton(onClick = onCopy) { Icon(Icons.Default.ContentCopy, "Copy") }
-            IconButton(onClick = onDownload) { Icon(Icons.Default.FileDownload, "Download") }
-            IconButton(onClick = onShare) { Icon(Icons.Default.Share, "Share") }
+            IconButton(onClick = onCopy) {
+                Icon(Icons.Default.ContentCopy, stringResource(R.string.logs_action_copy))
+            }
+            IconButton(onClick = onDownload) {
+                Icon(Icons.Default.FileDownload, stringResource(R.string.logs_action_download))
+            }
+            IconButton(onClick = onShare) {
+                Icon(Icons.Default.Share, stringResource(R.string.logs_action_share))
+            }
             IconButton(onClick = onClear) {
-                Icon(Icons.Default.Delete, "Clear", tint = MaterialTheme.colorScheme.error)
+                Icon(
+                    Icons.Default.Delete,
+                    stringResource(R.string.logs_action_clear),
+                    tint = MaterialTheme.colorScheme.error,
+                )
             }
         }
 
@@ -75,7 +87,7 @@ fun LogToolbar(
                 Row(horizontalArrangement = Arrangement.spacedBy(0.dp)) {
                     if (query.isNotEmpty()) {
                         IconButton(onClick = { onQueryChange("") }) {
-                            Icon(Icons.Default.Close, "Очистить поиск")
+                            Icon(Icons.Default.Close, stringResource(R.string.logs_clear_query))
                         }
                     }
                     IconToggleButton(checked = regexMode, onCheckedChange = { onToggleRegex() }) {
@@ -90,7 +102,7 @@ fun LogToolbar(
             },
             singleLine = true,
             isError = invalidRegex,
-            placeholder = { Text("Поиск…") },
+            placeholder = { Text(stringResource(R.string.logs_search_placeholder)) },
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
         )
     }

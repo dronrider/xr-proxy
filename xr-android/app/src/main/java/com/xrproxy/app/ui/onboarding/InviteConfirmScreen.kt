@@ -26,8 +26,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.xrproxy.app.R
 import com.xrproxy.app.ui.ConnectPhase
 import com.xrproxy.app.ui.components.ShieldArrowIcon
 import kotlinx.coroutines.delay
@@ -72,25 +74,25 @@ fun InviteConfirmScreen(
             ShieldArrowIcon(phase = ConnectPhase.Idle, modifier = Modifier.size(96.dp))
             Spacer(Modifier.height(16.dp))
             Text(
-                "Настройка подключения",
+                stringResource(R.string.invite_confirm_title),
                 style = MaterialTheme.typography.headlineSmall,
                 color = MaterialTheme.colorScheme.onSurface,
             )
             Spacer(Modifier.height(24.dp))
 
-            InviteField("Хаб", hubUrl)
-            InviteField("Пресет", preset)
+            InviteField(stringResource(R.string.invite_field_hub), hubUrl)
+            InviteField(stringResource(R.string.invite_field_preset), preset)
             if (comment.isNotBlank()) {
-                InviteField("От кого", comment)
+                InviteField(stringResource(R.string.invite_field_from), comment)
             }
-            InviteField("Действителен", ttlLabel(expiresAt))
+            InviteField(stringResource(R.string.invite_field_expires), ttlLabel(expiresAt))
 
             if (reclaimable) {
                 // Инвайт потрачен нами же, и хаб отдаст настройки повторно
                 // (XR-216). Это не отказ, поэтому и не красным.
                 Spacer(Modifier.height(16.dp))
                 Text(
-                    "Этот инвайт уже применяли на этом устройстве. Можно применить снова",
+                    stringResource(R.string.invite_reclaimable_note),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.bodyMedium,
                     textAlign = TextAlign.Center,
@@ -98,9 +100,9 @@ fun InviteConfirmScreen(
             } else if (status != "active") {
                 Spacer(Modifier.height(16.dp))
                 val statusText = when (status) {
-                    "consumed" -> "Этот инвайт уже использован"
-                    "expired" -> "Срок действия инвайта истёк"
-                    else -> "Инвайт недоступен"
+                    "consumed" -> stringResource(R.string.invite_status_consumed)
+                    "expired" -> stringResource(R.string.invite_status_expired)
+                    else -> stringResource(R.string.invite_status_unavailable)
                 }
                 Text(
                     statusText,
@@ -113,7 +115,7 @@ fun InviteConfirmScreen(
             if (willReplaceExisting && status == "active") {
                 Spacer(Modifier.height(16.dp))
                 Text(
-                    "⚠ Существующие настройки подключения будут заменены.",
+                    stringResource(R.string.invite_replace_warning),
                     color = MaterialTheme.colorScheme.tertiary,
                     style = MaterialTheme.typography.bodyMedium,
                     textAlign = TextAlign.Center,
@@ -129,7 +131,7 @@ fun InviteConfirmScreen(
                     onClick = onCancel,
                     shape = RoundedCornerShape(28.dp),
                     modifier = Modifier.weight(1f).height(56.dp),
-                ) { Text("Отмена") }
+                ) { Text(stringResource(R.string.invite_cancel)) }
 
                 Button(
                     onClick = onApply,
@@ -149,7 +151,7 @@ fun InviteConfirmScreen(
                         )
                         Spacer(Modifier.width(8.dp))
                     }
-                    Text("Добавить")
+                    Text(stringResource(R.string.invite_apply_button))
                 }
             }
         }
@@ -192,30 +194,37 @@ private fun ttlLabel(expiresAt: String): String {
     }
     // Read `tick` so recomposition picks up new state.
     @Suppress("UNUSED_EXPRESSION") tick
-    return try {
-        val expires = OffsetDateTime.parse(expiresAt)
-        val now = OffsetDateTime.now()
-        val left = Duration.between(now, expires)
-        if (left.isNegative) "истёк" else formatDuration(left)
+    // Разбор даты держим отдельно от текста: вокруг вызова composable
+    // try/catch не ставится, а неразобранную метку показываем как есть.
+    val left = try {
+        Duration.between(OffsetDateTime.now(), OffsetDateTime.parse(expiresAt))
     } catch (_: DateTimeParseException) {
-        expiresAt
+        null
+    }
+    return when {
+        left == null -> expiresAt
+        left.isNegative -> stringResource(R.string.invite_ttl_expired)
+        else -> formatDuration(left)
     }
 }
 
+@Composable
 private fun formatDuration(d: Duration): String {
     val totalMinutes = d.toMinutes()
     return when {
-        totalMinutes < 1 -> "< 1 мин"
-        totalMinutes < 60 -> "ещё $totalMinutes мин"
+        totalMinutes < 1 -> stringResource(R.string.invite_ttl_lt_1min)
+        totalMinutes < 60 -> stringResource(R.string.invite_ttl_minutes, totalMinutes.toInt())
         totalMinutes < 24 * 60 -> {
             val h = totalMinutes / 60
             val m = totalMinutes % 60
-            if (m == 0L) "ещё $h ч" else "ещё $h ч $m мин"
+            if (m == 0L) stringResource(R.string.invite_ttl_hours, h.toInt())
+            else stringResource(R.string.invite_ttl_hours_minutes, h.toInt(), m.toInt())
         }
         else -> {
             val days = totalMinutes / (24 * 60)
             val hours = (totalMinutes % (24 * 60)) / 60
-            if (hours == 0L) "ещё $days д" else "ещё $days д $hours ч"
+            if (hours == 0L) stringResource(R.string.invite_ttl_days, days.toInt())
+            else stringResource(R.string.invite_ttl_days_hours, days.toInt(), hours.toInt())
         }
     }
 }

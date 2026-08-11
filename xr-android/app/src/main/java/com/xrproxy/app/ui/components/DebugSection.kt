@@ -35,7 +35,9 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import com.xrproxy.app.R
 import com.xrproxy.app.ui.VpnUiState
 import kotlinx.coroutines.launch
 import org.json.JSONObject
@@ -79,11 +81,15 @@ fun DebugSection(
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Spacer(Modifier.padding(start = 8.dp))
-                    Text("Debug", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        stringResource(R.string.debug_title),
+                        style = MaterialTheme.typography.titleSmall,
+                    )
                 }
                 Icon(
                     if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                    contentDescription = if (expanded) "Collapse" else "Expand",
+                    contentDescription = if (expanded) stringResource(R.string.debug_collapse)
+                    else stringResource(R.string.debug_expand),
                     modifier = Modifier.size(20.dp),
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -103,23 +109,26 @@ fun DebugSection(
                 ),
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    DebugGroup("Network") {
-                        DebugRow("DNS queries", "${state.dnsQueries}")
-                        DebugRow("TCP SYNs", "${state.tcpSyns}")
+                    DebugGroup(stringResource(R.string.debug_group_network)) {
+                        DebugRow(stringResource(R.string.debug_dns_queries), "${state.dnsQueries}")
+                        DebugRow(stringResource(R.string.debug_tcp_syns), "${state.tcpSyns}")
                     }
 
                     Spacer(Modifier.height(12.dp))
 
+                    // «smoltcp» это имя стека, не переводится.
                     DebugGroup("smoltcp") {
-                        DebugRow("Recv", formatBytes(state.smolRecv))
-                        DebugRow("Send", formatBytes(state.smolSend))
+                        DebugRow(stringResource(R.string.debug_recv), formatBytes(state.smolRecv))
+                        DebugRow(stringResource(R.string.debug_send), formatBytes(state.smolSend))
                     }
 
                     Spacer(Modifier.height(12.dp))
 
-                    DebugGroup("Relay") {
-                        DebugRow("Warnings", "${state.relayWarnings}")
-                        DebugRow("Errors", "${state.relayErrors}")
+                    DebugGroup(stringResource(R.string.debug_group_relay)) {
+                        DebugRow(
+                            stringResource(R.string.debug_warnings), "${state.relayWarnings}",
+                        )
+                        DebugRow(stringResource(R.string.debug_errors), "${state.relayErrors}")
                         if (state.debugMsg.isNotBlank()) {
                             Spacer(Modifier.height(4.dp))
                             Text(
@@ -132,13 +141,15 @@ fun DebugSection(
 
                     Spacer(Modifier.height(16.dp))
 
-                    // Copy all button
+                    // Copy all button. Текст снекбара читается заранее:
+                    // показывает его корутина, а не композиция.
+                    val copied = stringResource(R.string.main_copied)
                     Button(
                         onClick = {
                             val json = buildDebugJson(state)
                             val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                             cm.setPrimaryClip(ClipData.newPlainText("XR Proxy Debug", json))
-                            scope.launch { snackbarHostState.showSnackbar("Скопировано") }
+                            scope.launch { snackbarHostState.showSnackbar(copied) }
                         },
                         modifier = Modifier.align(Alignment.CenterHorizontally),
                         colors = ButtonDefaults.buttonColors(
@@ -148,7 +159,7 @@ fun DebugSection(
                     ) {
                         Icon(Icons.Default.ContentCopy, null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.padding(start = 8.dp))
-                        Text("Copy all (JSON)")
+                        Text(stringResource(R.string.debug_copy_all))
                     }
                 }
             }

@@ -15,7 +15,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import com.xrproxy.app.R
 import com.xrproxy.app.model.HealthLevel
 
 /**
@@ -45,7 +47,7 @@ fun HealthFace(level: HealthLevel, modifier: Modifier = Modifier) {
 
     Icon(
         imageVector = icon,
-        contentDescription = "Health: ${level.name}",
+        contentDescription = stringResource(R.string.health_content_description, level.name),
         tint = animatedTint,
         modifier = modifier
             .size(32.dp)

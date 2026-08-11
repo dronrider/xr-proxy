@@ -17,7 +17,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import com.xrproxy.app.R
 
 /**
  * Paste-link dialog (LLD-04 §3.3). Two paths to fill the field:
@@ -35,7 +37,7 @@ fun PasteLinkDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Вставить ссылку") },
+        title = { Text(stringResource(R.string.invite_paste_dialog_title)) },
         text = {
             Column {
                 OutlinedTextField(
@@ -53,7 +55,7 @@ fun PasteLinkDialog(
                     TextButton(onClick = {
                         text = clipboard.getText()?.text?.trim().orEmpty()
                     }) {
-                        Text("Вставить из буфера")
+                        Text(stringResource(R.string.invite_paste_from_clipboard))
                     }
                 }
             }
@@ -62,10 +64,10 @@ fun PasteLinkDialog(
             TextButton(
                 onClick = { onSubmit(text.trim()) },
                 enabled = text.isNotBlank(),
-            ) { Text("Применить") }
+            ) { Text(stringResource(R.string.invite_apply_action)) }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Отмена") }
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.invite_cancel)) }
         },
     )
 }

@@ -16,6 +16,7 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
+import com.xrproxy.app.R
 import com.xrproxy.app.data.CachedPreset
 import com.xrproxy.app.data.JournalSettings
 import com.xrproxy.app.data.PresetCacheReader
@@ -400,7 +401,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         updateManager.onInstallStatus = { status ->
             when (status) {
                 is UpdateManager.InstallStatus.Success -> {
-                    emitMessage("Обновление установлено", UiSeverity.Info)
+                    emitMessage(str(R.string.vpn_update_installed), UiSeverity.Info)
                     _updateState.value = UpdateUiState.Idle
                 }
                 is UpdateManager.InstallStatus.Cancelled -> {
@@ -412,7 +413,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
                 is UpdateManager.InstallStatus.Failed -> {
-                    emitMessage("Установка не удалась: ${status.message}", UiSeverity.Error)
+                    emitMessage(
+                        str(R.string.vpn_update_install_failed, status.message),
+                        UiSeverity.Error,
+                    )
                     _updateState.value = UpdateUiState.Error("install: ${status.message}")
                 }
             }
@@ -463,7 +467,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             SwitchAction.SetActive -> repo.setActive(id)
             SwitchAction.Reconnect -> {
                 repo.setActive(id)
-                reconnectActive("Переключаю сервер")
+                reconnectActive(str(R.string.vpn_switching_server))
             }
         }
     }
@@ -498,7 +502,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         val wasActive = repo.activeId.value == profile.id
         repo.upsert(profile)
         if (wasActive && _uiState.value.phase == ConnectPhase.Connected) {
-            reconnectActive("Применяю новые настройки")
+            reconnectActive(str(R.string.vpn_applying_settings))
         }
     }
 
@@ -552,11 +556,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             val cm = getApplication<Application>()
                 .getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
             if (cm == null) {
-                emitMessage("Буфер обмена недоступен", UiSeverity.Warn)
+                emitMessage(str(R.string.logs_clipboard_unavailable), UiSeverity.Warn)
                 return@launch
             }
             cm.setPrimaryClip(android.content.ClipData.newPlainText("xr-proxy log", text))
-            emitMessage("Скопировано", UiSeverity.Info)
+            emitMessage(str(R.string.main_copied), UiSeverity.Info)
         }
     }
 
@@ -575,9 +579,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                     putExtra(Intent.EXTRA_STREAM, uri)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
-                context.startActivity(Intent.createChooser(intent, "Share log"))
+                context.startActivity(
+                    Intent.createChooser(intent, str(R.string.logs_share_chooser)),
+                )
             } catch (e: Exception) {
-                emitMessage("Не удалось поделиться: ${e.message}", UiSeverity.Error)
+                emitMessage(str(R.string.logs_share_failed, e.message.orEmpty()), UiSeverity.Error)
             }
         }
     }
@@ -590,9 +596,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 resolver.openOutputStream(uri)?.use { out ->
                     out.writer(Charsets.UTF_8).use { w -> w.write(text) }
                 }
-                emitMessage("Лог сохранён", UiSeverity.Info)
+                emitMessage(str(R.string.logs_saved), UiSeverity.Info)
             } catch (e: Exception) {
-                emitMessage("Не удалось сохранить: ${e.message}", UiSeverity.Error)
+                emitMessage(str(R.string.logs_save_failed, e.message.orEmpty()), UiSeverity.Error)
             }
         }
     }
@@ -618,7 +624,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun addTrustedNetwork(ssid: String) {
         val clean = ssid.trim()
         if (clean.isBlank()) {
-            emitMessage("Введите имя сети (SSID)", UiSeverity.Info)
+            emitMessage(str(R.string.vpn_trusted_enter_ssid), UiSeverity.Info)
             return
         }
         trustedRepo.add(clean)
@@ -730,7 +736,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 UserRulesStore.save(getApplication<Application>().filesDir, capped)
             } catch (e: Exception) {
-                emitMessage("Не удалось сохранить правила: ${e.message}", UiSeverity.Error)
+                emitMessage(
+                    str(R.string.vpn_rules_save_failed, e.message.orEmpty()),
+                    UiSeverity.Error,
+                )
             }
             try {
                 NativeBridge.nativeApplyUserRules(
@@ -753,13 +762,13 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         val hubUrl = server?.hubUrl?.takeIf { it.isNotBlank() }
         val preset = server?.hubPreset?.takeIf { it.isNotBlank() }
         if (hubUrl == null || preset == null) {
-            return PresetRefresh.Failed("У сервера не настроен хаб или пресет")
+            return PresetRefresh.Failed(str(R.string.vpn_preset_no_hub))
         }
         val json = withContext(Dispatchers.IO) {
             NativeBridge.nativeRefreshPreset(hubUrl, preset, presetCacheDir.absolutePath, 5_000L)
         }
         val obj = runCatching { JSONObject(json) }.getOrNull()
-            ?: return PresetRefresh.Failed("Ошибка ответа хаба")
+            ?: return PresetRefresh.Failed(str(R.string.vpn_hub_bad_response))
         obj.optString("error").takeIf { it.isNotBlank() }?.let { code ->
             return PresetRefresh.Failed(friendlyPresetError(code, preset))
         }
@@ -769,24 +778,25 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun friendlyPresetError(code: String, preset: String): String = when {
-        code == "not_found" -> "Пресета «$preset» больше нет на хабе"
-        code.startsWith("network") -> "Хаб недоступен. Проверьте интернет"
-        code.startsWith("http_") -> "Ошибка хаба: ${code.removePrefix("http_")}"
-        else -> "Не удалось обновить пресет: $code"
+        code == "not_found" -> str(R.string.vpn_preset_gone, preset)
+        code.startsWith("network") -> str(R.string.vpn_hub_unreachable)
+        code.startsWith("http_") -> str(R.string.vpn_hub_error, code.removePrefix("http_"))
+        else -> str(R.string.vpn_preset_refresh_failed, code)
     }
 
     /** Список пресетов активного хаба для пикера выбора (XR-119). */
     suspend fun listHubPresets(): PresetList {
-        val hubUrl = activeHubUrl() ?: return PresetList.Failed("У активного сервера не настроен хаб")
+        val hubUrl = activeHubUrl() ?: return PresetList.Failed(str(R.string.vpn_hub_not_set))
         val json = withContext(Dispatchers.IO) {
             NativeBridge.nativeListPresets(hubUrl, 5_000L)
         }
         val obj = runCatching { JSONObject(json) }.getOrNull()
-            ?: return PresetList.Failed("Ошибка ответа хаба")
+            ?: return PresetList.Failed(str(R.string.vpn_hub_bad_response))
         obj.optString("error").takeIf { it.isNotBlank() }?.let { code ->
             return PresetList.Failed(friendlyHubError(code))
         }
-        val arr = obj.optJSONArray("presets") ?: return PresetList.Failed("Ошибка ответа хаба")
+        val arr = obj.optJSONArray("presets")
+            ?: return PresetList.Failed(str(R.string.vpn_hub_bad_response))
         val out = buildList {
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
@@ -805,9 +815,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun friendlyHubError(code: String): String = when {
-        code.startsWith("network") -> "Хаб недоступен. Проверьте интернет"
-        code.startsWith("http_") -> "Ошибка хаба: ${code.removePrefix("http_")}"
-        else -> "Не удалось получить список пресетов: $code"
+        code.startsWith("network") -> str(R.string.vpn_hub_unreachable)
+        code.startsWith("http_") -> str(R.string.vpn_hub_error, code.removePrefix("http_"))
+        else -> str(R.string.vpn_preset_list_failed, code)
     }
 
     // ── APK self-update (LLD-12) ────────────────────────────────────
@@ -824,7 +834,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun checkForUpdates(manual: Boolean) {
         val hubUrl = activeHubUrl()
         if (hubUrl == null) {
-            if (manual) emitMessage("Для проверки обновлений нужен сервер с хабом", UiSeverity.Info)
+            if (manual) emitMessage(str(R.string.vpn_update_needs_hub), UiSeverity.Info)
             return
         }
         // Never interrupt an in-flight download / install. Припаркованное
@@ -959,10 +969,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun installReadyUpdate() {
         val s = _updateState.value as? UpdateUiState.ReadyToInstall ?: return
         if (!updateManager.canRequestInstall()) {
-            emitMessage(
-                "Разрешите установку из этого источника, затем нажмите «Установить»",
-                UiSeverity.Info,
-            )
+            emitMessage(str(R.string.vpn_update_allow_source), UiSeverity.Info)
             viewModelScope.launch { _openIntent.emit(updateManager.unknownSourcesSettingsIntent()) }
             return
         }
@@ -988,14 +995,14 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun friendlyUpdateError(code: String): String = when {
-        code == "no_release" -> "На хабе пока нет опубликованных релизов"
-        code == "no_hub" -> "Для сервера не задан хаб"
-        code == "no_release_key" -> "В этой сборке обновление по воздуху отключено"
-        code == "sha_mismatch" -> "Загруженный файл повреждён — попробуйте ещё раз"
-        code.startsWith("verify") -> "Подпись обновления неверна — установка отклонена"
+        code == "no_release" -> str(R.string.vpn_update_no_release)
+        code == "no_hub" -> str(R.string.vpn_update_no_hub)
+        code == "no_release_key" -> str(R.string.vpn_update_no_key)
+        code == "sha_mismatch" -> str(R.string.vpn_update_sha_mismatch)
+        code.startsWith("verify") -> str(R.string.vpn_update_bad_signature)
         code.startsWith("network") || code.startsWith("http") ->
-            "Хаб недоступен. Проверьте интернет"
-        else -> "Не удалось обновить: $code"
+            str(R.string.vpn_hub_unreachable)
+        else -> str(R.string.vpn_update_failed, code)
     }
 
     fun toggleDebug() {
@@ -1015,14 +1022,14 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 val err = parsed?.optString("error") ?: "parse failed"
                 Log.w("xr-onboarding", "parseInviteLink: $err")
                 _onboardingState.value = badInviteError(hubUrl = "", raw = raw,
-                    detail = "Неправильный формат приглашения")
+                    detail = str(R.string.vpn_invite_bad_format))
                 return@launch
             }
             val hubUrl = parsed.optString("hub_url")
             val token = parsed.optString("token")
             if (hubUrl.isBlank() || token.isBlank()) {
                 _onboardingState.value = badInviteError(hubUrl = hubUrl, raw = raw,
-                    detail = "Неправильный формат приглашения")
+                    detail = str(R.string.vpn_invite_bad_format))
                 return@launch
             }
 
@@ -1036,7 +1043,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             }
             val info = runCatching { JSONObject(infoJson) }.getOrNull()
             if (info == null) {
-                _onboardingState.value = hubInviteError(hubUrl, raw, "Ошибка ответа хаба")
+                _onboardingState.value =
+                    hubInviteError(hubUrl, raw, str(R.string.vpn_hub_bad_response))
                 return@launch
             }
             if (info.has("error")) {
@@ -1071,7 +1079,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private fun badInviteError(hubUrl: String, raw: String, detail: String) =
         OnboardingState.InviteError(
             hubUrl = hubUrl,
-            title = "Приглашение не подходит",
+            title = str(R.string.vpn_invite_bad_title),
             detail = detail,
             retryable = false,
             rawLink = raw,
@@ -1081,7 +1089,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private fun hubInviteError(hubUrl: String, raw: String, detail: String) =
         OnboardingState.InviteError(
             hubUrl = hubUrl,
-            title = "Хаб не ответил",
+            title = str(R.string.vpn_invite_hub_silent),
             detail = detail,
             retryable = true,
             rawLink = raw,
@@ -1138,7 +1146,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
             val profile = ServerProfile(
                 id = UUID.randomUUID().toString(),
-                name = repo.generateName(serverAddr, hubFromPayload, current.comment),
+                name = repo.generateName(getApplication(), serverAddr, hubFromPayload, current.comment),
                 serverAddress = endpoints.firstOrNull()?.address ?: serverAddr,
                 serverPort = endpoints.firstOrNull()?.port ?: serverPort,
                 endpoints = endpoints,
@@ -1159,11 +1167,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             if (inviteActivatesProfile(_uiState.value.phase, repo.activeId.value != null)) {
                 repo.setActive(profile.id)
             } else {
-                emitMessage("Профиль добавлен, активный сервер прежний", UiSeverity.Info)
+                emitMessage(str(R.string.vpn_profile_added), UiSeverity.Info)
             }
 
             if (!presetCached) {
-                emitMessage("Хаб недоступен, подпись пресета не будет проверяться", UiSeverity.Warn)
+                emitMessage(str(R.string.vpn_preset_unsigned), UiSeverity.Warn)
             }
             _onboardingState.value = OnboardingState.Completed
         }
@@ -1186,23 +1194,28 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun friendlyInviteInfoError(code: String): String = when (code) {
-        "not_found" -> "Приглашение не найдено"
-        "gone" -> "Приглашение уже использовано или истекло"
+        "not_found" -> str(R.string.vpn_invite_not_found)
+        "gone" -> str(R.string.vpn_invite_gone)
         else -> when {
-            code.startsWith("network") -> "Проверьте интернет и попробуйте снова"
-            code.contains("certificate") -> "Небезопасное соединение с хабом"
-            code.startsWith("http_") -> "Ошибка хаба: ${code.removePrefix("http_")}"
-            else -> "Ошибка: $code"
+            code.startsWith("network") -> str(R.string.vpn_invite_check_network)
+            code.contains("certificate") -> str(R.string.vpn_invite_insecure)
+            code.startsWith("http_") -> str(R.string.vpn_hub_error, code.removePrefix("http_"))
+            else -> str(R.string.vpn_error_code, code)
         }
     }
 
     private fun friendlyClaimError(code: String): String = when {
-        code.contains("gone") -> "Приглашение уже использовано или истекло"
-        code.contains("not_found") -> "Приглашение не найдено"
-        code.contains("network") -> "Хаб недоступен. Проверьте интернет"
-        code.contains("certificate") -> "Небезопасное соединение с хабом"
-        else -> "Ошибка применения: $code"
+        code.contains("gone") -> str(R.string.vpn_invite_gone)
+        code.contains("not_found") -> str(R.string.vpn_invite_not_found)
+        code.contains("network") -> str(R.string.vpn_hub_unreachable)
+        code.contains("certificate") -> str(R.string.vpn_invite_insecure)
+        else -> str(R.string.vpn_invite_apply_failed, code)
     }
+
+    /** Текст из ресурсов приложения. Строки VM уезжают в снекбары и в
+     *  состояние экранов, локаль берётся системная (XR-092). */
+    private fun str(id: Int, vararg args: Any): String =
+        getApplication<Application>().getString(id, *args)
 
     private fun emitMessage(text: String, severity: UiSeverity) {
         viewModelScope.launch { _messages.emit(UiMessage(text, severity)) }
@@ -1215,7 +1228,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         if (s.phase != ConnectPhase.Idle) return
         val server = repo.activeServer()
         if (server == null || server.effectiveEndpoints.isEmpty() || server.obfuscationKey.isBlank()) {
-            emitMessage("Заполните сервер и ключ", UiSeverity.Info)
+            emitMessage(str(R.string.vpn_fill_server_and_key), UiSeverity.Info)
             return
         }
 
@@ -1237,7 +1250,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             actuallyStart()
         } else {
             _uiState.value = _uiState.value.copy(phase = ConnectPhase.Idle, state = "Disconnected")
-            emitMessage("VPN-разрешение не получено", UiSeverity.Info)
+            emitMessage(str(R.string.vpn_permission_denied), UiSeverity.Info)
         }
     }
 

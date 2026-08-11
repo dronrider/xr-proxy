@@ -17,14 +17,16 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.xrproxy.app.R
 
-/** Порог отображения (LLD-05 §5.6): огромный пресет не рендерим целиком,
+/** Порог отображения (LLD-05, п.5.6): огромный пресет не рендерим целиком,
  *  полный текст доступен через «Скопировать». */
 private const val DISPLAY_LIMIT = 50_000
 
@@ -40,12 +42,13 @@ fun TomlPreviewDialog(
     onCopied: () -> Unit,
 ) {
     val clipboard = LocalClipboardManager.current
-    val shown = remember(toml) {
+    val truncatedSuffix = stringResource(R.string.rules_toml_truncated_suffix)
+    val shown = remember(toml, truncatedSuffix) {
         if (toml.length <= DISPLAY_LIMIT) toml
         else {
             val cut = toml.take(DISPLAY_LIMIT)
             val rest = toml.substring(DISPLAY_LIMIT).count { it == '\n' }
-            "$cut\n… и ещё $rest строк (скопируйте для полного текста)"
+            "$cut\n" + String.format(truncatedSuffix, rest)
         }
     }
 
@@ -68,14 +71,14 @@ fun TomlPreviewDialog(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        "TOML",
+                        stringResource(R.string.rules_toml_title),
                         style = MaterialTheme.typography.titleMedium,
                         modifier = Modifier.weight(1f),
                     )
                     TextButton(onClick = {
                         clipboard.setText(AnnotatedString(toml))
                         onCopied()
-                    }) { Text("Скопировать") }
+                    }) { Text(stringResource(R.string.rules_toml_copy)) }
                 }
                 HorizontalDivider()
                 Text(
@@ -96,7 +99,7 @@ fun TomlPreviewDialog(
                         .padding(horizontal = 16.dp, vertical = 4.dp),
                 ) {
                     Text("", modifier = Modifier.weight(1f))
-                    TextButton(onClick = onDismiss) { Text("Закрыть") }
+                    TextButton(onClick = onDismiss) { Text(stringResource(R.string.rules_toml_close)) }
                 }
             }
         }

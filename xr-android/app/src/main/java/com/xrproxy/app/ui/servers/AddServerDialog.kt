@@ -18,6 +18,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.xrproxy.app.R
 
@@ -30,7 +31,7 @@ fun AddServerDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Добавить сервер") },
+        title = { Text(stringResource(R.string.servers_add_dialog_title)) },
         text = {
             Column {
                 Button(
@@ -44,7 +45,7 @@ fun AddServerDialog(
                 ) {
                     Icon(painterResource(R.drawable.ic_qr_scan), null, Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text("Сканировать QR")
+                    Text(stringResource(R.string.servers_add_scan_qr))
                 }
                 Spacer(Modifier.height(8.dp))
                 OutlinedButton(
@@ -54,7 +55,7 @@ fun AddServerDialog(
                 ) {
                     Icon(painterResource(R.drawable.ic_paste), null, Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text("Вставить ссылку")
+                    Text(stringResource(R.string.servers_add_paste_link))
                 }
                 Spacer(Modifier.height(8.dp))
                 TextButton(
@@ -62,7 +63,7 @@ fun AddServerDialog(
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(
-                        "Заполнить вручную",
+                        stringResource(R.string.servers_add_manual),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
@@ -70,7 +71,7 @@ fun AddServerDialog(
         },
         confirmButton = {},
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Отмена") }
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.servers_cancel)) }
         },
     )
 }

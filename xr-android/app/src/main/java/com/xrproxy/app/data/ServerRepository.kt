@@ -1,7 +1,9 @@
 package com.xrproxy.app.data
 
+import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
+import com.xrproxy.app.R
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONArray
@@ -53,11 +55,11 @@ class ServerRepository(private val prefs: SharedPreferences) {
             it.serverAddress == address && it.serverPort == port && it.id != excludeId
         }
 
-    fun generateName(address: String, hubUrl: String, comment: String): String = when {
+    fun generateName(context: Context, address: String, hubUrl: String, comment: String): String = when {
         comment.isNotBlank() -> comment
         hubUrl.isNotBlank() -> hostOf(hubUrl)
         address.isNotBlank() -> address
-        else -> "Server ${_servers.value.size + 1}"
+        else -> context.getString(R.string.data_server_default_name, _servers.value.size + 1)
     }
 
     // ── Persistence ─────────────────────────────────────────────────

@@ -38,8 +38,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
+import com.xrproxy.app.R
 
 /**
  * "Trusted networks" settings block (task 3b-2). Lists the Wi-Fi SSIDs on
@@ -65,14 +67,12 @@ fun TrustedNetworksSection(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text("Доверенные сети", style = MaterialTheme.typography.titleMedium)
+        Text(stringResource(R.string.trusted_title), style = MaterialTheme.typography.titleMedium)
         Switch(checked = enabled, onCheckedChange = onToggleEnabled)
     }
 
     Text(
-        "В этих Wi-Fi-сетях туннель автоматически встаёт на паузу — например " +
-            "дома, где трафик уже идёт через роутер. При уходе из сети туннель " +
-            "поднимается сам.",
+        stringResource(R.string.trusted_description),
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
@@ -88,15 +88,14 @@ fun TrustedNetworksSection(
                     Icon(Icons.Default.Warning, null, tint = Color(0xFFFFA726))
                     Spacer(Modifier.width(12.dp))
                     Text(
-                        "Для определения сети нужен доступ к местоположению " +
-                            "(имя Wi-Fi). Без него авто-пауза не работает.",
+                        stringResource(R.string.trusted_permission_warning),
                         color = Color(0xFFFFA726),
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
                 Spacer(Modifier.height(8.dp))
                 OutlinedButton(onClick = onRequestPermission, modifier = Modifier.fillMaxWidth()) {
-                    Text("Разрешить доступ")
+                    Text(stringResource(R.string.trusted_grant_permission))
                 }
             }
         }
@@ -106,7 +105,7 @@ fun TrustedNetworksSection(
 
     if (networks.isEmpty()) {
         Text(
-            "Список пуст — добавьте домашнюю сеть.",
+            stringResource(R.string.trusted_empty_list),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -128,7 +127,7 @@ fun TrustedNetworksSection(
                         modifier = Modifier.weight(1f),
                     )
                     IconButton(onClick = { onRemove(ssid) }) {
-                        Icon(Icons.Default.Close, "Удалить", tint = MaterialTheme.colorScheme.error)
+                        Icon(Icons.Default.Close, stringResource(R.string.trusted_remove_desc), tint = MaterialTheme.colorScheme.error)
                     }
                 }
             }
@@ -138,7 +137,7 @@ fun TrustedNetworksSection(
 
     Spacer(Modifier.height(8.dp))
     Button(onClick = { addDialogOpen = true }, modifier = Modifier.fillMaxWidth()) {
-        Text("+ Добавить сеть")
+        Text(stringResource(R.string.trusted_add_network_button))
     }
     Spacer(Modifier.height(16.dp))
 
@@ -171,20 +170,18 @@ private fun AddTrustedNetworkDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Добавить доверенную сеть") },
+        title = { Text(stringResource(R.string.trusted_add_dialog_title)) },
         text = {
             Column {
                 if (networks.isEmpty()) {
                     Text(
-                        "Доступные сети не найдены. Нужны разрешение на " +
-                            "местоположение и включённая геолокация — или введите " +
-                            "имя сети вручную.",
+                        stringResource(R.string.trusted_add_dialog_no_networks),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 } else {
                     Text(
-                        "Выберите сеть поблизости:",
+                        stringResource(R.string.trusted_add_dialog_pick_nearby),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -216,7 +213,7 @@ private fun AddTrustedNetworkDialog(
 
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    "Или вручную (например, скрытая сеть):",
+                    stringResource(R.string.trusted_add_dialog_manual_label),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -229,7 +226,7 @@ private fun AddTrustedNetworkDialog(
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                     trailingIcon = {
                         TextButton(onClick = { onConfirm(manual) }, enabled = manual.isNotBlank()) {
-                            Text("Добавить")
+                            Text(stringResource(R.string.trusted_add_dialog_add_button))
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
@@ -238,7 +235,7 @@ private fun AddTrustedNetworkDialog(
         },
         confirmButton = {},
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Отмена") }
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.trusted_cancel)) }
         },
     )
 }

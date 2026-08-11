@@ -48,9 +48,12 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.xrproxy.app.R
 import com.xrproxy.app.data.CachedPreset
 import com.xrproxy.app.data.UserRule
 import com.xrproxy.app.data.UserRulesStore
@@ -81,6 +84,7 @@ fun RulesScreen(
     viewModel: VpnViewModel,
     onBack: () -> Unit,
 ) {
+    val context = LocalContext.current
     val rules by viewModel.userRules.collectAsState()
     val state by viewModel.uiState.collectAsState()
     val servers by viewModel.repo.servers.collectAsState()
@@ -127,19 +131,20 @@ fun RulesScreen(
         return
     }
 
+    val backLabel = stringResource(R.string.rules_back)
     Scaffold(
         snackbarHost = { XrSnackbarHost(snackbarHostState, lastSeverity) },
         topBar = {
             TopAppBar(
-                title = { Text("Правила маршрутизации") },
+                title = { Text(stringResource(R.string.rules_title)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "Назад")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, backLabel)
                     }
                 },
                 actions = {
                     IconButton(onClick = { tomlOpen = true }) {
-                        Icon(Icons.Default.Code, "Показать TOML")
+                        Icon(Icons.Default.Code, stringResource(R.string.rules_show_toml))
                     }
                 },
             )
@@ -152,9 +157,9 @@ fun RulesScreen(
             scope.launch {
                 when (val r = viewModel.refreshPresetNow()) {
                     is PresetRefresh.Updated ->
-                        snack("Пресет обновлён до v${r.version}")
+                        snack(context.getString(R.string.rules_preset_updated, r.version))
                     is PresetRefresh.UpToDate ->
-                        snack("Пресет v${r.version} актуален")
+                        snack(context.getString(R.string.rules_preset_up_to_date, r.version))
                     is PresetRefresh.Failed ->
                         snack(r.message, UiSeverity.Error)
                 }
@@ -176,7 +181,10 @@ fun RulesScreen(
                 item { RulesPausedNote() }
             }
             item {
-                SectionHeader("Серверные правила", "Раздаёт хаб, только для чтения")
+                SectionHeader(
+                    stringResource(R.string.rules_server_rules_title),
+                    stringResource(R.string.rules_server_rules_subtitle),
+                )
                 PresetCard(
                     presetName = presetName,
                     preset = preset,
@@ -188,8 +196,8 @@ fun RulesScreen(
             }
             item {
                 SectionHeader(
-                    "Мои правила",
-                    "Переопределяют серверные, выше в списке применяется раньше.",
+                    stringResource(R.string.rules_my_rules_title),
+                    stringResource(R.string.rules_my_rules_subtitle),
                 )
                 Spacer(Modifier.height(8.dp))
             }
@@ -213,10 +221,14 @@ fun RulesScreen(
             }
             item {
                 Spacer(Modifier.height(12.dp))
+                val limitReachedText = stringResource(
+                    R.string.rules_limit_reached,
+                    UserRulesStore.MAX_RULES,
+                )
                 OutlinedButton(
                     onClick = {
                         if (rules.size >= UserRulesStore.MAX_RULES) {
-                            snack("Достигнут лимит ${UserRulesStore.MAX_RULES} правил", UiSeverity.Warn)
+                            snack(limitReachedText, UiSeverity.Warn)
                         } else {
                             addDialogOpen = true
                         }
@@ -225,7 +237,7 @@ fun RulesScreen(
                 ) {
                     Icon(Icons.Default.Add, null, Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text("Добавить правило")
+                    Text(stringResource(R.string.rules_add_rule))
                 }
                 Spacer(Modifier.height(24.dp))
             }
@@ -253,11 +265,13 @@ fun RulesScreen(
             },
         )
     }
+    val copiedText = stringResource(R.string.rules_copied)
+    val presetChangedText = stringResource(R.string.rules_preset_changed)
     if (tomlOpen) {
         TomlPreviewDialog(
             toml = buildMergedToml(rules, "direct", preset),
             onDismiss = { tomlOpen = false },
-            onCopied = { snack("Скопировано") },
+            onCopied = { snack(copiedText) },
         )
     }
     if (pickerOpen) {
@@ -269,7 +283,7 @@ fun RulesScreen(
                 viewModel.setActivePreset(name)
                 presetEpoch++
                 if (state.connected) {
-                    snack("Пресет сменён. Применится при следующем подключении")
+                    snack(presetChangedText)
                 }
             },
             onDismiss = { pickerOpen = false },
@@ -322,7 +336,7 @@ private fun RulesPausedNote() {
             )
             Spacer(Modifier.width(10.dp))
             Text(
-                "В доверенной сети VPN на паузе. Трафик идёт напрямую, правила не действуют.",
+                stringResource(R.string.rules_paused_note),
                 style = MaterialTheme.typography.bodySmall,
             )
         }
@@ -343,29 +357,34 @@ private fun PresetCard(
     OutlinedCard(modifier = Modifier.fillMaxWidth().padding(top = 4.dp)) {
         Column(modifier = Modifier.padding(16.dp)) {
             if (presetName.isBlank()) {
-                PresetTitleRow("Пресет не подключён", onPick)
+                PresetTitleRow(stringResource(R.string.rules_preset_not_connected), onPick)
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "Правила сервера раздаёт хаб. Примените приглашение или " +
-                        "укажите хаб в настройках сервера.",
+                    stringResource(R.string.rules_preset_not_connected_hint),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 return@Column
             }
             PresetTitleRow(
-                if (preset != null) "Пресет $presetName \u00B7 v${preset.version}"
-                else "Пресет $presetName",
+                if (preset != null) {
+                    stringResource(R.string.rules_preset_title_versioned, presetName, preset.version)
+                } else {
+                    stringResource(R.string.rules_preset_title, presetName)
+                },
                 onPick,
             )
             Spacer(Modifier.height(4.dp))
             Text(
                 if (preset != null) {
                     val date = preset.updatedAt.take(10)
-                    "${preset.rules.size} правил" +
-                        (if (date.isNotBlank()) " · обновлён $date" else "")
+                    if (date.isNotBlank()) {
+                        stringResource(R.string.rules_preset_summary_with_date, preset.rules.size, date)
+                    } else {
+                        stringResource(R.string.rules_preset_summary, preset.rules.size)
+                    }
                 } else {
-                    "Ещё не скачан с хаба"
+                    stringResource(R.string.rules_preset_not_downloaded)
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -377,10 +396,10 @@ private fun PresetCard(
                         CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
                         Spacer(Modifier.width(8.dp))
                     }
-                    Text("Обновить сейчас")
+                    Text(stringResource(R.string.rules_refresh_now))
                 }
                 OutlinedButton(onClick = onDetails, enabled = preset != null) {
-                    Text("Подробнее")
+                    Text(stringResource(R.string.rules_details))
                 }
             }
         }
@@ -402,7 +421,7 @@ private fun PresetTitleRow(text: String, onPick: (() -> Unit)?) {
         Text(text, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
         Icon(
             Icons.Default.ArrowDropDown,
-            "Сменить пресет",
+            stringResource(R.string.rules_change_preset),
             tint = MaterialTheme.colorScheme.primary,
         )
     }
@@ -426,7 +445,7 @@ private fun PresetPickerSheet(
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
         Column(modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp)) {
             Text(
-                "Выбрать пресет",
+                stringResource(R.string.rules_pick_preset_title),
                 style = MaterialTheme.typography.titleLarge,
                 modifier = Modifier.padding(start = 24.dp, end = 24.dp, bottom = 8.dp),
             )
@@ -445,7 +464,7 @@ private fun PresetPickerSheet(
                 )
                 is PresetList.Ok -> if (r.presets.isEmpty()) {
                     Text(
-                        "На хабе нет пресетов",
+                        stringResource(R.string.rules_no_presets),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp),
@@ -464,7 +483,11 @@ private fun PresetPickerSheet(
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(p.name, style = MaterialTheme.typography.bodyLarge)
                                 Text(
-                                    "${p.rulesCount} правил \u00B7 v${p.version}",
+                                    stringResource(
+                                        R.string.rules_preset_item_summary,
+                                        p.rulesCount,
+                                        p.version,
+                                    ),
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
@@ -508,35 +531,35 @@ private fun UserRuleRow(
             modifier = Modifier.weight(1f),
         )
         IconButton(onClick = { menuExpanded = true }) {
-            Icon(Icons.Default.MoreVert, "Меню правила")
+            Icon(Icons.Default.MoreVert, stringResource(R.string.rules_menu))
         }
         DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
             DropdownMenuItem(
-                text = { Text("Изменить") },
+                text = { Text(stringResource(R.string.rules_edit)) },
                 onClick = { menuExpanded = false; onEdit() },
             )
             DropdownMenuItem(
-                text = { Text("Выше") },
+                text = { Text(stringResource(R.string.rules_move_up)) },
                 enabled = !isFirst,
                 onClick = { menuExpanded = false; onMove(-1) },
             )
             DropdownMenuItem(
-                text = { Text("Ниже") },
+                text = { Text(stringResource(R.string.rules_move_down)) },
                 enabled = !isLast,
                 onClick = { menuExpanded = false; onMove(1) },
             )
             DropdownMenuItem(
-                text = { Text("В начало") },
+                text = { Text(stringResource(R.string.rules_move_top)) },
                 enabled = !isFirst,
                 onClick = { menuExpanded = false; onMove(Int.MIN_VALUE / 2) },
             )
             DropdownMenuItem(
-                text = { Text("В конец") },
+                text = { Text(stringResource(R.string.rules_move_bottom)) },
                 enabled = !isLast,
                 onClick = { menuExpanded = false; onMove(Int.MAX_VALUE / 2) },
             )
             DropdownMenuItem(
-                text = { Text("Удалить", color = MaterialTheme.colorScheme.error) },
+                text = { Text(stringResource(R.string.rules_delete), color = MaterialTheme.colorScheme.error) },
                 onClick = { menuExpanded = false; onDelete() },
             )
         }
@@ -572,10 +595,12 @@ private fun PresetDetailsScreen(preset: CachedPreset, onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("${preset.name} · v${preset.version}") },
+                title = {
+                    Text(stringResource(R.string.rules_preset_details_title, preset.name, preset.version))
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "Назад")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.rules_back))
                     }
                 },
             )
@@ -589,8 +614,7 @@ private fun PresetDetailsScreen(preset: CachedPreset, onBack: () -> Unit) {
         ) {
             item {
                 Text(
-                    "Пресет раздаёт хаб, на устройстве он только читается. " +
-                        "Переопределить домен можно своим правилом сверху.",
+                    stringResource(R.string.rules_preset_readonly_hint),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(vertical = 12.dp),
@@ -617,17 +641,21 @@ private fun PresetRuleCard(rule: com.xrproxy.app.data.CachedPresetRule) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 ActionPill(action = rule.action, onClick = { expanded = !expanded })
                 Spacer(Modifier.width(12.dp))
+                val domainsLabel = stringResource(R.string.rules_domains_count, rule.domains.size)
+                val ipLabel = stringResource(R.string.rules_ip_count, rule.ipRanges.size)
+                val geoipLabel = stringResource(R.string.rules_geoip_count, rule.geoip.size)
+                val emptyRuleLabel = stringResource(R.string.rules_empty_rule)
                 val summary = buildList {
-                    if (rule.domains.isNotEmpty()) add("доменов: ${rule.domains.size}")
-                    if (rule.ipRanges.isNotEmpty()) add("IP: ${rule.ipRanges.size}")
-                    if (rule.geoip.isNotEmpty()) add("geoip: ${rule.geoip.size}")
-                }.joinToString(" · ")
+                    if (rule.domains.isNotEmpty()) add(domainsLabel)
+                    if (rule.ipRanges.isNotEmpty()) add(ipLabel)
+                    if (rule.geoip.isNotEmpty()) add(geoipLabel)
+                }.joinToString(" \u00B7 ")
                 // Имя тематической группы (XR-117) отвечает на вопрос «что это
                 // за правило» лучше счётчика, поэтому счётчик уходит во вторую
                 // строку. Пресеты без имён показываются как раньше.
                 Column {
                     Text(
-                        rule.name.ifBlank { summary.ifBlank { "пустое правило" } },
+                        rule.name.ifBlank { summary.ifBlank { emptyRuleLabel } },
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     if (rule.name.isNotBlank() && summary.isNotBlank()) {
@@ -662,7 +690,7 @@ fun RulesEntryCard(
     onClick: () -> Unit,
 ) {
     Text(
-        "Маршрутизация",
+        stringResource(R.string.rules_entry_title),
         style = MaterialTheme.typography.titleMedium,
         modifier = Modifier.padding(vertical = 8.dp),
     )
@@ -678,11 +706,12 @@ fun RulesEntryCard(
             )
             Spacer(Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
-                Text("Правила маршрутизации", style = MaterialTheme.typography.bodyLarge)
+                Text(stringResource(R.string.rules_title), style = MaterialTheme.typography.bodyLarge)
                 Text(
-                    buildString {
-                        append("Мои правила: $userRulesCount")
-                        if (presetName.isNotBlank()) append(" · пресет $presetName")
+                    if (presetName.isNotBlank()) {
+                        stringResource(R.string.rules_entry_summary_with_preset, userRulesCount, presetName)
+                    } else {
+                        stringResource(R.string.rules_entry_summary, userRulesCount)
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,

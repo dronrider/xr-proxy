@@ -41,10 +41,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import com.xrproxy.app.R
 import com.xrproxy.app.data.ProfileEndpoint
 import com.xrproxy.app.data.ServerProfile
 import com.xrproxy.app.data.ServerSource
@@ -104,7 +106,14 @@ fun ServerEditScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(if (isCreate) "Новый сервер" else "Изменить сервер") },
+                title = {
+                    Text(
+                        stringResource(
+                            if (isCreate) R.string.servers_edit_title_new
+                            else R.string.servers_edit_title_edit,
+                        ),
+                    )
+                },
                 navigationIcon = {
                     IconButton(onClick = onCancel) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
@@ -122,19 +131,18 @@ fun ServerEditScreen(
         ) {
             OutlinedTextField(
                 value = name, onValueChange = { name = it; nameError = false },
-                label = { Text("Имя сервера") },
+                label = { Text(stringResource(R.string.servers_edit_name_label)) },
                 placeholder = { Text("Home VPS") },
                 modifier = Modifier.fillMaxWidth(), singleLine = true,
                 isError = nameError,
-                supportingText = if (nameError) {{ Text("Обязательное поле") }} else null,
+                supportingText = if (nameError) {{ Text(stringResource(R.string.servers_required_field)) }} else null,
             )
             Spacer(Modifier.height(8.dp))
 
-            Text("Серверы", style = MaterialTheme.typography.titleSmall)
+            Text(stringResource(R.string.servers_edit_pool_title), style = MaterialTheme.typography.titleSmall)
             Spacer(Modifier.height(4.dp))
             Text(
-                "Первый адрес основной, остальные резервные: при падении " +
-                    "основного трафик сам переключится на следующий.",
+                stringResource(R.string.servers_edit_pool_desc),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -156,20 +164,25 @@ fun ServerEditScreen(
                                 hubUrl = if (it.isBlank()) "" else "https://${it.trim()}"
                             }
                         },
-                        label = { Text(if (idx == 0) "Адрес сервера" else "Резерв ${idx}") },
+                        label = {
+                            Text(
+                                if (idx == 0) stringResource(R.string.servers_edit_address_primary)
+                                else stringResource(R.string.servers_edit_address_backup, idx),
+                            )
+                        },
                         placeholder = { Text("1.2.3.4") },
                         modifier = Modifier.weight(1f),
                         singleLine = true,
                         isError = endpointsError && draft.address.isBlank(),
                         supportingText = if (endpointsError && draft.address.isBlank()) {
-                            { Text("Обязательное поле") }
+                            { Text(stringResource(R.string.servers_required_field)) }
                         } else null,
                     )
                     Spacer(Modifier.width(8.dp))
                     OutlinedTextField(
                         value = draft.port,
                         onValueChange = { endpoints[idx] = draft.copy(port = it) },
-                        label = { Text("Порт") },
+                        label = { Text(stringResource(R.string.servers_edit_port_label)) },
                         modifier = Modifier.width(96.dp),
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -186,10 +199,10 @@ fun ServerEditScreen(
                             },
                             enabled = idx > 0,
                         ) {
-                            Icon(Icons.Default.ArrowUpward, "Выше приоритет")
+                            Icon(Icons.Default.ArrowUpward, stringResource(R.string.servers_edit_move_up_desc))
                         }
                         IconButton(onClick = { endpoints.removeAt(idx) }) {
-                            Icon(Icons.Default.Delete, "Удалить адрес")
+                            Icon(Icons.Default.Delete, stringResource(R.string.servers_edit_delete_address_desc))
                         }
                     }
                 }
@@ -201,21 +214,21 @@ fun ServerEditScreen(
             ) {
                 Icon(Icons.Default.Add, null, Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text("Добавить резервный адрес")
+                Text(stringResource(R.string.servers_edit_add_backup))
             }
             Spacer(Modifier.height(16.dp))
 
-            Text("Обфускация", style = MaterialTheme.typography.titleSmall)
+            Text(stringResource(R.string.servers_edit_obfuscation_title), style = MaterialTheme.typography.titleSmall)
             Spacer(Modifier.height(8.dp))
 
             OutlinedTextField(
                 value = key, onValueChange = { key = it; keyError = false },
-                label = { Text("Ключ (base64)") },
+                label = { Text(stringResource(R.string.servers_edit_key_label)) },
                 modifier = Modifier.fillMaxWidth(), singleLine = true,
                 visualTransformation = if (showKey) VisualTransformation.None
                 else PasswordVisualTransformation(),
                 isError = keyError,
-                supportingText = if (keyError) {{ Text("Обязательное поле") }} else null,
+                supportingText = if (keyError) {{ Text(stringResource(R.string.servers_required_field)) }} else null,
                 trailingIcon = {
                     IconButton(onClick = { showKey = !showKey }) {
                         Icon(
@@ -227,7 +240,7 @@ fun ServerEditScreen(
             )
             Spacer(Modifier.height(8.dp))
 
-            Text("Модификатор", style = MaterialTheme.typography.bodyMedium)
+            Text(stringResource(R.string.servers_edit_modifier_label), style = MaterialTheme.typography.bodyMedium)
             Spacer(Modifier.height(4.dp))
             FlowRow(modifier = Modifier.fillMaxWidth()) {
                 for ((value, label) in MODIFIERS) {
@@ -247,46 +260,39 @@ fun ServerEditScreen(
             OutlinedTextField(
                 value = salt, onValueChange = { salt = it; saltError = false },
                 label = { Text("Salt") },
-                placeholder = { Text("0xDEADBEEF или 3735928559") },
+                placeholder = { Text(stringResource(R.string.servers_edit_salt_placeholder)) },
                 modifier = Modifier.fillMaxWidth(), singleLine = true,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
                 isError = saltError,
                 supportingText = if (saltError) {
-                    { Text("Число: десятичное или 0x…, диапазон 0…4294967295") }
+                    { Text(stringResource(R.string.servers_edit_salt_error)) }
                 } else null,
             )
             Spacer(Modifier.height(16.dp))
 
-            Text("Хаб", style = MaterialTheme.typography.titleSmall)
+            Text(stringResource(R.string.servers_edit_hub_title), style = MaterialTheme.typography.titleSmall)
             Spacer(Modifier.height(8.dp))
             OutlinedTextField(
                 value = hubUrl,
                 onValueChange = { hubUrl = it; hubTouched = true },
-                label = { Text("Адрес хаба") },
+                label = { Text(stringResource(R.string.servers_edit_hub_label)) },
                 placeholder = { Text("https://hub.example.com") },
                 modifier = Modifier.fillMaxWidth(), singleLine = true,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                 supportingText = {
-                    Text(
-                        "Централизованный сервер конфигурации (HTTPS): хранит правила " +
-                            "маршрутизации (пресеты) и обновления приложения. По умолчанию — " +
-                            "адрес сервера; можно оставить пустым.",
-                    )
+                    Text(stringResource(R.string.servers_edit_hub_supporting))
                 },
             )
             Spacer(Modifier.height(4.dp))
             if (base.hubPreset.isNotBlank()) {
                 Text(
-                    "Правила маршрутизации берутся из хаба (пресет: ${base.hubPreset}), " +
-                        "свои поверх — в разделе «Правила» на вкладке «Серверы».",
+                    stringResource(R.string.servers_edit_hub_preset_note, base.hubPreset),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             } else {
                 Text(
-                    "Пресет с хаба у этого сервера не подключён; правила задаются " +
-                        "в разделе «Правила» на вкладке «Серверы», адрес хаба нужен " +
-                        "для проверки обновлений.",
+                    stringResource(R.string.servers_edit_hub_no_preset_note),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -325,11 +331,11 @@ fun ServerEditScreen(
             ) {
                 Icon(Icons.Default.Check, null, Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text("Сохранить")
+                Text(stringResource(R.string.servers_save_button))
             }
             Spacer(Modifier.height(8.dp))
             OutlinedButton(onClick = onCancel, modifier = Modifier.fillMaxWidth()) {
-                Text("Отмена")
+                Text(stringResource(R.string.servers_cancel))
             }
             Spacer(Modifier.height(16.dp))
         }

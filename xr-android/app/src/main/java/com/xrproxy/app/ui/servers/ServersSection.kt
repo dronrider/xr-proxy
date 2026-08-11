@@ -29,8 +29,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.xrproxy.app.R
 import com.xrproxy.app.data.ServerProfile
 import com.xrproxy.app.data.ServerSource
 
@@ -47,7 +50,7 @@ fun ServersSection(
     var deleteTarget by remember { mutableStateOf<ServerProfile?>(null) }
 
     Text(
-        "Серверы (${servers.size})",
+        stringResource(R.string.servers_section_title, servers.size),
         style = MaterialTheme.typography.titleMedium,
         modifier = Modifier.padding(vertical = 8.dp),
     )
@@ -69,20 +72,20 @@ fun ServersSection(
     Button(
         onClick = onAddServer,
         modifier = Modifier.fillMaxWidth(),
-    ) { Text("+ Добавить сервер") }
+    ) { Text(stringResource(R.string.servers_add_button)) }
     Spacer(Modifier.height(16.dp))
 
     deleteTarget?.let { target ->
         val isActiveAndConnected = target.id == activeId && isConnected
         AlertDialog(
             onDismissRequest = { deleteTarget = null },
-            title = { Text("Удалить сервер") },
+            title = { Text(stringResource(R.string.servers_delete_dialog_title)) },
             text = {
                 Text(
                     if (isActiveAndConnected)
-                        "Соединение будет разорвано, сервер «${target.name}» будет удалён."
+                        stringResource(R.string.servers_delete_confirm_active, target.name)
                     else
-                        "Удалить сервер «${target.name}»?"
+                        stringResource(R.string.servers_delete_confirm, target.name)
                 )
             },
             confirmButton = {
@@ -90,11 +93,11 @@ fun ServersSection(
                     deleteTarget = null
                     onDelete(target.id)
                 }) {
-                    Text("Удалить", color = MaterialTheme.colorScheme.error)
+                    Text(stringResource(R.string.servers_delete_button), color = MaterialTheme.colorScheme.error)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { deleteTarget = null }) { Text("Отмена") }
+                TextButton(onClick = { deleteTarget = null }) { Text(stringResource(R.string.servers_cancel)) }
             },
         )
     }
@@ -133,7 +136,7 @@ private fun ServerCard(
                 // посимвольно в столбик (XR-184).
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        server.displaySubtitle,
+                        server.displaySubtitle(LocalContext.current),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
@@ -168,16 +171,16 @@ private fun ServerCard(
             ) {
                 if (showSetActive) {
                     DropdownMenuItem(
-                        text = { Text("Сделать активным") },
+                        text = { Text(stringResource(R.string.servers_set_active)) },
                         onClick = { menuExpanded = false; onSetActive() },
                     )
                 }
                 DropdownMenuItem(
-                    text = { Text("Изменить") },
+                    text = { Text(stringResource(R.string.servers_edit_action)) },
                     onClick = { menuExpanded = false; onEdit() },
                 )
                 DropdownMenuItem(
-                    text = { Text("Удалить", color = MaterialTheme.colorScheme.error) },
+                    text = { Text(stringResource(R.string.servers_delete_button), color = MaterialTheme.colorScheme.error) },
                     onClick = { menuExpanded = false; onDelete() },
                 )
             }

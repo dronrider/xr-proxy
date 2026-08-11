@@ -18,8 +18,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.xrproxy.app.R
 import com.xrproxy.app.ui.VpnUiState
 
 /**
@@ -35,12 +37,12 @@ fun StatsGrid(state: VpnUiState, modifier: Modifier = Modifier) {
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             SmallStatCard(
-                label = "Upload",
+                label = stringResource(R.string.stats_upload),
                 value = formatBytes(state.bytesUp),
                 modifier = Modifier.weight(1f),
             )
             SmallStatCard(
-                label = "Download",
+                label = stringResource(R.string.stats_download),
                 value = formatBytes(state.bytesDown),
                 modifier = Modifier.weight(1f),
             )
@@ -52,12 +54,12 @@ fun StatsGrid(state: VpnUiState, modifier: Modifier = Modifier) {
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             SmallStatCard(
-                label = "Speed up",
+                label = stringResource(R.string.stats_speed_up),
                 value = formatSpeed(state.speedUp),
                 modifier = Modifier.weight(1f),
             )
             SmallStatCard(
-                label = "Speed down",
+                label = stringResource(R.string.stats_speed_down),
                 value = formatSpeed(state.speedDown),
                 modifier = Modifier.weight(1f),
             )
@@ -75,13 +77,15 @@ fun StatsGrid(state: VpnUiState, modifier: Modifier = Modifier) {
                 horizontalArrangement = Arrangement.SpaceEvenly,
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("Uptime", style = MaterialTheme.typography.labelSmall,
+                    Text(stringResource(R.string.stats_uptime),
+                        style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Text(formatUptime(state.uptime), style = MaterialTheme.typography.headlineSmall,
                         fontSize = 20.sp, color = MaterialTheme.colorScheme.onBackground)
                 }
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("Connections", style = MaterialTheme.typography.labelSmall,
+                    Text(stringResource(R.string.stats_connections),
+                        style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Text("${state.activeConnections}", style = MaterialTheme.typography.headlineSmall,
                         fontSize = 20.sp, color = MaterialTheme.colorScheme.onBackground)

@@ -21,9 +21,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import com.xrproxy.app.R
 import com.xrproxy.app.data.UserRule
 import com.xrproxy.app.jni.NativeBridge
 import kotlinx.coroutines.Dispatchers
@@ -41,12 +44,17 @@ private data class PatternCheck(
 private val PatternCheck.valid: Boolean
     get() = kind != "invalid" && kind.isNotBlank()
 
-/** Подпись распознанного типа под полем ввода (LLD-05 §3.5). */
+/** Подпись распознанного типа под полем ввода (LLD-05, п.3.5). */
+@Composable
 private fun kindLabel(kind: String, normalized: String): String = when (kind) {
-    "domain" -> "Домен"
-    "wildcard" -> if (normalized == "*") "Любой домен" else "Домен с подстановкой"
-    "cidr4" -> "IP-диапазон (IPv4)"
-    "cidr6" -> "IP-диапазон (IPv6)"
+    "domain" -> stringResource(R.string.rules_kind_domain)
+    "wildcard" -> if (normalized == "*") {
+        stringResource(R.string.rules_kind_any_domain)
+    } else {
+        stringResource(R.string.rules_kind_wildcard_domain)
+    }
+    "cidr4" -> stringResource(R.string.rules_kind_cidr4)
+    "cidr6" -> stringResource(R.string.rules_kind_cidr6)
     else -> ""
 }
 
@@ -62,6 +70,7 @@ fun RuleEditDialog(
     onDismiss: () -> Unit,
     onSave: (UserRule) -> Unit,
 ) {
+    val context = LocalContext.current
     var pattern by remember { mutableStateOf(initial?.pattern ?: "") }
     var action by remember { mutableStateOf(initial?.action ?: "proxy") }
     var check by remember { mutableStateOf<PatternCheck?>(null) }
@@ -80,7 +89,8 @@ fun RuleEditDialog(
             PatternCheck(
                 kind = json?.optString("kind") ?: "invalid",
                 normalized = json?.optString("normalized") ?: "",
-                error = json?.optString("error") ?: "Некорректный формат",
+                error = json?.optString("error")
+                    ?: context.getString(R.string.rules_pattern_invalid),
             )
         }
     }
@@ -88,14 +98,20 @@ fun RuleEditDialog(
     val current = check
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(if (initial == null) "Добавить правило" else "Изменить правило") },
+        title = {
+            Text(
+                stringResource(
+                    if (initial == null) R.string.rules_add_rule else R.string.rules_edit_rule_title,
+                ),
+            )
+        },
         text = {
             Column {
                 OutlinedTextField(
                     value = pattern,
                     onValueChange = { pattern = it },
-                    label = { Text("Домен или IP-диапазон") },
-                    placeholder = { Text("*.example.com или 10.0.0.0/8") },
+                    label = { Text(stringResource(R.string.rules_pattern_label)) },
+                    placeholder = { Text(stringResource(R.string.rules_pattern_placeholder)) },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                     isError = current != null && !current.valid,
@@ -118,12 +134,12 @@ fun RuleEditDialog(
                         selected = action == "proxy",
                         onClick = { action = "proxy" },
                         shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
-                    ) { Text("Через прокси") }
+                    ) { Text(stringResource(R.string.rules_action_proxy)) }
                     SegmentedButton(
                         selected = action == "direct",
                         onClick = { action = "direct" },
                         shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
-                    ) { Text("Напрямую") }
+                    ) { Text(stringResource(R.string.rules_action_direct)) }
                 }
             }
         },
@@ -141,10 +157,10 @@ fun RuleEditDialog(
                         )
                     )
                 },
-            ) { Text("Сохранить") }
+            ) { Text(stringResource(R.string.rules_save)) }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Отмена") }
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.rules_cancel)) }
         },
     )
 }
