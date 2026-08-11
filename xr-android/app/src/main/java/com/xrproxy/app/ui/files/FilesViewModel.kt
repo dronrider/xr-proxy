@@ -129,6 +129,10 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         /** FIFO of files queued with the per-row plus (XR-044); the head is the
          *  one being downloaded (or waiting out the background mirror's lock). */
         val queue: List<QueueItem> = emptyList(),
+        /** Сколько файлов этого батча очередь уже прошла (XR-056): общий
+         *  индикатор берёт из него размер батча, а сам счётчик обнуляется, как
+         *  только новый батч встаёт в пустую очередь. */
+        val queueDone: Int = 0,
         val failed: List<FailedDownload> = emptyList(),
         /** Snapshot of the native transfer, polled while the explorer is open;
          *  rows recognise themselves by share id + path, which also makes the
@@ -735,13 +739,19 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         if (missing.isEmpty()) return
         val missingPaths = missing.asSequence().map { it.path }.toHashSet()
         _ui.update { s ->
-            s.copy(
-                queue = s.queue + missing.map { QueueItem(shareId, it) },
+            s.enqueued(missing.map { QueueItem(shareId, it) }).copy(
                 failed = s.failed.filterNot { it.shareId == shareId && it.path in missingPaths },
             )
         }
         ensureQueueRunning()
     }
+
+    /** Хвост очереди плюс новые элементы (XR-056). Батч начинается только с
+     *  пустой очереди, поэтому счётчик пройденных обнуляется именно здесь:
+     *  очередь пустеет и по отмене, и по удалению шары, а размер батча общий
+     *  индикатор считает от него. */
+    private fun UiState.enqueued(items: List<QueueItem>): UiState =
+        copy(queue = queue + items, queueDone = if (queue.isEmpty()) 0 else queueDone)
 
     fun closeShare() {
         // Импорты закрытие шары не забывает (XR-175): опрос идёт по shareId
@@ -857,8 +867,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             applySelection(config.shareId, entry.path, true)
             _ui.update { st ->
                 if (st.queue.any { it.matches(config.shareId, entry.path) }) st
-                else st.copy(
-                    queue = st.queue + QueueItem(config.shareId, entry),
+                else st.enqueued(listOf(QueueItem(config.shareId, entry))).copy(
                     failed = st.failed.filterNot { it.shareId == config.shareId && it.path == entry.path },
                 )
             }
@@ -883,8 +892,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                 e.path.startsWith(prefix) && e.path !in st.localPaths && e.path !in queued
             }
             _ui.update { s ->
-                s.copy(
-                    queue = s.queue + missing.map { QueueItem(config.shareId, it) },
+                s.enqueued(missing.map { QueueItem(config.shareId, it) }).copy(
                     failed = s.failed.filterNot { it.shareId == config.shareId && it.path.startsWith(prefix) },
                 )
             }
@@ -1041,6 +1049,20 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Стоп всей очереди из общего индикатора (XR-056): та же отмена, что у
+     *  строки файла, применённая ко всему, что стоит в очереди. Пустая очередь
+     *  значит, что индикатор показывает проход фонового зеркала, и останавливать
+     *  надо саму передачу; недокачанное остаётся на диске, как и при отмене
+     *  одной строки. */
+    fun cancelQueue() {
+        val items = _ui.value.queue.toList()
+        if (items.isEmpty()) {
+            cancelTransfer()
+            return
+        }
+        items.forEach { cancelDownload(it.shareId, it.entry.path) }
+    }
+
     /** A fresh native transfer snapshot, or null when idle or unparsable. The
      *  UI one is up to 500ms stale; cancel decisions need the current owner. */
     private suspend fun freshSnapshot(): JSONObject? = withContext(Dispatchers.IO) {
@@ -1158,8 +1180,13 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     0L
                 }
                 _ui.update { st ->
+                    val rest = st.queue.filter { it !== item }
                     st.copy(
-                        queue = st.queue.filter { it !== item },
+                        queue = rest,
+                        // Пройденный файл поднимает счётчик батча (XR-056), но
+                        // размер батча от этого не растёт: индикатор берёт его
+                        // как сумму пройденных и оставшихся.
+                        queueDone = if (rest.isEmpty()) 0 else st.queueDone + 1,
                         localPaths = if (done && st.openShareId == item.shareId) st.localPaths + item.entry.path
                         else st.localPaths,
                         failed = if (done || cancelled) st.failed
@@ -1185,9 +1212,28 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
     private var transferPoll: Job? = null
 
+    /** Вкладка «Файлы» на экране (XR-056). Опрос снимка держится всё это время,
+     *  иначе фоновый синк виден только внутри открытой шары: список шар не
+     *  открывает ни одной, очередь у него пуста, и опрос заканчивался на первом
+     *  же витке, а вместе с ним пропадал и общий индикатор. */
+    private var screenOpen = false
+
+    /** Экран показан: начать следить за передачами. */
+    fun watchTransfers() {
+        screenOpen = true
+        ensureTransferPolling()
+    }
+
+    /** Экран ушёл: опрос доживает до конца текущей работы и заканчивается. */
+    fun unwatchTransfers() {
+        screenOpen = false
+    }
+
     /**
-     * Poll the native transfer snapshot while the explorer is open, the queue
-     * is busy or a migration runs. One poller covers the foreground queue, the
+     * Poll the native transfer snapshot while the Files screen is on, the
+     * explorer is open, the queue is busy or a migration runs. Опрос при
+     * показанном экране это то, что делает фоновый синк видимым на списке шар
+     * (XR-056). One poller covers the foreground queue, the
      * background mirror and the migration card: rows match themselves against
      * the snapshot's share + path, which is what makes background sync visible
      * per row (XR-044). When a transfer ends the local set is re-read, so
@@ -1200,7 +1246,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             var lastTime = System.currentTimeMillis()
             var lastFile = ""
             var wasActive = false
-            while (_ui.value.openShareId != null || _ui.value.queue.isNotEmpty() ||
+            while (screenOpen || _ui.value.openShareId != null || _ui.value.queue.isNotEmpty() ||
                 _ui.value.migratingShareId != null
             ) {
                 val snap = withContext(Dispatchers.IO) { NativeBridge.nativeTransferProgress() }

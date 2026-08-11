@@ -79,6 +79,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TriStateCheckbox
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -184,6 +185,13 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
     LaunchedEffect(Unit) {
         vm.refreshHub(hubUrl, inviteToken)
         vm.syncAllNow()
+    }
+    // Пока вкладка на экране, снимок передачи опрашивается и без открытой шары
+    // (XR-056): фоновый синк идёт своим воркером, и общему индикатору неоткуда
+    // узнать про него иначе.
+    DisposableEffect(Unit) {
+        vm.watchTransfers()
+        onDispose { vm.unwatchTransfers() }
     }
     LaunchedEffect(ui.message) {
         ui.message?.let {
@@ -373,6 +381,7 @@ private fun ShareListView(
                 )
             }
         }
+        syncIndicatorOf(ui)?.let { ind -> item { SyncQueueBar(ind) { vm.cancelQueue() } } }
         if (ui.migratingShareId != null) item { ProgressBar(ui.transfer) { vm.cancelTransfer() } }
 
         if (addable.isNotEmpty()) {
@@ -728,6 +737,7 @@ private fun ExplorerView(
                 modifier = Modifier.padding(vertical = 2.dp),
             )
         }
+        syncIndicatorOf(ui)?.let { ind -> SyncQueueBar(ind) { vm.cancelQueue() } }
         if (ui.migratingShareId != null) ProgressBar(ui.transfer) { vm.cancelTransfer() }
         // Строка на каждый импорт этой шары (LLD-29, XR-175): агент качает по
         // очереди, здесь только счётчик и отмена; уход с экрана не прерывает.
@@ -1337,6 +1347,59 @@ private fun folderPresence(
         if (e.path in localPaths || e.path in queuedPaths) a[1]++
     }
     return acc.mapValues { FolderPresence(it.value[0], it.value[1]) }
+}
+
+/** Состояние экрана в терминах общего индикатора (XR-056). Байты текущего
+ *  файла идут в расчёт только у передачи про один файл: проход зеркала по
+ *  нескольким файлам отдаёт в снимке агрегатные байты, и к текущему файлу они
+ *  отношения не имеют. */
+private fun syncIndicatorOf(ui: FilesViewModel.UiState): SyncIndicator? {
+    val t = ui.transfer
+    return syncIndicator(
+        SyncProgressInput(
+            queueSize = ui.queue.size,
+            queueDone = ui.queueDone,
+            queueHeadFile = ui.queue.firstOrNull()?.entry?.path,
+            nativeFile = t?.file?.ifEmpty { null },
+            nativeFilesDone = t?.filesDone ?: 0L,
+            nativeFilesTotal = t?.filesTotal ?: 0L,
+            nativeFileFraction = if (t != null && t.filesTotal == 1L && t.bytesTotal > 0) {
+                t.bytesDone.toFloat() / t.bytesTotal
+            } else {
+                0f
+            },
+            migrating = ui.migratingShareId != null,
+        ),
+    )
+}
+
+/** Общий индикатор очереди синка (XR-056): одна строка с именем файла,
+ *  счётчиком «X из N» и стопом всей очереди, под нею тонкая полоса по батчу.
+ *  Байты и скорость сюда не вернутся, они живут на строке файла (XR-044), а
+ *  карточка во всю ширину под один файл занимала пол-экрана. Индикатор один и
+ *  тот же на списке шар и в проводнике: очередь общая на все шары. */
+@Composable
+private fun SyncQueueBar(ind: SyncIndicator, onStop: () -> Unit) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                ind.file, fontSize = 12.sp, maxLines = 1,
+                overflow = TextOverflow.MiddleEllipsis, modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                ind.counter, fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            TextButton(onClick = onStop, contentPadding = PaddingValues(horizontal = 8.dp)) {
+                Text("Стоп", fontSize = 12.sp)
+            }
+        }
+        LinearProgressIndicator(
+            progress = { ind.fraction },
+            modifier = Modifier.fillMaxWidth().height(3.dp),
+        )
+    }
 }
 
 /** The storage-migration card. [p] null means the native side has not flipped
