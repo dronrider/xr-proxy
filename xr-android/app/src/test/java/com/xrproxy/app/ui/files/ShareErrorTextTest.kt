@@ -7,11 +7,11 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Регресс XR-243: `humanError` не знал категорий `http_*`, `parse:` и
- * `manifest_*`, которыми уже сам агент шары отвечает после прощупа XR-219, и
- * на экране висел сырой код вроде «Манифест: http_404». Логика чистая
- * Kotlin без Android SDK, поэтому раскладка вынесена в [ShareErrorText.kt] и
- * покрывается JVM-юнитом, а не эмулятором.
+ * Регресс XR-243: `humanError` не знал категорий `http_*`, `parse:`,
+ * `read:` и `manifest_*`, которыми уже сам агент шары отвечает после
+ * прощупа XR-219, и на экране висел сырой код вроде «Манифест: http_404».
+ * Логика чистая Kotlin без Android SDK, поэтому раскладка вынесена в
+ * [ShareErrorText.kt] и покрывается JVM-юнитом, а не эмулятором.
  */
 class ShareErrorTextTest {
 
@@ -28,6 +28,14 @@ class ShareErrorTextTest {
     fun parsePrefixGetsAHumanText() {
         val text = humanShareError("parse: expected value at line 1 column 1")
         assertEquals("ответ сервера не разбирается", text)
+    }
+
+    @Test
+    fun readPrefixGetsAHumanText() {
+        // До правки эта категория тоже падала в `else -> e` (sync.rs:1634).
+        val text = humanShareError("read: body closed")
+        assertNotEquals("read: body closed", text)
+        assertEquals("не удалось дочитать ответ сервера", text)
     }
 
     @Test
@@ -79,6 +87,10 @@ class ShareErrorTextTest {
         assertTrue(isTransientAgentErrorCategory("http_500"))
         assertTrue(isTransientAgentErrorCategory("http_503"))
         assertTrue(isTransientAgentErrorCategory("parse: expected value at line 1 column 1"))
+        // read: тот же обрыв соединения, что и parse:, просто пораньше -
+        // после статуса, но до конца тела (sync.rs:1634, should_try_next
+        // считает их равноценными на sync.rs:1453-1454).
+        assertTrue(isTransientAgentErrorCategory("read: body closed"))
     }
 
     @Test
