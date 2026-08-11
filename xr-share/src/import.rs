@@ -37,7 +37,9 @@ pub const JOB_DIR_PREFIX: &str = ".xr-import-";
 pub const HEIGHT_MIN: u32 = 144;
 pub const HEIGHT_MAX: u32 = 4320;
 
-/// Queued jobs beyond the running one; the fifth POST gets a `429`.
+/// Queued jobs beyond the running one when the config says nothing (an agent
+/// without an `[import]` block takes no jobs at all, so this is a floor rather
+/// than a policy); `queue_depth` in the block overrides it (XR-175).
 const QUEUE_DEPTH: usize = 4;
 /// How long a finished job stays visible to polls before the lazy sweep.
 const DONE_TTL: Duration = Duration::from_secs(3600);
@@ -160,12 +162,14 @@ impl ImportManager {
         self.config.read().expect("import config lock").clone()
     }
 
-    /// Add a job to the queue. `None` when the queue is full (`429`).
+    /// Add a job to the queue. `None` when the queue is full (`429`). Depth is
+    /// read at enqueue time, so a hot-reloaded `queue_depth` applies at once.
     pub fn enqueue(&self, spec: JobSpec) -> Option<String> {
+        let depth = self.config().map_or(QUEUE_DEPTH, |c| c.queue_depth);
         let mut jobs = self.jobs.lock().expect("import jobs lock");
         sweep_finished(&mut jobs);
         let waiting = jobs.values().filter(|j| j.state == JobState::Queued).count();
-        if waiting >= QUEUE_DEPTH {
+        if waiting >= depth {
             return None;
         }
         let id = format!("{:016x}", rand::random::<u64>());
@@ -1003,6 +1007,45 @@ mod tests {
         let (cmd, args) = build_argv(&p, url, 720);
         assert_eq!(cmd, "true");
         assert_eq!(args, vec!["-f".to_string(), "b[height<=720]".into(), url.into()]);
+    }
+
+    /// XR-175: the queue is agent-global, four places on everyone who imports
+    /// into the house is little, so the depth comes from `[import]`.
+    #[test]
+    fn queue_depth_comes_from_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = || JobSpec {
+            share_id: "S".into(),
+            share_root: dir.path().to_path_buf(),
+            dest_rel: String::new(),
+            url: "https://example.com/v".into(),
+            height: 1080,
+            plugin: plugin("yt", &["*"], 1080),
+            timeout: Duration::from_secs(60),
+            max_total_bytes: None,
+            max_file_bytes: None,
+            sandbox: "none".into(),
+        };
+        let manager = |cfg: Option<ImportConfig>| ImportManager::new(cfg, Arc::new(HashCache::new()));
+        let with_depth = |depth: usize| ImportConfig { queue_depth: depth, ..ImportConfig::reference() };
+
+        let narrow = manager(Some(with_depth(1)));
+        assert!(narrow.enqueue(spec()).is_some());
+        assert!(narrow.enqueue(spec()).is_none(), "сверх настроенной глубины это 429");
+
+        let wide = manager(Some(with_depth(6)));
+        for i in 0..6 {
+            assert!(wide.enqueue(spec()).is_some(), "джоба {i} при глубине 6");
+        }
+        assert!(wide.enqueue(spec()).is_none());
+
+        // Агент без блока [import] джоб не принимает вовсе, но потолок у него
+        // остаётся прежним.
+        let bare = manager(None);
+        for i in 0..QUEUE_DEPTH {
+            assert!(bare.enqueue(spec()).is_some(), "джоба {i} по умолчанию");
+        }
+        assert!(bare.enqueue(spec()).is_none());
     }
 
     #[test]

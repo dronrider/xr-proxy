@@ -139,6 +139,11 @@ pub struct ImportConfig {
     /// (Linux); `none` disables the wrapper explicitly.
     #[serde(default = "default_import_sandbox")]
     pub sandbox: String,
+    /// How many jobs may wait beyond the running one (XR-175). The queue is
+    /// agent-global, so a house where several people import at once runs out of
+    /// the default four places sooner than one owner does.
+    #[serde(default = "default_import_queue_depth")]
+    pub queue_depth: usize,
     #[serde(default, rename = "plugin")]
     pub plugins: Vec<ImportPlugin>,
 }
@@ -168,6 +173,10 @@ fn default_import_sandbox() -> String {
     "auto".into()
 }
 
+fn default_import_queue_depth() -> usize {
+    4
+}
+
 fn default_import_max_height() -> u32 {
     1080
 }
@@ -181,6 +190,7 @@ impl ImportConfig {
             timeout_min: default_import_timeout_min(),
             max_total_mb: Some(4096),
             sandbox: default_import_sandbox(),
+            queue_depth: default_import_queue_depth(),
             plugins: vec![ImportPlugin {
                 name: "yt-dlp".into(),
                 patterns: vec!["youtube.com".into(), "youtu.be".into(), "*".into()],

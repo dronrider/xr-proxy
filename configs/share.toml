@@ -86,6 +86,10 @@ max_total_mb = 4096
 # the plugin runs bare and the gate is the only barrier; "none" disables the
 # wrapper explicitly.
 sandbox = "auto"
+# How many jobs wait beyond the running one (default 4): the fifth POST gets a
+# 429 and the device says the queue is full. The queue is one for the whole
+# agent, so raise it in a house where several people import at once.
+queue_depth = 4
 
 # One plugin per [[import.plugin]]: an external command the owner installed.
 # Nothing is vendored -- update yt-dlp with your package manager, not an agent

@@ -1352,6 +1352,7 @@ mod tests {
             timeout_min: 30,
             max_total_mb: None,
             sandbox: "none".into(),
+            queue_depth: 4,
             plugins: vec![ImportPlugin {
                 name: "тест".into(),
                 patterns: patterns.iter().map(|s| s.to_string()).collect(),
