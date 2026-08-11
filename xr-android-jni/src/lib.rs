@@ -40,6 +40,27 @@ fn journal_log(level: &str, source: &str, msg: &str) {
     }
 }
 
+/// Поставить подписчика `tracing` (один раз на процесс). Слой `fmt` пишет в
+/// stdout, который Android выбрасывает, поэтому диагностика движка доезжает до
+/// пользователя вторым слоем, мостом в журнал (XR-237). Мост ставится вместе с
+/// журналом, до старта движка, иначе первые его предупреждения теряются.
+fn init_tracing(journal: Option<&xr_core::journal::Journal>) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+
+    let fmt = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_filter(tracing_subscriber::EnvFilter::new("xr_core=debug,xr_proto=info"));
+    let bridge = journal.map(|j| xr_core::journal_bridge::JournalLayer::new(j.clone()));
+    let ok = tracing_subscriber::registry().with(fmt).with(bridge).try_init().is_ok();
+    if ok {
+        if let Some(j) = journal {
+            xr_core::journal_bridge::announce(j);
+        }
+    }
+}
+
 /// Global JVM reference.
 static JVM: OnceLock<JavaVM> = OnceLock::new();
 
@@ -379,10 +400,9 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
     _tun_fd: jint,
     config_json: JString,
 ) -> jstring {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("xr_core=debug,xr_proto=info")
-        .with_target(false)
-        .try_init();
+    // Штатно подписчик уже стоит с мостом (`nativeJournalInit`); здесь только
+    // страховка на случай старта движка без инициализации журнала.
+    init_tracing(JOURNAL.get());
 
     // Cache JVM reference (once).
     if JVM.get().is_none() {
@@ -702,6 +722,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalInit(
         Some(j) => j.set_rotation(bytes, files),
         None => {
             let _ = JOURNAL.set(xr_core::journal::Journal::open(PathBuf::from(dir), bytes, files));
+            init_tracing(JOURNAL.get());
         }
     }
 }
@@ -2231,5 +2252,20 @@ domains = ["youtube.com", "*.youtube.com"]"#;
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].address, "9.9.9.9");
         assert_eq!(servers[0].port, 8443);
+    }
+
+    /// Подписчик, поставленный вместе с журналом, доводит `warn!` движка до
+    /// ленты (XR-237). Тест один на процесс: глобальный подписчик ставится раз.
+    #[test]
+    fn tracing_bridge_feeds_journal() {
+        let j = xr_core::journal::Journal::memory();
+        init_tracing(Some(&j));
+        tracing::warn!("разбор правил не удался");
+
+        let tail = j.tail();
+        assert_eq!(tail.len(), 2, "tail: {:?}", tail);
+        assert!(tail[0].contains("мост диагностики движка включён"), "unexpected: {}", tail[0]);
+        assert!(tail[1].contains("  WARN ["), "unexpected: {}", tail[1]);
+        assert!(tail[1].contains("разбор правил не удался"), "unexpected: {}", tail[1]);
     }
 }
