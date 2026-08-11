@@ -287,23 +287,15 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
      *  [fetchManifestHealing] after a failed heal, never returned by the agent. */
     private fun Throwable.isAccessExpired(): Boolean = message?.startsWith("access_expired") == true
 
-    /** Native error strings are category-prefixed and carry the human wording
-     *  after the prefix; show that instead of the machine category, keeping the
-     *  text's single source in Rust (XR-134). A stale token has no per-error
-     *  detail worth showing, so it gets a fixed line (XR-167). */
-    private fun humanError(e: String): String = when {
-        e.startsWith("agent_offline") -> e.substringAfter(": ", "агент шары не на связи")
-        e.startsWith("access_expired") -> e.substringAfter(": ", "доступ к шаре истёк")
-        e.startsWith("stale_token") -> "токен шары устарел, обновите список по инвайту"
-        // Хаб честно ответил 410: инвайт истёк или его отозвали, а не просто
-        // не открылся (XR-121). Отдельно от прочих http_* - тем текст не пишем,
-        // это редкий случай, который проще разобрать по сырому коду в журнале.
-        e == "http_410" -> "инвайт истёк или отозван, примените его заново"
-        // Транспортный сбой (нет сети, агент недоступен): с офлайн-полным
-        // списком качать нечего, файл ждёт сеть. Категорию наружу не тащим.
-        e.startsWith("network") -> "нет сети, попробуйте позже"
-        else -> e
-    }
+    /** Раскладка категории в текст живёт в [ShareErrorText.kt] отдельным
+     *  файлом (чистая Kotlin-логика без Android SDK, XR-243). */
+    private fun humanError(e: String): String = humanShareError(e)
+
+    /** Ответ агента похож на переходное состояние (5xx, битое тело): офлайн-
+     *  цикл вправе повторить попытку, как и настоящую недоступность сети
+     *  (XR-243). Правило в [isTransientAgentErrorCategory]. */
+    private fun Throwable.isTransientAgentError(): Boolean =
+        message?.let(::isTransientAgentErrorCategory) == true
 
     /**
      * Refresh of the invite carries the agent's current address/port/token. If a
@@ -539,10 +531,21 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                                     manifestLoading = false, offlineLocal = true,
                                     message = humanError(e.message.orEmpty()),
                                 )
+                            // Ответ агента похож на переходный сбой (5xx,
+                            // битое тело): ведём себя как при офлайне, чтобы
+                            // список сам подтянулся фоновым ретраем (XR-243).
+                            e.isTransientAgentError() ->
+                                st.copy(
+                                    manifestLoading = false, offlineLocal = true,
+                                    message = "Манифест: ${humanError(e.message.orEmpty())}",
+                                )
                             // The agent answered (expired token, http_4xx): a real
                             // error the user should see, unlike a mere no-network.
                             !e.isOffline() ->
-                                st.copy(manifestLoading = false, message = "Манифест: ${e.message}")
+                                st.copy(
+                                    manifestLoading = false,
+                                    message = "Манифест: ${humanError(e.message.orEmpty())}",
+                                )
                             // Offline, а cache-first уже показал кэш или локальные
                             // файлы: пометка «Офлайн» всё говорит, тост не нужен.
                             st.manifest.isNotEmpty() -> st.copy(manifestLoading = false)
@@ -590,7 +593,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                         // надо только когда полного списка не было вовсе, иначе
                         // жест-refresh офлайн ронял бы шару до «только скачанные»
                         // (XR-099). Ретрай молча вернёт свежий список с сетью.
-                        val offline = e.isOffline() || e.isAgentOffline()
+                        val offline = e.isOffline() || e.isAgentOffline() || e.isTransientAgentError()
                         val hadFull = st.offlineFullListing || !st.offlineLocal
                         val fallback = if (hadFull) st.manifest else localManifest
                         st.copy(
@@ -621,11 +624,13 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
      *  запрос, и до перезахода в шару новых попыток не было, вернувшаяся сеть
      *  ничего не меняла (XR-099). Теперь неудача по сети или по молчащему
      *  агенту заводит тихий перезапрос по бэкофу; появление сети (колбэк в
-     *  init) перезапускает его немедленно. Ответ агента по существу (4xx,
-     *  истёкший доступ) ретраем не лечится и цикл не заводит. */
+     *  init) перезапускает его немедленно, а временный сбой агента (5xx,
+     *  битое тело) заводит цикл тем же путём (XR-243). Ответ агента по
+     *  существу (404, 4xx, подпись манифеста не сошлась) ретраем не лечится
+     *  и цикл не заводит. */
     private fun maybeStartOfflineRetry(error: Throwable?) {
         if (error == null) return
-        if (error.isOffline() || error.isAgentOffline()) startOfflineRetry()
+        if (error.isOffline() || error.isAgentOffline() || error.isTransientAgentError()) startOfflineRetry()
     }
 
     private var offlineRetryJob: Job? = null
@@ -646,11 +651,12 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     applyFreshManifest(config, result.getOrDefault(emptyList()))
                     return@launch
                 }
-                // Содержательный ответ (4xx, истёкший доступ) ретрай не лечит,
-                // а stale_token-ветка при нём ещё и ходила бы в хаб на каждом
-                // круге: продолжаем только на сетевых исходах.
+                // Содержательный ответ (404, 4xx, истёкший доступ, подпись не
+                // сошлась) ретрай не лечит, а stale_token-ветка при нём ещё и
+                // ходила бы в хаб на каждом круге: продолжаем на сетевых
+                // исходах и на временном сбое агента (5xx, битое тело, XR-243).
                 val e = result.exceptionOrNull()
-                if (e == null || !(e.isOffline() || e.isAgentOffline())) return@launch
+                if (e == null || !(e.isOffline() || e.isAgentOffline() || e.isTransientAgentError())) return@launch
                 attempt++
                 delayMs = OFFLINE_RETRY_DELAYS_MS[minOf(attempt, OFFLINE_RETRY_DELAYS_MS.lastIndex)]
             }
