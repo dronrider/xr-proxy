@@ -439,10 +439,18 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             // а полный список подтянется при следующем онлайн-заходе.
             withContext(Dispatchers.IO) { repo.clearManifestCache(shareId) }
             rescheduleIfNeeded()
+            // Импорты снятой шары забываются вместе с ней (XR-175): конфига под
+            // них больше нет, опрос по такой строке молча ничего не меняет, а
+            // цикл, обещавший гаснуть на пустом списке, крутился бы вхолостую
+            // до конца жизни ViewModel.
+            _ui.value.importJobs.asSequence()
+                .filter { it.shareId == shareId }
+                .forEach { importPollFailures.remove(it.jobId) }
             _ui.update { st ->
                 st.copy(
                     queue = st.queue.filterNot { it.shareId == shareId },
                     failed = st.failed.filterNot { it.shareId == shareId },
+                    importJobs = st.importJobs.filterNot { it.shareId == shareId },
                 )
             }
             // A live transfer of the removed share (our head or its mirror
