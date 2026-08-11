@@ -83,6 +83,35 @@ class SyncProgressTest {
     }
 
     @Test
+    fun aFinishedFileMovesTheBatchOn() {
+        assertEquals(1, queueDoneAfter(done = 0, rest = 2, cancelled = false))
+    }
+
+    @Test
+    fun anEmptyQueueEndsTheBatch() {
+        assertEquals(0, queueDoneAfter(done = 4, rest = 0, cancelled = false))
+    }
+
+    @Test
+    fun aCancelledHeadShortensTheBatchInsteadOfCounting() {
+        // Крестик на качающейся голове: воркер узнаёт об отмене, когда
+        // нативная передача вернётся, и засчитывать файл ему нечего.
+        assertEquals(0, queueDoneAfter(done = 0, rest = 2, cancelled = true))
+    }
+
+    @Test
+    fun cancellingHeadsInARowDoesNotFinishTheBatch() {
+        // Очередь A, B, C, крестиком отменены A и B на закачке: батч ужимается
+        // до одного оставшегося файла, а не доезжает до «3 из 3».
+        var done = 0
+        done = queueDoneAfter(done, rest = 2, cancelled = true)
+        done = queueDoneAfter(done, rest = 1, cancelled = true)
+        val i = syncIndicator(SyncProgressInput(queueSize = 1, queueDone = done, queueHeadFile = "c.mkv"))!!
+        assertEquals("1 из 1", i.counter)
+        assertEquals(0f, i.fraction, 0.0001f)
+    }
+
+    @Test
     fun storageMigrationKeepsItsOwnCard() {
         assertNull(
             syncIndicator(

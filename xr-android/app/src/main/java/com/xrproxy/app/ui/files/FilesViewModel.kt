@@ -1183,10 +1183,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     val rest = st.queue.filter { it !== item }
                     st.copy(
                         queue = rest,
-                        // Пройденный файл поднимает счётчик батча (XR-056), но
-                        // размер батча от этого не растёт: индикатор берёт его
-                        // как сумму пройденных и оставшихся.
-                        queueDone = if (rest.isEmpty()) 0 else st.queueDone + 1,
+                        queueDone = queueDoneAfter(st.queueDone, rest.size, cancelled),
                         localPaths = if (done && st.openShareId == item.shareId) st.localPaths + item.entry.path
                         else st.localPaths,
                         failed = if (done || cancelled) st.failed
