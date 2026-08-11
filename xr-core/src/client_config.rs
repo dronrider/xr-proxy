@@ -12,7 +12,7 @@
 //! системы ([`ClientProfile`]), получает готовый JSON и передаёт его движку;
 //! движок читает его же [`parse_config`].
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use xr_proto::config::RoutingConfig;
 use xr_proto::user_rule::UserRule;
@@ -67,7 +67,10 @@ pub struct ClientProfile {
     pub obfuscation_key: String,
     #[serde(default)]
     pub modifier: String,
-    #[serde(default)]
+    /// Salt профиля. Читается и знаковым числом: у Kotlin целое это `Long`, и
+    /// salt из верхней половины диапазона `u64` приезжает оттуда со знаком.
+    /// Биты при этом те же, а движку от salt нужны младшие 32.
+    #[serde(default, deserialize_with = "de_salt")]
     pub salt: Option<u64>,
     #[serde(default)]
     pub hub_url: String,
@@ -75,8 +78,10 @@ pub struct ClientProfile {
     pub hub_preset: String,
     #[serde(default)]
     pub hub_cache_dir: String,
-    /// Мои правила поверх пресета (LLD-05), в порядке пользователя.
-    #[serde(default)]
+    /// Мои правила поверх пресета (LLD-05), в порядке пользователя. Битая
+    /// запись выбрасывается, а не роняет весь профиль: остаться без туннеля
+    /// из-за одного правила хуже, чем поехать без него.
+    #[serde(default, deserialize_with = "de_user_rules")]
     pub user_rules: Vec<UserRule>,
     /// Резолверы системы как их отдала платформа, без чистки.
     #[serde(default)]
@@ -86,6 +91,28 @@ pub struct ClientProfile {
     /// выпускать проксируемый трафик напрямую.
     #[serde(default)]
     pub fail_closed: Option<bool>,
+}
+
+fn de_salt<'de, D>(de: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(de)?;
+    Ok(value.and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_i64().map(|signed| signed as u64))
+    }))
+}
+
+fn de_user_rules<'de, D>(de: D) -> Result<Vec<UserRule>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let items = Vec::<serde_json::Value>::deserialize(de)?;
+    Ok(items
+        .into_iter()
+        .filter_map(|item| serde_json::from_value(item).ok())
+        .collect())
 }
 
 /// Собрать JSON конфига движка из профиля. `Err` только когда сервера в
@@ -592,6 +619,37 @@ mod tests {
         assert_eq!(cfg.modifier, DEFAULT_MODIFIER);
         assert_eq!(cfg.salt, 0xDEAD_BEEF);
         assert_eq!(cfg.server_port, 8443);
+    }
+
+    /// Kotlin отдаёт целое как `Long`, и salt из верхней половины `u64`
+    /// приезжает со знаком. Биты обязаны доехать до движка те же, иначе
+    /// обфускация разъедется с сервером.
+    #[test]
+    fn build_reads_signed_salt() {
+        let big: u64 = 0xDEAD_BEEF_CAFE_1234;
+        let signed = big as i64;
+        let profile = parse_client_profile(&format!(
+            r#"{{"server_address":"203.0.113.10","obfuscation_key":"a2V5","salt":{}}}"#,
+            signed
+        ))
+        .unwrap();
+        assert_eq!(profile.salt, Some(big));
+        let cfg = parse_config(&build_config_json(&profile).unwrap()).unwrap();
+        assert_eq!(cfg.salt, big as u32);
+    }
+
+    /// Битое правило выбрасывается, а туннель поднимается: остаться без
+    /// связи из-за одной записи хуже, чем поехать без неё.
+    #[test]
+    fn build_skips_broken_user_rules() {
+        let profile = parse_client_profile(
+            r#"{"server_address":"203.0.113.10","obfuscation_key":"a2V5",
+                "user_rules":[{"action":"proxy","pattern":"a.example"},{"pattern":"без действия"}]}"#,
+        )
+        .unwrap();
+        let cfg = parse_config(&build_config_json(&profile).unwrap()).unwrap();
+        assert_eq!(cfg.routing.rules.len(), 1);
+        assert_eq!(cfg.routing.rules[0].domains, vec!["a.example"]);
     }
 
     #[test]
