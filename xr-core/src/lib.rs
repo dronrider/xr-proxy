@@ -6,8 +6,10 @@
 //! - Session management (proxy vs direct)
 //! - Integration with xr-proto for obfuscated tunneling
 
+pub mod client_config;
 pub mod dns;
 pub mod engine;
+pub mod health;
 pub mod ip_stack;
 pub mod journal;
 pub mod journal_bridge;

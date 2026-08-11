@@ -25,8 +25,10 @@ use std::time::Duration;
 
 use base64::Engine;
 use reqwest::StatusCode;
+use serde::Serialize;
 use xr_proto::preset::{InviteInfo, InvitePayload, Preset};
 
+use crate::client_config::ProfileEndpoint;
 use crate::presets::PresetCache;
 
 /// Имя файла с ключом клиента рядом с кэшем пресетов.
@@ -38,6 +40,101 @@ pub struct ApplyInviteResult {
     pub public_key: Option<String>,
     pub preset_cached: bool,
     pub errors: Vec<String>,
+}
+
+/// Профиль сервера, каким его заводит приложение по принятому приглашению.
+/// Раскладку payload'а на профиль каждая платформа писала бы заново, хотя
+/// правила у неё общие: пул по приоритету, легаси-адрес запасным вариантом,
+/// дефолты обфускации (XR-271). Имя профиля сюда не входит, его выбирает
+/// приложение (комментарий инвайта, хост хаба, счётчик).
+#[derive(Debug, Clone, Serialize)]
+pub struct InviteProfile {
+    /// Основной адрес: голова пула. Легаси-поля профиля зеркалят его, чтобы
+    /// откат на старую версию приложения не терял сервер (LLD-10).
+    pub server_address: String,
+    pub server_port: u16,
+    /// Пул профиля в порядке приоритета.
+    pub endpoints: Vec<ProfileEndpoint>,
+    pub obfuscation_key: String,
+    pub modifier: String,
+    pub salt: u64,
+    pub hub_url: String,
+    pub preset: String,
+}
+
+/// Модификатор обфускации, когда приглашение его не назвало.
+const DEFAULT_MODIFIER: &str = "positional_xor_rotate";
+/// Salt по умолчанию.
+const DEFAULT_SALT: u64 = 0xDEAD_BEEF;
+/// Порт сервера по умолчанию.
+const DEFAULT_SERVER_PORT: u16 = 8443;
+
+/// Разложить payload принятого приглашения на профиль сервера.
+///
+/// Пул берётся из `servers` по возрастанию `priority` (записи без адреса
+/// выбрасываются); приглашение без пула, каким его выдавал хаб до LLD-10,
+/// даёт профиль с одним легаси-адресом. `fallback_hub_url` это адрес, по
+/// которому приложение и пришло за приглашением: payload вправе назвать
+/// другой хаб, но пустое поле не должно оставлять профиль без хаба, иначе
+/// пресет обновлять станет неоткуда.
+pub fn profile_from_payload(payload: &InvitePayload, fallback_hub_url: &str) -> InviteProfile {
+    let mut pool: Vec<(u32, ProfileEndpoint)> = payload
+        .servers
+        .iter()
+        .filter(|s| !s.address.trim().is_empty())
+        .map(|s| {
+            (
+                s.priority,
+                ProfileEndpoint {
+                    name: s.name.trim().to_string(),
+                    address: s.address.trim().to_string(),
+                    port: if s.port == 0 { DEFAULT_SERVER_PORT } else { s.port },
+                },
+            )
+        })
+        .collect();
+    pool.sort_by_key(|(priority, _)| *priority);
+    let mut endpoints: Vec<ProfileEndpoint> = pool.into_iter().map(|(_, e)| e).collect();
+
+    let legacy_address = payload.server_address.trim().to_string();
+    let legacy_port = if payload.server_port == 0 {
+        DEFAULT_SERVER_PORT
+    } else {
+        payload.server_port
+    };
+    if endpoints.is_empty() && !legacy_address.is_empty() {
+        endpoints.push(ProfileEndpoint {
+            name: String::new(),
+            address: legacy_address.clone(),
+            port: legacy_port,
+        });
+    }
+
+    let primary = endpoints.first();
+    let hub_url = if payload.hub_url.trim().is_empty() {
+        fallback_hub_url.trim().to_string()
+    } else {
+        payload.hub_url.trim().to_string()
+    };
+
+    InviteProfile {
+        server_address: primary.map(|e| e.address.clone()).unwrap_or(legacy_address),
+        server_port: primary.map(|e| e.port).unwrap_or(legacy_port),
+        endpoints,
+        obfuscation_key: payload.obfuscation_key.clone(),
+        modifier: if payload.modifier.trim().is_empty() {
+            DEFAULT_MODIFIER.to_string()
+        } else {
+            payload.modifier.trim().to_string()
+        },
+        salt: if payload.salt == 0 {
+            DEFAULT_SALT
+        } else {
+            payload.salt
+        },
+        hub_url,
+        preset: payload.preset.trim().to_string(),
+    }
 }
 
 /// GET the invite metadata. Does not consume.
@@ -464,5 +561,82 @@ mod tests {
         assert!(result.preset_cached, "пресет не лёг в кэш: {:?}", result.errors);
         assert!(result.errors.is_empty(), "лишние ошибки: {:?}", result.errors);
         assert!(dir.path().join("russia.json").exists(), "файла пресета нет в кэше");
+    }
+
+    fn payload(extra: &str) -> InvitePayload {
+        let json = format!(
+            r#"{{"server_address":"203.0.113.10","server_port":8443,"obfuscation_key":"a2V5",
+                 "modifier":"positional_xor_rotate","salt":7,"preset":"russia",
+                 "hub_url":"https://hub.example"{}}}"#,
+            extra
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    /// Пул профиля строится по `priority`, а не по порядку в массиве, и голова
+    /// пула становится основным адресом.
+    #[test]
+    fn profile_orders_pool_by_priority() {
+        let p = payload(
+            r#","servers":[{"name":"резерв","address":"198.51.100.7","port":9000,"priority":5},
+                           {"name":"основной","address":"203.0.113.10","port":8443,"priority":0}]"#,
+        );
+        let profile = profile_from_payload(&p, "https://hub.fallback");
+        assert_eq!(profile.endpoints.len(), 2);
+        assert_eq!(profile.endpoints[0].name, "основной");
+        assert_eq!(profile.endpoints[1].address, "198.51.100.7");
+        assert_eq!(profile.server_address, "203.0.113.10");
+        assert_eq!(profile.server_port, 8443);
+    }
+
+    /// Приглашение без пула (каким его выдавал хаб до LLD-10) даёт профиль с
+    /// одним адресом, как раньше.
+    #[test]
+    fn profile_falls_back_to_legacy_address() {
+        let profile = profile_from_payload(&payload(""), "https://hub.fallback");
+        assert_eq!(profile.endpoints.len(), 1);
+        assert_eq!(profile.endpoints[0].address, "203.0.113.10");
+        assert_eq!(profile.endpoints[0].port, 8443);
+        assert!(profile.endpoints[0].name.is_empty());
+    }
+
+    /// Записи без адреса в пуле выбрасываются, нулевой порт читается как
+    /// дефолтный.
+    #[test]
+    fn profile_skips_blank_addresses() {
+        let p = payload(
+            r#","servers":[{"address":"  ","port":8443,"priority":0},
+                           {"address":"198.51.100.7","port":0,"priority":1}]"#,
+        );
+        let profile = profile_from_payload(&p, "https://hub.fallback");
+        assert_eq!(profile.endpoints.len(), 1);
+        assert_eq!(profile.endpoints[0].address, "198.51.100.7");
+        assert_eq!(profile.endpoints[0].port, 8443);
+    }
+
+    /// Хаб из payload'а главнее, но пустое поле не должно оставлять профиль
+    /// без адреса хаба: тогда пресет неоткуда обновлять.
+    #[test]
+    fn profile_keeps_a_hub_url() {
+        let named = profile_from_payload(&payload(""), "https://hub.fallback");
+        assert_eq!(named.hub_url, "https://hub.example");
+
+        let mut blank = payload("");
+        blank.hub_url = "  ".into();
+        let profile = profile_from_payload(&blank, "https://hub.fallback");
+        assert_eq!(profile.hub_url, "https://hub.fallback");
+    }
+
+    /// Приглашение без модификатора и salt получает те же дефолты, что раньше
+    /// подставляло приложение.
+    #[test]
+    fn profile_fills_obfuscation_defaults() {
+        let mut p = payload("");
+        p.modifier = String::new();
+        p.salt = 0;
+        let profile = profile_from_payload(&p, "https://hub.fallback");
+        assert_eq!(profile.modifier, "positional_xor_rotate");
+        assert_eq!(profile.salt, 0xDEAD_BEEF);
+        assert_eq!(profile.preset, "russia");
     }
 }
