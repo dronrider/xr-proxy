@@ -729,11 +729,10 @@ private fun ExplorerView(
             )
         }
         if (ui.migratingShareId != null) ProgressBar(ui.transfer) { vm.cancelTransfer() }
-        // The live import job's row (LLD-29): the agent downloads, this is just
-        // the counter and the cancel; leaving the screen does not interrupt.
-        val importJob = ui.importJob
-        if (importJob != null && importJob.shareId == cfg.shareId) {
-            ImportRow(importJob) { vm.cancelImport(cfg) }
+        // Строка на каждый импорт этой шары (LLD-29, XR-175): агент качает по
+        // очереди, здесь только счётчик и отмена; уход с экрана не прерывает.
+        ui.importJobs.filter { it.shareId == cfg.shareId }.forEach { job ->
+            ImportRow(job) { vm.cancelImport(cfg, job.jobId) }
         }
         HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
 
@@ -1122,7 +1121,8 @@ private fun ImportErrorDialog(text: String, onCopy: () -> Unit, onDismiss: () ->
     )
 }
 
-/** The task row above the file list: "Импорт: N%" with a cancel cross. */
+/** The task row above the file list: "Импорт: N%" with a cancel cross. Джоба,
+ *  до которой воркер агента ещё не дошёл, подписана «в очереди» (XR-175). */
 @Composable
 private fun ImportRow(job: FilesViewModel.ImportJob, onCancel: () -> Unit) {
     Card(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
@@ -1131,7 +1131,11 @@ private fun ImportRow(job: FilesViewModel.ImportJob, onCancel: () -> Unit) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                job.progress?.let { "Импорт: ${it.toInt()}%" } ?: "Импорт...",
+                when {
+                    job.queued -> "Импорт: в очереди"
+                    job.progress != null -> "Импорт: ${job.progress.toInt()}%"
+                    else -> "Импорт..."
+                },
                 fontSize = 13.sp,
                 modifier = Modifier.weight(1f),
             )

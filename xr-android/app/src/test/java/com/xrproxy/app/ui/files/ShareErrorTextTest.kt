@@ -80,6 +80,24 @@ class ShareErrorTextTest {
         assertEquals("cancelled", humanShareError("cancelled"))
     }
 
+    // -- импорт по URL ----------------------------------------------------
+
+    @Test
+    fun fullImportQueueGetsItsOwnText() {
+        // 429 от агента: очередь импорта забита, и текст ядра про занятость
+        // пользователю ничего не подсказывает (XR-175).
+        assertEquals("Очередь импорта заполнена, попробуй позже", humanImportError("queue_full: очередь импорта занята, попробуй позже"))
+    }
+
+    @Test
+    fun otherImportCategoriesKeepTheirHumanTail() {
+        assertEquals("нет плагина под эту ссылку", humanImportError("no_plugin: нет плагина под эту ссылку"))
+        assertEquals("агент перезапустился, задание потерялось", humanImportError("job_lost: агент перезапустился, задание потерялось"))
+        // Текст без машинного префикса едет как есть: так приходит хвост
+        // stderr плагина у сорвавшейся джобы.
+        assertEquals("ffmpeg not found", humanImportError("ffmpeg not found"))
+    }
+
     // -- офлайн-ретрай ----------------------------------------------------
 
     @Test

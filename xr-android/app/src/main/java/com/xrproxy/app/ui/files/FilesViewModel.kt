@@ -150,9 +150,10 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         val storagePromptMode: Boolean = false,
         /** Share whose "Импорт по URL" dialog is open (LLD-29), or null. */
         val importDialogFor: String? = null,
-        /** Live import job: the agent downloads, this screen polls every 2
-         *  seconds. Leaving the screen stops the poll, not the download. */
-        val importJob: ImportJob? = null,
+        /** Импорты, за которыми следит приложение (XR-175): очередь держит сам
+         *  агент, здесь строка на каждую свою джобу. Один цикл опрашивает их
+         *  раз в 2 секунды; уход с экрана скачивание не прерывает. */
+        val importJobs: List<ImportJob> = emptyList(),
         /** Причина сорвавшегося импорта, как её назвал агент (XR-161). Тост её
          *  обрезает: с Android 12 в нём две строки, а сюда приходит хвост
          *  stderr плагина в несколько абзацев. Поэтому отдельный диалог. */
@@ -165,6 +166,10 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         val jobId: String,
         /** Percent from the agent; null until the plugin reports any. */
         val progress: Double? = null,
+        /** Джоба ждёт своей очереди у агента (XR-175): прогресса ещё нет и не
+         *  будет, пока воркер не дойдёт до неё, поэтому строка подписывается
+         *  «в очереди», а не висит пустым процентом. */
+        val queued: Boolean = true,
     )
 
     /** An action deferred until the user makes the first-sync storage choice. */
@@ -731,15 +736,15 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun closeShare() {
-        // The poll lives as long as the share screen; the agent-side download
-        // continues without us and the file shows up on the next open.
-        stopImportPolling()
+        // Импорты закрытие шары не забывает (XR-175): опрос идёт по shareId
+        // джобы, поэтому возврат в шару застаёт свои строки на месте, а уход в
+        // соседнюю их не роняет. Скачивание на агенте от нас и так не зависит.
         offlineRetryJob?.cancel()
         _ui.update {
             it.copy(
                 openShareId = null, currentPath = "", manifest = emptyList(),
                 localPaths = emptySet(), viewedPaths = emptySet(),
-                importJob = null, importDialogFor = null, detailsPath = null,
+                importDialogFor = null, detailsPath = null,
             )
         }
     }
@@ -1290,20 +1295,20 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
      *  network handover must not orphan a job that keeps running on the agent. */
     private val importPollFailureLimit = 3
 
+    /** Промахи опроса по каждой джобе: счёт свой, иначе одна недоступная джоба
+     *  снимала бы соседние. */
+    private val importPollFailures = mutableMapOf<String, Int>()
+
     fun openImportDialog(shareId: String) = _ui.update { it.copy(importDialogFor = shareId) }
     fun dismissImportDialog() = _ui.update { it.copy(importDialogFor = null) }
 
     fun dismissImportError() = _ui.update { it.copy(importError = null) }
 
     /** Start importing [url] into the currently open folder of the share.
-     *  [height] null means "Максимум": the owner's cap alone limits quality. */
+     *  [height] null means "Максимум": the owner's cap alone limits quality.
+     *  Гейта на второй импорт нет (XR-175): очередь держит агент, а строка в
+     *  списке даёт чем отследить и отменить каждую джобу. */
     fun startImport(config: ShareConfig, url: String, height: Int?) {
-        // One tracked job at a time: a second start would orphan the first
-        // (untrackable, uncancellable) on the agent's single-worker queue.
-        if (_ui.value.importJob != null) {
-            _ui.update { it.copy(importDialogFor = null, message = "Импорт уже идёт, дождись или отмени его") }
-            return
-        }
         val dest = _ui.value.currentPath
         _ui.update { it.copy(importDialogFor = null) }
         viewModelScope.launch {
@@ -1312,8 +1317,8 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             }
             result.fold(
                 onSuccess = { jobId ->
-                    _ui.update { it.copy(importJob = ImportJob(config.shareId, jobId)) }
-                    startImportPolling(config, jobId)
+                    _ui.update { it.copy(importJobs = it.importJobs + ImportJob(config.shareId, jobId)) }
+                    ensureImportPolling()
                 },
                 onFailure = { e ->
                     _ui.update { it.copy(importError = humanImportError(e.message ?: "ошибка")) }
@@ -1322,74 +1327,76 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** The cross on the import row: kill the download on the agent, forget the job. */
-    fun cancelImport(config: ShareConfig) {
-        val job = _ui.value.importJob ?: return
-        stopImportPolling()
-        _ui.update { it.copy(importJob = null) }
-        viewModelScope.launch(Dispatchers.IO) { repo.importCancel(config, job.jobId) }
+    /** The cross on the import row: kill the download on the agent, forget the
+     *  job. Остальные джобы списка идут дальше своим чередом. */
+    fun cancelImport(config: ShareConfig, jobId: String) {
+        forgetImportJob(jobId)
+        viewModelScope.launch(Dispatchers.IO) { repo.importCancel(config, jobId) }
     }
 
-    /** Poll every 2 seconds while the screen is open (LLD-29 п. 2.8): on done
-     *  the row disappears and the listing refreshes, on failed the agent's
-     *  error text is shown. Transient poll failures are tolerated up to
-     *  [importPollFailureLimit] in a row: the job runs on the agent and one
-     *  lost network round-trip says nothing about it. */
-    private fun startImportPolling(config: ShareConfig, jobId: String) {
-        stopImportPolling()
+    private fun forgetImportJob(jobId: String) {
+        importPollFailures.remove(jobId)
+        _ui.update { it.copy(importJobs = it.importJobs.filterNot { job -> job.jobId == jobId }) }
+    }
+
+    /** Один цикл на весь список (XR-175): раз в 2 секунды обходит все живые
+     *  джобы, свою на каждую заводить незачем. Живёт, пока список не опустеет,
+     *  и переживает уход в другую шару: конфиг берётся по shareId джобы. */
+    private fun ensureImportPolling() {
+        if (importPoll?.isActive == true) return
         importPoll = viewModelScope.launch {
-            var failures = 0
-            while (true) {
+            while (_ui.value.importJobs.isNotEmpty()) {
                 delay(2_000)
-                val result = withContext(Dispatchers.IO) { repo.importStatus(config, jobId) }
-                val state = result.getOrNull()
-                when {
-                    state == null -> {
-                        failures++
-                        if (failures >= importPollFailureLimit) {
-                            _ui.update {
-                                it.copy(
-                                    importJob = null,
-                                    importError = humanImportError(result.exceptionOrNull()?.message ?: "ошибка"),
-                                )
+                for (job in _ui.value.importJobs) pollImportJob(job)
+            }
+            importPoll = null
+        }
+    }
+
+    /** Один опрос джобы (LLD-29 п. 2.8): done убирает строку и обновляет
+     *  листинг, failed показывает причину от агента. Промахи сети терпятся до
+     *  [importPollFailureLimit] подряд на джобу: она качается на агенте, и один
+     *  потерянный ответ о ней ничего не говорит. */
+    private suspend fun pollImportJob(job: ImportJob) {
+        val config = store().get(job.shareId) ?: return
+        val result = withContext(Dispatchers.IO) { repo.importStatus(config, job.jobId) }
+        val state = result.getOrNull()
+        when {
+            state == null -> {
+                val failures = (importPollFailures[job.jobId] ?: 0) + 1
+                importPollFailures[job.jobId] = failures
+                if (failures >= importPollFailureLimit) {
+                    forgetImportJob(job.jobId)
+                    _ui.update {
+                        it.copy(importError = humanImportError(result.exceptionOrNull()?.message ?: "ошибка"))
+                    }
+                }
+            }
+            state.state == "done" -> {
+                forgetImportJob(job.jobId)
+                _ui.update { it.copy(message = "Импорт завершён") }
+                refreshOpenShare(config)
+            }
+            state.state == "failed" -> {
+                forgetImportJob(job.jobId)
+                _ui.update { it.copy(importError = state.error ?: "причина неизвестна") }
+            }
+            else -> {
+                importPollFailures.remove(job.jobId)
+                _ui.update { st ->
+                    st.copy(
+                        importJobs = st.importJobs.map {
+                            if (it.jobId == job.jobId) {
+                                it.copy(progress = state.progress, queued = state.state == "queued")
+                            } else {
+                                it
                             }
-                            break
-                        }
-                    }
-                    state.state == "done" -> {
-                        _ui.update { it.copy(importJob = null, message = "Импорт завершён") }
-                        refreshOpenShare(config)
-                        break
-                    }
-                    state.state == "failed" -> {
-                        _ui.update {
-                            it.copy(
-                                importJob = null,
-                                importError = state.error ?: "причина неизвестна",
-                            )
-                        }
-                        break
-                    }
-                    else -> {
-                        failures = 0
-                        _ui.update { st ->
-                            st.copy(importJob = st.importJob?.copy(progress = state.progress))
-                        }
-                    }
+                        },
+                    )
                 }
             }
         }
     }
-
-    private fun stopImportPolling() {
-        importPoll?.cancel()
-        importPoll = null
-    }
-
-    /** Import errors carry a machine prefix (`no_plugin: ...`); the text after
-     *  it is already human-worded and single-sourced in Rust. */
-    private fun humanImportError(e: String): String =
-        if (Regex("^[a-z_]+: ").containsMatchIn(e)) e.substringAfter(": ") else e
 
     /** Re-fetch the open share's manifest after a finished import, so the new
      *  file shows up in the listing without a manual refresh. */
