@@ -109,11 +109,12 @@ pub struct VpnEngine {
     /// активный роутер. `None`, пока движок не запущен.
     ctx: Option<Arc<SessionContext>>,
     /// Локальные правила пользователя в общем владении с фоновым watch'ем
-    /// пресета. Отдельная копия нужна потому, что merged-роутер собирается из
-    /// двух половин: правки пользователя и правил хаба. Читай watch эту
-    /// половину из своей копии, снятой на старте, первая же новая версия
-    /// пресета откатила бы применённое на лету правило.
-    live_overrides: Option<Arc<std::sync::RwLock<RoutingConfig>>>,
+    /// пресета, он же точка сериализации пересборок (см. `swap_router`).
+    /// Отдельная копия нужна потому, что merged-роутер собирается из двух
+    /// половин: правки пользователя и правил хаба. Читай watch эту половину
+    /// из своей копии, снятой на старте, первая же новая версия пресета
+    /// откатила бы применённое на лету правило.
+    live_overrides: Option<Arc<std::sync::Mutex<RoutingConfig>>>,
 }
 
 /// Собрать роутер из локальных правил и (если он есть) пресета хаба. Одна
@@ -134,20 +135,33 @@ fn build_router(
 /// пересборки (новая версия пресета с хаба и правка пользователя) ходят
 /// сюда, и обоим локальную половину даёт один и тот же `overrides`: разъедься
 /// они, публикация с хаба вернула бы правила, какими они были на старте.
+///
+/// Лок `overrides` держится на весь цикл «записать новую половину, собрать,
+/// подменить». Двум поводам иначе нечем разойтись: пересекись они, порядок
+/// записи в `ctx.router` решал бы не порядок событий, а то, чей снимок
+/// локальной половины оказался старше, и публикация пресета молча перекрыла
+/// бы только что применённое правило пользователя. Новую локальную половину
+/// пишет тот же вызов (`new_overrides`), отдельного захвата под неё нет.
 fn swap_router(
     ctx: &SessionContext,
-    overrides: &std::sync::RwLock<RoutingConfig>,
+    overrides: &std::sync::Mutex<RoutingConfig>,
+    new_overrides: Option<RoutingConfig>,
     preset: Option<&RoutingConfig>,
     geoip_path: Option<&str>,
     reason: &str,
 ) -> bool {
-    let overrides = match overrides.read() {
-        Ok(guard) => guard.clone(),
-        Err(e) => {
-            tracing::error!("failed to read local overrides: {}", e);
-            return false;
+    // Отравленный лок восстанавливаем: паника в чужом месте не должна
+    // застревать правила маршрутизации до перезапуска движка.
+    let mut overrides = match overrides.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!("local overrides lock poisoned, recovering");
+            poisoned.into_inner()
         }
     };
+    if let Some(fresh) = new_overrides {
+        *overrides = fresh;
+    }
     let new_router = build_router(&overrides, preset, geoip_path);
     match ctx.router.write() {
         Ok(mut guard) => {
@@ -303,7 +317,7 @@ impl VpnEngine {
         // without tearing down the whole engine.
         self.server_pool = Some(server_pool.clone());
 
-        let live_overrides = Arc::new(std::sync::RwLock::new(self.config.routing.clone()));
+        let live_overrides = Arc::new(std::sync::Mutex::new(self.config.routing.clone()));
         self.live_overrides = Some(live_overrides.clone());
 
         let ctx = Arc::new(SessionContext {
@@ -375,6 +389,7 @@ impl VpnEngine {
                         swap_router(
                             &ctx_bg,
                             &local_overrides,
+                            None,
                             Some(preset_rules),
                             geoip_path_owned.as_deref(),
                             &format!("пресет '{}' обновился", preset_name),
@@ -443,9 +458,11 @@ impl VpnEngine {
     /// Раньше правки экрана правил ждали переподключения: движок собирал
     /// merged-роутер только на старте и на новой версии пресета. Путь тот же,
     /// что у пресета: пересобрать роутер из двух половин и подменить его в
-    /// `SessionContext` под write-локом. Пресет берётся из дискового кэша, в
-    /// сеть эта ручка не ходит. Живые сессии продолжают со своим `Action`,
-    /// новые решения принимаются по свежим правилам.
+    /// `SessionContext`. Новый список и пересборка едут одним вызовом
+    /// `swap_router`, то есть под общим локом: параллельная публикация с хаба
+    /// либо ждёт своей очереди, либо уже видит новые правила. Пресет берётся
+    /// из дискового кэша, в сеть эта ручка не ходит. Живые сессии продолжают
+    /// со своим `Action`, новые решения принимаются по свежим правилам.
     ///
     /// Возвращает `false`, когда движок не запущен: правила тогда просто
     /// лежат в конфиге и уедут в роутер на ближайшем старте.
@@ -454,13 +471,6 @@ impl VpnEngine {
         let Some(overrides) = self.live_overrides.clone() else {
             return false;
         };
-        match overrides.write() {
-            Ok(mut guard) => *guard = routing,
-            Err(e) => {
-                tracing::error!("failed to update local overrides: {}", e);
-                return false;
-            }
-        }
         let Some(ctx) = self.ctx.clone() else { return false };
 
         let cache = match (
@@ -483,6 +493,7 @@ impl VpnEngine {
         swap_router(
             &ctx,
             &overrides,
+            Some(routing),
             preset,
             self.config.geoip_path.as_deref(),
             "правила пользователя изменены",
@@ -1251,12 +1262,113 @@ mod tests {
         let ctx = engine.ctx.clone().unwrap();
         let overrides = engine.live_overrides.clone().unwrap();
         let preset = routing_with(vec![("proxy", "example.com")]);
-        assert!(swap_router(&ctx, &overrides, Some(&preset), None, "тест"));
+        assert!(swap_router(&ctx, &overrides, None, Some(&preset), None, "тест"));
 
         assert_eq!(
             action_for(&engine, "example.com"),
             Action::Direct,
             "публикация с хаба не должна откатывать правило пользователя"
+        );
+        engine.stop();
+    }
+
+    /// Пересборки не наступают друг другу на пятки: пока лок держит кто-то
+    /// один, обе стоят и роутера не касаются, а после освобождения правило
+    /// пользователя переживает публикацию пресета при любом их порядке.
+    /// Порядок здесь задан локом, а не удачей планировщика: тест держит ту же
+    /// точку синхронизации и отпускает её сам.
+    #[test]
+    fn concurrent_rebuilds_keep_the_user_rule() {
+        let (_rt, mut engine) = started_engine(test_config(routing_with(vec![])));
+        let ctx = engine.ctx.clone().unwrap();
+        let overrides = engine.live_overrides.clone().unwrap();
+        let held = overrides.lock().unwrap();
+
+        let watch = {
+            let ctx = ctx.clone();
+            let overrides = overrides.clone();
+            std::thread::spawn(move || {
+                let preset = routing_with(vec![("proxy", "example.com")]);
+                swap_router(&ctx, &overrides, None, Some(&preset), None, "пресет")
+            })
+        };
+        let user = {
+            let ctx = ctx.clone();
+            let overrides = overrides.clone();
+            std::thread::spawn(move || {
+                swap_router(
+                    &ctx,
+                    &overrides,
+                    Some(routing_with(vec![("direct", "example.com")])),
+                    None,
+                    None,
+                    "правила пользователя",
+                )
+            })
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            action_for(&engine, "example.com"),
+            Action::Direct,
+            "пересборка не имеет права трогать роутер мимо общего лока"
+        );
+
+        drop(held);
+        assert!(watch.join().unwrap());
+        assert!(user.join().unwrap());
+        assert_eq!(
+            action_for(&engine, "example.com"),
+            Action::Direct,
+            "правило пользователя обязано пережить любой порядок пересборок"
+        );
+        engine.stop();
+    }
+
+    /// Пересборка держит лок на весь цикл, а не отпускает его после снимка.
+    /// Порядок задан размером пресета: пока watch компилирует свои десятки
+    /// тысяч правил, правка пользователя обязана стоять в очереди, поэтому
+    /// последним в роутер попадает её результат. Отпусти пересборка лок
+    /// раньше сборки, правка успела бы целиком, а watch перекрыл бы её своим
+    /// снимком, снятым до правки.
+    #[test]
+    fn rebuild_holds_the_lock_for_the_whole_cycle() {
+        let (_rt, mut engine) = started_engine(test_config(routing_with(vec![])));
+        let ctx = engine.ctx.clone().unwrap();
+        let overrides = engine.live_overrides.clone().unwrap();
+
+        // Пресет заведомо долгой сборки: на его фоне окно гонки видно.
+        let mut heavy: Vec<(String, String)> = (0..150_000)
+            .map(|i| ("proxy".to_string(), format!("host{}.example.org", i)))
+            .collect();
+        heavy.push(("proxy".to_string(), "example.com".to_string()));
+        let heavy = RoutingConfig {
+            default_action: "direct".into(),
+            rules: heavy
+                .into_iter()
+                .map(|(action, domain)| xr_proto::config::RoutingRule {
+                    name: None,
+                    action,
+                    domains: vec![domain],
+                    ip_ranges: vec![],
+                    geoip: vec![],
+                })
+                .collect(),
+        };
+
+        let watch = std::thread::spawn(move || {
+            swap_router(&ctx, &overrides, None, Some(&heavy), None, "пресет")
+        });
+        // Дать watch войти в критическую секцию: дальше правка пользователя
+        // либо ждёт его целиком, либо (без общего лока) обгоняет и теряется.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(engine.apply_user_rules(routing_with(vec![("direct", "example.com")])));
+        assert!(watch.join().unwrap());
+
+        assert_eq!(
+            action_for(&engine, "example.com"),
+            Action::Direct,
+            "правку пользователя перекрыла пересборка со старым снимком правил"
         );
         engine.stop();
     }
