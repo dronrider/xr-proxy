@@ -10,6 +10,7 @@ pub mod dns;
 pub mod engine;
 pub mod ip_stack;
 pub mod journal;
+pub mod journal_bridge;
 pub mod onboarding;
 pub mod presets;
 pub mod session;

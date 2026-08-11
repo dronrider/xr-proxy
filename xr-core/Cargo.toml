@@ -17,6 +17,10 @@ uniffi = ["dep:uniffi"]
 xr-proto = { path = "../xr-proto", features = ["share", "relay-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "fs"] }
 tracing = "0.1"
+# Мост tracing в журнал приложения (XR-237) это слой подписчика, поэтому
+# tracing-subscriber переехал из dev-зависимостей в обычные. Фич сверх
+# дефолтных ему не нужно: фильтрация у слоя своя.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry"] }
 smoltcp = { version = "0.12", default-features = false, features = [
     "std", "log", "medium-ip", "proto-ipv4", "proto-ipv6",
     "socket-tcp", "socket-udp", "socket-dns",
