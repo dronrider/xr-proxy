@@ -67,6 +67,17 @@ object NativeBridge {
         }
     }
 
+    /**
+     * Собрать JSON конфига движка из профиля активного сервера (XR-271).
+     * [profileJson] это `{server_address,server_port,servers:[{name,address,
+     * port}],obfuscation_key,modifier,salt,hub_url,hub_preset,hub_cache_dir,
+     * user_rules:[{action,pattern}],dns_resolvers:[..],fail_closed}`. Дефолты,
+     * порядок пула, чистка резолверов системы и экранирование живут в ядре, а
+     * не в приложении: порт под другую платформу собирает конфиг тем же
+     * вызовом. Возвращает готовый конфиг либо `{"error":".."}`.
+     */
+    external fun nativeBuildConfig(profileJson: String): String
+
     /** Start the VPN engine. Returns null on success, or an error message on failure. */
     external fun nativeStart(tunFd: Int, configJson: String): String?
     external fun nativeStop()
@@ -97,6 +108,21 @@ object NativeBridge {
 
     external fun nativeGetState(): String
     external fun nativeGetStats(): String
+
+    // -- Здоровье сессии (LLD-06, XR-271) ----------------------------
+    // Скользящее окно по счётчикам движка живёт в ядре, трекер один на
+    // процесс. Возвращается имя ступени: "healthy", "good", "watching",
+    // "hurt", "critical".
+
+    /** Обновить здоровье накопительными счётчиками движка (раз в тик опроса). */
+    external fun nativeHealthUpdate(relayErrors: Long, relayWarnings: Long): String
+
+    /** Сети нет: подтянуть базовую линию к текущим счётчикам, не портя
+     *  здоровье ошибками, которые про отсутствие связи (XR-183). */
+    external fun nativeHealthFreeze(relayErrors: Long, relayWarnings: Long): String
+
+    /** Сброс перед новой сессией туннеля. */
+    external fun nativeHealthReset()
 
     // ── Единый журнал приложения (XR-042) ───────────────────────────
     // Персистентный append-only буфер, общий для движка, проб, смен
@@ -174,8 +200,26 @@ object NativeBridge {
     /** Применить правки «моих правил» к живому туннелю (XR-180): движок
      *  пересобирает merged-роутер тем же путём, каким подхватывает новую
      *  версию пресета. `rulesJson` это массив `user_rules` из конфига.
+     *  Пустой `defaultAction` значит «как в конфиге старта»: своей копии
+     *  этого значения приложение не держит (XR-271).
      *  `false`, когда движок не запущен (правила уедут ближайшим стартом). */
     external fun nativeApplyUserRules(rulesJson: String, defaultAction: String): Boolean
+
+    /** Кэшированный пресет для карточки экрана правил (XR-271). Кэш пишет и
+     *  читает ядро, формат файла наружу не выходит. Возвращает
+     *  `{"name","version","updated_at","default_action","rules":[{"name",
+     *  "action","domains","ip_ranges","geoip"}]}` либо `{"error":"no_cache"}`. */
+    external fun nativeCachedPreset(cacheDir: String, preset: String): String
+
+    /** Превью блока `[routing]` из моих правил и пресета хаба (кнопка `{ }`).
+     *  Собирается в ядре рядом с кэшем пресета; пустой `defaultAction` берёт
+     *  общий дефолт клиента. */
+    external fun nativeMergedToml(
+        cacheDir: String,
+        preset: String,
+        rulesJson: String,
+        defaultAction: String,
+    ): String
 
     // ── APK self-update (LLD-12) ────────────────────────────────────
 

@@ -24,7 +24,7 @@ import com.xrproxy.app.data.TrustedNetworksRepository
 import com.xrproxy.app.data.UserRulesStore
 import com.xrproxy.app.jni.NativeBridge
 import com.xrproxy.app.model.HealthLevel
-import com.xrproxy.app.model.HealthTracker
+import com.xrproxy.app.model.healthLevelOf
 import com.xrproxy.app.ui.MainActivity
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -253,8 +253,6 @@ class XrVpnService : VpnService() {
     private var prevBytesDown: Long = 0
     private var prevTickMs: Long = 0
 
-    // Health tracking (LLD-06 §3.5a)
-    private val healthTracker = HealthTracker()
 
     // ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -447,7 +445,7 @@ class XrVpnService : VpnService() {
 
         // Reset speed and health tracking for the (re)started session.
         prevBytesUp = 0; prevBytesDown = 0; prevTickMs = 0
-        healthTracker.reset()
+        NativeBridge.nativeHealthReset()
 
         val builder = Builder()
             .setSession("XR Proxy")
@@ -640,10 +638,14 @@ class XrVpnService : VpnService() {
             // а не от прокси: здоровье не деградируем, замораживаем на Healthy
             // (XR-183). UI при noNetwork смайлик всё равно прячет, но заморозка
             // ещё и не даёт ложного всплеска в момент возврата сети.
-            val health = if (_stateFlow.value.noNetwork)
-                healthTracker.freezeAt(snap.relayErrors, snap.relayWarnings)
-            else
-                healthTracker.update(snap.relayErrors, snap.relayWarnings)
+            // Само окно живёт в ядре (XR-271), сервис только кормит его
+            // счётчиками раз в тик и раскладывает ответ в свою ступень.
+            val health = healthLevelOf(
+                if (_stateFlow.value.noNetwork)
+                    NativeBridge.nativeHealthFreeze(snap.relayErrors, snap.relayWarnings)
+                else
+                    NativeBridge.nativeHealthUpdate(snap.relayErrors, snap.relayWarnings),
+            )
 
             // Через update, не присваиванием: колбэк сети параллельно правит
             // noNetwork атомарным update, а copy-assign с прочитанного снапшота

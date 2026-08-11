@@ -41,6 +41,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.time.OffsetDateTime
@@ -182,11 +183,6 @@ data class VpnUiState(
     val paused: Boolean
         get() = phase == ConnectPhase.Paused
 }
-
-/** Действие для трафика, не попавшего ни под одно правило. Одно на конфиг
- *  старта и на применение правил к живому туннелю: разъедься эти два места,
- *  правка правил меняла бы заодно и маршрут по умолчанию. */
-private const val DEFAULT_ROUTING_ACTION = "direct"
 
 class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -742,9 +738,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             try {
+                // Пустое действие по умолчанию значит «как в конфиге старта»:
+                // само значение живёт в ядре (XR-271).
                 NativeBridge.nativeApplyUserRules(
                     UserRulesStore.toConfigJson(capped).toString(),
-                    DEFAULT_ROUTING_ACTION,
+                    "",
                 )
             } catch (e: Throwable) {
                 Log.w("xr-rules", "не удалось применить правила на лету: $e")
@@ -752,9 +750,21 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** Кэшированный пресет активного сервера для карточки/просмотра/TOML. */
+    /** Кэшированный пресет активного сервера для карточки и просмотра. */
     fun readCachedPreset(presetName: String): CachedPreset? =
         PresetCacheReader.read(presetCacheDir, presetName)
+
+    /** Превью блока `[routing]` для кнопки `{ }` на экране правил: мои правила
+     *  поверх пресета хаба. Собирает ядро рядом с кэшем пресета (XR-271),
+     *  поэтому вызов ходит на диск и живёт на IO. */
+    suspend fun mergedToml(rules: List<UserRule>): String = withContext(Dispatchers.IO) {
+        NativeBridge.nativeMergedToml(
+            presetCacheDir.absolutePath,
+            repo.activeServer()?.hubPreset.orEmpty(),
+            UserRulesStore.toConfigJson(rules).toString(),
+            "",
+        )
+    }
 
     /** Форсированный fetch пресета с хаба («Обновить сейчас»). */
     suspend fun refreshPresetNow(): PresetRefresh {
@@ -1133,28 +1143,27 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             } ?: ""
             val presetCached = result.optBoolean("preset_cached", false)
 
-            val hubFromPayload = payload.optString("hub_url").ifBlank { current.hubUrl }
-            val serverAddr = payload.optString("server_address")
-            val serverPort = payload.optInt("server_port", 8443)
-            val presetName = payload.optString("preset")
-            // Пул серверов из payload'а (LLD-10 §2.8); легаси-инвайт без
-            // `servers` даёт профиль с одним адресом, как раньше.
-            val endpoints = parsePayloadServers(payload).ifEmpty {
-                if (serverAddr.isBlank()) emptyList()
-                else listOf(ProfileEndpoint(address = serverAddr, port = serverPort))
+            // Раскладку payload'а на профиль (пул по приоритету, легаси-адрес
+            // запасным вариантом, дефолты обфускации) делает ядро, XR-271.
+            val fields = result.optJSONObject("profile") ?: run {
+                emitMessage(friendlyClaimError("unknown"), UiSeverity.Error)
+                _onboardingState.value = current.copy(applyInProgress = false)
+                return@launch
             }
+            val serverAddr = fields.optString("server_address")
+            val hubFromPayload = fields.optString("hub_url").ifBlank { current.hubUrl }
 
             val profile = ServerProfile(
                 id = UUID.randomUUID().toString(),
                 name = repo.generateName(getApplication(), serverAddr, hubFromPayload, current.comment),
-                serverAddress = endpoints.firstOrNull()?.address ?: serverAddr,
-                serverPort = endpoints.firstOrNull()?.port ?: serverPort,
-                endpoints = endpoints,
-                obfuscationKey = payload.optString("obfuscation_key"),
-                modifier = payload.optString("modifier", "positional_xor_rotate"),
-                salt = payload.optLong("salt", 0xDEADBEEFL),
+                serverAddress = serverAddr,
+                serverPort = fields.optInt("server_port", 8443),
+                endpoints = parseProfileEndpoints(fields),
+                obfuscationKey = fields.optString("obfuscation_key"),
+                modifier = fields.optString("modifier"),
+                salt = fields.optLong("salt"),
                 hubUrl = hubFromPayload,
-                hubPreset = presetName,
+                hubPreset = fields.optString("preset"),
                 trustedPublicKey = publicKey,
                 inviteToken = current.token,
                 createdAt = OffsetDateTime.now().toString(),
@@ -1177,20 +1186,17 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** Список серверов инвайт-payload'а, отсортированный по `priority`. */
-    private fun parsePayloadServers(payload: JSONObject): List<ProfileEndpoint> {
-        val arr = payload.optJSONArray("servers") ?: return emptyList()
-        return (0 until arr.length())
-            .mapNotNull { i -> arr.optJSONObject(i) }
-            .filter { it.optString("address").isNotBlank() }
-            .sortedBy { it.optInt("priority", 0) }
-            .map {
-                ProfileEndpoint(
-                    name = it.optString("name", ""),
-                    address = it.optString("address"),
-                    port = it.optInt("port", 8443),
-                )
-            }
+    /** Пул профиля из ответа ядра: порядок в массиве уже приоритетный. */
+    private fun parseProfileEndpoints(fields: JSONObject): List<ProfileEndpoint> {
+        val arr = fields.optJSONArray("endpoints") ?: return emptyList()
+        return (0 until arr.length()).mapNotNull { i ->
+            val o = arr.optJSONObject(i) ?: return@mapNotNull null
+            ProfileEndpoint(
+                name = o.optString("name", ""),
+                address = o.optString("address"),
+                port = o.optInt("port", 8443),
+            )
+        }
     }
 
     private fun friendlyInviteInfoError(code: String): String = when (code) {
@@ -1256,7 +1262,12 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun actuallyStart() {
         val server = repo.activeServer() ?: return
-        val configJson = buildConfigJson(server)
+        val configJson = buildConfigJson(server) ?: run {
+            _uiState.value = _uiState.value.copy(
+                phase = ConnectPhase.Idle, state = "Disconnected",
+            )
+            return
+        }
         val intent = Intent(getApplication(), XrVpnService::class.java).apply {
             action = XrVpnService.ACTION_START
             putExtra(XrVpnService.EXTRA_CONFIG_JSON, configJson)
@@ -1355,66 +1366,57 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     // ── Config building ─────────────────────────────────────────────
 
-    private fun buildConfigJson(server: ServerProfile): String {
-        // Мои правила уезжают массивом user_rules (LLD-05): движок соберёт
-        // merged-роутер сам, докачав пресет хаба из hub_* полей ниже.
-        val userRulesJson = UserRulesStore.toConfigJson(_userRules.value).toString()
-        val systemDns = collectSystemDnsServers()
-        val dnsArray = systemDns.joinToString(", ") { "\"$it\"" }
-        val hubFields = if (server.hubUrl.isNotBlank() && server.hubPreset.isNotBlank()) {
-            """,
-                "hub_url": "${server.hubUrl}",
-                "hub_preset": "${server.hubPreset}",
-                "hub_cache_dir": "${presetCacheDir.absolutePath}",
-                "hub_refresh_interval_secs": 300"""
-        } else ""
-        // Пул серверов (LLD-10): порядок в массиве и есть приоритет.
-        // Legacy-поля с primary остаются рядом, движок и старые версии
-        // читают их как раньше.
-        val endpoints = server.effectiveEndpoints
-        // Пустой пул сюда не доходит (onConnectClicked валидирует), но пустой
-        // адрес пусть отвергает движок своей ошибкой, а не NPE здесь.
-        val primary = endpoints.firstOrNull()
-            ?: ProfileEndpoint(address = server.serverAddress, port = server.serverPort)
-        fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
-        val serversArray = endpoints.joinToString(", ") {
-            """{"name": "${esc(it.name)}", "address": "${esc(it.address)}", "port": ${it.port}}"""
+    /** Конфиг движка собирает ядро (XR-271): порядок пула, дефолты обфускации,
+     *  чистка резолверов системы и экранирование живут там же, где движок этот
+     *  конфиг читает. Приложение отдаёт профиль как есть и получает готовый
+     *  JSON, либо null, если ядро отказалось (тогда причина уже в снекбаре). */
+    private fun buildConfigJson(server: ServerProfile): String? {
+        val endpoints = JSONArray()
+        server.effectiveEndpoints.forEach {
+            endpoints.put(
+                JSONObject()
+                    .put("name", it.name)
+                    .put("address", it.address)
+                    .put("port", it.port),
+            )
         }
-        return """
-            {
-                "server_address": "${esc(primary.address)}",
-                "server_port": ${primary.port},
-                "servers": [$serversArray],
-                "obfuscation_key": "${server.obfuscationKey}",
-                "modifier": "${server.modifier}",
-                "salt": ${server.salt},
-                "padding_min": 16,
-                "padding_max": 128,
-                "default_action": "$DEFAULT_ROUTING_ACTION",
-                "user_rules": $userRulesJson,
-                "on_server_down": "${if (_failClosed.value) "block" else "direct"}",
-                "dns_resolvers": [$dnsArray]$hubFields
-            }
-        """.trimIndent()
+        val dns = JSONArray()
+        collectSystemDnsServers().forEach { dns.put(it) }
+        val profile = JSONObject()
+            // Legacy-поля с primary остаются рядом с пулом: движок и старые
+            // версии читают их как раньше (LLD-10).
+            .put("server_address", server.serverAddress)
+            .put("server_port", server.serverPort)
+            .put("servers", endpoints)
+            .put("obfuscation_key", server.obfuscationKey)
+            .put("modifier", server.modifier)
+            .put("salt", server.salt)
+            .put("hub_url", server.hubUrl)
+            .put("hub_preset", server.hubPreset)
+            .put("hub_cache_dir", presetCacheDir.absolutePath)
+            // Мои правила уезжают массивом user_rules (LLD-05): движок соберёт
+            // merged-роутер сам, докачав пресет хаба из hub-полей выше.
+            .put("user_rules", UserRulesStore.toConfigJson(_userRules.value))
+            .put("dns_resolvers", dns)
+            .put("fail_closed", _failClosed.value)
+
+        val json = NativeBridge.nativeBuildConfig(profile.toString())
+        val error = runCatching { JSONObject(json).optString("error") }.getOrNull()
+        if (error.isNullOrBlank() || error == "null") return json
+        emitMessage(str(R.string.vpn_fill_server_and_key), UiSeverity.Info)
+        Log.w("xr-config", "ядро отвергло профиль: $error")
+        return null
     }
 
+    /** Резолверы дефолтной сети как их отдала система. Что из них годится
+     *  движку, решает ядро при сборке конфига. */
     private fun collectSystemDnsServers(): List<String> {
         val cm = getApplication<Application>()
             .getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
             ?: return emptyList()
-        val seen = mutableSetOf<String>()
-        val result = mutableListOf<String>()
-        fun addFrom(network: Network?) {
-            if (network == null) return
-            val lp: LinkProperties = cm.getLinkProperties(network) ?: return
-            for (addr in lp.dnsServers) {
-                val ip = addr.hostAddress ?: continue
-                if (ip.startsWith("10.0.0.") || ip == "127.0.0.1" || ip.startsWith("169.254.")) continue
-                if (seen.add(ip)) result.add(ip)
-            }
-        }
-        addFrom(cm.activeNetwork)
-        return result
+        val network = cm.activeNetwork ?: return emptyList()
+        val lp: LinkProperties = cm.getLinkProperties(network) ?: return emptyList()
+        return lp.dnsServers.mapNotNull { it.hostAddress }
     }
 
 }

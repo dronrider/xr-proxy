@@ -268,8 +268,13 @@ fun RulesScreen(
     val copiedText = stringResource(R.string.rules_copied)
     val presetChangedText = stringResource(R.string.rules_preset_changed)
     if (tomlOpen) {
+        // Превью собирает ядро рядом с кэшем пресета (XR-271), поэтому текст
+        // приезжает не сразу: до первого ответа диалог показывает пустой блок.
+        val toml by produceState("", rules, presetName, presetEpoch) {
+            value = viewModel.mergedToml(rules)
+        }
         TomlPreviewDialog(
-            toml = buildMergedToml(rules, "direct", preset),
+            toml = toml,
             onDismiss = { tomlOpen = false },
             onCopied = { snack(copiedText) },
         )
