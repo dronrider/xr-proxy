@@ -6,9 +6,9 @@ import org.junit.Test
 
 /**
  * XR-056: общий индикатор очереди синка считает батч сам, а экран только
- * рисует готовую подпись. Расчёт это чистая Kotlin-логика без Android SDK,
- * поэтому он живёт в [SyncProgress.kt] и проверяется JVM-юнитом, а не
- * эмулятором.
+ * подписывает его числа: «X из N» собирает ресурс на экране (XR-092). Расчёт
+ * это чистая Kotlin-логика без Android SDK, поэтому он живёт в
+ * [SyncProgress.kt] и проверяется JVM-юнитом, а не эмулятором.
  */
 class SyncProgressTest {
 
@@ -23,7 +23,8 @@ class SyncProgressTest {
             SyncProgressInput(queueSize = 3, queueDone = 2, queueHeadFile = "видео/кино/a.mkv"),
         )!!
         assertEquals("a.mkv", i.file)
-        assertEquals("3 из 5", i.counter)
+        assertEquals(3, i.current)
+        assertEquals(5, i.total)
         assertEquals(2f / 5, i.fraction, 0.0001f)
     }
 
@@ -35,7 +36,8 @@ class SyncProgressTest {
                 nativeFile = "a.mkv", nativeFilesTotal = 1, nativeFileFraction = 0.5f,
             ),
         )!!
-        assertEquals("1 из 1", i.counter)
+        assertEquals(1, i.current)
+        assertEquals(1, i.total)
         assertEquals(0.5f, i.fraction, 0.0001f)
     }
 
@@ -64,7 +66,8 @@ class SyncProgressTest {
             ),
         )!!
         assertEquals("b.flac", i.file)
-        assertEquals("5 из 10", i.counter)
+        assertEquals(5, i.current)
+        assertEquals(10, i.total)
         assertEquals(0.4f, i.fraction, 0.0001f)
     }
 
@@ -73,7 +76,8 @@ class SyncProgressTest {
         val i = syncIndicator(
             SyncProgressInput(nativeFile = "b.flac", nativeFilesDone = 10, nativeFilesTotal = 10),
         )!!
-        assertEquals("10 из 10", i.counter)
+        assertEquals(10, i.current)
+        assertEquals(10, i.total)
         assertEquals(1f, i.fraction, 0.0001f)
     }
 
@@ -107,7 +111,8 @@ class SyncProgressTest {
         done = queueDoneAfter(done, rest = 2, cancelled = true)
         done = queueDoneAfter(done, rest = 1, cancelled = true)
         val i = syncIndicator(SyncProgressInput(queueSize = 1, queueDone = done, queueHeadFile = "c.mkv"))!!
-        assertEquals("1 из 1", i.counter)
+        assertEquals(1, i.current)
+        assertEquals(1, i.total)
         assertEquals(0f, i.fraction, 0.0001f)
     }
 

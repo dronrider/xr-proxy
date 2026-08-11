@@ -1,44 +1,84 @@
 package com.xrproxy.app.ui.files
 
 /**
+ * Что показать вместо категории ошибки: либо своя формулировка приложения, либо
+ * текст, который приехал готовым. Раскладка категории в ресурс живёт в
+ * Android-слое ([FilesViewModel]), поэтому здесь только выбор варианта, и файл
+ * обходится без единого упоминания Android (XR-092).
+ */
+sealed interface ShareErrorText {
+    /** Текст пришёл готовым от движка или от агента: показываем как есть. */
+    data class Raw(val text: String) : ShareErrorText
+
+    /** Своя формулировка: [kind] выбирает ресурс, [arg] подставляется в него
+     *  (сейчас это только код ответа агента). */
+    data class Known(val kind: ShareErrorKind, val arg: String = "") : ShareErrorText
+}
+
+/** Категории, на которые у приложения есть свои слова. */
+enum class ShareErrorKind {
+    AGENT_OFFLINE,
+    ACCESS_EXPIRED,
+    STALE_TOKEN,
+    INVITE_GONE,
+    NETWORK,
+    NOT_FOUND,
+    SERVER_ERROR,
+    HTTP_STATUS,
+    PARSE,
+    READ,
+    MANIFEST_UNSIGNED,
+    MANIFEST_SIGNATURE,
+    IMPORT_QUEUE_FULL,
+    UNKNOWN,
+}
+
+/**
  * Ошибки из ядра приходят строкой с префиксом категории, а человеческий текст
  * это хвост после префикса (единый источник в Rust, XR-134); у устаревшего
- * токена детали по каждой ошибке нет, для него фиксированная строка (XR-167).
+ * токена детали по каждой ошибке нет, для него фиксированная формулировка
+ * (XR-167).
  *
  * `http_*`, `parse:`, `read:` и `manifest_*` - категории, которыми отвечает
  * уже сам агент шары: прощуп прямого пути (XR-219) отсеивает чужой хост
- * раньше, чем ошибка доедет досюда. `humanError` этих категорий не знал,
- * поэтому на экране всплывал сырой код вроде `http_404` (XR-243). Чистая
- * Kotlin-логика без Android SDK, поэтому раскладка живёт отдельным файлом от
+ * раньше, чем ошибка доедет досюда. Разбор этих категорий не знал, поэтому на
+ * экране всплывал сырой код вроде `http_404` (XR-243). Чистая Kotlin-логика
+ * без Android SDK, поэтому раскладка живёт отдельным файлом от
  * [FilesViewModel] и покрывается JVM-юнитом, а не эмулятором.
  */
-fun humanShareError(e: String): String {
+fun shareErrorOf(e: String): ShareErrorText {
     val httpStatus = if (e.startsWith("http_")) e.removePrefix("http_").toIntOrNull() else null
     return when {
-        e.startsWith("agent_offline") -> e.substringAfter(": ", "агент шары не на связи")
-        e.startsWith("access_expired") -> e.substringAfter(": ", "доступ к шаре истёк")
-        e.startsWith("stale_token") -> "токен шары устарел, обновите список по инвайту"
+        e.startsWith("agent_offline") -> tailOr(e, ShareErrorKind.AGENT_OFFLINE)
+        e.startsWith("access_expired") -> tailOr(e, ShareErrorKind.ACCESS_EXPIRED)
+        e.startsWith("stale_token") -> ShareErrorText.Known(ShareErrorKind.STALE_TOKEN)
         // Хаб честно ответил 410: инвайт истёк или его отозвали, а не просто
         // не открылся (XR-121). Отдельно от прочих http_* - тем текст не пишем,
         // это редкий случай, который проще разобрать по сырому коду в журнале.
-        e == "http_410" -> "инвайт истёк или отозван, примените его заново"
+        e == "http_410" -> ShareErrorText.Known(ShareErrorKind.INVITE_GONE)
         // Транспортный сбой (нет сети, агент недоступен): с офлайн-полным
         // списком качать нечего, файл ждёт сеть. Категорию наружу не тащим.
-        e.startsWith("network") -> "нет сети, попробуйте позже"
+        e.startsWith("network") -> ShareErrorText.Known(ShareErrorKind.NETWORK)
         // Путь не существует именно у настоящего агента - перебор кандидатов
         // (XR-219) уже отсеял чужие хосты раньше, чем ошибка дошла сюда.
-        e == "http_404" -> "файл не найден на сервере (404)"
+        e == "http_404" -> ShareErrorText.Known(ShareErrorKind.NOT_FOUND)
         httpStatus != null && httpStatus in 500..599 ->
-            "агент шары сейчас отвечает ошибкой ($httpStatus), пробуем ещё раз"
-        httpStatus != null -> "агент шары ответил ошибкой $httpStatus"
-        e.startsWith("parse:") -> "ответ сервера не разбирается"
+            ShareErrorText.Known(ShareErrorKind.SERVER_ERROR, httpStatus.toString())
+        httpStatus != null -> ShareErrorText.Known(ShareErrorKind.HTTP_STATUS, httpStatus.toString())
+        e.startsWith("parse:") -> ShareErrorText.Known(ShareErrorKind.PARSE)
         // Статус пришёл, а тело оборвалось на чтении - тот же обрыв
         // соединения, что и parse:, просто пораньше (sync.rs:1634).
-        e.startsWith("read:") -> "не удалось дочитать ответ сервера"
-        e == "manifest_unsigned" -> "манифест шары пришёл без подписи"
-        e.startsWith("manifest_signature") -> "подпись манифеста не сошлась"
-        else -> e
+        e.startsWith("read:") -> ShareErrorText.Known(ShareErrorKind.READ)
+        e == "manifest_unsigned" -> ShareErrorText.Known(ShareErrorKind.MANIFEST_UNSIGNED)
+        e.startsWith("manifest_signature") -> ShareErrorText.Known(ShareErrorKind.MANIFEST_SIGNATURE)
+        else -> ShareErrorText.Raw(e)
     }
+}
+
+/** Хвост после `категория: ` показываем как есть, а без него берём свои слова. */
+private fun tailOr(e: String, kind: ShareErrorKind): ShareErrorText {
+    val tail = e.substringAfter(": ", "")
+    return if (tail.isBlank()) ShareErrorText.Known(kind) else ShareErrorText.Raw(tail)
 }
 
 /**
@@ -46,13 +86,13 @@ fun humanShareError(e: String): String {
  * уже человеческий (единый источник в Rust), поэтому по умолчанию показывается
  * хвост. Исключение это переполненная очередь агента (429): её текст в ядре
  * написан про занятость, а на экране нужна причина отказа именно этой ссылке
- * (XR-175). Логика чистая Kotlin, живёт рядом с [humanShareError] и покрыта
- * тем же JVM-юнитом.
+ * (XR-175). Логика чистая Kotlin, живёт рядом с [shareErrorOf] и покрыта тем
+ * же JVM-юнитом.
  */
-fun humanImportError(e: String): String = when {
-    e.startsWith("queue_full") -> "Очередь импорта заполнена, попробуй позже"
-    Regex("^[a-z_]+: ").containsMatchIn(e) -> e.substringAfter(": ")
-    else -> e
+fun importErrorOf(e: String): ShareErrorText = when {
+    e.startsWith("queue_full") -> ShareErrorText.Known(ShareErrorKind.IMPORT_QUEUE_FULL)
+    Regex("^[a-z_]+: ").containsMatchIn(e) -> ShareErrorText.Raw(e.substringAfter(": "))
+    else -> ShareErrorText.Raw(e)
 }
 
 /**

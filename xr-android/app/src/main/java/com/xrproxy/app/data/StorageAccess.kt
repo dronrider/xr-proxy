@@ -8,6 +8,7 @@ import android.os.Environment
 import android.provider.DocumentsContract
 import android.provider.Settings
 import androidx.annotation.RequiresApi
+import com.xrproxy.app.R
 import java.io.File
 
 /**
@@ -51,15 +52,17 @@ object StorageAccess {
     }
 
     /** A short human label for where a share's files live. */
-    fun label(storagePath: String?): String =
-        if (storagePath == null) "Папка приложения" else prettyPath(storagePath)
+    fun label(context: Context, storagePath: String?): String =
+        if (storagePath == null) context.getString(R.string.data_storage_app_folder)
+        else prettyPath(context, storagePath)
 
     /** Trim the volume prefix for display: `/storage/emulated/0/Download/xr` ->
      *  `Download/xr`. Falls back to the full path off the primary volume. */
-    private fun prettyPath(path: String): String {
+    private fun prettyPath(context: Context, path: String): String {
         val root = Environment.getExternalStorageDirectory().absolutePath
         return if (path.startsWith(root)) {
-            path.removePrefix(root).trimStart('/').ifEmpty { "Хранилище" }
+            path.removePrefix(root).trimStart('/')
+                .ifEmpty { context.getString(R.string.data_storage_root_volume) }
         } else {
             path
         }

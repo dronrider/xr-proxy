@@ -2,100 +2,122 @@ package com.xrproxy.app.ui.files
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Регресс XR-243: `humanError` не знал категорий `http_*`, `parse:`,
- * `read:` и `manifest_*`, которыми уже сам агент шары отвечает после
- * прощупа XR-219, и на экране висел сырой код вроде «Манифест: http_404».
- * Логика чистая Kotlin без Android SDK, поэтому раскладка вынесена в
- * [ShareErrorText.kt] и покрывается JVM-юнитом, а не эмулятором.
+ * Регресс XR-243: разбор не знал категорий `http_*`, `parse:`, `read:` и
+ * `manifest_*`, которыми уже сам агент шары отвечает после прощупа XR-219, и
+ * на экране висел сырой код вроде «Манифест: http_404». Логика чистая Kotlin
+ * без Android SDK, поэтому раскладка вынесена в [ShareErrorText.kt] и
+ * покрывается JVM-юнитом, а не эмулятором.
+ *
+ * Текстов тут больше нет (XR-092): своя формулировка приложения это ключ
+ * [ShareErrorKind], который экран кладёт в ресурс, а сравниваются варианты.
  */
 class ShareErrorTextTest {
 
     @Test
-    fun http404GetsAHumanTextInsteadOfTheRawCode() {
-        // До правки эта категория падала в `else -> e` и текст был "http_404".
-        val text = humanShareError("http_404")
-        assertNotEquals("http_404", text)
-        assertTrue(text, text.contains("404"))
-        assertTrue(text, text.contains("не найден"))
+    fun http404GetsItsOwnKindInsteadOfTheRawCode() {
+        // До правки XR-243 эта категория падала в `else` и на экран уходил
+        // сырой «http_404».
+        assertEquals(ShareErrorText.Known(ShareErrorKind.NOT_FOUND), shareErrorOf("http_404"))
     }
 
     @Test
-    fun parsePrefixGetsAHumanText() {
-        val text = humanShareError("parse: expected value at line 1 column 1")
-        assertEquals("ответ сервера не разбирается", text)
-    }
-
-    @Test
-    fun readPrefixGetsAHumanText() {
-        // До правки эта категория тоже падала в `else -> e` (sync.rs:1634).
-        val text = humanShareError("read: body closed")
-        assertNotEquals("read: body closed", text)
-        assertEquals("не удалось дочитать ответ сервера", text)
-    }
-
-    @Test
-    fun manifestCategoriesGetHumanTexts() {
-        assertNotEquals("manifest_unsigned", humanShareError("manifest_unsigned"))
-        assertNotEquals(
-            "manifest_signature: bad",
-            humanShareError("manifest_signature: bad"),
+    fun parsePrefixGetsItsOwnKind() {
+        assertEquals(
+            ShareErrorText.Known(ShareErrorKind.PARSE),
+            shareErrorOf("parse: expected value at line 1 column 1"),
         )
     }
 
     @Test
-    fun serverErrorStatusesGetAHumanTextTooWithTheCodeInside() {
-        val text = humanShareError("http_503")
-        assertNotEquals("http_503", text)
-        assertTrue(text, text.contains("503"))
+    fun readPrefixGetsItsOwnKind() {
+        // До правки эта категория тоже падала в `else` (sync.rs:1634).
+        assertEquals(ShareErrorText.Known(ShareErrorKind.READ), shareErrorOf("read: body closed"))
     }
 
     @Test
-    fun unlistedHttpCodeStillGetsSomeHumanWordingWithTheCode() {
-        val text = humanShareError("http_409")
-        assertNotEquals("http_409", text)
-        assertTrue(text, text.contains("409"))
+    fun manifestCategoriesGetTheirOwnKinds() {
+        assertEquals(
+            ShareErrorText.Known(ShareErrorKind.MANIFEST_UNSIGNED),
+            shareErrorOf("manifest_unsigned"),
+        )
+        assertEquals(
+            ShareErrorText.Known(ShareErrorKind.MANIFEST_SIGNATURE),
+            shareErrorOf("manifest_signature: bad"),
+        )
+    }
+
+    @Test
+    fun serverErrorStatusesCarryTheCodeAsTheArgument() {
+        assertEquals(
+            ShareErrorText.Known(ShareErrorKind.SERVER_ERROR, "503"),
+            shareErrorOf("http_503"),
+        )
+    }
+
+    @Test
+    fun unlistedHttpCodeStillCarriesItsCode() {
+        assertEquals(
+            ShareErrorText.Known(ShareErrorKind.HTTP_STATUS, "409"),
+            shareErrorOf("http_409"),
+        )
     }
 
     @Test
     fun existingCategoriesKeepWorking() {
-        assertEquals("нет сети, попробуйте позже", humanShareError("network: unreachable"))
+        assertEquals(ShareErrorText.Known(ShareErrorKind.NETWORK), shareErrorOf("network: unreachable"))
+        assertEquals(ShareErrorText.Known(ShareErrorKind.INVITE_GONE), shareErrorOf("http_410"))
+        assertEquals(ShareErrorText.Known(ShareErrorKind.AGENT_OFFLINE), shareErrorOf("agent_offline"))
+        assertEquals(ShareErrorText.Known(ShareErrorKind.STALE_TOKEN), shareErrorOf("stale_token"))
         assertEquals(
-            "инвайт истёк или отозван, примените его заново",
-            humanShareError("http_410"),
+            ShareErrorText.Known(ShareErrorKind.ACCESS_EXPIRED),
+            shareErrorOf("access_expired"),
         )
-        assertEquals("агент шары не на связи", humanShareError("agent_offline"))
+    }
+
+    /** Хвост после «категория: » пишет ядро, и он уже человеческий: показываем
+     *  его как есть, а свои слова остаются на случай голой категории. */
+    @Test
+    fun theEngineTailWinsOverOurOwnWording() {
         assertEquals(
-            "токен шары устарел, обновите список по инвайту",
-            humanShareError("stale_token"),
+            ShareErrorText.Raw("агент шары не отвечает с полудня"),
+            shareErrorOf("agent_offline: агент шары не отвечает с полудня"),
         )
     }
 
     @Test
     fun unknownCategoryFallsThroughUnchanged() {
-        assertEquals("cancelled", humanShareError("cancelled"))
+        assertEquals(ShareErrorText.Raw("cancelled"), shareErrorOf("cancelled"))
     }
 
     // -- импорт по URL ----------------------------------------------------
 
     @Test
-    fun fullImportQueueGetsItsOwnText() {
+    fun fullImportQueueGetsItsOwnKind() {
         // 429 от агента: очередь импорта забита, и текст ядра про занятость
         // пользователю ничего не подсказывает (XR-175).
-        assertEquals("Очередь импорта заполнена, попробуй позже", humanImportError("queue_full: очередь импорта занята, попробуй позже"))
+        assertEquals(
+            ShareErrorText.Known(ShareErrorKind.IMPORT_QUEUE_FULL),
+            importErrorOf("queue_full: очередь импорта занята, попробуй позже"),
+        )
     }
 
     @Test
     fun otherImportCategoriesKeepTheirHumanTail() {
-        assertEquals("нет плагина под эту ссылку", humanImportError("no_plugin: нет плагина под эту ссылку"))
-        assertEquals("агент перезапустился, задание потерялось", humanImportError("job_lost: агент перезапустился, задание потерялось"))
+        assertEquals(
+            ShareErrorText.Raw("нет плагина под эту ссылку"),
+            importErrorOf("no_plugin: нет плагина под эту ссылку"),
+        )
+        assertEquals(
+            ShareErrorText.Raw("агент перезапустился, задание потерялось"),
+            importErrorOf("job_lost: агент перезапустился, задание потерялось"),
+        )
         // Текст без машинного префикса едет как есть: так приходит хвост
         // stderr плагина у сорвавшейся джобы.
-        assertEquals("ffmpeg not found", humanImportError("ffmpeg not found"))
+        assertEquals(ShareErrorText.Raw("ffmpeg not found"), importErrorOf("ffmpeg not found"))
     }
 
     // -- офлайн-ретрай ----------------------------------------------------

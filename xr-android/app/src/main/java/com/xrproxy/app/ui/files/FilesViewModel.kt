@@ -6,6 +6,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.xrproxy.app.R
 import com.xrproxy.app.data.ShareRepository
 import com.xrproxy.app.data.ShareStore
 import com.xrproxy.app.data.StorageAccess
@@ -251,7 +252,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         this.hubUrl = hubUrl
         this.inviteToken = inviteToken
         if (hubUrl.isNullOrBlank() || inviteToken.isNullOrBlank()) {
-            _ui.update { it.copy(message = "Нет инвайта, добавьте сервер по инвайту") }
+            _ui.update { it.copy(message = text(R.string.files_no_invite)) }
             return
         }
         _ui.update { it.copy(loadingHub = true) }
@@ -270,7 +271,10 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                         // failure is a real answer (expired invite, bad hub) and
                         // stays visible.
                         if (it.isOffline()) st.copy(loadingHub = false, hubOffline = true)
-                        else st.copy(loadingHub = false, message = "Шары по инвайту: ${humanError(it.message ?: "ошибка")}")
+                        else st.copy(
+                            loadingHub = false,
+                            message = text(R.string.files_hub_shares_error, humanError(it.message)),
+                        )
                     },
                 )
             }
@@ -296,9 +300,25 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
      *  [fetchManifestHealing] after a failed heal, never returned by the agent. */
     private fun Throwable.isAccessExpired(): Boolean = message?.startsWith("access_expired") == true
 
-    /** Раскладка категории в текст живёт в [ShareErrorText.kt] отдельным
-     *  файлом (чистая Kotlin-логика без Android SDK, XR-243). */
-    private fun humanError(e: String): String = humanShareError(e)
+    /** Раскладка категории в вариант живёт в [ShareErrorText.kt] отдельным
+     *  файлом (чистая Kotlin-логика без Android SDK, XR-243), а ресурс под
+     *  вариант подставляет [renderShareError]. Пустая причина бывает у
+     *  нативного вызова, который отдал только код возврата. */
+    private fun humanError(e: String?): String =
+        if (e.isNullOrBlank()) text(R.string.share_error_unknown)
+        else renderShareError(shareErrorOf(e), appContext)
+
+    /** То же для ошибки импорта по URL (LLD-29): разбор в [importErrorOf],
+     *  ресурс под вариант в [renderShareError]. */
+    private fun humanImport(e: String?): String =
+        if (e.isNullOrBlank()) text(R.string.share_error_unknown)
+        else renderShareError(importErrorOf(e), appContext)
+
+    /** Текст ресурса приложения: в этой вью-модели строк UI больше нет, они
+     *  живут в `strings.xml` (XR-092). */
+    private fun text(id: Int, vararg args: Any): String = appContext.getString(id, *args)
+
+    private val appContext: Context get() = getApplication<Application>()
 
     /** Ответ агента похож на переходное состояние (5xx, битое тело): офлайн-
      *  цикл вправе повторить попытку, как и настоящую недоступность сети
@@ -407,7 +427,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     fun addShare(grant: ShareGrant) {
         viewModelScope.launch {
             store().upsert(ShareConfig.fromGrant(grant))
-            _ui.update { it.copy(message = "Шара «${grant.name}» добавлена") }
+            _ui.update { it.copy(message = text(R.string.files_share_added, grant.name)) }
         }
     }
 
@@ -537,7 +557,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                             e.isAgentOffline() ->
                                 st.copy(
                                     manifestLoading = false, offlineLocal = true,
-                                    message = humanError(e.message.orEmpty())
+                                    message = humanError(e.message)
                                         .replaceFirstChar { c -> c.uppercaseChar() },
                                 )
                             // The stored token was pre-scope and the grant refresh
@@ -546,7 +566,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                             e.isAccessExpired() ->
                                 st.copy(
                                     manifestLoading = false, offlineLocal = true,
-                                    message = humanError(e.message.orEmpty()),
+                                    message = humanError(e.message),
                                 )
                             // Ответ агента похож на переходный сбой (5xx,
                             // битое тело): ведём себя как при офлайне, чтобы
@@ -554,14 +574,20 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                             e.isTransientAgentError() ->
                                 st.copy(
                                     manifestLoading = false, offlineLocal = true,
-                                    message = "Манифест: ${humanError(e.message.orEmpty())}",
+                                    message = text(
+                                        R.string.files_manifest_error,
+                                        humanError(e.message),
+                                    ),
                                 )
                             // The agent answered (expired token, http_4xx): a real
                             // error the user should see, unlike a mere no-network.
                             !e.isOffline() ->
                                 st.copy(
                                     manifestLoading = false,
-                                    message = "Манифест: ${humanError(e.message.orEmpty())}",
+                                    message = text(
+                                        R.string.files_manifest_error,
+                                        humanError(e.message),
+                                    ),
                                 )
                             // Offline, а cache-first уже показал кэш или локальные
                             // файлы: пометка «Офлайн» всё говорит, тост не нужен.
@@ -620,8 +646,8 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                             offlineFullListing = if (offline) hadFull else st.offlineFullListing,
                             // No network (also the offline outcome of a stale-token
                             // heal, XR-167): a clean line, not the raw reqwest text.
-                            message = if (e.isOffline()) "Список: хаб недоступен, попробуйте позже"
-                            else "Список: ${humanError(e.message ?: "ошибка")}",
+                            message = if (e.isOffline()) text(R.string.files_listing_hub_offline)
+                            else text(R.string.files_listing_error, humanError(e.message)),
                         )
                     },
                 )
@@ -838,7 +864,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update { st ->
                     st.copy(
                         localPaths = if (st.openShareId == config.shareId) st.localPaths - entry.path else st.localPaths,
-                        message = "Файла уже нет на устройстве",
+                        message = text(R.string.files_file_gone_locally),
                     )
                 }
             }
@@ -938,7 +964,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                 st.copy(
                     localPaths = if (st.openShareId == config.shareId) local else st.localPaths,
                     failed = st.failed.filterNot { it.shareId == config.shareId && it.path.startsWith(prefix) },
-                    message = if (stillWanted) "Офлайн: папка остаётся выбранной и вернётся при синке" else st.message,
+                    message = if (stillWanted) text(R.string.files_offline_folder_wanted) else st.message,
                 )
             }
         }
@@ -958,7 +984,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             _ui.update { st ->
                 st.copy(
                     localPaths = if (st.openShareId == config.shareId) st.localPaths - entry.path else st.localPaths,
-                    message = if (stillWanted) "Офлайн: файл остаётся выбранным и вернётся при синке" else st.message,
+                    message = if (stillWanted) text(R.string.files_offline_file_wanted) else st.message,
                 )
             }
         }
@@ -1008,7 +1034,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                             failed = st.failed.filterNot {
                                 it.shareId == config.shareId && it.path == entry.path
                             },
-                            message = "Файл удалён из шары",
+                            message = text(R.string.files_file_deleted),
                         )
                     }
                     // Свежий манифест от агента заодно перезапишет кэш листинга,
@@ -1017,7 +1043,12 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                 },
                 onFailure = { e ->
                     _ui.update {
-                        it.copy(message = "Не удалось удалить: ${humanDeleteError(e.message ?: "ошибка")}")
+                        it.copy(
+                            message = text(
+                                R.string.files_delete_failed,
+                                humanDeleteError(e.message.orEmpty()),
+                            ),
+                        )
                     }
                 },
             )
@@ -1027,10 +1058,13 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     /** Отказы записи (LLD-28) поверх общего [humanError]: у агента здесь свои
      *  коды, и «http_412» пользователю ничего не говорит. */
     private fun humanDeleteError(e: String): String = when {
-        e == "not_found" -> "файла уже нет в шаре"
-        e == "http_403" -> "агент не разрешает запись в эту шару"
-        e == "http_412" -> "файл на агенте изменился, обновите список"
-        e.startsWith("no_write_scope") -> e.substringAfter(": ", "нет права записи на эту шару")
+        e == "not_found" -> text(R.string.share_error_delete_not_found)
+        e == "http_403" -> text(R.string.share_error_delete_forbidden)
+        e == "http_412" -> text(R.string.share_error_delete_changed)
+        // Хвост после категории пишет агент, и он уже человеческий; голая
+        // категория остаётся на наших словах, как и в [shareErrorOf].
+        e.startsWith("no_write_scope") ->
+            e.substringAfter(": ", "").ifBlank { text(R.string.share_error_no_write_scope) }
         else -> humanError(e)
     }
 
@@ -1189,13 +1223,17 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                         failed = if (done || cancelled) st.failed
                         else st.failed + FailedDownload(
                             item.shareId, item.entry.path,
-                            bytesDone, item.entry.size, humanError(err ?: "ошибка"),
+                            bytesDone, item.entry.size, humanError(err),
                         ),
                         // One toast per burst: the first failure says why, the
                         // rest just turn their rows red (a dead network would
                         // otherwise queue a toast per file).
                         message = if (!done && !cancelled && st.failed.isEmpty()) {
-                            "Не скачался «${item.entry.path.substringAfterLast('/')}»: ${humanError(err ?: "ошибка")}"
+                            text(
+                                R.string.files_download_failed,
+                                item.entry.path.substringAfterLast('/'),
+                                humanError(err),
+                            )
                         } else {
                             st.message
                         },
@@ -1311,7 +1349,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val cfg = store().get(shareId) ?: return@launch
             if (enabled && !cfg.hasToken) {
-                _ui.update { it.copy(message = "Нет токена доступа") }
+                _ui.update { it.copy(message = text(R.string.files_no_token)) }
                 return@launch
             }
             // Enabling background sync starts writing files, so settle the storage
@@ -1324,7 +1362,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             rescheduleIfNeeded()
             if (enabled) {
                 withContext(Dispatchers.IO) { ShareSyncScheduler.syncNow(getApplication()) }
-                _ui.update { it.copy(message = "Фоновый синк включён: докачивает выбранное и убирает удалённое на сервере") }
+                _ui.update { it.copy(message = text(R.string.files_sync_enabled)) }
             }
         }
     }
@@ -1335,7 +1373,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             freshSnapshot()?.let { cancelNative(it) }
         }
-        _ui.update { it.copy(message = "Останавливаю...") }
+        _ui.update { it.copy(message = text(R.string.files_stopping)) }
     }
 
     // -- URL import (LLD-29) ----------------------------------------
@@ -1372,7 +1410,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                     ensureImportPolling()
                 },
                 onFailure = { e ->
-                    _ui.update { it.copy(importError = humanImportError(e.message ?: "ошибка")) }
+                    _ui.update { it.copy(importError = humanImport(e.message)) }
                 },
             )
         }
@@ -1419,18 +1457,20 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                 if (failures >= importPollFailureLimit) {
                     forgetImportJob(job.jobId)
                     _ui.update {
-                        it.copy(importError = humanImportError(result.exceptionOrNull()?.message ?: "ошибка"))
+                        it.copy(importError = humanImport(result.exceptionOrNull()?.message))
                     }
                 }
             }
             state.state == "done" -> {
                 forgetImportJob(job.jobId)
-                _ui.update { it.copy(message = "Импорт завершён") }
+                _ui.update { it.copy(message = text(R.string.files_import_done)) }
                 refreshOpenShare(config)
             }
             state.state == "failed" -> {
                 forgetImportJob(job.jobId)
-                _ui.update { it.copy(importError = state.error ?: "причина неизвестна") }
+                _ui.update {
+                    it.copy(importError = state.error ?: text(R.string.files_import_reason_unknown))
+                }
             }
             else -> {
                 importPollFailures.remove(job.jobId)
@@ -1516,7 +1556,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                 return@launch
             }
             if (_ui.value.migratingShareId != null || _ui.value.queue.isNotEmpty()) {
-                _ui.update { it.copy(message = "Идёт передача, попробуйте позже") }
+                _ui.update { it.copy(message = text(R.string.files_transfer_busy)) }
                 return@launch
             }
             _ui.update {
@@ -1565,13 +1605,13 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun migrateMessage(o: ShareRepository.MigrateOutcome, newPath: String?): String = when {
-        o.error == "busy" -> "Идёт синхронизация, попробуйте позже"
-        o.error?.startsWith("no_space") == true -> "Недостаточно места в новой папке"
-        o.error != null -> "Не удалось перенести: ${o.error}"
-        o.cancelled -> "Перенос отменён, папка не изменена"
-        else -> "Папка: ${StorageAccess.label(newPath)} (перенесено ${o.moved})" +
-            (if (o.conflicts > 0) ", конфликтов ${o.conflicts}" else "") +
-            (if (o.failed > 0) ", ошибок ${o.failed}" else "")
+        o.error == "busy" -> text(R.string.files_migrate_busy)
+        o.error?.startsWith("no_space") == true -> text(R.string.files_migrate_no_space)
+        o.error != null -> text(R.string.files_migrate_failed, o.error)
+        o.cancelled -> text(R.string.files_migrate_cancelled)
+        else -> text(R.string.files_migrate_done, StorageAccess.label(getApplication(), newPath), o.moved) +
+            (if (o.conflicts > 0) text(R.string.files_migrate_conflicts, o.conflicts) else "") +
+            (if (o.failed > 0) text(R.string.files_migrate_errors, o.failed) else "")
     }
 
     // The scheduler goes through WorkManager, and its first getInstance in the
@@ -1591,14 +1631,15 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
 
     private companion object {
         /** A stale token whose grant refresh proved the access is gone (XR-167).
-         *  Category-prefixed like the native errors so [humanError] renders the
-         *  wording after the colon and the folds route it apart from serde. */
-        const val ERR_ACCESS_EXPIRED =
-            "access_expired: Доступ к шаре истёк, удалите её или перевыпустите инвайт"
+         *  Голая категория без хвоста: слова к ней подбирает [shareErrorOf], а
+         *  свёртки роутят её отдельно от serde (XR-092). */
+        const val ERR_ACCESS_EXPIRED = "access_expired"
 
         /** Stale token, but the hub was unreachable to refresh the grant: reuse
-         *  the "network:" category so the offline handling kicks in (XR-167). */
-        const val ERR_HUB_OFFLINE = "network: хаб недоступен, обновите список позже"
+         *  the "network" category so the offline handling kicks in (XR-167).
+         *  Текст этой ветки на экран не выходит: офлайн-развилка говорит своими
+         *  словами, а сюда смотрит только [Throwable.isOffline]. */
+        const val ERR_HUB_OFFLINE = "network"
 
         /** Бэкоф тихого перезапроса манифеста офлайн-шары (XR-099); последний
          *  шаг повторяется, пока шара открыта. */

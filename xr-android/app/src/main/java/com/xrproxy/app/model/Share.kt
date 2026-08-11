@@ -452,6 +452,23 @@ fun explorerLevel(
 enum class FileGrouping { NONE, DATE, SOURCE }
 
 /**
+ * Чем подписан заголовок группы. Раскладка живёт без ресурсов (XR-092): свои
+ * подписи едут ключом, а готовый текст, который взять больше неоткуда (имя
+ * источника от агента, отформатированный месяц), едет строкой. Подставляет
+ * текст экран.
+ */
+sealed interface GroupTitle {
+    /** Готовая подпись: имя источника или месяц. */
+    data class Text(val text: String) : GroupTitle
+
+    /** Своя подпись приложения под ключом [kind]. */
+    data class Known(val kind: GroupKind) : GroupTitle
+}
+
+/** Группы, у которых подпись своя, а не пришедшая с данными. */
+enum class GroupKind { FOLDERS, NO_SOURCE, NO_DATE, TODAY, THIS_WEEK }
+
+/**
  * Строка списка проводника: заголовок группы либо сам узел дерева. Заголовки
  * едут в том же списке, что и строки: ленивый список рисует их так же лениво,
  * а вложенные списки на группу ему пришлось бы разворачивать целиком.
@@ -464,7 +481,7 @@ sealed interface ExplorerRow {
      *  «Без источника», и тогда два заголовка с одним ключом уронили бы ленивый
      *  список. Нулевой байт не встречается ни в пути файла, ни в имени
      *  источника, поэтому с ключами строк заголовок не столкнётся. */
-    data class Header(val title: String, val count: Int, val group: String) : ExplorerRow {
+    data class Header(val title: GroupTitle, val count: Int, val group: String) : ExplorerRow {
         override val key: String get() = "\u0000$group"
     }
 
@@ -493,11 +510,13 @@ fun explorerRows(
     val rows = ArrayList<ExplorerRow>(nodes.size + 4)
     val folders = nodes.filterIsInstance<TreeNode.Folder>()
     if (folders.isNotEmpty()) {
-        rows.add(ExplorerRow.Header("Папки", folders.size, FOLDERS_KEY))
+        rows.add(
+            ExplorerRow.Header(GroupTitle.Known(GroupKind.FOLDERS), folders.size, FOLDERS_KEY),
+        )
         folders.forEach { rows.add(ExplorerRow.Node(it)) }
     }
     val members = LinkedHashMap<String, MutableList<TreeNode.FileNode>>()
-    val titles = HashMap<String, String>()
+    val titles = HashMap<String, GroupTitle>()
     val ranks = HashMap<String, Long>()
     for (file in nodes.filterIsInstance<TreeNode.FileNode>()) {
         val group = when (grouping) {
@@ -510,19 +529,22 @@ fun explorerRows(
         // дате вес один на всю группу, поэтому максимум годится обеим.
         ranks[group.key] = maxOf(ranks[group.key] ?: Long.MIN_VALUE, group.rank)
     }
+    // Совпавший вес разводит ключ группы: у групп по источнику это само имя
+    // источника, то есть тот же порядок, что и по подписи, а подписи у групп с
+    // ключом сравнивать нечем.
     val order = members.keys.sortedWith(
-        compareByDescending<String> { ranks[it] ?: Long.MIN_VALUE }.thenBy { titles[it] },
+        compareByDescending<String> { ranks[it] ?: Long.MIN_VALUE }.thenBy { it },
     )
     for (key in order) {
         val files = members[key] ?: continue
-        rows.add(ExplorerRow.Header(titles[key] ?: key, files.size, key))
+        rows.add(ExplorerRow.Header(titles[key] ?: GroupTitle.Text(key), files.size, key))
         files.forEach { rows.add(ExplorerRow.Node(it)) }
     }
     return rows
 }
 
 /** Группа файла: ключ, заголовок и вес, которым группы расставляются. */
-private data class FileGroup(val key: String, val title: String, val rank: Long)
+private data class FileGroup(val key: String, val title: GroupTitle, val rank: Long)
 
 /** Ключ группы для файлов, которым группировать нечем: имя источника приходит
  *  от агента свободным текстом, и канал по имени «none» или «Без источника»
@@ -537,15 +559,18 @@ private const val FOLDERS_KEY = "\u0000folders"
  *  источника не прячется, а собирается в свою группу последней. */
 private fun sourceGroup(entry: ManifestEntry): FileGroup {
     val source = entry.meta?.source?.trim().orEmpty()
-    return if (source.isEmpty()) FileGroup(NO_GROUP_KEY, "Без источника", Long.MIN_VALUE)
-    else FileGroup(source, source, entry.mtime)
+    return if (source.isEmpty()) {
+        FileGroup(NO_GROUP_KEY, GroupTitle.Known(GroupKind.NO_SOURCE), Long.MIN_VALUE)
+    } else {
+        FileGroup(source, GroupTitle.Text(source), entry.mtime)
+    }
 }
 
 /** Корзина даты: сегодня, текущая неделя, дальше по месяцам. Дата это mtime из
  *  манифеста, то есть когда файл появился у агента; запись без даты уходит в
  *  свою группу последней. */
 private fun dateGroup(mtime: Long, now: Long): FileGroup {
-    if (mtime <= 0L) return FileGroup(NO_GROUP_KEY, "Без даты", Long.MIN_VALUE)
+    if (mtime <= 0L) return FileGroup(NO_GROUP_KEY, GroupTitle.Known(GroupKind.NO_DATE), Long.MIN_VALUE)
     val stamp = mtime * 1000
     val cal = Calendar.getInstance()
     cal.timeInMillis = now
@@ -555,15 +580,16 @@ private fun dateGroup(mtime: Long, now: Long): FileGroup {
     cal.set(Calendar.DAY_OF_WEEK, cal.firstDayOfWeek)
     val weekStart = minOf(cal.timeInMillis, dayStart)
     return when {
-        stamp >= dayStart -> FileGroup("today", "Сегодня", Long.MAX_VALUE)
-        stamp >= weekStart -> FileGroup("week", "На этой неделе", Long.MAX_VALUE - 1)
+        stamp >= dayStart -> FileGroup("today", GroupTitle.Known(GroupKind.TODAY), Long.MAX_VALUE)
+        stamp >= weekStart ->
+            FileGroup("week", GroupTitle.Known(GroupKind.THIS_WEEK), Long.MAX_VALUE - 1)
         else -> {
             val month = Calendar.getInstance()
             month.timeInMillis = stamp
             month.set(Calendar.DAY_OF_MONTH, 1)
             month.startOfDay()
             val start = month.timeInMillis
-            FileGroup("month$start", monthLabel(month.time), start)
+            FileGroup("month$start", GroupTitle.Text(monthLabel(month.time)), start)
         }
     }
 }
@@ -575,9 +601,11 @@ private fun Calendar.startOfDay() {
     set(Calendar.MILLISECOND, 0)
 }
 
-/** «Июль 2026»: месяц в именительном падеже, иначе получается «июля 2026». */
+/** «Июль 2026»: месяц в именительном падеже, иначе получается «июля 2026».
+ *  Названия месяцев в ресурсы не переносятся, их даёт локаль телефона, и она
+ *  же решает, на каком языке подписана группа (XR-092). */
 private fun monthLabel(date: Date): String =
-    SimpleDateFormat("LLLL yyyy", Locale.forLanguageTag("ru")).format(date)
+    SimpleDateFormat("LLLL yyyy", Locale.getDefault()).format(date)
         .replaceFirstChar { it.uppercase() }
 
 private fun <T : TreeNode> sortRows(rows: List<T>, order: SortOrder, mtime: (T) -> Long): List<T> {

@@ -14,7 +14,8 @@ import java.util.TimeZone
  * запись без даты, пустой и пробельный источник, порядок групп по свежести.
  *
  * Время и локаль зафиксированы: от локали зависит, каким днём начинается
- * неделя, и без фиксации тест краснел бы на другой машине.
+ * неделя и на каком языке подписан месяц, и без фиксации тест краснел бы на
+ * другой машине.
  */
 class ShareGroupingTest {
 
@@ -64,12 +65,12 @@ class ShareGroupingTest {
         )
         assertEquals(
             listOf(
-                "# Сегодня 2", "полночь.mp4", "вечер.mp4",
-                "# На этой неделе 1", "понедельник.mp4",
+                "# TODAY 2", "полночь.mp4", "вечер.mp4",
+                "# THIS_WEEK 1", "понедельник.mp4",
                 "# Август 2026 1", "воскресенье.mp4",
                 "# Июль 2026 1", "июльский.mp4",
                 "# Июнь 2026 1", "июньский.mp4",
-                "# Без даты 1", "без даты.mp4",
+                "# NO_DATE 1", "без даты.mp4",
             ),
             render(explorerRows(nodes, FileGrouping.DATE, now)),
         )
@@ -82,7 +83,7 @@ class ShareGroupingTest {
         Locale.setDefault(Locale.US)
         val nodes = listOf(file("воскресенье.mp4", at(2026, 8, 2, 23, 59)))
         assertEquals(
-            listOf("# На этой неделе 1", "воскресенье.mp4"),
+            listOf("# THIS_WEEK 1", "воскресенье.mp4"),
             render(explorerRows(nodes, FileGrouping.DATE, now)),
         )
     }
@@ -93,7 +94,7 @@ class ShareGroupingTest {
     fun stampFromTheFutureFallsIntoToday() {
         val nodes = listOf(file("завтрашний.mp4", at(2026, 8, 6, 9, 0)))
         assertEquals(
-            listOf("# Сегодня 1", "завтрашний.mp4"),
+            listOf("# TODAY 1", "завтрашний.mp4"),
             render(explorerRows(nodes, FileGrouping.DATE, now)),
         )
     }
@@ -116,7 +117,7 @@ class ShareGroupingTest {
             listOf(
                 "# Сети без магии 2", "сети старое.mp4", "сети свежее.mp4",
                 "# Ясно и по делу 1", "ясно.mp4",
-                "# Без источника 3", "пробелы.mp4", "пустая строка.mp4", "без метаданных.mp4",
+                "# NO_SOURCE 3", "пробелы.mp4", "пустая строка.mp4", "без метаданных.mp4",
             ),
             render(explorerRows(nodes, FileGrouping.SOURCE, now)),
         )
@@ -134,7 +135,7 @@ class ShareGroupingTest {
         assertEquals(
             listOf(
                 "# none 1", "ролик канала none.mp4",
-                "# Без источника 1", "безымянный.mp4",
+                "# NO_SOURCE 1", "безымянный.mp4",
             ),
             render(explorerRows(nodes, FileGrouping.SOURCE, now)),
         )
@@ -142,7 +143,9 @@ class ShareGroupingTest {
 
     /** Тот же случай, только имя канала совпадает с названием группы
      *  безымянных: ключи строк обязаны остаться разными, иначе ленивый список
-     *  падает на дубликате ключа. */
+     *  падает на дубликате ключа. Подписи при этом приезжают разными путями,
+     *  у канала это его собственное имя, у безымянных ключ своей строки
+     *  ресурсов, и совпадают они только на глаз русского пользователя. */
     @Test
     fun headerKeysStayUniqueWhenChannelTakesTheGroupName() {
         val nodes = listOf(
@@ -155,9 +158,9 @@ class ShareGroupingTest {
         assertEquals(keys.size, keys.toSet().size)
         assertEquals(
             listOf(
-                "# Папки 1", "видео",
+                "# FOLDERS 1", "видео",
                 "# Без источника 1", "ролик канала.mp4",
-                "# Без источника 1", "безымянный.mp4",
+                "# NO_SOURCE 1", "безымянный.mp4",
             ),
             render(rows),
         )
@@ -173,11 +176,11 @@ class ShareGroupingTest {
             file("ролик.mp4", at(2026, 7, 1, 12, 0), "Ясно и по делу"),
         )
         assertEquals(
-            listOf("# Папки 2", "видео", "архив", "# Ясно и по делу 1", "ролик.mp4"),
+            listOf("# FOLDERS 2", "видео", "архив", "# Ясно и по делу 1", "ролик.mp4"),
             render(explorerRows(nodes, FileGrouping.SOURCE, now)),
         )
         assertEquals(
-            listOf("# Папки 2", "видео", "архив", "# Июль 2026 1", "ролик.mp4"),
+            listOf("# FOLDERS 2", "видео", "архив", "# Июль 2026 1", "ролик.mp4"),
             render(explorerRows(nodes, FileGrouping.DATE, now)),
         )
     }
@@ -212,11 +215,18 @@ class ShareGroupingTest {
 
     private fun folder(name: String) = TreeNode.Folder(name, name, 1)
 
-    /** Строки в читаемом виде: заголовок как «# Название счётчик», файл именем. */
+    /** Строки в читаемом виде: заголовок как «# Подпись счётчик», файл именем.
+     *  Своя подпись группы приезжает ключом (текст ей подставляет экран), и в
+     *  ожиданиях теста стоит имя этого ключа, а не русские слова. */
     private fun render(rows: List<ExplorerRow>): List<String> = rows.map { row ->
         when (row) {
-            is ExplorerRow.Header -> "# ${row.title} ${row.count}"
+            is ExplorerRow.Header -> "# ${label(row.title)} ${row.count}"
             is ExplorerRow.Node -> row.node.name
         }
+    }
+
+    private fun label(title: GroupTitle): String = when (title) {
+        is GroupTitle.Known -> title.kind.name
+        is GroupTitle.Text -> title.text
     }
 }

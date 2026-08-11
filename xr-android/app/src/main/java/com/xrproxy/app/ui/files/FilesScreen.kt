@@ -94,6 +94,8 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.state.ToggleableState
@@ -105,11 +107,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.xrproxy.app.R
 import com.xrproxy.app.data.StorageAccess
 import com.xrproxy.app.ui.components.XrPullToRefresh
 import com.xrproxy.app.model.ExplorerRow
 import com.xrproxy.app.model.FileGrouping
 import com.xrproxy.app.model.FileSort
+import com.xrproxy.app.model.GroupKind
+import com.xrproxy.app.model.GroupTitle
 import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
 import com.xrproxy.app.model.SortOrder
@@ -157,7 +162,8 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
         }
         val path = StorageAccess.treeUriToRealPath(uri)
         if (path == null) {
-            Toast.makeText(context, "Выберите папку на основном хранилище (не SD-карту)", Toast.LENGTH_LONG).show()
+            Toast.makeText(context, context.getString(R.string.files_storage_main_only), Toast.LENGTH_LONG)
+                .show()
             vm.dismissStorageDialog()
         } else {
             vm.chooseStorage(sid, path)
@@ -169,12 +175,14 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
         } else {
             pickShareId = null
             vm.dismissStorageDialog()
-            Toast.makeText(context, "Доступ ко всем файлам не выдан", Toast.LENGTH_LONG).show()
+            Toast.makeText(context, context.getString(R.string.files_storage_no_access), Toast.LENGTH_LONG)
+                .show()
         }
     }
     val startCustomPick: (String) -> Unit = startCustomPick@{ sid ->
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            Toast.makeText(context, "Своя папка доступна на Android 11+", Toast.LENGTH_LONG).show()
+            Toast.makeText(context, context.getString(R.string.files_storage_android11), Toast.LENGTH_LONG)
+                .show()
             return@startCustomPick
         }
         pickShareId = sid
@@ -221,8 +229,8 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
             // showSnackbar задержала бы отклик на десять секунд.
             snackbarHost.currentSnackbarData?.dismiss()
             val result = snackbarHost.showSnackbar(
-                message = "Шара «${cfg.name}» удалена",
-                actionLabel = "Отменить",
+                message = context.getString(R.string.files_share_removed, cfg.name),
+                actionLabel = context.getString(R.string.files_undo),
                 duration = SnackbarDuration.Long,
             )
             if (result == SnackbarResult.ActionPerformed) vm.restoreShare(cfg)
@@ -271,7 +279,7 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
         ImportErrorDialog(
             text = text,
             onCopy = {
-                Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, context.getString(R.string.files_copied), Toast.LENGTH_SHORT).show()
             },
             onDismiss = { vm.dismissImportError() },
         )
@@ -290,26 +298,39 @@ private fun StorageDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(if (promptMode) "Куда сохранять файлы?" else "Папка хранения") },
+        title = {
+            Text(
+                stringResource(
+                    if (promptMode) R.string.files_storage_title_prompt
+                    else R.string.files_storage_title,
+                ),
+            )
+        },
         text = {
             Column {
                 if (promptMode) {
                     Text(
-                        "Куда складывать скачанные файлы шары «${cfg.name}». Поменять можно позже.",
+                        stringResource(R.string.files_storage_prompt_text, cfg.name),
                         fontSize = 13.sp,
                     )
                 } else {
-                    Text("Сейчас: ${StorageAccess.label(cfg.storagePath)}", fontSize = 13.sp)
+                    Text(
+                        stringResource(
+                            R.string.files_storage_current,
+                            StorageAccess.label(LocalContext.current, cfg.storagePath),
+                        ),
+                        fontSize = 13.sp,
+                    )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "Смена папки перенесёт уже скачанное в новое место без повторной загрузки.",
+                        stringResource(R.string.files_storage_move_note),
                         fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
                 if (!StorageAccess.customFolderSupported()) {
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        "Своя папка доступна на Android 11+.",
+                        stringResource(R.string.files_storage_android11_note),
                         fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
@@ -317,10 +338,12 @@ private fun StorageDialog(
         },
         confirmButton = {
             TextButton(onClick = onCustom, enabled = StorageAccess.customFolderSupported()) {
-                Text("Своя папка…")
+                Text(stringResource(R.string.files_storage_custom))
             }
         },
-        dismissButton = { TextButton(onClick = onAppDir) { Text("Папка приложения") } },
+        dismissButton = {
+            TextButton(onClick = onAppDir) { Text(stringResource(R.string.files_storage_app_dir)) }
+        },
     )
 }
 
@@ -366,16 +389,19 @@ private fun ShareListView(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("Файлы", style = MaterialTheme.typography.titleLarge)
+                Text(stringResource(R.string.files_title), style = MaterialTheme.typography.titleLarge)
                 IconButton(onClick = refreshByHand) {
-                    Icon(Icons.Default.Refresh, contentDescription = "Обновить по инвайту")
+                    Icon(
+                        Icons.Default.Refresh,
+                        contentDescription = stringResource(R.string.files_refresh_invite),
+                    )
                 }
             }
         }
         if (ui.hubOffline) {
             item {
                 Text(
-                    "Хаб недоступен, показан сохранённый список",
+                    stringResource(R.string.files_hub_offline),
                     fontSize = 11.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -385,7 +411,7 @@ private fun ShareListView(
         if (ui.migratingShareId != null) item { ProgressBar(ui.transfer) { vm.cancelTransfer() } }
 
         if (addable.isNotEmpty()) {
-            item { SectionLabel("Доступно по инвайту") }
+            item { SectionLabel(stringResource(R.string.files_section_available)) }
             items(addable, key = { it.shareId }) { g ->
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Row(
@@ -394,20 +420,24 @@ private fun ShareListView(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(g.name, modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
-                        Button(onClick = { vm.addShare(g) }) { Text("Добавить") }
+                        Button(onClick = { vm.addShare(g) }) {
+                            Text(stringResource(R.string.files_add))
+                        }
                     }
                 }
             }
         }
 
-        item { SectionLabel("Мои шары") }
+        item { SectionLabel(stringResource(R.string.files_section_mine)) }
         // Until the store has loaded, an empty list means "still opening", so
         // hold the empty-state text back instead of flashing it.
         if (configs.isEmpty() && ui.storeReady) {
             item {
                 Text(
-                    if (ui.hubOffline) "Нет сети, а сохранённых шар пока нет"
-                    else "Пока нет шар. Обнови список и добавь нужные.",
+                    stringResource(
+                        if (ui.hubOffline) R.string.files_empty_offline
+                        else R.string.files_empty,
+                    ),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(8.dp),
                 )
@@ -436,7 +466,10 @@ private fun ShareListView(
                         ShareStatusLine(cfg)
                     }
                     IconButton(onClick = { menuShareId = cfg.shareId }) {
-                        Icon(Icons.Default.MoreVert, contentDescription = "Действия с шарой")
+                        Icon(
+                            Icons.Default.MoreVert,
+                            contentDescription = stringResource(R.string.files_share_actions),
+                        )
                     }
                 }
             }
@@ -493,10 +526,17 @@ private fun ShareStatusLine(cfg: ShareConfig) {
     }
 }
 
+@Composable
 private fun shareStatusText(cfg: ShareConfig): String {
-    val selection = if (cfg.selection.isEmpty()) "ничего не выбрано" else "выбрано: ${cfg.selection.size}"
-    return if (cfg.syncEnabled) "Синхронизируется \u00B7 $selection"
-    else "Синхронизация выключена \u00B7 $selection"
+    val selection = if (cfg.selection.isEmpty()) {
+        stringResource(R.string.files_selection_none)
+    } else {
+        stringResource(R.string.files_selection_count, cfg.selection.size)
+    }
+    return stringResource(
+        if (cfg.syncEnabled) R.string.files_share_status_on else R.string.files_share_status_off,
+        selection,
+    )
 }
 
 // -- Лист действий шары (макет 1d) ----------------------------------
@@ -540,13 +580,13 @@ private fun ShareActionsSheet(
         HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
         SheetActionRow(
             icon = { Icon(Icons.Default.FolderOpen, contentDescription = null) },
-            title = "Открыть шару",
+            title = stringResource(R.string.files_action_open),
             chevron = true,
             onClick = { dismissThen { vm.openShare(cfg) } },
         )
         SheetActionRow(
             icon = { Icon(Icons.Default.Sync, contentDescription = null) },
-            title = "Синхронизация",
+            title = stringResource(R.string.files_action_sync),
             trailing = {
                 Switch(
                     checked = cfg.syncEnabled,
@@ -556,8 +596,8 @@ private fun ShareActionsSheet(
         )
         SheetActionRow(
             icon = { Icon(Icons.Default.SaveAlt, contentDescription = null) },
-            title = "Папка на устройстве",
-            subtitle = StorageAccess.label(cfg.storagePath),
+            title = stringResource(R.string.files_action_storage),
+            subtitle = StorageAccess.label(LocalContext.current, cfg.storagePath),
             chevron = true,
             onClick = { dismissThen { vm.openStorageDialog(cfg.shareId) } },
         )
@@ -567,7 +607,7 @@ private fun ShareActionsSheet(
                 Icon(Icons.Default.Delete, contentDescription = null,
                     tint = MaterialTheme.colorScheme.error)
             },
-            title = "Удалить шару",
+            title = stringResource(R.string.files_action_remove),
             titleColor = MaterialTheme.colorScheme.error,
             onClick = { dismissThen { onDelete(cfg) } },
         )
@@ -670,23 +710,29 @@ private fun ExplorerView(
             TextButton(
                 onClick = { vm.navigateUp() },
                 contentPadding = PaddingValues(horizontal = 8.dp),
-            ) { Text(BACK_LABEL) }
+            ) { Text(stringResource(R.string.files_back)) }
             Spacer(Modifier.weight(1f))
             // URL import (LLD-29): the agent downloads the page into the open
             // folder. Shown only when the grant carries share:import.
             if (cfg.canImport) {
                 IconButton(onClick = { vm.openImportDialog(cfg.shareId) }) {
-                    Icon(Icons.Default.AddLink, contentDescription = "Импорт по URL")
+                    Icon(
+                        Icons.Default.AddLink,
+                        contentDescription = stringResource(R.string.files_import_title),
+                    )
                 }
             }
             // Refresh the listing from the agent. Deliberately not the sync
             // action: the old circular-arrows button confused both meanings
             // (XR-044), downloads now go through the per-row controls.
             IconButton(onClick = refreshByHand) {
-                Icon(Icons.Default.Refresh, contentDescription = "Обновить список")
+                Icon(
+                    Icons.Default.Refresh,
+                    contentDescription = stringResource(R.string.files_refresh_listing),
+                )
             }
             Spacer(Modifier.width(6.dp))
-            Text("Синк", fontSize = 12.sp)
+            Text(stringResource(R.string.files_sync_switch), fontSize = 12.sp)
             Spacer(Modifier.width(4.dp))
             Switch(checked = cfg.syncEnabled, onCheckedChange = { vm.setSyncEnabled(cfg.shareId, it) })
         }
@@ -713,12 +759,13 @@ private fun ExplorerView(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    "Только непросмотренные$SEP$unviewedCount из $fileCount",
+                    stringResource(R.string.files_unviewed_banner, unviewedCount, fileCount),
                     fontSize = 11.sp, color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.weight(1f),
                 )
                 Icon(
-                    Icons.Default.Close, contentDescription = "Снять фильтр",
+                    Icons.Default.Close,
+                    contentDescription = stringResource(R.string.files_unviewed_clear),
                     tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(24.dp)
                         .clickable { vm.setUnviewedOnly(false) }
@@ -730,8 +777,10 @@ private fun ExplorerView(
             Text(
                 // Полный кэшированный манифест показывает и не скачанные файлы,
                 // так что «только скачанные» тут врало бы (XR-099).
-                if (ui.offlineFullListing) "Офлайн: показан последний известный список, файлы могли измениться"
-                else "Офлайн: показаны только скачанные файлы",
+                stringResource(
+                    if (ui.offlineFullListing) R.string.files_offline_full
+                    else R.string.files_offline_local,
+                ),
                 fontSize = 11.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(vertical = 2.dp),
@@ -759,7 +808,8 @@ private fun ExplorerView(
                 when {
                     ui.manifest.isEmpty() && ui.offlineLocal -> item {
                         Text(
-                            "Нет сети, а скачанных файлов пока нет", modifier = Modifier.padding(16.dp),
+                            stringResource(R.string.files_offline_nothing),
+                            modifier = Modifier.padding(16.dp),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
@@ -770,7 +820,8 @@ private fun ExplorerView(
                     }
                     level.isEmpty() && !ui.manifestLoading -> item {
                         Text(
-                            "Папка пуста", modifier = Modifier.padding(16.dp),
+                            stringResource(R.string.files_folder_empty),
+                            modifier = Modifier.padding(16.dp),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
@@ -778,14 +829,16 @@ private fun ExplorerView(
                     // говорить о нём надо иначе.
                     shown.isEmpty() -> item {
                         Text(
-                            "Непросмотренных файлов здесь нет", modifier = Modifier.padding(16.dp),
+                            stringResource(R.string.files_no_unviewed),
+                            modifier = Modifier.padding(16.dp),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                     else -> {
                         items(rows, key = { it.key }) { row ->
                             when (row) {
-                                is ExplorerRow.Header -> GroupHeader(row.title, row.count)
+                                is ExplorerRow.Header ->
+                                    GroupHeader(groupTitleText(row.title), row.count)
                                 is ExplorerRow.Node -> {
                                     when (val node = row.node) {
                                         is TreeNode.Folder ->
@@ -861,7 +914,7 @@ private fun FileInfoScreen(
             TextButton(
                 onClick = { vm.closeDetails() },
                 contentPadding = PaddingValues(horizontal = 8.dp),
-            ) { Text(BACK_LABEL) }
+            ) { Text(stringResource(R.string.files_back)) }
         }
         Column(modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
             // Имя целиком: обрезать его тут нечем и незачем, ради него на экран
@@ -871,50 +924,67 @@ private fun FileInfoScreen(
                 displayFileName(path.substringAfterLast('/')),
                 fontSize = 18.sp, fontWeight = FontWeight.SemiBold, lineHeight = 23.sp,
             )
+            val stateWord = when {
+                downloaded -> stringResource(R.string.files_state_downloaded)
+                transferring -> stringResource(R.string.files_state_downloading)
+                queued -> stringResource(R.string.files_state_queued)
+                else -> null
+            }
             Text(
                 buildList {
-                    add(humanSize(entry.size))
+                    add(humanSize(context, entry.size))
                     date?.let { add(it) }
-                    when {
-                        downloaded -> add("скачано")
-                        transferring -> add("качается")
-                        queued -> add("в очереди")
-                    }
+                    stateWord?.let { add(it) }
                 }.joinToString(SEP),
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 8.dp),
             )
 
-            InfoCard("Файл") {
-                InfoRow("Путь", path)
-                InfoRow("Размер", humanSize(entry.size))
-                if (date != null) InfoRow("Дата", date)
-                InfoRow("Просмотр", if (viewed) "Просмотрено" else "Не просмотрено")
+            InfoCard(stringResource(R.string.files_info_file)) {
+                InfoRow(stringResource(R.string.files_info_path), path)
+                InfoRow(stringResource(R.string.files_info_size), humanSize(context, entry.size))
+                if (date != null) InfoRow(stringResource(R.string.files_info_date), date)
+                InfoRow(
+                    stringResource(R.string.files_info_viewed),
+                    stringResource(
+                        if (viewed) R.string.files_viewed else R.string.files_not_viewed,
+                    ),
+                )
                 // Офлайн-листинг собран по локальным файлам и хеша не знает
                 // (XR-099), пустая строка «SHA-256: ...» врала бы.
                 if (entry.sha256.isNotBlank()) {
-                    InfoRow("SHA-256", entry.sha256.take(16) + "...", mono = true)
+                    InfoRow(
+                        stringResource(R.string.files_info_sha256),
+                        entry.sha256.take(16) + "...",
+                        mono = true,
+                    )
                 }
             }
 
-            InfoCard("Откуда файл") {
+            InfoCard(stringResource(R.string.files_info_origin)) {
                 if (meta == null) {
                     Text(
-                        "Неизвестно. Файл появился в шаре раньше, чем приложение стало " +
-                            "запоминать ссылку, и восстановить её нечем.",
+                        stringResource(R.string.files_info_origin_unknown),
                         fontSize = 12.5.sp, lineHeight = 18.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 } else {
                     if (meta.url.isNotBlank()) {
-                        InfoRow("Страница", meta.title, link = meta.url)
+                        InfoRow(stringResource(R.string.files_info_page), meta.title, link = meta.url)
                     }
                     if (meta.source.isNotBlank() || meta.sourceUrl.isNotBlank()) {
-                        InfoRow("Канал", meta.source, link = meta.sourceUrl)
+                        InfoRow(
+                            stringResource(R.string.files_info_channel),
+                            meta.source,
+                            link = meta.sourceUrl,
+                        )
                     }
                     if (meta.published.isNotBlank()) {
-                        InfoRow("Опубликовано", humanPublished(meta.published, dateFormat))
+                        InfoRow(
+                            stringResource(R.string.files_info_published),
+                            humanPublished(meta.published, dateFormat),
+                        )
                     }
                 }
             }
@@ -928,12 +998,14 @@ private fun FileInfoScreen(
                 modifier = Modifier.fillMaxWidth().padding(top = 18.dp).height(52.dp),
             ) {
                 Text(
-                    when {
-                        downloaded -> "Открыть"
-                        transferring -> "Качается"
-                        queued -> "В очереди"
-                        else -> "Скачать"
-                    },
+                    stringResource(
+                        when {
+                            downloaded -> R.string.files_open
+                            transferring -> R.string.files_downloading
+                            queued -> R.string.files_in_queue
+                            else -> R.string.files_download
+                        },
+                    ),
                     fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
                 )
             }
@@ -941,7 +1013,7 @@ private fun FileInfoScreen(
                 TextButton(
                     onClick = { vm.removeLocal(cfg, entry) },
                     modifier = Modifier.fillMaxWidth(),
-                ) { Text("Удалить с устройства") }
+                ) { Text(stringResource(R.string.files_remove_local)) }
             }
             // Удаление из шары (XR-250) необратимо и видно только с правом
             // записи в токене; подтверждение с него не снимаем.
@@ -949,7 +1021,12 @@ private fun FileInfoScreen(
                 TextButton(
                     onClick = { confirmDelete = true },
                     modifier = Modifier.fillMaxWidth(),
-                ) { Text("Удалить из шары", color = MaterialTheme.colorScheme.error) }
+                ) {
+                    Text(
+                        stringResource(R.string.files_delete_remote),
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
             }
             Spacer(Modifier.height(24.dp))
         }
@@ -958,11 +1035,13 @@ private fun FileInfoScreen(
     if (confirmDelete) {
         AlertDialog(
             onDismissRequest = { confirmDelete = false },
-            title = { Text("Удалить из шары?") },
+            title = { Text(stringResource(R.string.files_delete_remote_title)) },
             text = {
                 Text(
-                    "«${path.substringAfterLast('/')}» пропадёт у всех, у кого есть доступ " +
-                        "к шаре, и с этого устройства. Вернуть файл сможет только владелец.",
+                    stringResource(
+                        R.string.files_delete_remote_text,
+                        path.substringAfterLast('/'),
+                    ),
                     fontSize = 13.sp,
                 )
             },
@@ -972,9 +1051,18 @@ private fun FileInfoScreen(
                 TextButton(onClick = {
                     confirmDelete = false
                     vm.deleteFromShare(cfg, entry)
-                }) { Text("Удалить", color = MaterialTheme.colorScheme.error) }
+                }) {
+                    Text(
+                        stringResource(R.string.files_delete),
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
             },
-            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Отмена") } },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }) {
+                    Text(stringResource(R.string.files_cancel))
+                }
+            },
         )
     }
 }
@@ -1059,13 +1147,13 @@ private fun ImportDialog(onStart: (String, Int?) -> Unit, onDismiss: () -> Unit)
     var height by remember { mutableStateOf<Int?>(1080) }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Импорт по URL") },
+        title = { Text(stringResource(R.string.files_import_title)) },
         text = {
             Column {
                 OutlinedTextField(
                     value = url,
                     onValueChange = { url = it },
-                    label = { Text("Ссылка") },
+                    label = { Text(stringResource(R.string.files_import_url)) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
@@ -1084,7 +1172,7 @@ private fun ImportDialog(onStart: (String, Int?) -> Unit, onDismiss: () -> Unit)
                     FilterChip(
                         selected = height == null,
                         onClick = { height = null },
-                        label = { Text("Максимум") },
+                        label = { Text(stringResource(R.string.files_import_quality_max)) },
                     )
                 }
             }
@@ -1093,9 +1181,11 @@ private fun ImportDialog(onStart: (String, Int?) -> Unit, onDismiss: () -> Unit)
             TextButton(
                 onClick = { onStart(url, height) },
                 enabled = url.isNotBlank(),
-            ) { Text("Импортировать") }
+            ) { Text(stringResource(R.string.files_import_start)) }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.files_cancel)) }
+        },
     )
 }
 
@@ -1111,7 +1201,7 @@ private fun ImportErrorDialog(text: String, onCopy: () -> Unit, onDismiss: () ->
     val clipboard = LocalClipboardManager.current
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Импорт не удался") },
+        title = { Text(stringResource(R.string.files_import_failed)) },
         text = {
             Text(
                 text,
@@ -1125,9 +1215,11 @@ private fun ImportErrorDialog(text: String, onCopy: () -> Unit, onDismiss: () ->
             TextButton(onClick = {
                 clipboard.setText(AnnotatedString(text))
                 onCopy()
-            }) { Text("Скопировать") }
+            }) { Text(stringResource(R.string.files_copy)) }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Закрыть") } },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.files_close)) }
+        },
     )
 }
 
@@ -1142,15 +1234,19 @@ private fun ImportRow(job: FilesViewModel.ImportJob, onCancel: () -> Unit) {
         ) {
             Text(
                 when {
-                    job.queued -> "Импорт: в очереди"
-                    job.progress != null -> "Импорт: ${job.progress.toInt()}%"
-                    else -> "Импорт..."
+                    job.queued -> stringResource(R.string.files_import_row_queued)
+                    job.progress != null ->
+                        stringResource(R.string.files_import_row_progress, job.progress.toInt())
+                    else -> stringResource(R.string.files_import_row_working)
                 },
                 fontSize = 13.sp,
                 modifier = Modifier.weight(1f),
             )
             IconButton(onClick = onCancel) {
-                Icon(Icons.Default.Close, contentDescription = "Отменить импорт")
+                Icon(
+                    Icons.Default.Close,
+                    contentDescription = stringResource(R.string.files_import_cancel),
+                )
             }
         }
     }
@@ -1186,8 +1282,11 @@ private fun FolderRow(
         Spacer(Modifier.width(8.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(node.name, maxLines = 1, fontSize = 14.sp, overflow = TextOverflow.MiddleEllipsis)
-            Text("${node.fileCount} файл(ов)", fontSize = 10.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                pluralStringResource(R.plurals.files_folder_files, node.fileCount, node.fileCount),
+                fontSize = 10.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
         Text(">", fontSize = 22.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.width(6.dp))
@@ -1215,6 +1314,7 @@ private fun FileRow(
     dateFormat: DateFormat,
     onDetails: (ManifestEntry) -> Unit,
 ) {
+    val context = LocalContext.current
     val path = node.entry.path
     val downloaded = ui.localPaths.contains(path)
     // The native transfer snapshot claimed by this row (ours or the mirror's).
@@ -1261,12 +1361,13 @@ private fun FileRow(
         // Точка у непросмотренного (XR-256): метится то, что ещё не смотрели,
         // серого глазка на просмотренном владелец не видел вовсе. Метка стоит в
         // тех же 14dp отступа колонки, поэтому имя не теряет ширины.
+        val notViewedLabel = stringResource(R.string.files_not_viewed)
         Box(modifier = Modifier.width(14.dp), contentAlignment = Alignment.Center) {
             if (!viewed) {
                 Box(
                     modifier = Modifier.size(7.dp)
                         .background(MaterialTheme.colorScheme.primary, CircleShape)
-                        .semantics { contentDescription = "Не просмотрено" },
+                        .semantics { contentDescription = notViewedLabel },
                 )
             }
         }
@@ -1280,15 +1381,26 @@ private fun FileRow(
                 lineHeight = 15.sp, overflow = TextOverflow.Ellipsis,
             )
             val status = when {
-                downloaded -> humanSize(node.entry.size) + SEP + "скачано, тап откроет"
-                snap != null && snap.filesTotal == 1L ->
-                    "${humanSize(snap.bytesDone)} из ${humanSize(node.entry.size)}" +
-                        SEP + "${humanSize(snap.speedBytesPerSec)}/с"
-                bgFetch -> "качается фоновым синком"
-                isHead -> "готовится..."
-                queued -> humanSize(node.entry.size) + SEP + "в очереди"
-                failed != null -> "оборвалось на ${humanSize(failed.bytesDone)} из ${humanSize(failed.bytesTotal)}"
-                else -> humanSize(node.entry.size)
+                downloaded ->
+                    humanSize(context, node.entry.size) + SEP +
+                        stringResource(R.string.files_row_downloaded)
+                snap != null && snap.filesTotal == 1L -> stringResource(
+                    R.string.files_row_transfer,
+                    humanSize(context, snap.bytesDone),
+                    humanSize(context, node.entry.size),
+                    humanSize(context, snap.speedBytesPerSec),
+                )
+                bgFetch -> stringResource(R.string.files_row_background)
+                isHead -> stringResource(R.string.files_row_preparing)
+                queued ->
+                    humanSize(context, node.entry.size) + SEP +
+                        stringResource(R.string.files_state_queued)
+                failed != null -> stringResource(
+                    R.string.files_row_broken,
+                    humanSize(context, failed.bytesDone),
+                    humanSize(context, failed.bytesTotal),
+                )
+                else -> humanSize(context, node.entry.size)
             }
             // Дата это mtime из манифеста, то есть когда файл появился у агента.
             // Нулевой mtime бывает у записи без даты, тогда строка остаётся
@@ -1306,19 +1418,36 @@ private fun FileRow(
         }
         when {
             downloaded -> IconButton(onClick = { vm.removeLocal(cfg, node.entry) }) {
-                Icon(Icons.Default.Remove, contentDescription = "Удалить с устройства")
+                Icon(
+                    Icons.Default.Remove,
+                    contentDescription = stringResource(R.string.files_remove_local),
+                )
             }
             isHead || bgFetch -> IconButton(onClick = { vm.cancelDownload(cfg.shareId, path) }) {
-                Icon(Icons.Default.Close, contentDescription = "Отменить загрузку")
+                Icon(
+                    Icons.Default.Close,
+                    contentDescription = stringResource(R.string.files_cancel_download),
+                )
             }
             queued -> IconButton(onClick = { vm.cancelDownload(cfg.shareId, path) }) {
-                Icon(Icons.Default.Schedule, contentDescription = "Убрать из очереди")
+                Icon(
+                    Icons.Default.Schedule,
+                    contentDescription = stringResource(R.string.files_dequeue),
+                )
             }
             failed != null -> IconButton(onClick = { vm.enqueue(cfg, node.entry) }) {
-                Icon(Icons.Default.Replay, contentDescription = "Докачать", tint = errorColor)
+                Icon(
+                    Icons.Default.Replay,
+                    contentDescription = stringResource(R.string.files_resume),
+                    tint = errorColor,
+                )
             }
             else -> IconButton(onClick = { vm.enqueue(cfg, node.entry) }) {
-                Icon(Icons.Default.Add, contentDescription = "Скачать", tint = DownloadGreen)
+                Icon(
+                    Icons.Default.Add,
+                    contentDescription = stringResource(R.string.files_download),
+                    tint = DownloadGreen,
+                )
             }
         }
     }
@@ -1388,11 +1517,12 @@ private fun SyncQueueBar(ind: SyncIndicator, onStop: () -> Unit) {
             )
             Spacer(Modifier.width(8.dp))
             Text(
-                ind.counter, fontSize = 11.sp,
+                stringResource(R.string.files_sync_counter, ind.current, ind.total),
+                fontSize = 11.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             TextButton(onClick = onStop, contentPadding = PaddingValues(horizontal = 8.dp)) {
-                Text("Стоп", fontSize = 12.sp)
+                Text(stringResource(R.string.files_stop), fontSize = 12.sp)
             }
         }
         LinearProgressIndicator(
@@ -1406,22 +1536,39 @@ private fun SyncQueueBar(ind: SyncIndicator, onStop: () -> Unit) {
  *  active yet (still listing files), rendered as an indeterminate start. */
 @Composable
 private fun ProgressBar(p: FilesViewModel.Progress?, onCancel: () -> Unit) {
+    val context = LocalContext.current
     val frac = if (p != null && p.bytesTotal > 0) (p.bytesDone.toFloat() / p.bytesTotal).coerceIn(0f, 1f) else 0f
     Card(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
         Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    p?.file?.substringAfterLast('/')?.ifEmpty { null } ?: "Подготовка...",
+                    p?.file?.substringAfterLast('/')?.ifEmpty { null }
+                        ?: stringResource(R.string.files_preparing),
                     maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 12.sp,
                     modifier = Modifier.weight(1f),
                 )
-                TextButton(onClick = onCancel) { Text("Стоп") }
+                TextButton(onClick = onCancel) { Text(stringResource(R.string.files_stop)) }
             }
             LinearProgressIndicator(progress = { frac }, modifier = Modifier.fillMaxWidth())
             Text(
-                if (p == null) "Подготовка..."
-                else "${humanSize(p.bytesDone)} / ${humanSize(p.bytesTotal)} - ${humanSize(p.speedBytesPerSec)}/с" +
-                    if (p.filesTotal > 1) ", файл ${p.filesDone + 1}/${p.filesTotal}" else "",
+                if (p == null) {
+                    stringResource(R.string.files_preparing)
+                } else {
+                    stringResource(
+                        R.string.files_migrate_progress,
+                        humanSize(context, p.bytesDone),
+                        humanSize(context, p.bytesTotal),
+                        humanSize(context, p.speedBytesPerSec),
+                    ) + if (p.filesTotal > 1) {
+                        stringResource(
+                            R.string.files_migrate_file_of,
+                            p.filesDone + 1,
+                            p.filesTotal,
+                        )
+                    } else {
+                        ""
+                    }
+                },
                 fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 2.dp),
             )
@@ -1440,17 +1587,19 @@ private fun ProgressBar(p: FilesViewModel.Progress?, onCancel: () -> Unit) {
 private fun SortButton(order: SortOrder, onPick: (FileSort) -> Unit) {
     var menuOpen by remember { mutableStateOf(false) }
     val arrow = if (order.descending) Icons.Default.ArrowDownward else Icons.Default.ArrowUpward
-    val direction = if (order.descending) "по убыванию" else "по возрастанию"
+    val direction = stringResource(
+        if (order.descending) R.string.files_sort_desc else R.string.files_sort_asc,
+    )
     Box {
         TextButton(onClick = { menuOpen = true }, contentPadding = PaddingValues(horizontal = 8.dp)) {
-            Text(sortLabel(order.mode), fontSize = 13.sp)
+            Text(stringResource(sortLabel(order.mode)), fontSize = 13.sp)
             Spacer(Modifier.width(2.dp))
             Icon(arrow, contentDescription = direction, modifier = Modifier.size(14.dp))
         }
         DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
             FileSort.entries.forEach { mode ->
                 DropdownMenuItem(
-                    text = { Text(sortMenuLabel(mode)) },
+                    text = { Text(stringResource(sortMenuLabel(mode))) },
                     trailingIcon = {
                         if (mode == order.mode) Icon(arrow, contentDescription = direction)
                     },
@@ -1482,32 +1631,35 @@ private fun ViewMenuButton(
                 Icons.Default.Tune,
                 // Состояние названо словами: по цвету иконки экранный сценарий
                 // и скринридер режим не прочитают.
-                contentDescription = when {
-                    grouped && unviewedOnly -> "Вид, группировка и фильтр включены"
-                    grouped -> "Вид, группировка включена"
-                    unviewedOnly -> "Вид, фильтр включён"
-                    else -> "Вид"
-                },
+                contentDescription = stringResource(
+                    when {
+                        grouped && unviewedOnly -> R.string.files_view_both_on
+                        grouped -> R.string.files_view_grouping_on
+                        unviewedOnly -> R.string.files_view_filter_on
+                        else -> R.string.files_view
+                    },
+                ),
                 tint = if (grouped || unviewedOnly) MaterialTheme.colorScheme.primary
                 else MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
         DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
             Text(
-                "Группировка",
+                stringResource(R.string.files_grouping),
                 fontSize = 11.sp, letterSpacing = 0.4.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(start = 16.dp, top = 8.dp, bottom = 2.dp),
             )
             FileGrouping.entries.forEach { mode ->
                 DropdownMenuItem(
-                    text = { Text(groupingLabel(mode)) },
+                    text = { Text(stringResource(groupingLabel(mode))) },
                     leadingIcon = {
                         // Пустое место под галочкой держим всегда, иначе
                         // невыбранные пункты разъезжались бы влево.
                         if (mode == grouping) {
                             Icon(
-                                Icons.Default.Check, contentDescription = "выбрано",
+                                Icons.Default.Check,
+                                contentDescription = stringResource(R.string.files_chosen),
                                 tint = MaterialTheme.colorScheme.primary,
                             )
                         } else {
@@ -1519,7 +1671,7 @@ private fun ViewMenuButton(
             }
             HorizontalDivider()
             DropdownMenuItem(
-                text = { Text("Только непросмотренные") },
+                text = { Text(stringResource(R.string.files_view_unviewed_only)) },
                 leadingIcon = {
                     Icon(
                         if (unviewedOnly) Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,
@@ -1534,10 +1686,55 @@ private fun ViewMenuButton(
     }
 }
 
-private fun groupingLabel(mode: FileGrouping): String = when (mode) {
-    FileGrouping.NONE -> "Без групп"
-    FileGrouping.DATE -> "По дате"
-    FileGrouping.SOURCE -> "По источнику"
+private fun groupingLabel(mode: FileGrouping): Int = when (mode) {
+    FileGrouping.NONE -> R.string.files_group_none
+    FileGrouping.DATE -> R.string.files_group_by_date
+    FileGrouping.SOURCE -> R.string.files_group_by_source
+}
+
+/**
+ * Подпись заголовка группы (XR-092): раскладка проводника несёт ключ, а ресурс
+ * под него подбирается здесь. `when` по enum держит полноту сам: заведут новую
+ * группу, и без её подписи файл не соберётся.
+ */
+@Composable
+private fun groupTitleText(title: GroupTitle): String = when (title) {
+    is GroupTitle.Text -> title.text
+    is GroupTitle.Known -> stringResource(
+        when (title.kind) {
+            GroupKind.FOLDERS -> R.string.files_group_folders
+            GroupKind.NO_SOURCE -> R.string.files_group_no_source
+            GroupKind.NO_DATE -> R.string.files_group_no_date
+            GroupKind.TODAY -> R.string.files_group_today
+            GroupKind.THIS_WEEK -> R.string.files_group_this_week
+        },
+    )
+}
+
+/**
+ * Текст ошибки шары по её варианту (XR-092): разбор категории живёт в
+ * [ShareErrorText.kt] и об Android не знает, а ресурс к варианту подбирается
+ * здесь. Берёт [Context], а не composable-окружение: этими же словами
+ * [FilesViewModel] подписывает свои тосты.
+ */
+internal fun renderShareError(e: ShareErrorText, context: Context): String = when (e) {
+    is ShareErrorText.Raw -> e.text
+    is ShareErrorText.Known -> when (e.kind) {
+        ShareErrorKind.AGENT_OFFLINE -> context.getString(R.string.share_error_agent_offline)
+        ShareErrorKind.ACCESS_EXPIRED -> context.getString(R.string.share_error_access_expired)
+        ShareErrorKind.STALE_TOKEN -> context.getString(R.string.share_error_stale_token)
+        ShareErrorKind.INVITE_GONE -> context.getString(R.string.share_error_invite_gone)
+        ShareErrorKind.NETWORK -> context.getString(R.string.share_error_network)
+        ShareErrorKind.NOT_FOUND -> context.getString(R.string.share_error_not_found)
+        ShareErrorKind.SERVER_ERROR -> context.getString(R.string.share_error_server, e.arg)
+        ShareErrorKind.HTTP_STATUS -> context.getString(R.string.share_error_http, e.arg)
+        ShareErrorKind.PARSE -> context.getString(R.string.share_error_parse)
+        ShareErrorKind.READ -> context.getString(R.string.share_error_read)
+        ShareErrorKind.MANIFEST_UNSIGNED -> context.getString(R.string.share_error_manifest_unsigned)
+        ShareErrorKind.MANIFEST_SIGNATURE -> context.getString(R.string.share_error_manifest_signature)
+        ShareErrorKind.IMPORT_QUEUE_FULL -> context.getString(R.string.share_error_queue_full)
+        ShareErrorKind.UNKNOWN -> context.getString(R.string.share_error_unknown)
+    }
 }
 
 /**
@@ -1566,14 +1763,14 @@ private fun GroupHeader(title: String, count: Int) {
     }
 }
 
-private fun sortLabel(mode: FileSort): String = when (mode) {
-    FileSort.NAME -> "Имя"
-    FileSort.DATE -> "Дата"
+private fun sortLabel(mode: FileSort): Int = when (mode) {
+    FileSort.NAME -> R.string.files_sort_name
+    FileSort.DATE -> R.string.files_sort_date
 }
 
-private fun sortMenuLabel(mode: FileSort): String = when (mode) {
-    FileSort.NAME -> "По имени"
-    FileSort.DATE -> "По дате"
+private fun sortMenuLabel(mode: FileSort): Int = when (mode) {
+    FileSort.NAME -> R.string.files_sort_by_name
+    FileSort.DATE -> R.string.files_sort_by_date
 }
 
 @Composable
@@ -1623,11 +1820,6 @@ private val DownloadGreen = Color(0xFF4CAF50)
  *  пускают правила проекта. */
 private const val SEP = " \u00B7 "
 
-/** Надпись кнопки возврата: одинаковая в проводнике и на экране информации о
- *  файле. Угловая кавычка задана escape-последовательностью по той же причине,
- *  что и средняя точка выше. */
-private const val BACK_LABEL = "\u2039 Назад"
-
 private fun openLocalFile(context: Context, file: File) {
     try {
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
@@ -1636,9 +1828,12 @@ private fun openLocalFile(context: Context, file: File) {
             setDataAndType(uri, mime)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        context.startActivity(Intent.createChooser(intent, "Открыть файл"))
+        context.startActivity(
+            Intent.createChooser(intent, context.getString(R.string.files_open_with)),
+        )
     } catch (_: Exception) {
-        Toast.makeText(context, "Нет приложения, чтобы открыть этот файл", Toast.LENGTH_SHORT).show()
+        Toast.makeText(context, context.getString(R.string.files_no_opener), Toast.LENGTH_SHORT)
+            .show()
     }
 }
 
@@ -1651,7 +1846,8 @@ private fun openLink(context: Context, url: String) {
             Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
         )
     } catch (_: Exception) {
-        Toast.makeText(context, "Нет приложения, чтобы открыть ссылку", Toast.LENGTH_SHORT).show()
+        Toast.makeText(context, context.getString(R.string.files_no_browser), Toast.LENGTH_SHORT)
+            .show()
     }
 }
 
@@ -1683,9 +1879,12 @@ private fun displayFileName(name: String): String {
     return if (trimmed.isBlank()) name else trimmed + ext
 }
 
-private fun humanSize(bytes: Long): String = when {
-    bytes >= 1L shl 30 -> "%.1f ГБ".format(bytes / (1L shl 30).toDouble())
-    bytes >= 1 shl 20 -> "%.1f МБ".format(bytes / (1 shl 20).toDouble())
-    bytes >= 1 shl 10 -> "%.1f КБ".format(bytes / (1 shl 10).toDouble())
-    else -> "$bytes Б"
+/** Размер с единицей измерения. Единицу берём из ресурсов, поэтому нужен
+ *  [Context]: функцию зовут и из строки файла, и с экрана информации, и из
+ *  карточки переноса. */
+private fun humanSize(context: Context, bytes: Long): String = when {
+    bytes >= 1L shl 30 -> context.getString(R.string.files_size_gb, bytes / (1L shl 30).toDouble())
+    bytes >= 1 shl 20 -> context.getString(R.string.files_size_mb, bytes / (1 shl 20).toDouble())
+    bytes >= 1 shl 10 -> context.getString(R.string.files_size_kb, bytes / (1 shl 10).toDouble())
+    else -> context.getString(R.string.files_size_b, bytes)
 }

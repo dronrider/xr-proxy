@@ -9,8 +9,11 @@ package com.xrproxy.app.ui.files
 data class SyncIndicator(
     /** Имя файла без пути. */
     val file: String,
-    /** Подпись «X из N», где X это номер текущего файла, а не число готовых. */
-    val counter: String,
+    /** Номер текущего файла в батче, считая с единицы, а не число готовых.
+     *  Подпись «X из N» собирает экран: чистой логике ресурсы не видны. */
+    val current: Int,
+    /** Сколько всего файлов в батче. */
+    val total: Int,
     /** Доля батча, 0..1. */
     val fraction: Float,
 )
@@ -93,7 +96,8 @@ private fun indicator(done: Int, total: Int, file: String, fileFraction: Float):
     val part = fileFraction.coerceIn(0f, 1f)
     return SyncIndicator(
         file = file.substringAfterLast('/'),
-        counter = "${(whole + 1).coerceAtMost(total)} из $total",
+        current = (whole + 1).coerceAtMost(total),
+        total = total,
         fraction = ((whole + part) / total).coerceIn(0f, 1f),
     )
 }
