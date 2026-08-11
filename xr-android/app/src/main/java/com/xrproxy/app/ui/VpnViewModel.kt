@@ -502,6 +502,12 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Живой реконнект, ровно один. Ожидание `Idle` внутри него ничем не
+     *  отличает свой disconnect от чужого, поэтому нажатое посреди
+     *  переключения «Отключить» подняло бы туннель обратно, а второе
+     *  переключение подряд наложило бы два цикла друг на друга. */
+    private var reconnectJob: Job? = null
+
     /** Погасить туннель и поднять его заново на текущем активном профиле.
      *  Один путь на правку активного сервера и на переключение между
      *  серверами (XR-088): конфигурацию движок читает на старте, поэтому
@@ -510,8 +516,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
      *  почему туннель мигнул. */
     private fun reconnectActive(notice: String) {
         emitMessage(notice, UiSeverity.Info)
-        viewModelScope.launch {
-            disconnect()
+        reconnectJob?.cancel()
+        reconnectJob = viewModelScope.launch {
+            disconnect(cancelReconnect = false)
             _uiState.map { it.phase == ConnectPhase.Idle }.first { it }
             delay(300)
             onConnectClicked()
@@ -1246,7 +1253,16 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.value = _uiState.value.copy(phase = ConnectPhase.Preparing, state = "Connecting...")
     }
 
-    fun disconnect() {
+    /** [cancelReconnect] снимает живой авто-реконнект: отключение руками
+     *  главнее переключения сервера, иначе ожидание `Idle` внутри
+     *  [reconnectActive] примет ручной disconnect за свой и поднимет туннель
+     *  обратно. Сам реконнект гасит туннель этим же вызовом и свою отмену не
+     *  заказывает. */
+    fun disconnect(cancelReconnect: Boolean = true) {
+        if (cancelReconnect) {
+            reconnectJob?.cancel()
+            reconnectJob = null
+        }
         val svc = boundService
         if (svc != null) {
             svc.stopFromUi()
