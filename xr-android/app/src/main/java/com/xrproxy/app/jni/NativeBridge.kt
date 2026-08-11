@@ -171,6 +171,12 @@ object NativeBridge {
         timeoutMs: Long,
     ): String
 
+    /** Применить правки «моих правил» к живому туннелю (XR-180): движок
+     *  пересобирает merged-роутер тем же путём, каким подхватывает новую
+     *  версию пресета. `rulesJson` это массив `user_rules` из конфига.
+     *  `false`, когда движок не запущен (правила уедут ближайшим стартом). */
+    external fun nativeApplyUserRules(rulesJson: String, defaultAction: String): Boolean
+
     // ── APK self-update (LLD-12) ────────────────────────────────────
 
     /**

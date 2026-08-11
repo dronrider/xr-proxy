@@ -530,6 +530,49 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeOnNetworkChan
     }
 }
 
+/// Применить правки экрана правил к живому туннелю (XR-180). `rules_json` это
+/// тот же массив `user_rules`, что уезжает в конфиг при старте, `default_action`
+/// строка рядом с ним. Движок пересобирает merged-роутер тем же путём, каким
+/// подхватывает новую версию пресета, поэтому переподключения правило не ждёт.
+/// Возвращает `false`, когда движок не запущен: правила тогда уедут в него
+/// ближайшим стартом.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeApplyUserRules(
+    mut env: JNIEnv,
+    _class: JClass,
+    rules_json: JString,
+    default_action: JString,
+) -> jboolean {
+    let Ok(rules_json) = read_jstring(&mut env, &rules_json) else {
+        return 0;
+    };
+    let default_action = read_jstring(&mut env, &default_action)
+        .unwrap_or_else(|_| "direct".to_string());
+    let rules: Vec<xr_proto::user_rule::UserRule> =
+        match serde_json::from_str::<Vec<serde_json::Value>>(&rules_json) {
+            Ok(items) => items
+                .into_iter()
+                .filter_map(|item| serde_json::from_value(item).ok())
+                .collect(),
+            Err(e) => {
+                journal_log("WARN", "rules", &format!("правила не разобраны: {}", e));
+                return 0;
+            }
+        };
+    let routing = xr_proto::user_rule::to_routing_config(&rules, &default_action);
+
+    let mut lock = get_engine().lock().unwrap();
+    let Some(ref mut handle) = *lock else {
+        return 0;
+    };
+    if handle.engine.apply_user_rules(routing) {
+        journal_log("INFO", "rules", "правила применены к живому туннелю");
+        1
+    } else {
+        0
+    }
+}
+
 /// Read a Java `String[]` into a `Vec<String>`, skipping null/unreadable
 /// elements. Used by the trusted-network SSID bridge below.
 fn read_jstring_array(env: &mut JNIEnv, arr: &JObjectArray) -> Vec<String> {

@@ -182,6 +182,11 @@ data class VpnUiState(
         get() = phase == ConnectPhase.Paused
 }
 
+/** Действие для трафика, не попавшего ни под одно правило. Одно на конфиг
+ *  старта и на применение правил к живому туннелю: разъедься эти два места,
+ *  правка правил меняла бы заодно и маршрут по умолчанию. */
+private const val DEFAULT_ROUTING_ACTION = "direct"
+
 class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     private val prefs = application.getSharedPreferences("xr_proxy", Context.MODE_PRIVATE)
@@ -694,9 +699,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
      *  активного сервера, первое совпадение выигрывает. */
     val userRules: StateFlow<List<UserRule>> = _userRules
 
-    /** Сохранить новый список целиком: состояние сразу, диск в фоне.
-     *  Применение на лету не делаем (LLD-05 §3.10) — правила попадут в
-     *  движок при следующем Connect через [buildConfigJson]. */
+    /** Сохранить новый список целиком: состояние сразу, диск и живой движок
+     *  в фоне. Правка действует на живом туннеле без переподключения
+     *  (XR-180): движок пересобирает merged-роутер тем же путём, каким
+     *  подхватывает новую версию пресета. Незапущенный движок правила
+     *  заберёт ближайшим Connect через [buildConfigJson]. */
     fun saveUserRules(rules: List<UserRule>) {
         val capped = rules.take(UserRulesStore.MAX_RULES)
         _userRules.value = capped
@@ -705,6 +712,14 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 UserRulesStore.save(getApplication<Application>().filesDir, capped)
             } catch (e: Exception) {
                 emitMessage("Не удалось сохранить правила: ${e.message}", UiSeverity.Error)
+            }
+            try {
+                NativeBridge.nativeApplyUserRules(
+                    UserRulesStore.toConfigJson(capped).toString(),
+                    DEFAULT_ROUTING_ACTION,
+                )
+            } catch (e: Throwable) {
+                Log.w("xr-rules", "не удалось применить правила на лету: $e")
             }
         }
     }
@@ -1331,7 +1346,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 "salt": ${server.salt},
                 "padding_min": 16,
                 "padding_max": 128,
-                "default_action": "direct",
+                "default_action": "$DEFAULT_ROUTING_ACTION",
                 "user_rules": $userRulesJson,
                 "on_server_down": "${if (_failClosed.value) "block" else "direct"}",
                 "dns_resolvers": [$dnsArray]$hubFields
