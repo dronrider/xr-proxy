@@ -9,14 +9,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use xr_core::engine::{VpnConfig, VpnEngine};
+use xr_core::client_config::{self, parse_config};
+use xr_core::engine::VpnEngine;
 use xr_core::ip_stack::PacketQueue;
 use xr_core::onboarding;
 use xr_core::presets;
 use xr_core::session::{ProtectSocketFn, SystemResolverFn};
 use xr_core::sync;
 use xr_core::update;
-use xr_proto::config::RoutingConfig;
 use xr_proto::invite_url;
 use xr_core::sync::LocalFile;
 use xr_proto::share::{RelayGrant, ShareGrant, ShareManifest, ShareManifestEntry, ShareToken};
@@ -185,194 +185,6 @@ fn make_system_resolver_fn() -> SystemResolverFn {
     })
 }
 
-/// Proper JSON string value extractor. Walks char-by-char from the
-/// opening quote and honors `\"`, `\\`, `\n`, `\t`, `\r` escape sequences,
-/// so embedded TOML (routing_toml) with quoted strings doesn't truncate
-/// at the first `\"`. The original `find('"')` approach cut off
-/// `routing_toml` at the very first escaped quote, and `toml::from_str`
-/// silently fell back to the default "proxy everything" routing.
-fn json_get_str(json: &str, key: &str) -> Result<String, String> {
-    let pattern = format!("\"{}\"", key);
-    let pos = json.find(&pattern).ok_or(format!("missing {}", key))?;
-    let after = &json[pos + pattern.len()..];
-    let start = after.find('"').ok_or(format!("bad value for {}", key))? + 1;
-    let rest = &after[start..];
-
-    let mut result = String::new();
-    let mut iter = rest.chars();
-    while let Some(c) = iter.next() {
-        if c == '\\' {
-            match iter.next() {
-                Some('n') => result.push('\n'),
-                Some('"') => result.push('"'),
-                Some('\\') => result.push('\\'),
-                // org.json на Android всегда пишет `/` как `\/`, и после
-                // пересериализации конфига сервисом этот эскейп несёт каждый
-                // URL и почти каждый base64-ключ (XR-118).
-                Some('/') => result.push('/'),
-                Some('t') => result.push('\t'),
-                Some('r') => result.push('\r'),
-                Some(other) => {
-                    // Unknown escape — keep literally, don't break parsing.
-                    result.push('\\');
-                    result.push(other);
-                }
-                None => return Err(format!("unterminated escape in {}", key)),
-            }
-        } else if c == '"' {
-            // End of string value (unescaped quote).
-            return Ok(result);
-        } else {
-            result.push(c);
-        }
-    }
-    Err(format!("unterminated {}", key))
-}
-
-fn parse_config(json: &str) -> Result<VpnConfig, String> {
-    let get_str = |key: &str| json_get_str(json, key);
-
-    let get_num = |key: &str| -> Result<u64, String> {
-        let pattern = format!("\"{}\"", key);
-        let pos = json.find(&pattern).ok_or(format!("missing {}", key))?;
-        let after = &json[pos + pattern.len()..];
-        let colon = after.find(':').ok_or(format!("bad {}", key))? + 1;
-        let rest = after[colon..].trim_start();
-        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        num_str.parse().map_err(|_| format!("bad number for {}", key))
-    };
-
-    let server_address = get_str("server_address")?;
-    let server_port = get_num("server_port")? as u16;
-    let obfuscation_key = get_str("obfuscation_key")?;
-    let modifier = get_str("modifier").unwrap_or_else(|_| "positional_xor_rotate".into());
-    let salt = get_num("salt").unwrap_or(0xDEADBEEF) as u32;
-    let padding_min = get_num("padding_min").unwrap_or(16) as u8;
-    let padding_max = get_num("padding_max").unwrap_or(128) as u8;
-    let on_server_down = get_str("on_server_down").unwrap_or_else(|_| "block".into());
-
-    // Пользовательские правила (LLD-05): массив `user_rules` главнее
-    // `routing_toml`. Легаси-ветка с TOML остаётся для старых конфигов.
-    let routing = if let Some(cfg) = parse_user_rules(json) {
-        cfg
-    } else if let Ok(toml_str) = get_str("routing_toml") {
-        toml::from_str::<RoutingConfig>(&toml_str).unwrap_or_else(|e| {
-            tracing::warn!("Failed to parse routing TOML: {}", e);
-            default_routing()
-        })
-    } else {
-        default_routing()
-    };
-
-    let hub_url = get_str("hub_url").ok();
-    let hub_preset = get_str("hub_preset").ok();
-    let hub_cache_dir = get_str("hub_cache_dir").ok();
-    let hub_refresh_interval_secs = get_num("hub_refresh_interval_secs").ok();
-    let mux_pool_size = get_num("mux_pool_size").map(|v| v as usize).unwrap_or(0);
-
-    let dns_resolvers = parse_dns_resolvers(json);
-    let servers = parse_servers(json);
-
-    Ok(VpnConfig {
-        server_address, server_port, servers, obfuscation_key, modifier, salt,
-        padding_min, padding_max, routing, geoip_path: None, on_server_down,
-        dns_resolvers,
-        hub_url, hub_preset, hub_cache_dir, hub_refresh_interval_secs,
-        // Wired in at engine start (nativeStart), not from JSON — the
-        // resolver is a JNI callback, not a config value.
-        system_resolver: None,
-        mux_pool_size,
-    })
-}
-
-/// Extract the `servers` array (LLD-10): `[{"name":"aeza","address":"1.2.3.4",
-/// "port":8443}, ...]`, порядок в массиве и есть приоритет. Разбирается
-/// полноценным serde_json (в отличие от остального ad-hoc парсера): это
-/// вложенные объекты, ручной парсер их не потянет. Отсутствие ключа или
-/// битый JSON дают пустой список, движок тогда работает по legacy-полю.
-fn parse_servers(json: &str) -> Vec<xr_proto::config::ServerEntry> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
-        return vec![];
-    };
-    let Some(arr) = value.get("servers").and_then(|v| v.as_array()) else {
-        return vec![];
-    };
-    arr.iter()
-        .enumerate()
-        .filter_map(|(idx, item)| {
-            let address = item.get("address")?.as_str()?.trim().to_string();
-            if address.is_empty() {
-                return None;
-            }
-            Some(xr_proto::config::ServerEntry {
-                name: item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                address,
-                port: item.get("port").and_then(|v| v.as_u64()).unwrap_or(8443) as u16,
-                priority: idx as u32,
-                key: None,
-                salt: None,
-                modifier: None,
-            })
-        })
-        .collect()
-}
-
-/// Собирает `RoutingConfig` из массива `user_rules` (LLD-05): `[{"action":
-/// "proxy","pattern":"*.github.com"}, ...]` плюс строка `default_action`
-/// рядом (по умолчанию "direct"). `None`, когда ключа нет вовсе (легаси-конфиг
-/// со старым приложением). Битые записи выбрасывает `to_routing_config`
-/// с WARN, старт туннеля они не валят.
-fn parse_user_rules(json: &str) -> Option<RoutingConfig> {
-    let value = serde_json::from_str::<serde_json::Value>(json).ok()?;
-    let arr = value.get("user_rules")?.as_array()?;
-    let rules: Vec<xr_proto::user_rule::UserRule> = arr
-        .iter()
-        .filter_map(|item| serde_json::from_value(item.clone()).ok())
-        .collect();
-    let default_action = value
-        .get("default_action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("direct");
-    Some(xr_proto::user_rule::to_routing_config(&rules, default_action))
-}
-
-/// Extract the `dns_resolvers` JSON array of strings, e.g.
-/// `"dns_resolvers": ["1.1.1.1", "8.8.8.8:53"]`.
-/// Tolerant of missing key (returns empty vec) and minor whitespace.
-fn parse_dns_resolvers(json: &str) -> Vec<String> {
-    let key = "\"dns_resolvers\"";
-    let pos = match json.find(key) { Some(p) => p, None => return vec![] };
-    let after = &json[pos + key.len()..];
-    let bracket = match after.find('[') { Some(p) => p, None => return vec![] };
-    let close = match after[bracket..].find(']') { Some(p) => p, None => return vec![] };
-    let inner = &after[bracket + 1..bracket + close];
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut in_string = false;
-    for c in inner.chars() {
-        match c {
-            '"' if !in_string => in_string = true,
-            '"' if in_string => {
-                if !current.is_empty() {
-                    out.push(std::mem::take(&mut current));
-                }
-                in_string = false;
-            }
-            _ if in_string => current.push(c),
-            _ => {}
-        }
-    }
-    out
-}
-
-fn default_routing() -> RoutingConfig {
-    RoutingConfig { default_action: "proxy".into(), rules: vec![] }
-}
-
 /// Translate engine InvalidInput errors into user-friendly messages.
 fn humanize_config_error(e: &std::io::Error) -> String {
     let raw = e.to_string();
@@ -388,6 +200,27 @@ fn humanize_config_error(e: &std::io::Error) -> String {
     } else {
         format!("Ошибка настроек: {}", raw)
     }
+}
+
+/// Собрать JSON конфига движка из профиля активного сервера. Сборка живёт в
+/// ядре (`xr_core::client_config`), а не в приложении: дефолты, порядок пула,
+/// чистка резолверов и экранирование одни на все платформы (XR-271).
+/// Возвращает готовый конфиг либо `{"error":".."}` (профиль без сервера,
+/// нечитаемый JSON).
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeBuildConfig(
+    mut env: JNIEnv,
+    _class: JClass,
+    profile_json: JString,
+) -> jstring {
+    let profile_json = match read_jstring(&mut env, &profile_json) {
+        Ok(s) => s,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let json = client_config::parse_client_profile(&profile_json)
+        .and_then(|p| client_config::build_config_json(&p))
+        .unwrap_or_else(|e| json_error(&e));
+    jstring_into_raw(&mut env, json)
 }
 
 // ── JNI exports ─────────────────────────────────────────────────────
@@ -550,6 +383,26 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeOnNetworkChan
     }
 }
 
+/// Разобрать массив `user_rules` (тот же, что уезжает в конфиг движка).
+/// Битые записи выбрасываются молча, они и в конфиге не выживают.
+fn parse_user_rules_json(json: &str) -> Result<Vec<xr_proto::user_rule::UserRule>, String> {
+    let items: Vec<serde_json::Value> =
+        serde_json::from_str(json).map_err(|e| e.to_string())?;
+    Ok(items
+        .into_iter()
+        .filter_map(|item| serde_json::from_value(item).ok())
+        .collect())
+}
+
+/// Действие по умолчанию: названное вызывающим либо общее клиентское.
+fn effective_default_action(raw: &str) -> String {
+    if raw.trim().is_empty() {
+        client_config::DEFAULT_ROUTING_ACTION.to_string()
+    } else {
+        raw.trim().to_string()
+    }
+}
+
 /// Применить правки экрана правил к живому туннелю (XR-180). `rules_json` это
 /// тот же массив `user_rules`, что уезжает в конфиг при старте, `default_action`
 /// строка рядом с ним. Движок пересобирает merged-роутер тем же путём, каким
@@ -566,20 +419,17 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeApplyUserRule
     let Ok(rules_json) = read_jstring(&mut env, &rules_json) else {
         return 0;
     };
-    let default_action = read_jstring(&mut env, &default_action)
-        .unwrap_or_else(|_| "direct".to_string());
-    let rules: Vec<xr_proto::user_rule::UserRule> =
-        match serde_json::from_str::<Vec<serde_json::Value>>(&rules_json) {
-            Ok(items) => items
-                .into_iter()
-                .filter_map(|item| serde_json::from_value(item).ok())
-                .collect(),
-            Err(e) => {
-                journal_log("WARN", "rules", &format!("правила не разобраны: {}", e));
-                return 0;
-            }
-        };
-    let routing = xr_proto::user_rule::to_routing_config(&rules, &default_action);
+    // Пустая строка значит «действие по умолчанию как у конфига старта»:
+    // своей копии этого значения у приложения больше нет (XR-271).
+    let default_action = read_jstring(&mut env, &default_action).unwrap_or_default();
+    let rules = match parse_user_rules_json(&rules_json) {
+        Ok(rules) => rules,
+        Err(e) => {
+            journal_log("WARN", "rules", &format!("правила не разобраны: {}", e));
+            return 0;
+        }
+    };
+    let routing = xr_proto::user_rule::to_routing_config(&rules, &effective_default_action(&default_action));
 
     let mut lock = get_engine().lock().unwrap();
     let Some(ref mut handle) = *lock else {
@@ -697,6 +547,58 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetStats(
         None => "{\"bytes_up\":0,\"bytes_down\":0,\"active\":0,\"total\":0,\"uptime\":0,\"dns\":0,\"syns\":0,\"smol_recv\":0,\"smol_send\":0,\"relay_warn\":0,\"relay_err\":0,\"debug\":\"\"}".into(),
     };
     env.new_string(&json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+// -- Здоровье сессии (LLD-06) ----------------------------------------
+// Скользящее окно по счётчикам движка живёт в ядре (XR-271), здесь только
+// один трекер на процесс: движок в приложении тоже один, а сервис зовёт
+// обновление раз в тик из своего цикла опроса.
+
+static HEALTH: OnceLock<Mutex<xr_core::health::HealthTracker>> = OnceLock::new();
+
+fn health() -> &'static Mutex<xr_core::health::HealthTracker> {
+    HEALTH.get_or_init(|| Mutex::new(xr_core::health::HealthTracker::new()))
+}
+
+/// Обновить здоровье накопительными счётчиками движка, вернуть имя ступени
+/// ("healthy", "good", "watching", "hurt", "critical").
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeHealthUpdate(
+    mut env: JNIEnv,
+    _class: JClass,
+    relay_errors: jlong,
+    relay_warnings: jlong,
+) -> jstring {
+    let level = health()
+        .lock()
+        .unwrap()
+        .update(relay_errors.max(0) as u64, relay_warnings.max(0) as u64);
+    jstring_into_raw(&mut env, level.as_str().to_string())
+}
+
+/// Сети нет (XR-183): подтянуть базовую линию к текущим счётчикам, не портя
+/// здоровье ошибками, которые про отсутствие связи, а не про прокси.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeHealthFreeze(
+    mut env: JNIEnv,
+    _class: JClass,
+    relay_errors: jlong,
+    relay_warnings: jlong,
+) -> jstring {
+    let level = health()
+        .lock()
+        .unwrap()
+        .freeze_at(relay_errors.max(0) as u64, relay_warnings.max(0) as u64);
+    jstring_into_raw(&mut env, level.as_str().to_string())
+}
+
+/// Сброс перед новой сессией туннеля.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeHealthReset(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    health().lock().unwrap().reset();
 }
 
 // ── Журнал приложения (XR-042) ──────────────────────────────────────
@@ -954,8 +856,18 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeApplyInvite(
                 .as_ref()
                 .and_then(|p| serde_json::to_value(p).ok())
                 .unwrap_or(serde_json::Value::Null);
+            // Раскладка payload'а на профиль сервера живёт в ядре (XR-271):
+            // приоритеты пула, легаси-адрес и дефолты обфускации одни на все
+            // платформы, приложению остаётся имя профиля и хранилище.
+            let profile_value = apply
+                .payload
+                .as_ref()
+                .map(|p| onboarding::profile_from_payload(p, &hub_url))
+                .and_then(|p| serde_json::to_value(p).ok())
+                .unwrap_or(serde_json::Value::Null);
             serde_json::json!({
                 "payload": payload_value,
+                "profile": profile_value,
                 "public_key": apply.public_key,
                 "preset_cached": apply.preset_cached,
                 "errors": apply.errors,
@@ -964,6 +876,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeApplyInvite(
         }
         Err(e) => serde_json::json!({
             "payload": serde_json::Value::Null,
+            "profile": serde_json::Value::Null,
             "public_key": serde_json::Value::Null,
             "preset_cached": false,
             "errors": [e],
@@ -1051,6 +964,56 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeRefreshPreset
         }
     };
     jstring_into_raw(&mut env, json)
+}
+
+/// Кэшированный пресет для карточки экрана правил. Кэш пишет только ядро,
+/// оно же его и читает (XR-271): формат файла наружу не выходит. Возвращает
+/// `{"name","version","updated_at","default_action","rules":[..]}` либо
+/// `{"error":"no_cache"}`, когда пресета в кэше нет.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeCachedPreset(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_dir: JString,
+    preset: JString,
+) -> jstring {
+    let cache_dir = match read_jstring(&mut env, &cache_dir) {
+        Ok(s) => PathBuf::from(s),
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let preset = match read_jstring(&mut env, &preset) {
+        Ok(s) => s,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let json = presets::cached_preset_json(&cache_dir, &preset)
+        .unwrap_or_else(|| json_error("no_cache"));
+    jstring_into_raw(&mut env, json)
+}
+
+/// Превью `[routing]` из моих правил и пресета хаба (кнопка `{ }` на экране
+/// правил). Собирается в ядре рядом с самим кэшем пресета, пустое
+/// `default_action` берёт общий дефолт клиента.
+#[no_mangle]
+pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeMergedToml(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_dir: JString,
+    preset: JString,
+    rules_json: JString,
+    default_action: JString,
+) -> jstring {
+    let cache_dir = match read_jstring(&mut env, &cache_dir) {
+        Ok(s) => PathBuf::from(s),
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let preset_name = read_jstring(&mut env, &preset).unwrap_or_default();
+    let rules_json = read_jstring(&mut env, &rules_json).unwrap_or_default();
+    let default_action = read_jstring(&mut env, &default_action).unwrap_or_default();
+
+    let rules = parse_user_rules_json(&rules_json).unwrap_or_default();
+    let preset = presets::read_cached(&cache_dir, &preset_name);
+    let toml = presets::merged_toml(&rules, &default_action, preset.as_ref());
+    jstring_into_raw(&mut env, toml)
 }
 
 // ── APK self-update bridge (LLD-12) ─────────────────────────────────
@@ -1939,75 +1902,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn get_str_simple_value() {
-        let json = r#"{"foo":"bar","baz":"qux"}"#;
-        assert_eq!(json_get_str(json, "foo").unwrap(), "bar");
-        assert_eq!(json_get_str(json, "baz").unwrap(), "qux");
-    }
-
-    #[test]
-    fn get_str_escaped_quote_inside_value() {
-        // Regression: the previous naive parser truncated here at the
-        // first `\"`, returning only `he said `. Now the escape is honored.
-        let json = r#"{"msg":"he said \"hi\" and left","other":"x"}"#;
-        assert_eq!(json_get_str(json, "msg").unwrap(), r#"he said "hi" and left"#);
-        assert_eq!(json_get_str(json, "other").unwrap(), "x");
-    }
-
-    #[test]
-    fn get_str_routing_toml_with_quoted_rules() {
-        // The actual case that broke user routing — routing_toml contains
-        // many escaped quotes. Without the fix, this returned only
-        // `default_action = \`, `toml::from_str` failed, and the engine
-        // fell back to proxy-everything default.
-        let routing_toml = r#"default_action = "direct"
-[[rules]]
-action = "proxy"
-domains = ["youtube.com", "*.youtube.com"]"#;
-        let escaped = routing_toml.replace('"', "\\\"").replace('\n', "\\n");
-        let json = format!(
-            r#"{{"server_address":"1.2.3.4","routing_toml":"{}","on_server_down":"direct"}}"#,
-            escaped
-        );
-
-        let result = json_get_str(&json, "routing_toml").unwrap();
-        assert_eq!(result, routing_toml, "routing_toml must round-trip through escape/unescape");
-
-        // Sanity: other fields still parse after the multi-line value.
-        assert_eq!(json_get_str(&json, "server_address").unwrap(), "1.2.3.4");
-        assert_eq!(json_get_str(&json, "on_server_down").unwrap(), "direct");
-    }
-
-    #[test]
-    fn get_str_newline_escape() {
-        let json = r#"{"multi":"line1\nline2\nline3"}"#;
-        assert_eq!(json_get_str(json, "multi").unwrap(), "line1\nline2\nline3");
-    }
-
-    /// Android'овский org.json при пересериализации конфига всегда экранирует
-    /// `/` как `\/` (легальный JSON-эскейп), а парсер держал обратный слэш в
-    /// значении: base64-ключ с `/` не декодировался, hub_url ломался, и
-    /// туннель в APK 0.80.0 не стартовал ни одним путём (XR-118).
-    #[test]
-    fn get_str_forward_slash_escape() {
-        let json = r#"{"obfuscation_key":"a2V5\/c2\/x=","hub_url":"https:\/\/hub.example"}"#;
-        assert_eq!(json_get_str(json, "obfuscation_key").unwrap(), "a2V5/c2/x=");
-        assert_eq!(json_get_str(json, "hub_url").unwrap(), "https://hub.example");
-    }
-
-    #[test]
-    fn get_str_missing_key() {
-        let json = r#"{"foo":"bar"}"#;
-        assert!(json_get_str(json, "nope").is_err());
-    }
-
-    #[test]
-    fn get_str_unterminated() {
-        let json = r#"{"foo":"bar"#;
-        assert!(json_get_str(json, "foo").is_err());
-    }
-
-    #[test]
     fn selection_absent_is_whole_share() {
         // No selection at all mirrors everything (plan_sync). The three ways the
         // Kotlin side can spell "no selection": empty string, whitespace, null.
@@ -2131,127 +2025,30 @@ domains = ["youtube.com", "*.youtube.com"]"#;
         assert_eq!(optional_hash(" abc123 "), Some("abc123".to_string()));
     }
 
+    /// Пустое действие по умолчанию (так его шлёт экран правил после
+    /// XR-271) берётся из ядра: разъедься эти два места, правка правил на
+    /// живом туннеле меняла бы заодно и маршрут по умолчанию.
     #[test]
-    fn parse_dns_resolvers_basic() {
-        let json = r#"{"dns_resolvers":["1.1.1.1","8.8.8.8:53","77.88.8.8"]}"#;
-        assert_eq!(parse_dns_resolvers(json), vec!["1.1.1.1", "8.8.8.8:53", "77.88.8.8"]);
+    fn blank_default_action_comes_from_core() {
+        assert_eq!(
+            effective_default_action(""),
+            client_config::DEFAULT_ROUTING_ACTION
+        );
+        assert_eq!(effective_default_action("  "), client_config::DEFAULT_ROUTING_ACTION);
+        assert_eq!(effective_default_action(" proxy "), "proxy");
     }
 
+    /// Массив правил разбирается тот же, что уезжает в конфиг движка; битая
+    /// запись выбрасывается, а не роняет весь список.
     #[test]
-    fn parse_dns_resolvers_missing() {
-        let json = r#"{"server_address":"1.2.3.4"}"#;
-        assert!(parse_dns_resolvers(json).is_empty());
-    }
-
-    #[test]
-    fn parse_dns_resolvers_empty_array() {
-        let json = r#"{"dns_resolvers":[]}"#;
-        assert!(parse_dns_resolvers(json).is_empty());
-    }
-
-    #[test]
-    fn parse_dns_resolvers_with_whitespace() {
-        let json = r#"{"dns_resolvers": [ "1.1.1.1" , "8.8.4.4" ]}"#;
-        assert_eq!(parse_dns_resolvers(json), vec!["1.1.1.1", "8.8.4.4"]);
-    }
-
-    /// Пользовательские правила (LLD-05): массив `user_rules` главнее
-    /// `routing_toml`, порядок сохраняется, домены и CIDR расходятся по полям.
-    #[test]
-    fn parse_config_user_rules_take_precedence_over_toml() {
-        let json = r#"{
-            "server_address": "1.2.3.4",
-            "server_port": 8443,
-            "obfuscation_key": "a2V5",
-            "routing_toml": "default_action = \"proxy\"",
-            "default_action": "direct",
-            "user_rules": [
-                {"action": "direct", "pattern": "youtube.com"},
-                {"action": "proxy", "pattern": "*.github.corp"},
-                {"action": "proxy", "pattern": "10.0.0.0/8"}
-            ]
-        }"#;
-        let cfg = parse_config(json).unwrap();
-        assert_eq!(cfg.routing.default_action, "direct");
-        assert_eq!(cfg.routing.rules.len(), 3);
-        assert_eq!(cfg.routing.rules[0].domains, vec!["youtube.com"]);
-        assert_eq!(cfg.routing.rules[0].action, "direct");
-        assert_eq!(cfg.routing.rules[2].ip_ranges, vec!["10.0.0.0/8"]);
-    }
-
-    /// Пустой список правил это валидный конфиг: только default_action,
-    /// пресет хаба доклеится в движке.
-    #[test]
-    fn parse_config_empty_user_rules() {
-        let json = r#"{
-            "server_address": "1.2.3.4",
-            "server_port": 8443,
-            "obfuscation_key": "a2V5",
-            "default_action": "direct",
-            "user_rules": []
-        }"#;
-        let cfg = parse_config(json).unwrap();
-        assert_eq!(cfg.routing.default_action, "direct");
-        assert!(cfg.routing.rules.is_empty());
-    }
-
-    /// Легаси-конфиг без `user_rules` идёт по старой ветке routing_toml.
-    #[test]
-    fn parse_config_without_user_rules_falls_back_to_toml() {
-        let json = r#"{
-            "server_address": "1.2.3.4",
-            "server_port": 8443,
-            "obfuscation_key": "a2V5",
-            "routing_toml": "default_action = \"proxy\""
-        }"#;
-        let cfg = parse_config(json).unwrap();
-        assert_eq!(cfg.routing.default_action, "proxy");
-    }
-
-    /// Пул серверов в JNI-конфиге (LLD-10): массив объектов, порядок в массиве
-    /// и есть приоритет.
-    #[test]
-    fn parse_servers_basic() {
-        let json = r#"{
-            "server_address": "1.2.3.4",
-            "servers": [
-                {"name": "aeza", "address": "1.2.3.4", "port": 8443},
-                {"name": "timeweb", "address": "5.6.7.8", "port": 9000}
-            ]
-        }"#;
-        let servers = parse_servers(json);
-        assert_eq!(servers.len(), 2);
-        assert_eq!(servers[0].name, "aeza");
-        assert_eq!(servers[0].priority, 0);
-        assert_eq!(servers[1].address, "5.6.7.8");
-        assert_eq!(servers[1].port, 9000);
-        assert_eq!(servers[1].priority, 1);
-    }
-
-    /// Легаси-конфиг без `servers` даёт пустой список: движок строит пул из
-    /// одиночного `server_address`, поведение прежнее.
-    #[test]
-    fn parse_servers_missing_falls_back_to_legacy() {
-        let json = r#"{"server_address":"1.2.3.4","server_port":8443,"obfuscation_key":"a2V5"}"#;
-        assert!(parse_servers(json).is_empty());
-
-        let cfg = parse_config(json).unwrap();
-        assert!(cfg.servers.is_empty());
-        assert_eq!(cfg.server_address, "1.2.3.4");
-    }
-
-    /// Записи без адреса выбрасываются, порт по умолчанию 8443.
-    #[test]
-    fn parse_servers_skips_bad_entries() {
-        let json = r#"{"servers": [
-            {"name": "no-addr"},
-            {"address": "  "},
-            {"address": "9.9.9.9"}
-        ]}"#;
-        let servers = parse_servers(json);
-        assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].address, "9.9.9.9");
-        assert_eq!(servers[0].port, 8443);
+    fn user_rules_json_skips_broken_entries() {
+        let rules = parse_user_rules_json(
+            r#"[{"action":"proxy","pattern":"a.example"},{"pattern":"нет действия"}]"#,
+        )
+        .unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].pattern, "a.example");
+        assert!(parse_user_rules_json("не json").is_err());
     }
 
     /// Подписчик, поставленный вместе с журналом, доводит `warn!` движка до
