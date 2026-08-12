@@ -29,6 +29,14 @@ use crate::session::{relay_session_with_domain, ProtectSocketFn, SessionContext,
 use crate::state::{StateHandle, VpnState};
 use crate::stats::Stats;
 
+/// Буферы smoltcp на одну TCP-сессию: заводятся на каждый SYN и живут, пока
+/// живёт сессия. Вынесены в константы, потому что на них держится бюджет
+/// памяти движка под iOS (LLD-39): расширение NEPacketTunnelProvider не
+/// переживает 50 МБ на процесс, а 128 КиБ на сессию это главная статья
+/// расхода. Меняя размер, смотри `tests/ios_memory_budget.rs`.
+pub const SESSION_RX_BUF: usize = 65535;
+pub const SESSION_TX_BUF: usize = 65535;
+
 /// Ephemeral port counter for unique listen endpoints.
 /// Each smoltcp socket listens on a unique port so multiple SYNs
 /// to the same dst port (e.g. 443) don't conflict.
@@ -672,7 +680,7 @@ async fn run_event_loop(
                 if is_syn && !sessions.contains_key(&orig_key) {
                     // New connection: assign ephemeral port, create listen socket.
                     let eph_port = next_ephemeral_port();
-                    let handle = stack.add_tcp_socket(65535, 65535);
+                    let handle = stack.add_tcp_socket(SESSION_RX_BUF, SESSION_TX_BUF);
                     let socket = stack.tcp_socket_mut(handle);
 
                     if socket.listen(eph_port).is_ok() {
