@@ -140,7 +140,9 @@ pub fn build_config_json(profile: &ClientProfile) -> Result<String, String> {
         .collect();
 
     let modifier = non_blank(&profile.modifier).unwrap_or(DEFAULT_MODIFIER);
-    let salt = profile.salt.filter(|v| *v != 0).unwrap_or(DEFAULT_SALT);
+    // Дефолт только на отсутствующее поле: ноль это законный salt, и подмена
+    // его на что-то своё развела бы клиент с сервером по обфускации молча.
+    let salt = profile.salt.unwrap_or(DEFAULT_SALT);
     let on_server_down = if profile.fail_closed.unwrap_or(true) {
         "block"
     } else {
@@ -619,6 +621,20 @@ mod tests {
         assert_eq!(cfg.modifier, DEFAULT_MODIFIER);
         assert_eq!(cfg.salt, 0xDEAD_BEEF);
         assert_eq!(cfg.server_port, 8443);
+    }
+
+    /// Ноль это значение salt, а не его отсутствие: экран правки сервера
+    /// принимает весь диапазон, включая 0, и подмена дефолтом разводила бы
+    /// клиент с сервером по обфускации без единого слова в журнале.
+    #[test]
+    fn build_keeps_explicit_zero_salt() {
+        let profile = parse_client_profile(
+            r#"{"server_address":"203.0.113.10","obfuscation_key":"a2V5","salt":0}"#,
+        )
+        .unwrap();
+        assert_eq!(profile.salt, Some(0));
+        let cfg = parse_config(&build_config_json(&profile).unwrap()).unwrap();
+        assert_eq!(cfg.salt, 0);
     }
 
     /// Kotlin отдаёт целое как `Long`, и salt из верхней половины `u64`

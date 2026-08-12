@@ -64,8 +64,6 @@ pub struct InviteProfile {
 
 /// Модификатор обфускации, когда приглашение его не назвало.
 const DEFAULT_MODIFIER: &str = "positional_xor_rotate";
-/// Salt по умолчанию.
-const DEFAULT_SALT: u64 = 0xDEAD_BEEF;
 /// Порт сервера по умолчанию.
 const DEFAULT_SERVER_PORT: u16 = 8443;
 
@@ -127,11 +125,10 @@ pub fn profile_from_payload(payload: &InvitePayload, fallback_hub_url: &str) -> 
         } else {
             payload.modifier.trim().to_string()
         },
-        salt: if payload.salt == 0 {
-            DEFAULT_SALT
-        } else {
-            payload.salt
-        },
+        // Salt едет как есть, включая ноль: поле у приглашения обязательное,
+        // без него оно не разбирается вовсе, поэтому нулю тут взяться неоткуда
+        // кроме как из воли выдавшего приглашение.
+        salt: payload.salt,
         hub_url,
         preset: payload.preset.trim().to_string(),
     }
@@ -627,16 +624,25 @@ mod tests {
         assert_eq!(profile.hub_url, "https://hub.fallback");
     }
 
-    /// Приглашение без модификатора и salt получает те же дефолты, что раньше
+    /// Приглашение без модификатора получает тот же дефолт, что раньше
     /// подставляло приложение.
     #[test]
     fn profile_fills_obfuscation_defaults() {
         let mut p = payload("");
         p.modifier = String::new();
-        p.salt = 0;
         let profile = profile_from_payload(&p, "https://hub.fallback");
         assert_eq!(profile.modifier, "positional_xor_rotate");
-        assert_eq!(profile.salt, 0xDEAD_BEEF);
+        assert_eq!(profile.salt, 7);
         assert_eq!(profile.preset, "russia");
+    }
+
+    /// Нулевой salt приглашения едет в профиль как есть: это значение, а не
+    /// пропуск поля (без salt приглашение не разбирается вовсе). Подмена
+    /// дефолтом развела бы клиент с сервером по обфускации молча.
+    #[test]
+    fn profile_keeps_explicit_zero_salt() {
+        let mut p = payload("");
+        p.salt = 0;
+        assert_eq!(profile_from_payload(&p, "https://hub.fallback").salt, 0);
     }
 }
