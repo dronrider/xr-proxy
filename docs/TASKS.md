@@ -31,7 +31,6 @@ R >= 75, P1 при 50-74, P2 при 25-49, P3 при 0-24 (смысл: P0 чин
 
 | ID | Задача | Тип | P | R | Цена | Ссылка |
 |--------|--------|-----|---|---|------|--------|
-| XR-271 | Тонкий клиент перед iOS: инвентаризация бизнес-логики в Kotlin (VpnViewModel, FilesViewModel, ShareRepository, UpdateManager) и перенос переносимого в xr-core, чтобы порт не дублировал её на Swift | task | P3 | 7 (0+0+3+0+4) | L | [tasks/XR-271.md](tasks/XR-271.md) |
 
 ## Backlog
 
@@ -110,7 +109,7 @@ R >= 75, P1 при 50-74, P2 при 25-49, P3 при 0-24 (смысл: P0 чин
 | XR-104 | Команда самообновления агента `xr-share update`: скачать бинарь с хаба, сверить SHA-256, подменить себя и перезапустить службу (на Windows запущенный exe залочен, нужен стейджинг с переименованием); сейчас обновление это повторный install-скрипт руками плюс ручной рестарт службы | task | P3 | 9 (0+5+2+0+2) | M | [xr-share/dist/install.sh](../xr-share/dist/install.sh) |
 | XR-159 | Max-носитель: валидация сквозного канала с реальной РФ-мобилы в шатдаун (стадия 3, оказией, скриптом не воспроизводится). Зависит от XR-157/158 | task | P3 | 9 (0+4+3+0+2) | S | [docs/lld/30-max-carrier.md](lld/30-max-carrier.md) |
 | XR-171 | Автоустановка (ZTP), этап 2: Android-обёртка по SSH поверх xr-setup (ввод host/креды, TOFU host-key, степпер connect->verify; server: приём инвайта -> ServerProfile; router: verify-пинг). Поверх XR-015 и XR-177. iOS: Android-обёртка целиком, на iOS свой путь провижининга | LLD | P3 | 9 (0+5+2+0+2) | M | [docs/lld/13-zero-touch-provisioning.md](lld/13-zero-touch-provisioning.md) |
-| XR-272 | Спайк iOS: сборка xr-core под aarch64-apple-ios, мост вместо JNI (C FFI или UniFFI) и вписывается ли движок в лимит памяти Network Extension. Смежно с XR-085 [после XR-271] | LLD | P3 | 9 (0+0+5+0+4) | M | - |
+| XR-272 | Спайк iOS: сборка xr-core под aarch64-apple-ios, мост вместо JNI (C FFI или UniFFI) и вписывается ли движок в лимит памяти Network Extension. Смежно с XR-085 | LLD | P3 | 9 (0+0+5+0+4) | M | - |
 | XR-012 | Информативный индикатор соединения вместо смайлика | task/LLD | P3 | 8 (0+4+3+0+1) | M | `local-docs/problems.md` (10) |
 | XR-026 | Метрики и графики по парку роутеров (история, тренды, алерты): хаб копит отчёты и отдаёт в Prometheus-формате, поверх VictoriaMetrics + Grafana. Транспорт данных уже в XR-025, только операционные метрики без слежки за доменами | LLD | P3 | 8 (0+3+3+0+2) | L | [docs/lld/18-fleet-metrics-grafana.md](lld/18-fleet-metrics-grafana.md) |
 | XR-065 | Zero-copy фрейминг и 0-RTT: убрать per-frame аллокации (`payload.to_vec()` в mux, свежий `Vec` в `encode_frame`, `copy_within`-компакция) через `bytes::Bytes`/пул буферов; 0-RTT возобновление (Noise IK/тикеты) срезает RTT на стрим и на инициализацию слота. Зависит от XR-061 | task | P3 | 8 (0+4+2+0+2) | L | (LLD позже) |
