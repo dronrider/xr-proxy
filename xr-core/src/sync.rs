@@ -2201,63 +2201,147 @@ mod tests {
 
     // -- write path: upload_file / delete_file (LLD-28) ------------------
 
-    /// Read a full HTTP request from `sock`: the head plus the body named by
-    /// `Content-Length`. Draining the body before the caller answers is what
-    /// keeps [`serve_capture`]/[`serve_capture_json`] from racing a streamed
-    /// `PUT`/`POST`: answering after only the first read let the server shut the
-    /// socket while the client was still writing, and reqwest then failed the
-    /// whole request with "error sending request" (~1 run in 10, XR-142). Returns
-    /// the request text (head + whatever body arrived) for method/path asserts.
-    async fn read_http_request(sock: &mut tokio::net::TcpStream) -> String {
+    /// Дочитать в `buf` очередную порцию из сокета; `false`, если он кончился.
+    async fn read_more(sock: &mut tokio::net::TcpStream, buf: &mut Vec<u8>) -> bool {
         use tokio::io::AsyncReadExt;
-        let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 8192];
-        // First, the head (up to the blank line).
+        match sock.read(&mut chunk).await {
+            Ok(0) | Err(_) => false,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                true
+            }
+        }
+    }
+
+    fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Прочитать из `sock` весь запрос: голову до пустой строки и тело, длину
+    /// которого называет либо `content-length`, либо chunked-разметка. Дочитать
+    /// тело обязан именно мок: ответ и закрытие сокета посреди чужой записи
+    /// оборачиваются RST, и клиент теряет запрос целиком с «error sending
+    /// request» (XR-142, XR-236). Первая правка смотрела только на
+    /// `content-length`, а `upload_file` шлёт файл потоком, то есть chunked и без
+    /// этого заголовка, поэтому тело не дочитывалось вовсе. Возвращает текст
+    /// запроса (голова плюс пришедшее тело) для проверок метода и пути.
+    async fn read_http_request(sock: &mut tokio::net::TcpStream) -> String {
+        let mut buf: Vec<u8> = Vec::new();
         let head_end = loop {
-            match sock.read(&mut chunk).await {
-                Ok(0) | Err(_) => return String::from_utf8_lossy(&buf).into_owned(),
-                Ok(n) => {
-                    buf.extend_from_slice(&chunk[..n]);
-                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        break pos + 4;
-                    }
-                }
+            if let Some(pos) = find_sub(&buf, b"\r\n\r\n") {
+                break pos + 4;
+            }
+            if !read_more(sock, &mut buf).await {
+                return String::from_utf8_lossy(&buf).into_owned();
             }
         };
-        // Then exactly Content-Length body bytes, so the client finishes writing
-        // before we respond.
-        let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
-        let want = head
-            .lines()
-            .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")))
-            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        while buf.len() < head_end + want {
-            match sock.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+        if head.contains("transfer-encoding: chunked") {
+            let mut pos = head_end;
+            loop {
+                let line_end = loop {
+                    if let Some(p) = find_sub(&buf[pos..], b"\r\n") {
+                        break pos + p;
+                    }
+                    if !read_more(sock, &mut buf).await {
+                        return String::from_utf8_lossy(&buf).into_owned();
+                    }
+                };
+                let size = usize::from_str_radix(
+                    String::from_utf8_lossy(&buf[pos..line_end])
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim(),
+                    16,
+                )
+                .unwrap_or(0);
+                // Сам кусок и CRLF за ним; у нулевого куска эти же два байта
+                // закрывают запрос.
+                let need = line_end + 2 + size + 2;
+                while buf.len() < need {
+                    if !read_more(sock, &mut buf).await {
+                        return String::from_utf8_lossy(&buf).into_owned();
+                    }
+                }
+                if size == 0 {
+                    break;
+                }
+                pos = need;
+            }
+        } else {
+            let want = head
+                .lines()
+                .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim() == "content-length"))
+                .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while buf.len() < head_end + want {
+                if !read_more(sock, &mut buf).await {
+                    break;
+                }
             }
         }
         String::from_utf8_lossy(&buf).into_owned()
     }
 
-    /// A canned one-shot HTTP server that captures the request (line + headers +
-    /// body) and answers `status_line`. Returns its address and a channel with
-    /// the request text (enough to assert method/path/headers).
+    /// Ответить и разойтись без RST: ответ целиком, затем FIN своей половины и
+    /// дочитывание того, что клиент ещё дошлёт. Сокет, закрытый с неразобранными
+    /// байтами в приёмном буфере, ядро гасит через RST, и клиент теряет уже
+    /// полученный ответ (XR-236).
+    async fn answer_and_close(sock: &mut tokio::net::TcpStream, resp: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        let _ = sock.write_all(resp).await;
+        let _ = sock.flush().await;
+        let _ = sock.shutdown().await;
+        let mut rest = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while read_more(sock, &mut rest).await {}
+        })
+        .await;
+    }
+
+    /// Мок HTTP-агента для тестов: принимает соединения, пока живёт тест, на
+    /// каждый запрос зовёт `answer` и отвечает его текстом. Приём именно в цикле:
+    /// на один адрес клиент ходит не по разу (проба живости, сверка агента, сама
+    /// операция), а ответ с `connection: close` соединения не переиспользует, и
+    /// мок, принимавший ровно одно, оставлял следующий запрос висеть до таймаута
+    /// (XR-236).
+    fn spawn_http_mock<F>(listener: tokio::net::TcpListener, answer: F)
+    where
+        F: FnMut(&str) -> String + Send + 'static,
+    {
+        let answer = std::sync::Arc::new(std::sync::Mutex::new(answer));
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let answer = answer.clone();
+                tokio::spawn(async move {
+                    let req = read_http_request(&mut sock).await;
+                    let resp = {
+                        let mut answer = answer.lock().unwrap();
+                        answer(&req)
+                    };
+                    answer_and_close(&mut sock, resp.as_bytes()).await;
+                });
+            }
+        });
+    }
+
+    /// Мок с готовым ответом, который захватывает первый пришедший запрос
+    /// (строка, заголовки, тело) и отдаёт его в канал: этого хватает на проверки
+    /// метода, пути и заголовков.
     async fn serve_capture(
         status_line: &'static str,
     ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
-        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let req = read_http_request(&mut sock).await;
-            let resp = format!("{status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
-            let _ = sock.write_all(resp.as_bytes()).await;
-            let _ = sock.shutdown().await;
-            let _ = tx.send(req);
+        let mut tx = Some(tx);
+        spawn_http_mock(listener, move |req| {
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(req.to_string());
+            }
+            format!("{status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
         });
         (addr, rx)
     }
@@ -2318,30 +2402,66 @@ mod tests {
         assert!(req.starts_with("DELETE /S/file/old.txt "), "wrong request line: {req}");
     }
 
+    #[tokio::test]
+    async fn mock_drains_streamed_body_before_answering() {
+        // Загрузка идёт потоком, то есть chunked и без content-length. Мок, что
+        // отвечал по одному content-length, тела не дочитывал и закрывал сокет,
+        // пока клиент ещё писал: приходил RST, и запрос падал целиком с «error
+        // sending request». Тело здесь заведомо больше сокетных буферов, чтобы
+        // гонка стала повторимой, а не одним прогоном из десяти (XR-236).
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("big.bin");
+        let mut payload = "полезная нагрузка ".repeat(60_000);
+        payload.push_str("КОНЕЦ");
+        std::fs::write(&f, payload.as_bytes()).unwrap();
+        let (addr, rx) = serve_capture("HTTP/1.1 201 Created").await;
+        let grant = write_grant(addr, "share:read share:write");
+
+        upload_file(&grant, "big.bin", &f, None, Duration::from_secs(10))
+            .await
+            .expect("streamed upload must survive the mock");
+
+        let req = rx.await.unwrap();
+        assert!(req.starts_with("PUT /S/file/big.bin "), "wrong request line");
+        assert!(req.ends_with("КОНЕЦ\r\n0\r\n\r\n"), "мок ответил, не дочитав тело");
+    }
+
+    #[tokio::test]
+    async fn mock_answers_a_second_request_on_a_new_connection() {
+        // Ответ несёт connection: close, поэтому вторую операцию клиент шлёт по
+        // новому соединению. Мок, принимавший ровно одно, второй запрос не
+        // забирал вовсе, и тот висел до таймаута операции (XR-236).
+        let (addr, rx) = serve_capture("HTTP/1.1 204 No Content").await;
+        let grant = write_grant(addr, "share:read share:write");
+
+        delete_file(&grant, "a.txt", None, Duration::from_secs(3)).await.unwrap();
+        delete_file(&grant, "b.txt", None, Duration::from_secs(3))
+            .await
+            .expect("вторая операция на тот же адрес");
+
+        assert!(rx.await.unwrap().starts_with("DELETE /S/file/a.txt "));
+    }
+
     // -- import path (LLD-29) -------------------------------------------
 
-    /// [`serve_capture`] with a JSON body in the answer (the import routes
-    /// return payloads, not just status lines).
+    /// [`serve_capture`] с телом в ответе: маршруты импорта возвращают полезную
+    /// нагрузку, а не одну строку статуса.
     async fn serve_capture_json(
         status_line: &'static str,
         body: &'static str,
     ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
-        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            // Drain the full request (incl. the POST body) before answering, so a
-            // streamed request never sees the socket close mid-write (XR-142).
-            let req = read_http_request(&mut sock).await;
-            let resp = format!(
+        let mut tx = Some(tx);
+        spawn_http_mock(listener, move |req| {
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(req.to_string());
+            }
+            format!(
                 "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
-            );
-            let _ = sock.write_all(resp.as_bytes()).await;
-            let _ = sock.shutdown().await;
-            let _ = tx.send(req);
+            )
         });
         (addr, rx)
     }
@@ -2976,19 +3096,12 @@ mod tests {
 
     // ── fetch_manifest signature pinning (XR-046) ────────────────────
 
-    /// One-shot canned HTTP server: accepts a single connection, ignores the
-    /// request, answers with `response`. Returns the base URL.
-    async fn serve_once(response: String) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    /// Мок с готовым ответом: отвечает `response` на любой запрос и на любое
+    /// соединение, сколько бы их тест ни открыл. Живёт, пока идёт тест.
+    async fn serve_canned(response: String) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = sock.read(&mut buf).await;
-            let _ = sock.write_all(response.as_bytes()).await;
-            let _ = sock.shutdown().await;
-        });
+        spawn_http_mock(listener, move |_| response.clone());
         format!("http://{addr}")
     }
 
@@ -3023,7 +3136,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_manifest_verifies_pinned_signature() {
         let (key, pub_b64) = agent_key();
-        let url = serve_once(http_response(
+        let url = serve_canned(http_response(
             MANIFEST_BODY,
             &signed_headers(&key, "s1", 1234, MANIFEST_BODY),
         ))
@@ -3043,7 +3156,7 @@ mod tests {
         // empty stays absent rather than becoming an empty string.
         let (key, pub_b64) = agent_key();
         let body = r#"{"entries":[{"path":"Ролик.mp4","size":5,"mtime":1,"sha256":"aa","meta":{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ","source":"Канал","source_url":"https://www.youtube.com/@kanal","published":"2026-07-31"}},{"path":"руками.txt","size":1,"mtime":1,"sha256":"bb"}]}"#;
-        let url = serve_once(http_response(body, &signed_headers(&key, "s1", 1234, body))).await;
+        let url = serve_canned(http_response(body, &signed_headers(&key, "s1", 1234, body))).await;
         let m = fetch_manifest(&url, &test_token("s1"), &pub_b64, Duration::from_secs(5))
             .await
             .unwrap();
@@ -3058,7 +3171,7 @@ mod tests {
         // The same body with the channel swapped in flight fails the pin.
         let forged = body.replace("Канал", "Чужой");
         let url =
-            serve_once(http_response(&forged, &signed_headers(&key, "s1", 1234, body))).await;
+            serve_canned(http_response(&forged, &signed_headers(&key, "s1", 1234, body))).await;
         let err = fetch_manifest(&url, &test_token("s1"), &pub_b64, Duration::from_secs(5))
             .await
             .unwrap_err();
@@ -3073,7 +3186,7 @@ mod tests {
         let (key, pub_b64) = agent_key();
         let forged = MANIFEST_BODY.replace("\"aa\"", "\"bb\"");
         let url =
-            serve_once(http_response(&forged, &signed_headers(&key, "s1", 1234, MANIFEST_BODY)))
+            serve_canned(http_response(&forged, &signed_headers(&key, "s1", 1234, MANIFEST_BODY)))
                 .await;
         let err = fetch_manifest(&url, &test_token("s1"), &pub_b64, Duration::from_secs(5))
             .await
@@ -3086,7 +3199,7 @@ mod tests {
         // A valid manifest of share s2, signed by the same agent, replayed for
         // a request about s1: the share_id binding must reject it.
         let (key, pub_b64) = agent_key();
-        let url = serve_once(http_response(
+        let url = serve_canned(http_response(
             MANIFEST_BODY,
             &signed_headers(&key, "s2", 1234, MANIFEST_BODY),
         ))
@@ -3102,7 +3215,7 @@ mod tests {
         // No signature headers while a key is pinned: either an old agent or a
         // MITM stripping headers; both are refused (fail closed).
         let (_key, pub_b64) = agent_key();
-        let url = serve_once(http_response(MANIFEST_BODY, "")).await;
+        let url = serve_canned(http_response(MANIFEST_BODY, "")).await;
         let err = fetch_manifest(&url, &test_token("s1"), &pub_b64, Duration::from_secs(5))
             .await
             .unwrap_err();
@@ -3113,7 +3226,7 @@ mod tests {
     async fn fetch_manifest_without_pin_skips_verification() {
         // An empty agent_pubkey means there is nothing to verify against; the
         // legacy unverified path must keep working.
-        let url = serve_once(http_response(MANIFEST_BODY, "")).await;
+        let url = serve_canned(http_response(MANIFEST_BODY, "")).await;
         let m = fetch_manifest(&url, &test_token("s1"), "", Duration::from_secs(5))
             .await
             .unwrap();
@@ -3121,27 +3234,6 @@ mod tests {
     }
 
     // -- candidate walk: LAN then public (XR-050) -----------------------
-
-    /// A manifest server that answers *every* connection with the same response,
-    /// so a candidate walk that probes then fetches (two connections to the same
-    /// address) is served. Runs until the test drops it.
-    async fn serve_manifest_forever(response: String) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let response = response.clone();
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    let _ = sock.read(&mut buf).await;
-                    let _ = sock.write_all(response.as_bytes()).await;
-                    let _ = sock.shutdown().await;
-                });
-            }
-        });
-        format!("http://{addr}")
-    }
 
     /// A plain-text HTTP answer with an arbitrary status line: the liveness
     /// handle answers a bare `ok`, not JSON, and a foreign host answers whatever
@@ -3157,24 +3249,13 @@ mod tests {
     /// and serves `other` for every other request. Lets a test put a real agent,
     /// or a stranger convincing enough to reach the operation, behind the probe.
     async fn serve_healthz_then(other: String) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let other = other.clone();
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    let n = sock.read(&mut buf).await.unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let resp = if req.starts_with("GET /healthz ") {
-                        text_response("200 OK", "ok")
-                    } else {
-                        other
-                    };
-                    let _ = sock.write_all(resp.as_bytes()).await;
-                    let _ = sock.shutdown().await;
-                });
+        spawn_http_mock(listener, move |req| {
+            if req.starts_with("GET /healthz ") {
+                text_response("200 OK", "ok")
+            } else {
+                other.clone()
             }
         });
         format!("http://{addr}")
@@ -3185,7 +3266,7 @@ mod tests {
         // The LAN candidate refuses fast; the walk falls through to the reachable
         // public address and fetches from it (the XR-050 hairpin case from outside).
         let (key, pub_b64) = agent_key();
-        let live = serve_manifest_forever(http_response(
+        let live = serve_canned(http_response(
             MANIFEST_BODY,
             &signed_headers(&key, "s1", 1234, MANIFEST_BODY),
         ))
@@ -3206,7 +3287,7 @@ mod tests {
         // there was any fallback, so the probe would have spent that one connection
         // and the real fetch would have found nothing behind the public address.
         let (key, pub_b64) = agent_key();
-        let live = serve_once(http_response(
+        let live = serve_canned(http_response(
             MANIFEST_BODY,
             &signed_headers(&key, "s1", 1234, MANIFEST_BODY),
         ))
@@ -3232,7 +3313,7 @@ mod tests {
             &signed_headers(&key, "s1", 1234, MANIFEST_BODY),
         ))
         .await;
-        let good = serve_manifest_forever(http_response(
+        let good = serve_canned(http_response(
             MANIFEST_BODY,
             &signed_headers(&key, "s1", 1234, MANIFEST_BODY),
         ))
@@ -3252,8 +3333,8 @@ mod tests {
         // next address was never tried. The share is unpinned (a pre-XR-046
         // grant): with a pinned key the same page stops at the signature, so it
         // is the unpinned share that shows the walk breaking.
-        let captive = serve_manifest_forever(text_response("200 OK", "<html>login</html>")).await;
-        let live = serve_manifest_forever(http_response(MANIFEST_BODY, "")).await;
+        let captive = serve_canned(text_response("200 OK", "<html>login</html>")).await;
+        let live = serve_canned(http_response(MANIFEST_BODY, "")).await;
         let candidates = format!("{captive}/s1\n{live}/s1");
         let m = fetch_manifest_relay(&candidates, &test_token("s1"), "", None, Duration::from_secs(5))
             .await
@@ -3267,8 +3348,8 @@ mod tests {
         // 404 on any path; before XR-219 that 404 came back as http_404 and the
         // walk stopped there.
         let (key, pub_b64) = agent_key();
-        let foreign = serve_manifest_forever(text_response("404 Not Found", "not found")).await;
-        let live = serve_manifest_forever(http_response(
+        let foreign = serve_canned(text_response("404 Not Found", "not found")).await;
+        let live = serve_canned(http_response(
             MANIFEST_BODY,
             &signed_headers(&key, "s1", 1234, MANIFEST_BODY),
         ))
@@ -3310,7 +3391,7 @@ mod tests {
         // leg is the share's real path, so the walk must get there; before XR-219
         // it returned the stranger's http_404 and the relay stayed unopened.
         let (_key, pub_b64) = agent_key();
-        let foreign = serve_manifest_forever(text_response("404 Not Found", "not found")).await;
+        let foreign = serve_canned(text_response("404 Not Found", "not found")).await;
         let relay = broken_relay("s1");
         let err = fetch_manifest_relay(
             &format!("{foreign}/s1"),
@@ -3354,29 +3435,16 @@ mod tests {
         share_id: &'static str,
         mutate_status: &'static str,
     ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let manifest = http_response("{\"entries\":[]}", &signed_headers(&key, share_id, 1, "{\"entries\":[]}"));
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let manifest = manifest.clone();
-                let mutate = format!("{mutate_status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    let n = sock.read(&mut buf).await.unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let resp = if req.starts_with("GET") && req.contains("/manifest") {
-                        manifest
-                    } else {
-                        let _ = tx.send(req);
-                        mutate
-                    };
-                    let _ = sock.write_all(resp.as_bytes()).await;
-                    let _ = sock.shutdown().await;
-                });
+        spawn_http_mock(listener, move |req| {
+            if req.starts_with("GET") && req.contains("/manifest") {
+                manifest.clone()
+            } else {
+                let _ = tx.send(req.to_string());
+                format!("{mutate_status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
             }
         });
         (format!("http://{addr}"), rx)
@@ -3442,21 +3510,21 @@ mod tests {
         // Alive is our agent's own answer at /healthz and nothing else: the probe
         // used to accept any HTTP response, and a stranger at the address took the
         // whole operation over (XR-219).
-        let agent = serve_once(text_response("200 OK", "ok")).await;
+        let agent = serve_canned(text_response("200 OK", "ok")).await;
         assert!(direct_reachable(&agent, Duration::from_secs(5)).await);
         // Trailing whitespace from a proxy on the way is still our agent.
-        let padded = serve_once(text_response("200 OK", "ok\n")).await;
+        let padded = serve_canned(text_response("200 OK", "ok\n")).await;
         assert!(direct_reachable(&padded, Duration::from_secs(5)).await);
 
-        let captive = serve_once(text_response("200 OK", "<html>login</html>")).await;
+        let captive = serve_canned(text_response("200 OK", "<html>login</html>")).await;
         assert!(!direct_reachable(&captive, Duration::from_secs(5)).await);
-        let foreign = serve_once(text_response("404 Not Found", "not found")).await;
+        let foreign = serve_canned(text_response("404 Not Found", "not found")).await;
         assert!(!direct_reachable(&foreign, Duration::from_secs(5)).await);
-        let unauthorized = serve_once(text_response("401 Unauthorized", "")).await;
+        let unauthorized = serve_canned(text_response("401 Unauthorized", "")).await;
         assert!(!direct_reachable(&unauthorized, Duration::from_secs(5)).await);
         // A stub whose body happens to read `ok` under an error status is not
         // the handle answering either: the status is checked, not just the body.
-        let stub = serve_once(text_response("503 Service Unavailable", "ok")).await;
+        let stub = serve_canned(text_response("503 Service Unavailable", "ok")).await;
         assert!(!direct_reachable(&stub, Duration::from_secs(5)).await);
     }
 
@@ -3464,17 +3532,12 @@ mod tests {
     async fn probe_goes_to_host_root_not_share() {
         // The handle is the agent's, not the share's: /healthz sits at the host
         // root, so the share_id in the base URL must be dropped from the probe.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 4096];
-            let n = sock.read(&mut buf).await.unwrap_or(0);
-            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string());
-            let _ = sock.write_all(text_response("200 OK", "ok").as_bytes()).await;
-            let _ = sock.shutdown().await;
+        spawn_http_mock(listener, move |req| {
+            let _ = tx.send(req.lines().next().unwrap_or("").to_string());
+            text_response("200 OK", "ok")
         });
         assert!(direct_reachable(&format!("http://{addr}/s1"), Duration::from_secs(5)).await);
         let line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -3506,26 +3569,19 @@ mod tests {
 
     // ── sync_share_selected with a persistent index (XR-098) ─────────
 
-    /// Multi-request sibling of [`serve_once`]: answers `/manifest` with
+    /// Multi-request sibling of [`serve_canned`]: answers `/manifest` with
     /// `manifest_body` and any other GET (a `/file/...` download) with
     /// `file_body`, for as many connections as the test makes.
     async fn serve_share(manifest_body: String, file_body: &'static str) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
-                let mut buf = [0u8; 4096];
-                let n = sock.read(&mut buf).await.unwrap_or(0);
-                let body = if buf[..n].starts_with(b"GET /manifest") {
-                    manifest_body.clone()
-                } else {
-                    file_body.to_string()
-                };
-                let _ = sock.write_all(http_response(&body, "").as_bytes()).await;
-                let _ = sock.shutdown().await;
-            }
+        spawn_http_mock(listener, move |req| {
+            let body = if req.starts_with("GET /manifest") {
+                manifest_body.clone()
+            } else {
+                file_body.to_string()
+            };
+            http_response(&body, "")
         });
         format!("http://{addr}")
     }
