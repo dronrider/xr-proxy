@@ -2225,15 +2225,17 @@ mod tests {
     /// request» (XR-142, XR-236). Первая правка смотрела только на
     /// `content-length`, а `upload_file` шлёт файл потоком, то есть chunked и без
     /// этого заголовка, поэтому тело не дочитывалось вовсе. Возвращает текст
-    /// запроса (голова плюс пришедшее тело) для проверок метода и пути.
-    async fn read_http_request(sock: &mut tokio::net::TcpStream) -> String {
+    /// запроса (голова плюс тело) для проверок метода и пути, а на запросе,
+    /// который дочитать не удалось, отдаёт `None`: отвечать на такой нельзя,
+    /// иначе тест зеленеет на поломке вместо того, чтобы её показать.
+    async fn read_http_request(sock: &mut tokio::net::TcpStream) -> Option<String> {
         let mut buf: Vec<u8> = Vec::new();
         let head_end = loop {
             if let Some(pos) = find_sub(&buf, b"\r\n\r\n") {
                 break pos + 4;
             }
             if !read_more(sock, &mut buf).await {
-                return String::from_utf8_lossy(&buf).into_owned();
+                return None;
             }
         };
         let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
@@ -2245,9 +2247,11 @@ mod tests {
                         break pos + p;
                     }
                     if !read_more(sock, &mut buf).await {
-                        return String::from_utf8_lossy(&buf).into_owned();
+                        return None;
                     }
                 };
+                // Размер вне шестнадцатеричной записи это битая разметка, а не
+                // конец тела: разойтись молча честнее, чем ответить на обрывок.
                 let size = usize::from_str_radix(
                     String::from_utf8_lossy(&buf[pos..line_end])
                         .split(';')
@@ -2256,13 +2260,13 @@ mod tests {
                         .trim(),
                     16,
                 )
-                .unwrap_or(0);
+                .ok()?;
                 // Сам кусок и CRLF за ним; у нулевого куска эти же два байта
                 // закрывают запрос.
                 let need = line_end + 2 + size + 2;
                 while buf.len() < need {
                     if !read_more(sock, &mut buf).await {
-                        return String::from_utf8_lossy(&buf).into_owned();
+                        return None;
                     }
                 }
                 if size == 0 {
@@ -2278,11 +2282,11 @@ mod tests {
                 .unwrap_or(0);
             while buf.len() < head_end + want {
                 if !read_more(sock, &mut buf).await {
-                    break;
+                    return None;
                 }
             }
         }
-        String::from_utf8_lossy(&buf).into_owned()
+        Some(String::from_utf8_lossy(&buf).into_owned())
     }
 
     /// Ответить и разойтись без RST: ответ целиком, затем FIN своей половины и
@@ -2316,7 +2320,7 @@ mod tests {
             while let Ok((mut sock, _)) = listener.accept().await {
                 let answer = answer.clone();
                 tokio::spawn(async move {
-                    let req = read_http_request(&mut sock).await;
+                    let Some(req) = read_http_request(&mut sock).await else { return };
                     let resp = {
                         let mut answer = answer.lock().unwrap();
                         answer(&req)
@@ -2440,6 +2444,35 @@ mod tests {
             .expect("вторая операция на тот же адрес");
 
         assert!(rx.await.unwrap().starts_with("DELETE /S/file/a.txt "));
+    }
+
+    #[tokio::test]
+    async fn mock_stays_silent_on_a_broken_chunked_body() {
+        // Битая разметка кусков это не конец тела. Прежний разбор принимал
+        // нечитаемый размер за нулевой и потом ждал недостающих байтов, пока не
+        // кончится прогон, то есть поломка клиента оборачивалась висящим тестом
+        // без единого слова о причине. Теперь мок расходится молча (XR-236).
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (addr, _rx) = serve_capture("HTTP/1.1 201 Created").await;
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(
+            b"PUT /S/file/a.txt HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\n\r\nZZ\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut answer = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut answer))
+            .await
+            .expect("мок не разошёлся с клиентом за пять секунд")
+            .unwrap_or(0);
+
+        assert_eq!(
+            n,
+            0,
+            "мок ответил на недочитанное тело: {}",
+            String::from_utf8_lossy(&answer[..n])
+        );
     }
 
     // -- import path (LLD-29) -------------------------------------------
