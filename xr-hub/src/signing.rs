@@ -1,22 +1,10 @@
 use anyhow::{Context, Result};
 use base64::Engine;
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use serde::Serialize;
-use xr_proto::config::RoutingConfig;
-use xr_proto::preset::Preset;
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use xr_proto::preset::{canonical_json, Preset};
 
 pub struct SigningContext {
     pub signing_key: SigningKey,
-}
-
-/// Canonical form of a preset for signing (without the signature field).
-#[derive(Serialize)]
-struct CanonicalPreset<'a> {
-    description: &'a str,
-    name: &'a str,
-    rules: &'a RoutingConfig,
-    updated_at: &'a str,
-    version: u64,
 }
 
 impl SigningContext {
@@ -47,43 +35,14 @@ impl SigningContext {
     }
 }
 
-/// Verify a preset's signature against a public key.
-#[allow(dead_code)]
-pub fn verify_preset(preset: &Preset, verifying_key: &VerifyingKey) -> Result<bool> {
-    let sig_str = match &preset.signature {
-        Some(s) => s,
-        None => return Ok(false),
-    };
-    let sig_bytes = base64::engine::general_purpose::STANDARD
-        .decode(sig_str)
-        .context("decoding signature base64")?;
-    let signature = ed25519_dalek::Signature::from_bytes(
-        &sig_bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("signature must be 64 bytes"))?,
-    );
-    let bytes = canonical_json(preset);
-    Ok(verifying_key.verify(&bytes, &signature).is_ok())
-}
-
-/// Deterministic JSON for signing: fields in alphabetical order, no signature.
-fn canonical_json(preset: &Preset) -> Vec<u8> {
-    let canonical = CanonicalPreset {
-        description: &preset.description,
-        name: &preset.name,
-        rules: &preset.rules,
-        updated_at: &preset.updated_at,
-        version: preset.version,
-    };
-    // serde_json serializes struct fields in declaration order.
-    // CanonicalPreset fields are declared alphabetically.
-    serde_json::to_vec(&canonical).expect("canonical JSON serialization cannot fail")
-}
+// Канонизация и проверка подписи живут в xr-proto рядом с Preset (XR-207):
+// хаб подписывает, клиенты сверяют, реализация одна на обе стороны.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use xr_proto::config::{RoutingConfig, RoutingRule};
+    use xr_proto::preset::verify_preset;
 
     fn test_preset() -> Preset {
         Preset {
@@ -106,37 +65,13 @@ mod tests {
     }
 
     #[test]
-    fn canonical_json_is_deterministic() {
-        let p = test_preset();
-        let a = canonical_json(&p);
-        let b = canonical_json(&p);
-        assert_eq!(a, b);
-    }
-
-    #[test]
     fn sign_and_verify_roundtrip() {
         let key = SigningKey::generate(&mut rand::thread_rng());
         let ctx = SigningContext { signing_key: key };
         let mut preset = test_preset();
         let sig = ctx.sign_preset(&preset);
         preset.signature = Some(sig);
-        assert!(verify_preset(&preset, &ctx.verifying_key()).unwrap());
-    }
-
-    /// XR-117: имя группы у правила это часть подписываемых данных, а его
-    /// отсутствие ничего к ним не добавляет. Подписи пресетов, выданные до
-    /// появления поля, поэтому остаются действительными.
-    #[test]
-    fn rule_name_enters_canonical_json_only_when_set() {
-        let preset = test_preset();
-        assert_eq!(
-            String::from_utf8(canonical_json(&preset)).unwrap(),
-            r#"{"description":"Test preset","name":"russia","rules":{"default_action":"direct","rules":[{"action":"proxy","domains":["youtube.com"],"ip_ranges":[],"geoip":[]}]},"updated_at":"2026-01-01T00:00:00Z","version":1}"#
-        );
-
-        let mut named = test_preset();
-        named.rules.rules[0].name = Some("YouTube".into());
-        assert_ne!(canonical_json(&preset), canonical_json(&named));
+        assert_eq!(verify_preset(&preset, &ctx.verifying_key()), Ok(true));
     }
 
     /// Переименование группы это правка пресета, и старая подпись под ней
@@ -148,10 +83,10 @@ mod tests {
         let mut preset = test_preset();
         preset.rules.rules[0].name = Some("YouTube".into());
         preset.signature = Some(ctx.sign_preset(&preset));
-        assert!(verify_preset(&preset, &ctx.verifying_key()).unwrap());
+        assert_eq!(verify_preset(&preset, &ctx.verifying_key()), Ok(true));
 
         preset.rules.rules[0].name = Some("Видео".into());
-        assert!(!verify_preset(&preset, &ctx.verifying_key()).unwrap());
+        assert_eq!(verify_preset(&preset, &ctx.verifying_key()), Ok(false));
     }
 
     #[test]
@@ -161,6 +96,6 @@ mod tests {
         let mut preset = test_preset();
         preset.signature = Some(ctx.sign_preset(&preset));
         preset.version = 999;
-        assert!(!verify_preset(&preset, &ctx.verifying_key()).unwrap());
+        assert_eq!(verify_preset(&preset, &ctx.verifying_key()), Ok(false));
     }
 }
