@@ -88,10 +88,14 @@ pub struct VpnConfig {
     pub hub_preset: Option<String>,
     pub hub_cache_dir: Option<String>,
     /// Seconds between background preset refresh attempts (default 300).
-    /// Same semantic as `xr-client` — hot-swaps active Router when preset
-    /// version changes on the hub. Ignored if `hub_url`/`hub_preset`/
-    /// `hub_cache_dir` are not all set.
+    /// Same semantic as `xr-client` and hot-swaps the active Router when
+    /// the preset version changes on the hub. Ignored if `hub_url`/
+    /// `hub_preset`/`hub_cache_dir` are not all set.
     pub hub_refresh_interval_secs: Option<u64>,
+    /// Публичный ключ проверки подписи пресета (XR-207), base64. Ключ задан:
+    /// пресет без подписи или с неверной подписью не применяется, движок
+    /// живёт на прежних правилах. Ключа нет: пресет хаба доверяется целиком.
+    pub hub_trusted_public_key: Option<String>,
     /// Optional host-OS resolver for direct-mode fake-IP resolution.
     /// On Android it should call `Network.getAllByName()` on the underlying
     /// non-VPN network. When set, it's tried before the UDP:53 fallback.
@@ -219,10 +223,12 @@ impl VpnEngine {
             &self.config.hub_preset,
             &self.config.hub_cache_dir,
         ) {
+            crate::presets::warn_if_unverified(self.config.hub_trusted_public_key.as_deref());
             let mut cache = crate::presets::PresetCache::new(
                 std::path::Path::new(cache_dir),
                 hub_url,
                 preset_name,
+                self.config.hub_trusted_public_key.as_deref(),
             );
             cache.load_from_disk();
             // Try short fetch (2s timeout) at startup.
@@ -376,6 +382,7 @@ impl VpnEngine {
             self.config.hub_cache_dir.clone(),
         ) {
             let interval_secs = self.config.hub_refresh_interval_secs.unwrap_or(300);
+            let trusted_key = self.config.hub_trusted_public_key.clone();
             let local_overrides = live_overrides.clone();
             let geoip_path_owned = self.config.geoip_path.clone();
             let ctx_bg = ctx.clone();
@@ -385,6 +392,7 @@ impl VpnEngine {
                     std::path::Path::new(&cache_dir),
                     &hub_url,
                     &preset_name,
+                    trusted_key.as_deref(),
                 );
                 cache.load_from_disk();
                 crate::presets::watch_loop(
@@ -491,6 +499,7 @@ impl VpnEngine {
                     std::path::Path::new(cache_dir),
                     hub_url,
                     preset_name,
+                    self.config.hub_trusted_public_key.as_deref(),
                 );
                 cache.load_from_disk();
                 Some(cache)
@@ -1171,6 +1180,7 @@ mod tests {
             hub_preset: None,
             hub_cache_dir: None,
             hub_refresh_interval_secs: None,
+            hub_trusted_public_key: None,
             system_resolver: None,
             mux_pool_size: 1,
         }

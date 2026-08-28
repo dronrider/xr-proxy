@@ -78,6 +78,10 @@ pub struct ClientProfile {
     pub hub_preset: String,
     #[serde(default)]
     pub hub_cache_dir: String,
+    /// Публичный ключ проверки подписи пресета (XR-207): его кладёт в профиль
+    /// инвайт (TOFU на apply), и дальше движок сверяет им каждый пресет хаба.
+    #[serde(default)]
+    pub trusted_public_key: String,
     /// Мои правила поверх пресета (LLD-05), в порядке пользователя. Битая
     /// запись выбрасывается, а не роняет весь профиль: остаться без туннеля
     /// из-за одного правила хуже, чем поехать без него.
@@ -178,6 +182,11 @@ pub fn build_config_json(profile: &ClientProfile) -> Result<String, String> {
             "hub_refresh_interval_secs".into(),
             HUB_REFRESH_INTERVAL_SECS.into(),
         );
+        // Ключ проверки едет тем же блоком: без него пресеты просто доверяются
+        // как раньше, а пустая строка значила бы ключ задан и роняла проверку.
+        if let Some(key) = non_blank(&profile.trusted_public_key) {
+            obj.insert("hub_trusted_public_key".into(), key.into());
+        }
     }
 
     Ok(config.to_string())
@@ -341,6 +350,7 @@ pub fn parse_config(json: &str) -> Result<VpnConfig, String> {
     let hub_preset = get_str("hub_preset").ok();
     let hub_cache_dir = get_str("hub_cache_dir").ok();
     let hub_refresh_interval_secs = get_num("hub_refresh_interval_secs").ok();
+    let hub_trusted_public_key = get_str("hub_trusted_public_key").ok();
     let mux_pool_size = get_num("mux_pool_size").map(|v| v as usize).unwrap_or(0);
 
     let dns_resolvers = parse_dns_resolvers(json);
@@ -363,6 +373,7 @@ pub fn parse_config(json: &str) -> Result<VpnConfig, String> {
         hub_preset,
         hub_cache_dir,
         hub_refresh_interval_secs,
+        hub_trusted_public_key,
         // Ставится при старте движка, не из JSON: резолвер это колбэк
         // платформы, а не значение конфига.
         system_resolver: None,
@@ -596,6 +607,26 @@ mod tests {
         let cfg = parse_config(&build_config_json(&half).unwrap()).unwrap();
         assert!(cfg.hub_url.is_none());
         assert!(cfg.hub_preset.is_none());
+    }
+
+    /// Ключ проверки пресета (XR-207) едет из профиля в конфиг движка тем же
+    /// блоком хаба. Без ключа поля просто нет: пустая строка значила бы
+    /// «ключ задан» и отбраковывала бы каждый пресет.
+    #[test]
+    fn hub_trusted_key_travels_with_hub_fields() {
+        let with_key = parse_client_profile(&profile_json(
+            r#","hub_url":"https://hub.example","hub_preset":"russia","hub_cache_dir":"/data/presets","trusted_public_key":"a2V5""#,
+        ))
+        .unwrap();
+        let cfg = parse_config(&build_config_json(&with_key).unwrap()).unwrap();
+        assert_eq!(cfg.hub_trusted_public_key.as_deref(), Some("a2V5"));
+
+        let without_key = parse_client_profile(&profile_json(
+            r#","hub_url":"https://hub.example","hub_preset":"russia","hub_cache_dir":"/data/presets","trusted_public_key":"  ""#,
+        ))
+        .unwrap();
+        let cfg = parse_config(&build_config_json(&without_key).unwrap()).unwrap();
+        assert!(cfg.hub_trusted_public_key.is_none(), "пустой ключ не должен попадать в конфиг");
     }
 
     /// Резолверы системы чистятся до сборки: свой же fake-DNS туннеля,

@@ -3,8 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use ed25519_dalek::VerifyingKey;
 use xr_proto::config::RoutingConfig;
-use xr_proto::preset::{Preset, PresetSummary};
+use xr_proto::preset::{decode_verifying_key, verify_preset, Preset, PresetSummary};
 use xr_proto::user_rule::UserRule;
 
 /// Исход [`PresetCache::refresh`]: обновились до новой версии либо локальная
@@ -32,15 +33,29 @@ pub struct PresetCache {
     hub_url: String,
     preset_name: String,
     cached: Option<Preset>,
+    /// Публичный ключ проверки подписи (XR-207) в том виде, в каком его
+    /// назвал конфиг или профиль. Разбирается на каждую проверку: проверки
+    /// редки (новая версия пресета, чтение кэша), а хранение сырой строки
+    /// держит кэш и конфиг в одинаковых терминах.
+    trusted_public_key: Option<String>,
 }
 
 impl PresetCache {
-    pub fn new(cache_dir: &Path, hub_url: &str, preset_name: &str) -> Self {
+    pub fn new(
+        cache_dir: &Path,
+        hub_url: &str,
+        preset_name: &str,
+        trusted_public_key: Option<&str>,
+    ) -> Self {
         Self {
             cache_dir: cache_dir.to_path_buf(),
             hub_url: hub_url.trim_end_matches('/').to_string(),
             preset_name: preset_name.to_string(),
             cached: None,
+            trusted_public_key: trusted_public_key
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .map(str::to_string),
         }
     }
 
@@ -53,6 +68,16 @@ impl PresetCache {
         match std::fs::read_to_string(&path) {
             Ok(data) => match serde_json::from_str::<Preset>(&data) {
                 Ok(preset) => {
+                    if let Err(e) =
+                        verify_trusted(&preset, self.trusted_public_key.as_deref())
+                    {
+                        tracing::warn!(
+                            "cached preset {} rejected: {} (kept on disk, not applied)",
+                            path.display(),
+                            e
+                        );
+                        return None;
+                    }
                     tracing::info!(
                         "loaded cached preset '{}' v{} from {}",
                         preset.name,
@@ -137,6 +162,16 @@ impl PresetCache {
             .await
             .map_err(|e| format!("bad preset: {}", e))?;
 
+        if let Err(e) = verify_trusted(&preset, self.trusted_public_key.as_deref()) {
+            tracing::warn!(
+                "preset '{}' v{} from hub rejected: {}",
+                preset.name,
+                preset.version,
+                e
+            );
+            return Err(e);
+        }
+
         tracing::info!(
             "fetched preset '{}' v{} from hub",
             preset.name,
@@ -190,6 +225,16 @@ impl PresetCache {
             .json()
             .await
             .map_err(|e| format!("bad preset: {}", e))?;
+
+        if let Err(e) = verify_trusted(&preset, self.trusted_public_key.as_deref()) {
+            tracing::warn!(
+                "preset '{}' v{} from hub rejected: {}",
+                preset.name,
+                preset.version,
+                e
+            );
+            return Err(e);
+        }
 
         tracing::info!(
             "preset '{}' v{} received from hub (long-poll)",
@@ -298,21 +343,68 @@ fn next_backoff(current: Duration, cap: Duration) -> Duration {
     }
 }
 
+/// Прогнать пресет через проверку подписи (XR-207). Общий фильтр всех точек
+/// приёма: сетевой фетч, ожидание изменения, дисковый кэш и прогрев
+/// онбордингом. Ключ не задан, пресет принимается как раньше; ключ задан,
+/// пресет без подписи или с неверной подписью отбраковывается с причиной.
+/// Неразборная строка ключа тоже отбраковывает пресет: опечатка в конфиге
+/// не должна молча выключать проверку.
+pub(crate) fn verify_trusted(
+    preset: &Preset,
+    trusted_public_key: Option<&str>,
+) -> Result<(), String> {
+    let Some(key_b64) = trusted_public_key.map(str::trim).filter(|k| !k.is_empty()) else {
+        return Ok(());
+    };
+    let key: VerifyingKey =
+        decode_verifying_key(key_b64).map_err(|e| format!("trusted key: {e}"))?;
+    match verify_preset(preset, &key) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("signature: preset is unsigned or the signature is wrong".into()),
+        Err(e) => Err(format!("signature: {e}")),
+    }
+}
+
+/// Предупреждение на старт без ключа проверки (XR-207): пресет хаба тогда
+/// доверяется целиком, и подменённый хаб разворачивает трафик напрямую.
+/// Печатается один раз стартом клиента, а не каждой конструкцией кэша.
+pub fn warn_if_unverified(trusted_public_key: Option<&str>) {
+    let blank = trusted_public_key.map(str::trim).unwrap_or("").is_empty();
+    if blank {
+        tracing::warn!(
+            "hub presets are not signature-verified: set trusted_public_key \
+             (the public half of the hub [signing] key) to reject tampered presets"
+        );
+    }
+}
+
 /// Прочитать кэш пресета для экрана правил: `<cache_dir>/<name>.json`.
-/// `None`, когда файла нет или он не читается.
+/// `None`, когда файла нет или он не читается. Пресет проходит ту же
+/// проверку подписи, что и в [`PresetCache`] (XR-207): карточка и превью
+/// не должны показывать то, что движок применять откажется.
 ///
 /// Кэш пишет только ядро (apply инвайта, фоновый рефреш, кнопка «Обновить
 /// сейчас»), и раньше приложение лезло в него своим разбором, то есть знало
 /// внутренний формат чужого файла. Теперь наружу отдаётся ровно то, что нужно
 /// карточке, и формат кэша остаётся делом ядра (XR-271).
-pub fn read_cached(cache_dir: &Path, name: &str) -> Option<Preset> {
+pub fn read_cached(
+    cache_dir: &Path,
+    name: &str,
+    trusted_public_key: Option<&str>,
+) -> Option<Preset> {
     if name.trim().is_empty() {
         return None;
     }
     let path = cache_dir.join(format!("{}.json", name));
     let data = std::fs::read_to_string(&path).ok()?;
     match serde_json::from_str::<Preset>(&data) {
-        Ok(preset) => Some(preset),
+        Ok(preset) => match verify_trusted(&preset, trusted_public_key) {
+            Ok(()) => Some(preset),
+            Err(e) => {
+                tracing::warn!("cached preset {} rejected: {}", path.display(), e);
+                None
+            }
+        },
         Err(e) => {
             tracing::warn!("unreadable preset cache {}: {}", path.display(), e);
             None
@@ -322,8 +414,12 @@ pub fn read_cached(cache_dir: &Path, name: &str) -> Option<Preset> {
 
 /// Тот же кэш, свёрнутый в JSON для обвязки платформы: имя, версия, дата,
 /// действие по умолчанию и группы правил.
-pub fn cached_preset_json(cache_dir: &Path, name: &str) -> Option<String> {
-    let preset = read_cached(cache_dir, name)?;
+pub fn cached_preset_json(
+    cache_dir: &Path,
+    name: &str,
+    trusted_public_key: Option<&str>,
+) -> Option<String> {
+    let preset = read_cached(cache_dir, name, trusted_public_key)?;
     let rules: Vec<serde_json::Value> = preset
         .rules
         .rules
@@ -581,7 +677,7 @@ mod tests {
             }
         });
 
-        let mut cache = PresetCache::new(dir.path(), &url, "russia");
+        let mut cache = PresetCache::new(dir.path(), &url, "russia", None);
         let first = cache.wait_for_update(Duration::from_secs(1)).await.unwrap();
         let second = cache.wait_for_update(Duration::from_secs(1)).await.unwrap();
 
@@ -617,7 +713,7 @@ mod tests {
             ))
         });
 
-        let mut cache = PresetCache::new(dir.path(), &url, "russia");
+        let mut cache = PresetCache::new(dir.path(), &url, "russia", None);
         let err = cache
             .wait_for_update(Duration::from_secs(1))
             .await
@@ -633,7 +729,7 @@ mod tests {
             Some("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string())
         });
 
-        let mut cache = PresetCache::new(dir.path(), &url, "russia");
+        let mut cache = PresetCache::new(dir.path(), &url, "russia", None);
         let err = cache
             .wait_for_update(Duration::from_secs(1))
             .await
@@ -656,7 +752,7 @@ mod tests {
             }
         });
 
-        let cache = PresetCache::new(dir.path(), &url, "russia");
+        let cache = PresetCache::new(dir.path(), &url, "russia", None);
         let (rules_tx, mut rules_rx) = tokio::sync::mpsc::unbounded_channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
@@ -707,7 +803,7 @@ mod tests {
             }
         });
 
-        let cache = PresetCache::new(dir.path(), &url, "russia");
+        let cache = PresetCache::new(dir.path(), &url, "russia", None);
         let (rules_tx, mut rules_rx) = tokio::sync::mpsc::unbounded_channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
@@ -825,7 +921,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         PresetCache::write_to_disk(dir.path(), &sample_preset()).unwrap();
 
-        let json = cached_preset_json(dir.path(), "russia").expect("кэш не прочитан");
+        let json = cached_preset_json(dir.path(), "russia", None).expect("кэш не прочитан");
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["name"], "russia");
         assert_eq!(value["version"], 7);
@@ -841,9 +937,10 @@ mod tests {
     #[test]
     fn cached_preset_json_missing_is_none() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(cached_preset_json(dir.path(), "").is_none());
-        assert!(cached_preset_json(dir.path(), "russia").is_none());
+        assert!(cached_preset_json(dir.path(), "", None).is_none());
+        assert!(cached_preset_json(dir.path(), "russia", None).is_none());
         std::fs::write(dir.path().join("broken.json"), "{ не json").unwrap();
-        assert!(cached_preset_json(dir.path(), "broken").is_none());
+        assert!(cached_preset_json(dir.path(), "broken", None).is_none());
     }
+
 }

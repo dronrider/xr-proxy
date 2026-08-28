@@ -305,17 +305,29 @@ pub async fn apply_invite(
         }
     };
 
-    // 3. Pre-warm the preset cache, best-effort.
+    // 3. Pre-warm the preset cache, best-effort. Пресет сверяется с ключом,
+    // полученным шагом выше (XR-207): кэш и ключ профиля тогда сходятся друг
+    // с другом, а дальнейшие обновления движок проверяет уже этим ключом.
+    // Хаб без [signing] ключа не отдал, проверки нет, поведение прежнее.
     let preset_url = format!("{}/api/v1/presets/{}", hub, preset_name);
     let preset_cached = match client.get(&preset_url).send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<Preset>().await {
-            Ok(preset) => match PresetCache::write_to_disk(cache_dir, &preset) {
-                Ok(()) => true,
-                Err(e) => {
-                    errors.push(format!("preset cache write: {e}"));
+            Ok(preset) => {
+                if let Err(e) =
+                    crate::presets::verify_trusted(&preset, public_key.as_deref())
+                {
+                    errors.push(format!("preset signature: {e}"));
                     false
+                } else {
+                    match PresetCache::write_to_disk(cache_dir, &preset) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            errors.push(format!("preset cache write: {e}"));
+                            false
+                        }
+                    }
                 }
-            },
+            }
             Err(e) => {
                 errors.push(format!("preset parse: {e}"));
                 false
@@ -344,13 +356,14 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     use super::*;
 
     const TOKEN: &str = "abcdefghij0123456789AB";
-    const PUBLIC_KEY: &str = "3b5f8c1d2e4a6b7c8d9e0f1a2b3c4d5e";
     const PAYLOAD: &str = r#"{"server_address":"203.0.113.10","server_port":8443,
         "obfuscation_key":"a2V5","modifier":"positional_xor_rotate","salt":7,
         "preset":"russia","hub_url":"https://hub.example"}"#;
@@ -373,23 +386,54 @@ mod tests {
     /// в тест попадает и заголовок запроса, и разбор ответа целиком.
     struct FakeHub {
         url: String,
+        /// Ключ, который хаб отдаёт на `/api/v1/public-key`. Пресет подписан
+        /// парой к нему (XR-207): прогрев кэша в тесте проходит проверку так
+        /// же, как на живом хабе с секцией [signing].
+        public_key: String,
         seen: Arc<Mutex<Vec<SeenRequest>>>,
+    }
+
+    /// Ключи мок-хаба из фиксированного сида: подписи в тестах стабильны.
+    fn hub_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// PRESET, подписанный ключом мок-хаба.
+    fn signed_preset_body() -> String {
+        let mut preset: Preset = serde_json::from_str(PRESET).unwrap();
+        let signature = hub_signing_key().sign(&xr_proto::preset::canonical_json(&preset));
+        preset.signature = Some(b64(&signature.to_bytes()));
+        serde_json::to_string(&preset).unwrap()
     }
 
     impl FakeHub {
         /// `claim_bodies` это очередь тел на последовательные claim'ы.
         async fn start(claim_bodies: Vec<&'static str>) -> Self {
+            Self::start_with_preset(claim_bodies, signed_preset_body()).await
+        }
+
+        /// Хаб с произвольным телом пресета: тестам отбраковки нужен
+        /// неподписанный пресет при живой ручке ключа.
+        async fn start_with_preset(claim_bodies: Vec<&'static str>, preset_body: String) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
+            let public_key = b64(hub_signing_key().verifying_key().as_bytes());
             let seen = Arc::new(Mutex::new(Vec::new()));
             let bodies: VecDeque<String> = claim_bodies.into_iter().map(String::from).collect();
             let bodies = Arc::new(Mutex::new(bodies));
 
             let seen_task = seen.clone();
+            let public_key_task = public_key.clone();
             tokio::spawn(async move {
                 while let Ok((mut sock, _)) = listener.accept().await {
                     let seen = seen_task.clone();
                     let bodies = bodies.clone();
+                    let public_key_task = public_key_task.clone();
+                    let preset_body = preset_body.clone();
                     tokio::spawn(async move {
                         let mut head = Vec::new();
                         let mut chunk = [0u8; 1024];
@@ -425,9 +469,9 @@ mod tests {
                         } else if path.starts_with("/api/v1/invite/") {
                             ("application/json", INFO.to_string())
                         } else if path.ends_with("/public-key") {
-                            ("text/plain", PUBLIC_KEY.to_string())
+                            ("text/plain", public_key_task.clone())
                         } else {
-                            ("application/json", PRESET.to_string())
+                            ("application/json", preset_body.clone())
                         };
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -439,7 +483,7 @@ mod tests {
                 }
             });
 
-            FakeHub { url, seen }
+            FakeHub { url, public_key, seen }
         }
 
         fn claims(&self) -> Vec<SeenRequest> {
@@ -554,10 +598,33 @@ mod tests {
         let result = apply(&hub, dir.path()).await;
 
         assert_eq!(result.payload.expect("нет payload").server_port, 8443);
-        assert_eq!(result.public_key.as_deref(), Some(PUBLIC_KEY));
+        assert_eq!(result.public_key.as_deref(), Some(hub.public_key.as_str()));
         assert!(result.preset_cached, "пресет не лёг в кэш: {:?}", result.errors);
         assert!(result.errors.is_empty(), "лишние ошибки: {:?}", result.errors);
         assert!(dir.path().join("russia.json").exists(), "файла пресета нет в кэше");
+    }
+
+    /// XR-207: хаб отдал ключ, а пресет приехал без подписи. Прогрев обязан
+    /// его отбраковать: файл в кэш не пишется, причина названа в errors, сам
+    /// инвайт при этом применён.
+    #[tokio::test]
+    async fn apply_invite_rejects_unsigned_preset_when_hub_has_a_key() {
+        let hub = FakeHub::start_with_preset(vec![PAYLOAD], PRESET.to_string()).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = apply(&hub, dir.path()).await;
+
+        assert!(result.payload.is_some(), "инвайт применяется и без пресета");
+        assert!(
+            result.errors.iter().any(|e| e.starts_with("preset signature")),
+            "отбраковка не названа в errors: {:?}",
+            result.errors
+        );
+        assert!(!result.preset_cached);
+        assert!(
+            !dir.path().join("russia.json").exists(),
+            "отвергнутый пресет не должен писаться в кэш"
+        );
     }
 
     fn payload(extra: &str) -> InvitePayload {

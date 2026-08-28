@@ -141,6 +141,7 @@ fn config(server_port: u16) -> VpnConfig {
         hub_preset: None,
         hub_cache_dir: None,
         hub_refresh_interval_secs: None,
+        hub_trusted_public_key: None,
         system_resolver: None,
         // Столько же тоннелей, сколько поднимает приложение по умолчанию.
         mux_pool_size: 4,
