@@ -752,7 +752,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Кэшированный пресет активного сервера для карточки и просмотра. */
     fun readCachedPreset(presetName: String): CachedPreset? =
-        PresetCacheReader.read(presetCacheDir, presetName)
+        PresetCacheReader.read(presetCacheDir, presetName, activeTrustedKey())
 
     /** Превью блока `[routing]` для кнопки `{ }` на экране правил: мои правила
      *  поверх пресета хаба. Собирает ядро рядом с кэшем пресета (XR-271),
@@ -761,10 +761,16 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         NativeBridge.nativeMergedToml(
             presetCacheDir.absolutePath,
             repo.activeServer()?.hubPreset.orEmpty(),
+            activeTrustedKey(),
             UserRulesStore.toConfigJson(rules).toString(),
             "",
         )
     }
+
+    /** Ключ проверки подписи пресета активного профиля (XR-207): его положил
+     *  туда инвайт, пустая строка значит «ключа нет, пресет доверяется». */
+    private fun activeTrustedKey(): String =
+        repo.activeServer()?.trustedPublicKey.orEmpty()
 
     /** Форсированный fetch пресета с хаба («Обновить сейчас»). */
     suspend fun refreshPresetNow(): PresetRefresh {
@@ -775,7 +781,13 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             return PresetRefresh.Failed(str(R.string.vpn_preset_no_hub))
         }
         val json = withContext(Dispatchers.IO) {
-            NativeBridge.nativeRefreshPreset(hubUrl, preset, presetCacheDir.absolutePath, 5_000L)
+            NativeBridge.nativeRefreshPreset(
+                hubUrl,
+                preset,
+                activeTrustedKey(),
+                presetCacheDir.absolutePath,
+                5_000L,
+            )
         }
         val obj = runCatching { JSONObject(json) }.getOrNull()
             ?: return PresetRefresh.Failed(str(R.string.vpn_hub_bad_response))
@@ -789,6 +801,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun friendlyPresetError(code: String, preset: String): String = when {
         code == "not_found" -> str(R.string.vpn_preset_gone, preset)
+        code.startsWith("signature") || code.startsWith("trusted key") ->
+            str(R.string.vpn_preset_signature_failed)
         code.startsWith("network") -> str(R.string.vpn_hub_unreachable)
         code.startsWith("http_") -> str(R.string.vpn_hub_error, code.removePrefix("http_"))
         else -> str(R.string.vpn_preset_refresh_failed, code)
@@ -1394,6 +1408,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             .put("hub_url", server.hubUrl)
             .put("hub_preset", server.hubPreset)
             .put("hub_cache_dir", presetCacheDir.absolutePath)
+            // Ключ проверки подписи пресета (XR-207): его положил в профиль
+            // инвайт, ядро сверяет им каждый пресет хаба.
+            .put("trusted_public_key", server.trustedPublicKey)
             // Мои правила уезжают массивом user_rules (LLD-05): движок соберёт
             // merged-роутер сам, докачав пресет хаба из hub-полей выше.
             .put("user_rules", UserRulesStore.toConfigJson(_userRules.value))

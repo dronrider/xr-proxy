@@ -14,6 +14,7 @@
     <string name="vpn_hub_unreachable">Hub is unreachable. Check the internet</string>
     <string name="vpn_hub_error">Hub error: %1$s</string>
     <string name="vpn_preset_refresh_failed">Could not update the preset: %1$s</string>
+    <string name="vpn_preset_signature_failed">Preset signature check failed. The update was rejected, the previous rule set stays active</string>
     <string name="vpn_hub_not_set">The active server has no hub set up</string>
     <string name="vpn_preset_list_failed">Could not get the preset list: %1$s</string>
     <string name="vpn_update_needs_hub">Checking for updates needs a server with a hub</string>

@@ -15,6 +15,7 @@
     <string name="vpn_hub_unreachable">Хаб недоступен. Проверьте интернет</string>
     <string name="vpn_hub_error">Ошибка хаба: %1$s</string>
     <string name="vpn_preset_refresh_failed">Не удалось обновить пресет: %1$s</string>
+    <string name="vpn_preset_signature_failed">Подпись пресета не сошлась. Обновление отклонено, применён прежний набор правил</string>
     <string name="vpn_hub_not_set">У активного сервера не настроен хаб</string>
     <string name="vpn_preset_list_failed">Не удалось получить список пресетов: %1$s</string>
     <string name="vpn_update_needs_hub">Для проверки обновлений нужен сервер с хабом</string>

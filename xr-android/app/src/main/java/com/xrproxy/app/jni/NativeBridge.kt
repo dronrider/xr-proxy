@@ -188,11 +188,15 @@ object NativeBridge {
     external fun nativeClassifyPattern(raw: String): String
 
     /** Форсированный fetch пресета с хаба («Обновить сейчас»). Пишет в тот же
-     *  дисковый кэш, из которого движок собирает merged-роутер. Возвращает
-     *  `{"updated":bool,"version":N}` либо `{"error":".."}`. */
+     *  дисковый кэш, из которого движок собирает merged-роутер. Пресет
+     *  сверяется с ключом профиля ([trustedKey], XR-207): неверная или
+     *  отсутствующая подпись это `{"error":"signature.."}`, прежний пресет
+     *  остаётся в кэше. Возвращает `{"updated":bool,"version":N}` либо
+     *  `{"error":".."}`. */
     external fun nativeRefreshPreset(
         hubUrl: String,
         preset: String,
+        trustedKey: String,
         cacheDir: String,
         timeoutMs: Long,
     ): String
@@ -206,17 +210,21 @@ object NativeBridge {
     external fun nativeApplyUserRules(rulesJson: String, defaultAction: String): Boolean
 
     /** Кэшированный пресет для карточки экрана правил (XR-271). Кэш пишет и
-     *  читает ядро, формат файла наружу не выходит. Возвращает
+     *  читает ядро, формат файла наружу не выходит. Пресет проходит проверку
+     *  подписи ключом профиля ([trustedKey], XR-207), поэтому карточка не
+     *  показывает то, что движок применять откажется. Возвращает
      *  `{"name","version","updated_at","default_action","rules":[{"name",
      *  "action","domains","ip_ranges","geoip"}]}` либо `{"error":"no_cache"}`. */
-    external fun nativeCachedPreset(cacheDir: String, preset: String): String
+    external fun nativeCachedPreset(cacheDir: String, preset: String, trustedKey: String): String
 
     /** Превью блока `[routing]` из моих правил и пресета хаба (кнопка `{ }`).
      *  Собирается в ядре рядом с кэшем пресета; пустой `defaultAction` берёт
-     *  общий дефолт клиента. */
+     *  общий дефолт клиента. Пресет из кэша сверяется с ключом профиля
+     *  ([trustedKey], XR-207) тем же фильтром, что и у движка. */
     external fun nativeMergedToml(
         cacheDir: String,
         preset: String,
+        trustedKey: String,
         rulesJson: String,
         defaultAction: String,
     ): String

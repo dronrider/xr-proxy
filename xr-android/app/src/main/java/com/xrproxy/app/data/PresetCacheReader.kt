@@ -32,9 +32,12 @@ data class CachedPreset(
  */
 object PresetCacheReader {
 
-    fun read(cacheDir: File, presetName: String): CachedPreset? {
+    /** [trustedKey] это ключ проверки подписи из профиля сервера (XR-207):
+     *  ядро сверяет им кэш, и карточка не показывает пресет, который движок
+     *  применять откажется. Пустая строка значит «ключа нет». */
+    fun read(cacheDir: File, presetName: String, trustedKey: String): CachedPreset? {
         val json = runCatching {
-            NativeBridge.nativeCachedPreset(cacheDir.absolutePath, presetName)
+            NativeBridge.nativeCachedPreset(cacheDir.absolutePath, presetName, trustedKey)
         }.getOrNull() ?: return null
         return runCatching {
             val root = JSONObject(json)
