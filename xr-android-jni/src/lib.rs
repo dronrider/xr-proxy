@@ -920,14 +920,17 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeClassifyPatte
 
 /// Форсированный fetch пресета с хаба («Обновить сейчас» на карточке
 /// пресета). Обновляет тот же дисковый кэш, из которого движок собирает
-/// merged-роутер при старте и фоновом рефреше. Возвращает JSON:
-/// `{"updated":bool,"version":N}` либо `{"error":".."}` (сеть, not_found).
+/// merged-роутер при старте и фоновом рефреше. Пресет сверяется с ключом
+/// профиля (`trustedPublicKey`, XR-207): неверная или отсутствующая подпись
+/// это `{"error":"signature.."}` и прежний пресет остаётся в кэше.
+/// Возвращает JSON: `{"updated":bool,"version":N}` либо `{"error":".."}`.
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeRefreshPreset(
     mut env: JNIEnv,
     _class: JClass,
     hub_url: JString,
     preset: JString,
+    trusted_key: JString,
     cache_dir: JString,
     timeout_ms: jlong,
 ) -> jstring {
@@ -939,6 +942,8 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeRefreshPreset
         Ok(s) => s,
         Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
     };
+    let trusted_key = read_jstring(&mut env, &trusted_key).unwrap_or_default();
+    let trusted_key = trusted_key.trim().to_string();
     let cache_dir = match read_jstring(&mut env, &cache_dir) {
         Ok(s) => PathBuf::from(s),
         Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
@@ -946,7 +951,12 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeRefreshPreset
     let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
 
     let result = with_onboarding_runtime(async {
-        let mut cache = xr_core::presets::PresetCache::new(&cache_dir, &hub_url, &preset);
+        let mut cache = xr_core::presets::PresetCache::new(
+            &cache_dir,
+            &hub_url,
+            &preset,
+            if trusted_key.is_empty() { None } else { Some(trusted_key.as_str()) },
+        );
         cache.load_from_disk();
         cache.refresh(timeout).await
     });
@@ -967,7 +977,9 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeRefreshPreset
 }
 
 /// Кэшированный пресет для карточки экрана правил. Кэш пишет только ядро,
-/// оно же его и читает (XR-271): формат файла наружу не выходит. Возвращает
+/// оно же его и читает (XR-271): формат файла наружу не выходит. Пресет
+/// проходит проверку подписи ключом профиля (XR-207), поэтому карточка не
+/// показывает то, что движок применять откажется. Возвращает
 /// `{"name","version","updated_at","default_action","rules":[..]}` либо
 /// `{"error":"no_cache"}`, когда пресета в кэше нет.
 #[no_mangle]
@@ -976,6 +988,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeCachedPreset(
     _class: JClass,
     cache_dir: JString,
     preset: JString,
+    trusted_key: JString,
 ) -> jstring {
     let cache_dir = match read_jstring(&mut env, &cache_dir) {
         Ok(s) => PathBuf::from(s),
@@ -985,20 +998,28 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeCachedPreset(
         Ok(s) => s,
         Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
     };
-    let json = presets::cached_preset_json(&cache_dir, &preset)
-        .unwrap_or_else(|| json_error("no_cache"));
+    let trusted_key = read_jstring(&mut env, &trusted_key).unwrap_or_default();
+    let trusted_key = trusted_key.trim();
+    let json = presets::cached_preset_json(
+        &cache_dir,
+        &preset,
+        if trusted_key.is_empty() { None } else { Some(trusted_key) },
+    )
+    .unwrap_or_else(|| json_error("no_cache"));
     jstring_into_raw(&mut env, json)
 }
 
 /// Превью `[routing]` из моих правил и пресета хаба (кнопка `{ }` на экране
 /// правил). Собирается в ядре рядом с самим кэшем пресета, пустое
-/// `default_action` берёт общий дефолт клиента.
+/// `default_action` берёт общий дефолт клиента. Пресет из кэша сверяется с
+/// ключом профиля (XR-207) тем же фильтром, что и у движка.
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeMergedToml(
     mut env: JNIEnv,
     _class: JClass,
     cache_dir: JString,
     preset: JString,
+    trusted_key: JString,
     rules_json: JString,
     default_action: JString,
 ) -> jstring {
@@ -1007,11 +1028,17 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeMergedToml(
         Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
     };
     let preset_name = read_jstring(&mut env, &preset).unwrap_or_default();
+    let trusted_key = read_jstring(&mut env, &trusted_key).unwrap_or_default();
+    let trusted_key = trusted_key.trim();
     let rules_json = read_jstring(&mut env, &rules_json).unwrap_or_default();
     let default_action = read_jstring(&mut env, &default_action).unwrap_or_default();
 
     let rules = parse_user_rules_json(&rules_json).unwrap_or_default();
-    let preset = presets::read_cached(&cache_dir, &preset_name);
+    let preset = presets::read_cached(
+        &cache_dir,
+        &preset_name,
+        if trusted_key.is_empty() { None } else { Some(trusted_key) },
+    );
     let toml = presets::merged_toml(&rules, &default_action, preset.as_ref());
     jstring_into_raw(&mut env, toml)
 }
