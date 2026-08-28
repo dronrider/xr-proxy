@@ -68,4 +68,17 @@ class RestorePolicyTest {
         assertEquals(5_000L, restoreRetryDelayMs(-3))
         assertTrue(restoreRetryDelayMs(100) > 0)
     }
+
+    // Повторный вход в восстановление
+
+    @Test
+    fun duplicateEntryIntoRestoreIsSkippedWhileWindowIsOpen() {
+        // сервис занят живой сессией
+        assertTrue(duplicateRestoreSkipped(phaseBusy = true, restorePending = false))
+        // фаза ещё Idle, но окно восстановления уже открыто: второй старт
+        // поднял бы TUN поверх первого
+        assertTrue(duplicateRestoreSkipped(phaseBusy = false, restorePending = true))
+        // свободно и окна нет: вход разрешён
+        assertFalse(duplicateRestoreSkipped(phaseBusy = false, restorePending = false))
+    }
 }

@@ -264,7 +264,10 @@ class XrVpnService : VpnService() {
     // Idle, какой и была беда XR-279: пользователь без туннеля и не знает.
     @Volatile private var restorePending = false
     @Volatile private var restoreAttempt = 0
-    private var restoreRetryJob: Job? = null
+    // Поле пишется из корутины провала (Dispatchers.Default), а гасится
+    // с main: без @Volatile явное отключение могло увидеть устаревший null,
+    // не отменить отложенный старт и получить туннель после «Отключить».
+    @Volatile private var restoreRetryJob: Job? = null
 
     // Speed tracking: previous snapshot for delta computation
     private var prevBytesUp: Long = 0
@@ -351,8 +354,10 @@ class XrVpnService : VpnService() {
      *  восстановлении считает RestorePolicy по сохранённому желанию. */
     private fun restoreSession(source: String): Boolean {
         val phase = _stateFlow.value.phase
-        if (phase != Phase.Idle && phase != Phase.Error) {
-            NativeBridge.nativeJournalLog("INFO", "vpn", "восстановление после $source пропущено: сервис уже работает ($phase)")
+        val phaseBusy = phase != Phase.Idle && phase != Phase.Error
+        if (duplicateRestoreSkipped(phaseBusy, restorePending)) {
+            val why = if (phaseBusy) "сервис уже работает ($phase)" else "восстановление уже идёт"
+            NativeBridge.nativeJournalLog("INFO", "vpn", "восстановление после $source пропущено: $why")
             return true
         }
         val snap = wantedRepo.snapshot()
@@ -414,6 +419,7 @@ class XrVpnService : VpnService() {
         // handleSessionFailure впускает сюда только с живым конфигом; пустой
         // здесь означал бы повисшую сессию, поэтому страховочный путь гасит её.
         val configJson = lastConfigJson ?: run {
+            restorePending = false
             teardownToIdle(errorMessage)
             return
         }
@@ -430,6 +436,9 @@ class XrVpnService : VpnService() {
         updateNotification()
         restoreRetryJob = scope.launch {
             delay(delayMs)
+            // Пока ждали, сессию могли явно остановить или заменить свежим
+            // коннектом: обе половины гасят restorePending, повтор не стартует.
+            if (!restorePending) return@launch
             startVpn(configJson)
         }
     }

@@ -39,5 +39,13 @@ fun shouldRetryRestore(failure: RestoreFailureKind): Boolean =
 fun restoreRetryDelayMs(attempt: Int): Long =
     minOf(RESTORE_RETRY_BASE_MS shl attempt.coerceIn(0, 10), RESTORE_RETRY_MAX_MS)
 
+/** Пропустить ли повторный вход в восстановление. Сервис занят, когда фаза
+ *  ушла из Idle/Error, но и открытое окно восстановления считается занятой:
+ *  sticky-рестарт и ACTION_RESTORE могут прийти подряд, до первого
+ *  publish(Preparing), и без этого второй старт поднял бы TUN поверх
+ *  живого. */
+fun duplicateRestoreSkipped(phaseBusy: Boolean, restorePending: Boolean): Boolean =
+    phaseBusy || restorePending
+
 private const val RESTORE_RETRY_BASE_MS = 5_000L
 private const val RESTORE_RETRY_MAX_MS = 60_000L
