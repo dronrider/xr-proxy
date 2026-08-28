@@ -34,6 +34,11 @@
         android:name="android.permission.NEARBY_WIFI_DEVICES"
         android:usesPermissionFlags="neverForLocation" />
 
+    <!-- Возврат туннеля после перезагрузки и самообновления APK (XR-279):
+         ресивер читает сохранённое желание быть подключённым и поднимает
+         сервис, без этого события никто не встречает. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
     <application
         android:name=".XrApp"
         android:allowBackup="false"
@@ -79,6 +84,18 @@
                 <action android:name="android.net.VpnService" />
             </intent-filter>
         </service>
+
+        <!-- Оба события системные и защищённые, свой флаг exported им не мешает
+             (XR-279). Force-stop держит приложения без броадкастов, так что
+             «убить» из настроек остаётся способом всё выключить. -->
+        <receiver
+            android:name=".service.BootCompletedReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <provider
             android:name="androidx.core.content.FileProvider"

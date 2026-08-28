@@ -22,6 +22,7 @@ import androidx.core.content.ContextCompat
 import com.xrproxy.app.R
 import com.xrproxy.app.data.TrustedNetworksRepository
 import com.xrproxy.app.data.UserRulesStore
+import com.xrproxy.app.data.WantedSessionRepository
 import com.xrproxy.app.jni.NativeBridge
 import com.xrproxy.app.model.HealthLevel
 import com.xrproxy.app.model.healthLevelOf
@@ -67,7 +68,9 @@ class XrVpnService : VpnService() {
         const val ACTION_RESUME_OVERRIDE = "com.xrproxy.app.RESUME_OVERRIDE"
         const val ACTION_PAUSE_OVERRIDE = "com.xrproxy.app.PAUSE_OVERRIDE"
         const val ACTION_BIND_INTERNAL = "com.xrproxy.app.BIND_INTERNAL"
+        const val ACTION_RESTORE = "com.xrproxy.app.RESTORE"
         const val EXTRA_CONFIG_JSON = "config_json"
+        const val EXTRA_RESTORE_SOURCE = "restore_source"
         private const val CHANNEL_ID = "xr_vpn_channel"
         private const val NOTIFICATION_ID = 1
 
@@ -248,6 +251,21 @@ class XrVpnService : VpnService() {
         TrustedNetworksRepository(getSharedPreferences("xr_proxy", Context.MODE_PRIVATE))
     }
 
+    // Желание пользователя быть подключённым, переживающее смерть процесса и
+    // перезагрузку (XR-279). Пишется при Connect из UI, гасится только явным
+    // отключением (clearsWantedOnStop).
+    private val wantedRepo: WantedSessionRepository by lazy {
+        WantedSessionRepository(getSharedPreferences("xr_proxy", Context.MODE_PRIVATE))
+    }
+
+    // Восстановление ещё не дошло до устойчивого состояния: движок не
+    // подтвердил Connected и пауза на доверенной сети не наступила. Провал в
+    // этом окне ретраится по расписанию RestorePolicy, а не гасит сессию в
+    // Idle, какой и была беда XR-279: пользователь без туннеля и не знает.
+    @Volatile private var restorePending = false
+    @Volatile private var restoreAttempt = 0
+    private var restoreRetryJob: Job? = null
+
     // Speed tracking: previous snapshot for delta computation
     private var prevBytesUp: Long = 0
     private var prevBytesDown: Long = 0
@@ -287,9 +305,11 @@ class XrVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Process death + START_STICKY restart delivers a null intent.
-        // Do not silently resurrect a zombie — just go away.
+        // Process death + START_STICKY restart delivers a null intent. Раньше
+        // зомби гасился молча (XR-279): теперь смотрим сохранённое желание
+        // быть подключённым. С ним туннель поднимается заново.
         if (intent == null) {
+            if (restoreSession("перезапуск процесса")) return START_STICKY
             stopSelf()
             return START_NOT_STICKY
         }
@@ -303,13 +323,115 @@ class XrVpnService : VpnService() {
                 // A fresh user connect follows the default policy: a previously
                 // chosen "включить здесь" must not leak into the new session.
                 setOverrideSsid(null)
+                wantedRepo.startWanted(configJson)
+                cancelRestoreRetry()
+                // Свежий пользовательский коннект живёт по общим правилам: окно
+                // ретрая восстановления, если было открыто, закрывается, иначе
+                // провал ручного коннекта уезжал бы в бесконечный повтор.
+                restorePending = false
                 scope.launch { startVpn(configJson) }
+            }
+            ACTION_RESTORE -> {
+                val source = intent.getStringExtra(EXTRA_RESTORE_SOURCE) ?: "старт по команде"
+                if (!restoreSession(source)) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
             }
             ACTION_STOP -> stopFromUi()
             ACTION_RESUME_OVERRIDE -> resumeOverride()
             ACTION_PAUSE_OVERRIDE -> pauseOverride()
         }
         return START_STICKY
+    }
+
+    /** Поднять сохранённое подключение заново: рестарт процесса, загрузка
+     *  телефона, обновление приложения (XR-279). Возвращает false, когда
+     *  восстанавливать нечего и сервису пора погаситься. Решение о самом
+     *  восстановлении считает RestorePolicy по сохранённому желанию. */
+    private fun restoreSession(source: String): Boolean {
+        val phase = _stateFlow.value.phase
+        if (phase != Phase.Idle && phase != Phase.Error) {
+            NativeBridge.nativeJournalLog("INFO", "vpn", "восстановление после $source пропущено: сервис уже работает ($phase)")
+            return true
+        }
+        val snap = wantedRepo.snapshot()
+        val configJson = restoreConfigJson(snap.active, snap.configJson)
+        if (configJson == null) {
+            NativeBridge.nativeJournalLog("INFO", "vpn", "восстановление после $source: явного подключения не было, сервис гасится")
+            return false
+        }
+        NativeBridge.nativeJournalLog("INFO", "vpn", "восстановление после $source: поднимаю сохранённое подключение")
+        restorePending = true
+        restoreAttempt = 0
+        cancelRestoreRetry()
+        // «Включить здесь» на доверенной сети тоже часть желания: без этого
+        // восстановление уронило бы туннель в авто-паузу там, где пользователь
+        // явно просил его держать.
+        if (snap.overrideSsid != null) setOverrideSsid(snap.overrideSsid)
+        scope.launch { startVpn(configJson) }
+        return true
+    }
+
+    private fun cancelRestoreRetry() {
+        restoreRetryJob?.cancel()
+        restoreRetryJob = null
+    }
+
+    /** Полный провал сессии: то же, что было в каждой ветке провала до
+     *  XR-279, вынесено в одно место для [handleSessionFailure]. */
+    private fun teardownToIdle(errorMessage: String) {
+        publish(Phase.Error, errorMessage = errorMessage)
+        updateNotification()
+        stopInternal()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    /** Провал поднятия или жизни туннеля. В окне восстановления провал,
+     *  который лечится повтором (сети ещё нет после перезагрузки), не гасит
+     *  сессию, а переносит следующую попытку по расписанию RestorePolicy;
+     *  остальное разбирается как раньше. Стык с LLD-34 (XR-132): когда
+     *  появится фаза Reconnecting, окно ретрая станет общей машиной и для
+     *  авто-резюма; сейчас повтор живёт только у восстановления и снаружи
+     *  виден как Connecting. */
+    private fun handleSessionFailure(kind: RestoreFailureKind, errorMessage: String) {
+        if (restorePending && shouldRetryRestore(kind) && lastConfigJson != null) {
+            scheduleRestoreRetry(errorMessage)
+            return
+        }
+        if (restorePending && kind == RestoreFailureKind.ENGINE_START) {
+            // Конфиг не принят движком: тот же конфиг даст ту же ошибку,
+            // сохранённое желание гасим, чтобы каждая загрузка не крутила
+            // пустые попытки.
+            wantedRepo.stopWanted()
+        }
+        restorePending = false
+        teardownToIdle(errorMessage)
+    }
+
+    private fun scheduleRestoreRetry(errorMessage: String) {
+        // handleSessionFailure впускает сюда только с живым конфигом; пустой
+        // здесь означал бы повисшую сессию, поэтому страховочный путь гасит её.
+        val configJson = lastConfigJson ?: run {
+            teardownToIdle(errorMessage)
+            return
+        }
+        val delayMs = restoreRetryDelayMs(restoreAttempt)
+        restoreAttempt += 1
+        NativeBridge.nativeJournalLog(
+            "WARN", "vpn",
+            "восстановление не удалось ($errorMessage), повтор через ${delayMs / 1000}с",
+        )
+        // Гасим движок и TUN, но колбэки сети и foreground держим: пауза между
+        // попытками это часть живой сессии, а не её отсутствие.
+        tearTunnelDown()
+        publish(Phase.Connecting)
+        updateNotification()
+        restoreRetryJob = scope.launch {
+            delay(delayMs)
+            startVpn(configJson)
+        }
     }
 
     // Android дёргает revoke не только на явный отзыв разрешения в настройках,
@@ -322,6 +444,16 @@ class XrVpnService : VpnService() {
         super.onRevoke()
     }
 
+    /** Свайп из недавних сам по себе foreground-сервис не убивает, а OEM-ядра,
+     *  которые процесс всё же сносят, накрывает sticky-рестарт с восстановлением
+     *  (XR-279). Здесь остаётся след в журнале: если туннель после свайпа всё же
+     *  пропал, по нему видно, какое из двух произошло.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        NativeBridge.nativeJournalLog("INFO", "vpn", "задача убрана из недавних, сервис продолжает работать")
+        super.onTaskRemoved(rootIntent)
+    }
+
     // Public API used by VpnViewModel through the binder.
 
     fun stopFromUi() = stopTunnel(VpnStopReason.UI)
@@ -329,6 +461,11 @@ class XrVpnService : VpnService() {
     private fun stopTunnel(reason: VpnStopReason) {
         val current = _stateFlow.value.phase
         if (current == Phase.Idle || current == Phase.Stopping) return
+        // Явное отключение из приложения гасит сохранённое желание быть
+        // подключённым, системный отзыв нет (XR-279, различение XR-221).
+        if (clearsWantedOnStop(reason)) wantedRepo.stopWanted()
+        cancelRestoreRetry()
+        restorePending = false
         scope.launch {
             transitionMutex.withLock {
                 if (_stateFlow.value.phase == Phase.Idle) return@withLock
@@ -368,7 +505,15 @@ class XrVpnService : VpnService() {
             Phase.Paused ->
                 scope.launch { requestResume("«включить здесь», остаёмся на доверенной сети") }
             Phase.Idle, Phase.Error -> {
-                val configJson = lastConfigJson
+                // После смерти процесса конфиг сессии берём из сохранённого
+                // желания: «включить здесь» должен поднять туннель и там, где
+                // сам экземпляр сервиса сессии уже не помнит (XR-279).
+                val snap = wantedRepo.snapshot()
+                val configJson = lastConfigJson ?: restoreConfigJson(snap.active, snap.configJson)
+                if (lastConfigJson == null && configJson != null) {
+                    restorePending = true
+                    restoreAttempt = 0
+                }
                 if (configJson == null) {
                     // Recreated instance without a session (process death):
                     // nothing to start from, the user must connect from the app.
@@ -464,11 +609,10 @@ class XrVpnService : VpnService() {
 
         if (iface == null) {
             NativeBridge.nativeJournalLog("ERROR", "vpn", "Не удалось поднять TUN")
-            publish(Phase.Error, errorMessage = getString(R.string.service_error_tun_failed))
-            updateNotification()
-            stopInternal()
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            handleSessionFailure(
+                RestoreFailureKind.TUN_ESTABLISH,
+                getString(R.string.service_error_tun_failed),
+            )
             return false
         }
         vpnInterface = iface
@@ -480,11 +624,7 @@ class XrVpnService : VpnService() {
         if (startError != null) {
             iface.close()
             vpnInterface = null
-            publish(Phase.Error, errorMessage = startError)
-            updateNotification()
-            stopInternal()
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            handleSessionFailure(RestoreFailureKind.ENGINE_START, startError)
             return false
         }
 
@@ -581,17 +721,19 @@ class XrVpnService : VpnService() {
 
             // Engine reported a fatal error (health check failed, event loop
             // crashed, etc.). Shut down the tunnel and publish Error so the VM
-            // can show the message and unbind.
+            // can show the message and unbind; a pending restore retries
+            // instead (XR-279).
             if (native.startsWith("Error:")) {
                 val errorMsg = native.removePrefix("Error: ").trim()
                 NativeBridge.nativeJournalLog("ERROR", "vpn", "движок остановлен: $errorMsg")
-                publish(Phase.Error, errorMessage = errorMsg)
-                updateNotification()
-                stopInternal()
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                handleSessionFailure(RestoreFailureKind.ENGINE_DIED, errorMsg)
                 return
             }
+
+            // Warmup дошёл до конца и движок связался с сервером: окно
+            // восстановления закрыто, дальше сессия живёт по общим правилам
+            // (ретрай после смерти живого туннеля это территория LLD-34).
+            if (native == "Connected") restorePending = false
 
             // Periodic trusted-network re-check. The event-driven auto-pause in
             // maybeEvaluate can miss a return to a trusted Wi-Fi: while the
@@ -696,6 +838,9 @@ class XrVpnService : VpnService() {
     private fun doPause(rawSsid: String?) {
         tearTunnelDown()
         cancelGraceResume()
+        // Пауза на доверенной сети это устойчивое состояние, которого
+        // восстановление и добивалось: окно ретрая закрыто (XR-279).
+        restorePending = false
         pausedNetwork = currentDefaultNetwork
         val display = rawSsid?.let { NativeBridge.nativeNormalizeSsid(it) }
         NativeBridge.nativeJournalLog(
@@ -877,10 +1022,13 @@ class XrVpnService : VpnService() {
 
     /** Single write path for the override: keeps the volatile field and the
      *  published state in sync, so the trusted-network card and its toggle
-     *  follow the actual behavior. */
+     *  follow the actual behavior. Пишет и в сохранённое желание (XR-279):
+     *  переезд на другую сеть и «включить здесь» обязаны переживать смерть
+     *  процесса одинаково. */
     private fun setOverrideSsid(ssid: String?) {
         if (overrideSsid == ssid) return
         overrideSsid = ssid
+        wantedRepo.updateOverride(ssid)
         _stateFlow.update { it.copy(overrideSsid = ssid) }
     }
 
