@@ -134,8 +134,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let geoip_path = config.geoip.as_ref().map(|g| g.database.as_str());
     let hub_config = config.hub.as_ref();
     let router = if let Some(hub) = hub_config {
+        xr_core::presets::warn_if_unverified(hub.trusted_public_key.as_deref());
         let cache_dir = std::path::Path::new("/var/lib/xr-proxy/presets");
-        let mut cache = xr_core::presets::PresetCache::new(cache_dir, &hub.url, &hub.preset);
+        let mut cache = xr_core::presets::PresetCache::new(
+            cache_dir,
+            &hub.url,
+            &hub.preset,
+            hub.trusted_public_key.as_deref(),
+        );
         cache.load_from_disk();
         // Forced fetch at startup with short timeout.
         let _ = cache.fetch_if_stale(std::time::Duration::from_secs(2)).await;
@@ -244,12 +250,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let hub_url = hub.url.clone();
         let preset_name = hub.preset.clone();
         let interval_secs = hub.refresh_interval_secs;
+        let trusted_key = hub.trusted_public_key.clone();
         let local_overrides = config.routing.clone();
         let geoip_path_owned = config.geoip.as_ref().map(|g| g.database.clone());
         let state = state.clone();
         tokio::spawn(async move {
             let cache_dir = std::path::Path::new("/var/lib/xr-proxy/presets");
-            let mut cache = xr_core::presets::PresetCache::new(cache_dir, &hub_url, &preset_name);
+            let mut cache = xr_core::presets::PresetCache::new(
+                cache_dir,
+                &hub_url,
+                &preset_name,
+                trusted_key.as_deref(),
+            );
             cache.load_from_disk();
             xr_core::presets::watch_loop(
                 cache,
