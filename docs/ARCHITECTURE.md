@@ -129,6 +129,13 @@ Cargo-workspace + Android-модуль:
   только прочерк в поле SNI.
 - [udp_relay.rs](../xr-proto/src/udp_relay.rs) — wire-формат UDP relay:
   `[Nonce:4B][Obfuscated: type + dst + src_port + payload]`.
+- [preset.rs](../xr-proto/src/preset.rs) это формат пресета хаба (`Preset`,
+  `PresetSummary`) и его подпись (XR-207). `canonical_json` печатает
+  детерминированную форму под подпись, поля по алфавиту, без `signature`.
+  `verify_preset` сверяет подпись публичной половиной ключа ed25519,
+  `decode_verifying_key` разбирает сам ключ из base64. Крипта живёт за фичей
+  `share`, поэтому одна реализация служит и хабу, и клиенту, без копии на
+  каждой стороне.
 - mux — поверх TCP создаётся мультиплексированный поток (см. `MuxPool`,
   `MuxStream`). `MuxPool` держит N параллельных TCP-туннелей (`mux_pool_size`,
   default 4); стримы балансируются round-robin, при обрыве слота open_stream
@@ -281,7 +288,13 @@ Cargo-workspace + Android-модуль:
   `cached_preset_json` отдаёт карточку (имя, версия, дата, группы), а
   `merged_toml` печатает блок `[routing]` из моих правил поверх пресета для
   кнопки `{ }`. Кэш пишет ядро, поэтому оно же его и читает: формат файла
-  наружу не выходит (XR-271).
+  наружу не выходит (XR-271). Каждый вход пресета проходит проверку подписи
+  ключом `trusted_public_key` из конфига или профиля (XR-207). Фетч, ожидание
+  изменения, дисковый кэш и карточка с превью проходят её же. Ключ задан, а подписи нет или
+  она чужая, пресет отбраковывается целиком, прежний роутер живёт дальше,
+  отказ виден в логе и статусе. Ключа нет, поведение прежнее, и об этом уходит
+  предупреждение на старте. Неразборная строка ключа тоже считается заданным
+  ключом, опечатка в конфиге не выключает проверку молча.
 - [onboarding.rs](../xr-core/src/onboarding.rs) — one-shot HTTP-вызовы
   xr-hub для Android onboarding (LLD-04): `fetch_invite_info` (GET,
   без consume) и `apply_invite` (POST `/claim` → `InvitePayload` + TOFU
@@ -396,13 +409,13 @@ DNS и connect к цели. Прежний таймаут стоял на каж
 | `nativePopPacket()` → `byte[]?` | Пакет `PacketQueue.outbound` → TUN. |
 | `nativeParseInviteLink(raw)` → `String (JSON)` | Парсинг invite-URL (LLD-04). Успех: `{kind,hub_url,token}`, ошибка: `{error}`. |
 | `nativeFetchInviteInfo(hub_url, token, cacheDir, timeoutMs)` -> `String (JSON)` | GET `/api/v1/invite/<token>` отдаёт `InviteInfo` (без consume). `cacheDir` тот же, что у Apply: оттуда берётся ключ установки для `X-Claim-Id` (XR-216). |
-| `nativeApplyInvite(hub_url, token, preset, cacheDir, timeoutMs)` → `String (JSON)` | Claim + TOFU public-key + pre-warm preset. Одноразовый `tokio::runtime::Runtime` на вызов. |
+| `nativeApplyInvite(hub_url, token, preset, cacheDir, timeoutMs)` -> `String (JSON)` | Claim + TOFU public-key + pre-warm preset, пресет сверяется с этим же ключом (XR-207). Одноразовый `tokio::runtime::Runtime` на вызов. |
 | `nativeCheckUpdate(hubUrl, currentCode, pinnedKeyB64, timeoutMs)` → `String (JSON)` | LLD-12. Fetch + verify манифеста pinned release-ключом. `{available, manifest?, error?}`. |
 | `nativeVerifyApk(path, sha256Hex)` → `Boolean` | LLD-12. Потоковая SHA-256 скачанного APK против манифеста. |
 | `nativeBuildConfig(profileJson)` -> `String (JSON)` | XR-271. Конфиг движка из профиля активного сервера, собирает `client_config::build_config_json`. Ошибка (профиль без сервера) приходит как `{error}`. |
 | `nativeHealthUpdate(errors, warns)` / `nativeHealthFreeze(...)` / `nativeHealthReset()` | XR-271. Здоровье сессии: один трекер `xr_core::health` на процесс, ответ это имя ступени. |
-| `nativeCachedPreset(cacheDir, preset)` -> `String (JSON)` | XR-271. Карточка кэшированного пресета для экрана правил либо `{error:"no_cache"}`. |
-| `nativeMergedToml(cacheDir, preset, rulesJson, defaultAction)` -> `String` | XR-271. Превью `[routing]`: мои правила поверх пресета. Пустой `defaultAction` берёт дефолт клиента. |
+| `nativeCachedPreset(cacheDir, preset, trustedKey)` -> `String (JSON)` | XR-271. Карточка кэшированного пресета для экрана правил либо `{error:"no_cache"}`. Кэш сверяется с ключом подписи из профиля (XR-207), пустая строка значит «ключа нет». |
+| `nativeMergedToml(cacheDir, preset, trustedKey, rulesJson, defaultAction)` -> `String` | XR-271. Превью `[routing]`: мои правила поверх пресета. Пустой `defaultAction` берёт дефолт клиента. `trustedKey` тот же, что у карточки (XR-207). |
 
 **Обратный колбэк:** `NativeBridge.protectSocket(fd): Boolean` — статический
 метод Kotlin, вызывается из Rust при создании исходящих сокетов. Реализация
@@ -628,11 +641,12 @@ Kotlin держит ещё один слой, который в ядро не п
   `initialOnboardingState()` смотрит на prefs: если пусты `server_address`
   и `hub_url`, показываем Welcome.
 
-Хранилище настроек — SharedPreferences `xr_proxy`. Новые ключи от LLD-04:
-`hub_url`, `hub_preset`, `trusted_public_key` — пишутся при Apply инвайта,
-читаются в `buildConfigJson` и включают в движке PresetCache +
-периодический sanity-check раз в 5 минут. Кэш пресета живёт в
-`filesDir/presets/<name>.json`.
+Хранилище настроек это SharedPreferences `xr_proxy`. Ключи LLD-04 `hub_url`,
+`hub_preset` и `trusted_public_key` пишутся при Apply инвайта, читаются в
+`buildConfigJson` и включают в движке PresetCache + периодический
+sanity-check раз в 5 минут. Тем же ключом движок проверяет подпись пресета
+(XR-207). Ключ приехал из ручки `/public-key` при Apply и проверяет заодно
+манифест обновлений. Кэш пресета живёт в `filesDir/presets/<name>.json`.
 
 **Инвайт и смена сервера под живым туннелем (XR-088).** Ручного «сначала
 отключите VPN» нет ни при Apply инвайта, ни при выборе другого сервера.
@@ -1164,7 +1178,7 @@ Switch и Xbox от типа NAT зависит мультиплеер, ради
 - `GET /api/v1/invite/:token` это `InviteInfo` (метаданные без секретов), инвайт не потребляет. Читает `X-Claim-Id` и ставит `reclaimable`, когда потреблённый инвайт принадлежит спрашивающему (XR-216, см. ниже).
 - `POST /api/v1/invite/:token/claim` это `InvitePayload` (полный конфиг подключения). Одноразовый инвайт потребляется здесь же, повтор получает `410 Gone`; исключение это повтор того же клиента по ключу `X-Claim-Id` (XR-216, см. ниже). Потребление, не легшее на диск, отвечает `500` и инвайт не тратит (XR-211, см. ниже).
 - `GET /api/v1/invite/:token/view` - HTML-страница приглашения для получателя (QR, deep link на Android, кнопка APK). Голые пути `/invite/:token` и `/invite/:token/view` редиректят сюда.
-- `GET /api/v1/public-key` — публичный ключ ed25519 для проверки подписей пресетов.
+- `GET /api/v1/public-key` отдаёт публичный ключ ed25519 для проверки подписей пресетов. Клиент, у которого ключ уже назван в конфиге или профиле, отбраковывает пресет без подписи и с чужой подписью (XR-207), поэтому хаб без секции `[signing]` такому клиенту пресет не доставит.
 - `GET /api/v1/app/latest` — подписанный манифест последнего APK: `{manifest, signature}` с диска (LLD-12). `404` если релиз не выложен.
 - `GET /api/v1/shares` это индекс всех шар флота: имя, `addr:port`, LAN-адреса
   и ключ агента. Индекс закрывает карту инфраструктуры от анонима (XR-193):
@@ -1410,7 +1424,9 @@ Fail-soft здесь принципиален, потому что пресет 
 ### 6.2 Пресеты и override'ы
 
 - Пресеты хранятся централизованно в `xr-hub` (файлы JSON на диске),
-  версионируются, опционально подписываются ed25519.
+  версионируются, опционально подписываются ed25519. Подпись проверяет
+  клиент. С заданным `trusted_public_key` пресет без подписи или с чужой
+  подписью не применяется, прежний роутер остаётся жить (XR-207).
 - Название группы правится в Admin UI полем рядом с действием и уезжает
   клиентам в том же JSON. На Android оно стоит заголовком карточки правила в
   просмотре пресета (счётчик доменов уходит второй строкой) и печатается
