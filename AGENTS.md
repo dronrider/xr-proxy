@@ -93,6 +93,7 @@ Integer types differ across targets (`msg_controllen`, `iov_len`). Use `as _` fo
 
 - `deploy/xr-proxy.init` - procd init: start (TCP + UDP TPROXY setup), stop (cleanup both), respawn
 - `deploy/xr-watchdog.sh` - cron every minute: check process, log crash, cleanup rules, restart, set OOM protection
+- `deploy/xr-service-alert.sh` - сторож crash-loop сервисов VPS (XR-226): каждую минуту по cron смотрит факты systemd (`NRestarts` + `ActiveState`) у xr-proxy-server, xr-relay и xr-hub, цикл рестартов (порог 10) шлёт алертом в Telegram, восстановление отмечает одним сообщением, повтор не чаще раза в час. Судит по systemd, а не по самочувствию сервисов. Токен и чат в `/etc/xr-proxy/alert.env`, общем с cert-alert (нет файла: молча нулём, лишь строчка в stderr cron). Ставит `xr-setup` шагом `server:service-alert` в `/usr/local/bin` с `/etc/cron.d/xr-service-alert`, тесты стенда в `xr-setup/src/render.rs` (`service_alert_tests`)
 - `scripts/udp-tproxy-setup.sh` - reads source_ips from config, creates nftables TPROXY rules (ip family). Refuses to run with empty source_ips (safety).
 - `scripts/udp-tproxy-cleanup.sh` - removes TPROXY rules and policy routes
 - `scripts/diagnose.sh` - comprehensive diagnostics (binary, config, process, ports, firewall, connectivity)
