@@ -78,7 +78,7 @@ fn empty_key_is_a_named_failure() {
     let out = validate(&cfg.path);
     assert_eq!(out.status.code(), Some(1));
     let err = stderr(&out);
-    assert!(err.contains("servers 'primary'.key"), "{err}");
+    assert!(err.contains("obfuscation.key"), "{err}");
     assert!(err.contains("key must not be empty"), "{err}");
 }
 
@@ -113,4 +113,31 @@ fn bad_override_key_names_the_server() {
     assert_eq!(out.status.code(), Some(1));
     let err = stderr(&out);
     assert!(err.contains("servers 'primary'.key"), "{err}");
+}
+
+/// Битая глобальная тройка ловится и при override у всех записей (ревью
+/// XR-227): старт строит общий обфускатор безусловно, validate не мягче.
+#[test]
+fn broken_shared_obfuscation_fails_behind_server_overrides() {
+    let with_override = |body: String| {
+        body.replace(
+            "port = 8443",
+            "port = 8443\nkey = \"b3RoZXI=\"\nmodifier = \"rotating_salt\"",
+        )
+    };
+    let body = with_override(GOOD.replace("dGVzdA==", ""));
+    let cfg = TempConfig::new("shared-key", &body);
+    let out = validate(&cfg.path);
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(err.contains("obfuscation.key"), "{err}");
+    assert!(err.contains("key must not be empty"), "{err}");
+
+    let body = with_override(GOOD.replace("positional_xor_rotate", "garbage"));
+    let cfg = TempConfig::new("shared-modifier", &body);
+    let out = validate(&cfg.path);
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(err.contains("obfuscation.modifier"), "{err}");
+    assert!(err.contains("unknown modifier strategy 'garbage'"), "{err}");
 }

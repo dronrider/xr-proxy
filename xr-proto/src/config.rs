@@ -475,6 +475,14 @@ pub fn load_server_config(path: &Path) -> Result<ServerConfig, Box<dyn std::erro
 /// Проверяет то же, что потребует старт: годный для validate конфиг
 /// стартует, а конфиг, не прошедший validate, стартом падает.
 pub fn validate_client_config(config: &ClientConfig) -> Result<(), String> {
+    // Глобальная тройка проверяется безусловно: старт строит из неё общий
+    // обфускатор до цикла пула, и override у всех записей её не отменяет.
+    obfuscation_reject_reason(
+        "obfuscation",
+        &config.obfuscation.key,
+        &config.obfuscation.modifier,
+        config.obfuscation.salt,
+    )?;
     let entries = config.server_entries()?;
     for entry in &entries {
         let section = format!("servers '{}'", entry.display_name());
@@ -862,29 +870,34 @@ vps_port = 9999
     #[test]
     fn validate_names_reject_reasons() {
         // client_with несёт годный ключ и адрес, портим их точечно.
+        // Глобальные поля именуются секцией obfuscation, адрес записью пула.
         let mut cfg = client_with("");
         cfg.obfuscation.key = "".into();
         let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("obfuscation.key"), "{err}");
         assert!(err.contains("key must not be empty"), "{err}");
 
         cfg.obfuscation.key = "не-base64!".into();
         let err = validate_client_config(&cfg).unwrap_err();
-        assert!(err.contains("servers 'primary'.key"), "{err}");
+        assert!(err.contains("obfuscation.key"), "{err}");
         assert!(err.contains("Invalid symbol"), "{err}");
 
         cfg.obfuscation.key = "dGVzdA==".into();
         cfg.obfuscation.modifier = "xor".into();
         let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("obfuscation.modifier"), "{err}");
         assert!(err.contains("unknown modifier strategy 'xor'"), "{err}");
 
         cfg.obfuscation.modifier = "rotating_salt".into();
         cfg.obfuscation.salt = u32::MAX as u64 + 1;
         let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("obfuscation.salt"), "{err}");
         assert!(err.contains("does not fit in u32"), "{err}");
 
         cfg.obfuscation.salt = 42;
         cfg.servers[0].address = "vps.example.com".into();
         let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("servers 'primary'"), "{err}");
         assert!(err.contains("invalid address 'vps.example.com'"), "{err}");
     }
 
@@ -900,6 +913,34 @@ vps_port = 9999
         cfg.servers[0].modifier = Some("nope".into());
         let err = validate_client_config(&cfg).unwrap_err();
         assert!(err.contains("servers 'primary'.modifier"), "{err}");
+    }
+
+    /// Глобальная тройка [obfuscation] проверяется и при override у всех
+    /// записей пула (ревью XR-227): старт строит общий обфускатор до цикла
+    /// пула, и до правки validate пропускал такой конфиг, отвечая ok.
+    #[test]
+    fn validate_checks_shared_obfuscation_behind_full_override() {
+        let mut cfg = client_with(
+            "key = \"b3RoZXI=\"\nmodifier = \"rotating_salt\"\nsalt = 7",
+        );
+        cfg.obfuscation.key = "".into();
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("obfuscation.key"), "{err}");
+        assert!(err.contains("key must not be empty"), "{err}");
+
+        cfg.obfuscation.key = "dGVzdA==".into();
+        cfg.obfuscation.modifier = "garbage".into();
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("obfuscation.modifier"), "{err}");
+        assert!(err.contains("unknown modifier strategy 'garbage'"), "{err}");
+
+        cfg.obfuscation.modifier = "rotating_salt".into();
+        cfg.obfuscation.salt = 1 << 40;
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("obfuscation.salt"), "{err}");
+
+        cfg.obfuscation.salt = 42;
+        validate_client_config(&cfg).unwrap();
     }
 
     /// Адрес VPS для relay обязателен только у включённого relay: выключенный
