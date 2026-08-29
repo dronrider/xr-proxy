@@ -3,35 +3,50 @@ mod handler;
 mod mux_handler;
 mod udp_relay;
 
-use clap::Parser;
-use std::path::PathBuf;
+use clap::{Parser, Subcommand};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::time::Duration;
 use xr_proto::accept::accept_loop;
-use xr_proto::config::{decode_key, load_server_config};
+use xr_proto::config::{decode_key, load_server_config, validate_server_config};
 use xr_proto::obfuscation::{ModifierStrategy, Obfuscator};
 use xr_proto::protocol::Codec;
 
 #[derive(Parser)]
-#[command(name = "xr-server", about = "XR Proxy Server — lightweight obfuscated proxy server")]
+#[command(name = "xr-server", about = "lightweight obfuscated proxy server")]
 struct Cli {
     /// Path to config file
-    #[arg(short, long, default_value = "/etc/xr-proxy/server.toml")]
+    #[arg(short, long, global = true, default_value = "/etc/xr-proxy/server.toml")]
     config: PathBuf,
 
     /// Override log level
     #[arg(short, long)]
     log_level: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Проверить конфиг и выйти (XR-227): парсинг, ключи, salt, адреса.
+    /// Листенеры не поднимаются, годный конфиг отвечает ok.
+    Validate,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
+    if let Some(Commands::Validate) = cli.command {
+        validate_or_exit(&cli.config);
+    }
+
     // Load config
     let config = load_server_config(&cli.config)?;
+    validate_server_config(&config)?;
 
     // Setup logging
     let log_level = cli.log_level.as_deref().unwrap_or(&config.logging.level);
@@ -137,6 +152,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("XR Proxy Server stopped");
     outcome?;
     Ok(())
+}
+
+/// `xr-server validate` (XR-227): сухой прогон конфига, без листенеров.
+/// Годный конфиг отвечает ok и нулём, битый уходит в stderr с названной
+/// причиной, чтобы init и deploy видели отказ до бесконечных рестартов.
+fn validate_or_exit(path: &Path) -> ! {
+    let verdict = load_server_config(path)
+        .map_err(|e| format!("{}: {e}", path.display()))
+        .and_then(|config| validate_server_config(&config));
+    match verdict {
+        Ok(()) => {
+            println!("ok");
+            std::process::exit(0);
+        }
+        Err(reason) => {
+            eprintln!("config invalid: {reason}");
+            std::process::exit(1);
+        }
+    }
 }
 
 async fn shutdown_signal() {

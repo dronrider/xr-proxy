@@ -2,11 +2,13 @@ mod proxy;
 mod redirect;
 mod udp_relay;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use xr_proto::config::{decode_key, load_client_config, ObfuscationConfig, ServerEntry};
+use xr_proto::config::{
+    decode_key, load_client_config, validate_client_config, ObfuscationConfig, ServerEntry,
+};
 use xr_proto::obfuscation::{ModifierStrategy, Obfuscator};
 use xr_proto::protocol::Codec;
 use xr_proto::routing;
@@ -31,27 +33,42 @@ fn log_to_file(msg: &str) {
 }
 
 #[derive(Parser)]
-#[command(name = "xr-client", about = "XR Proxy Client — lightweight transparent proxy for OpenWRT")]
+#[command(name = "xr-client", about = "XR Proxy Client, transparent proxy for OpenWRT")]
 struct Cli {
     /// Path to config file
-    #[arg(short, long, default_value = "/etc/xr-proxy/config.toml")]
+    #[arg(short, long, global = true, default_value = "/etc/xr-proxy/config.toml")]
     config: PathBuf,
 
     /// Override log level
     #[arg(short, long)]
     log_level: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Проверить конфиг и выйти (XR-227): парсинг, ключи, salt, адреса.
+    /// Листенеры и файрвол не трогаются, годный конфиг отвечает ok.
+    Validate,
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    // Install panic hook — write to file so we don't lose crash info
+    // Install a panic hook that writes to a file, so crash info is not lost.
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("PANIC: {}", info);
         eprintln!("{}", msg);
         log_to_file(&msg);
     }));
 
-    if let Err(e) = run().await {
+    let cli = Cli::parse();
+    if let Some(Commands::Validate) = cli.command {
+        validate_or_exit(&cli.config);
+    }
+
+    if let Err(e) = run(cli).await {
         let msg = format!("FATAL: {}", e);
         eprintln!("{}", msg);
         log_to_file(&msg);
@@ -59,11 +76,29 @@ async fn main() {
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+/// `xr-client validate` (XR-227): сухой прогон конфига, без листенеров
+/// и файрвола. Годный конфиг отвечает ok и нулём, битый уходит в stderr
+/// с названной причиной, чтобы init и deploy видели отказ до рестартов.
+fn validate_or_exit(path: &Path) -> ! {
+    let verdict = load_client_config(path)
+        .map_err(|e| format!("{}: {e}", path.display()))
+        .and_then(|config| validate_client_config(&config));
+    match verdict {
+        Ok(()) => {
+            println!("ok");
+            std::process::exit(0);
+        }
+        Err(reason) => {
+            eprintln!("config invalid: {reason}");
+            std::process::exit(1);
+        }
+    }
+}
 
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Load config
     let config = load_client_config(&cli.config)?;
+    validate_client_config(&config)?;
 
     // Setup logging
     let log_level = cli.log_level.as_deref()
