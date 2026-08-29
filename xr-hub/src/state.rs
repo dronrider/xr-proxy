@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::{watch, RwLock};
@@ -19,7 +20,9 @@ pub struct AppState {
     /// Публикации локальных сервисов: имя -> запись (LLD-38 п. 2.1). Имя одно
     /// на хаб, потому что оно же поддомен браузерного входа.
     pub exposes: RwLock<HashMap<String, ExposeRecord>>,
-    pub sessions: RwLock<HashMap<String, String>>, // session_token → username
+    /// Admin-сессии (XR-194): TTL, logout и лимит на оператора держит сам
+    /// стор, поэтому карта не растёт бесконечно и утёкший Bearer гасится.
+    pub sessions: crate::sessions::SessionStore,
     pub config: HubConfig,
     pub signing: Option<SigningContext>,
     /// Поколение пресетов (LLD-37): любая правка через админку двигает его, и
@@ -79,7 +82,10 @@ pub fn hydrate(config: HubConfig) -> Result<Arc<AppState>> {
         invites: RwLock::new(invites),
         shares: RwLock::new(shares),
         exposes: RwLock::new(exposes),
-        sessions: RwLock::new(HashMap::new()),
+        sessions: crate::sessions::SessionStore::new(
+            Duration::from_secs(config.admin.session_ttl_secs),
+            config.admin.max_sessions_per_user,
+        ),
         config,
         signing,
         preset_gen: watch::Sender::new(0),

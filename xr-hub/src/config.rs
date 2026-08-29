@@ -100,6 +100,14 @@ pub struct AdminConfig {
     pub users: Vec<UserConfig>,
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    /// Срок жизни admin-сессии в секундах (XR-194): по истечении Bearer
+    /// отвергается, а админка уходит на страницу входа.
+    #[serde(default = "default_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+    /// Сколько сессий один оператор держит одновременно (XR-194): новая
+    /// вытесняет старейшую. Ноль снимает ограничение.
+    #[serde(default = "default_max_sessions_per_user")]
+    pub max_sessions_per_user: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,6 +208,12 @@ fn default_server_port() -> u16 {
 }
 fn default_splice_lifetime() -> u64 {
     3600
+}
+fn default_session_ttl_secs() -> u64 {
+    43200
+}
+fn default_max_sessions_per_user() -> usize {
+    5
 }
 fn default_modifier() -> String {
     "positional_xor_rotate".into()

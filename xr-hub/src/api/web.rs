@@ -640,7 +640,10 @@ mod tests {
             invites: RwLock::new(HashMap::new()),
             shares: RwLock::new(HashMap::new()),
             exposes: RwLock::new(HashMap::new()),
-            sessions: RwLock::new(HashMap::new()),
+            sessions: crate::sessions::SessionStore::new(
+                std::time::Duration::from_secs(config.admin.session_ttl_secs),
+                config.admin.max_sessions_per_user,
+            ),
             config,
             signing: Some(SigningContext { signing_key: hub }),
             preset_gen: tokio::sync::watch::Sender::new(0),
