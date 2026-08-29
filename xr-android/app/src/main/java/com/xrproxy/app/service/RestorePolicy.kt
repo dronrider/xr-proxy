@@ -48,12 +48,13 @@ fun duplicateRestoreSkipped(phaseBusy: Boolean, restorePending: Boolean): Boolea
     phaseBusy || restorePending
 
 /** Допускать ли тип location у foreground-старта этой сессии. Тип location
- *  из while-in-use, и на Android 14+ фоновый старт с ним платформа срезает
- *  целиком: сервис остаётся без типа, VpnService.establish() возвращает null,
- *  и восстановление после перезагрузки умирало на «Не удалось поднять TUN»
- *  (прогон XR-279 на эмуляторе API 35). Тип остаётся только стартам из UI,
- *  фоновые восстановления идут одним systemExempted. Плата: SSID на фоне
- *  восстановленной сессии закрыт, авто-пауза доверенной сети дождётся
+ *  из while-in-use, и фоновый старт (BOOT_COMPLETED, рестарт убитого
+ *  сервиса, повтор ретрая) права на него не имеет: без разрешения Android
+ *  14+ кидает исключение на старте с этим типом, а из фона платформа тип
+ *  срезает. Базовый тип сервиса specialUse, он у фонового старта
+ *  сохраняется, поэтому срез location туннель не ломает. Тип location
+ *  остаётся только стартам из UI с выданным разрешением. Плата: SSID на
+ *  фоне восстановленной сессии закрыт, авто-пауза доверенной сети дождётся
  *  первого открытия приложения; сам туннель от этого не зависит. */
 fun foregroundLocationTypeAllowed(startedFromUi: Boolean, locationGranted: Boolean): Boolean =
     startedFromUi && locationGranted

@@ -273,10 +273,9 @@ class XrVpnService : VpnService() {
     // в приложении, «включить здесь») или это фоновое восстановление
     // (BOOT_COMPLETED, MY_PACKAGE_REPLACED, sticky-рестарт, повтор окна
     // ретрая). На Android 14+ фоновый старт не имеет права на while-in-use
-    // тип location: платформа срезает тип целиком, VpnService.establish()
-    // возвращает null, и восстановление умирало на «Не удалось поднять TUN».
-    // Решение о типе ниже принимает RestorePolicy.foregroundLocationTypeAllowed,
-    // поле пишет main до запуска корутины старта.
+    // тип location, и решение о типе принимает
+    // RestorePolicy.foregroundLocationTypeAllowed: поле пишет main до
+    // запуска корутины старта.
     @Volatile private var sessionFromUi = false
 
     // Speed tracking: previous snapshot for delta computation
@@ -1543,21 +1542,30 @@ class XrVpnService : VpnService() {
     // ── Notification ──────────────────────────────────────────────────
 
     /**
-     * Go foreground, declaring the `location` FGS type when (and only when)
-     * both the session was started from the UI and location permission is
-     * actually granted. A location-typed foreground service keeps
-     * foreground-level location access for as long as the tunnel runs, which is
-     * what lets the trusted-network check read the Wi-Fi SSID while the app UI
-     * is backgrounded (XR-023): without it the SSID is redacted off the
-     * foreground and auto-pause only fired after opening the app. The type MUST
-     * be omitted when either condition fails. Without the permission Android
-     * 14+ throws on a location-typed start; from the background (restore after
-     * reboot, package replace, sticky restart) the platform strips
-     * while-in-use types, the FGS ends up with no type at all and
-     * VpnService.establish() returns null (XR-279 emulator run). The price of
-     * the omission: a restored session reads SSID only after the app is opened
-     * again, so trusted-network auto-pause on a restored session waits for
-     * that; the tunnel itself stays up.
+     * Go foreground on the `specialUse` type, declaring `location` on top of
+     * it when (and only when) both the session was started from the UI and
+     * location permission is actually granted. A location-typed foreground
+     * service keeps foreground-level location access for as long as the tunnel
+     * runs, which is what lets the trusted-network check read the Wi-Fi SSID
+     * while the app UI is backgrounded (XR-023): without it the SSID is
+     * redacted off the foreground and auto-pause only fired after opening the
+     * app. The location type MUST be omitted when either condition fails:
+     * without the permission Android 14+ throws on a location-typed start,
+     * and a background start has no right to while-in-use types anyway.
+     *
+     * The base type is `specialUse`, not `systemExempted`: the emulator run
+     * of XR-279 showed the platform strips systemExempted for an app that is
+     * neither a system UID, nor a Device Owner, nor a VPN configured as
+     * always-on, so every background start (reboot, package replace, restart
+     * of the killed service) was left with an empty type set and
+     * VpnService.establish() returned null («Не удалось поднять TUN»).
+     * specialUse is the one type a regular app is allowed to hold from the
+     * background; the manifest pairs it with the
+     * FOREGROUND_SERVICE_SPECIAL_USE permission and the subtype property.
+     *
+     * The price of the location omission: a restored session reads SSID only
+     * after the app is opened again, so trusted-network auto-pause on a
+     * restored session waits for that; the tunnel itself stays up.
      */
     private fun startForegroundWithLocationType() {
         val notif = buildNotification(_stateFlow.value)
@@ -1567,7 +1575,7 @@ class XrVpnService : VpnService() {
         }
         var types = 0
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            types = types or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED
+            types = types or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
         }
         val locGranted = checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) ==
             android.content.pm.PackageManager.PERMISSION_GRANTED

@@ -500,11 +500,16 @@ Kotlin держит ещё один слой, который в ядро не п
   пользователь в приложении ничего не нажимал (XR-221). `onBind`
   разветвляет: `ACTION_BIND_INTERNAL` → `LocalBinder`, иначе `super.onBind()`
   (штатный `BIND_VPN_SERVICE`). `onStartCommand(intent = null, ...)` делает
-  `stopSelf()` → `START_NOT_STICKY`, чтобы не воскрешать зомби-сервис после
-  process death. Foreground-уведомление: канал `IMPORTANCE_DEFAULT`,
+  `onStartCommand(intent = null, ...)` приходит на START_STICKY-рестарте
+  после смерти процесса: при сохранённом желании быть подключённым туннель
+  поднимается заново, без него сервис гасится молча и `START_NOT_STICKY`
+  воскрешения не просит. Foreground-уведомление: канал `IMPORTANCE_DEFAULT`,
   `CATEGORY_SERVICE`, `VISIBILITY_PUBLIC`, `setOnlyAlertOnce`, моно-иконка
   `ic_notification`, action «Отключить» через `PendingIntent` на `ACTION_STOP`,
-  цвет из `R.color.brand_primary`. `foregroundServiceType="systemExempted"`.
+  цвет из `R.color.brand_primary`. `foregroundServiceType="specialUse|location"`
+  с пермишеном `FOREGROUND_SERVICE_SPECIAL_USE` и property-декларацией
+  подтипа на сервисе: systemExempted платформа срезала у стороннего VPN и
+  фоновый старт оставался без типов (XR-279).
   `bringTunnelUp()` перед `establish()` зовёт `Builder.addDisallowedApplication`
   на `com.google.android.projection.gearhead` (XR-270): Android Auto проверяет
   связь с магнитолой по локальной сети и с этим трафиком в TUN отказывается
@@ -1495,13 +1500,18 @@ Fail-soft здесь принципиален, потому что пресет 
    Стык с LLD-34: ретрай сегодня живёт только в окне восстановления, до
    первого подтверждённого Connected или паузы, смерть уже живого туннеля
    остаётся территорией LLD-34. Фоновые старты (восстановление, повтор
-   ретрая) идут без типа location. На Android 14+ платформа срезает
-   while-in-use тип у фонового старта, сервис остаётся без типа, и
-   `VpnService.establish()` возвращает null. Тип location поэтому получает
-   только старт из UI, решение считает `RestorePolicy.foregroundLocationTypeAllowed`.
-   Фоновая сессия идёт одним systemExempted, её SSID закрыт до первого
-   открытия приложения. Авто-пауза доверенной сети в восстановленной сессии
-   ждёт этого открытия, сам туннель от него не зависит.
+   ретрая) идут без типа location. Тип location из while-in-use, его
+   получает только старт из UI с выданным разрешением, решение считает
+   `RestorePolicy.foregroundLocationTypeAllowed`. Базовый тип у старта
+   specialUse: первые два круга XR-279 стояли на systemExempted, и прогон
+   на эмуляторе API 35 показал, что платформа срезает его у приложения,
+   которое не системный UID, не Device Owner и не настроено как always-on
+   VPN, после чего срезанный же из фона location оставлял старт без типов
+   вовсе и `VpnService.establish()` возвращал null. specialUse доступен
+   стороннему приложению и в фоне, срезается только location, и туннель
+   поднимается. Фоновая сессия идёт одним specialUse, её SSID закрыт до
+   первого открытия приложения. Авто-пауза доверенной сети в восстановленной
+   сессии ждёт этого открытия, сам туннель от него не зависит.
 
 ## 8. Наблюдаемость
 
