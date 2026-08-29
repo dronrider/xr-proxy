@@ -1169,22 +1169,29 @@ fn parse_selection(json: &str) -> Result<Option<HashSet<String>>, String> {
         .map_err(|e| format!("bad selection json: {e}"))
 }
 
-/// GET the hub's public share index. Returns `{"shares":[{name,addr,port,
-/// agent_pubkey,share_id}...]}` or `{"error":".."}`.
+/// GET the hub's share index (XR-193: behind a grant or invite token, sent as
+/// `Authorization: Bearer`; an empty string means no credential). Returns
+/// `{"shares":[{name,addr,port,agent_pubkey,share_id}...]}` or `{"error":".."}`.
 #[no_mangle]
 pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeListShares(
     mut env: JNIEnv,
     _class: JClass,
     hub_url: JString,
+    bearer: JString,
     timeout_ms: jlong,
 ) -> jstring {
     let hub_url = match read_jstring(&mut env, &hub_url) {
         Ok(s) => s,
         Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
     };
+    let bearer = match read_jstring(&mut env, &bearer) {
+        Ok(s) => s,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
     let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+    let bearer = (!bearer.trim().is_empty()).then(|| bearer.trim());
 
-    let json = match with_onboarding_runtime(sync::list_shares(&hub_url, timeout)) {
+    let json = match with_onboarding_runtime(sync::list_shares(&hub_url, bearer, timeout)) {
         Ok(Ok(shares)) => serde_json::json!({ "shares": shares }).to_string(),
         Ok(Err(e)) | Err(e) => json_error(&e),
     };
