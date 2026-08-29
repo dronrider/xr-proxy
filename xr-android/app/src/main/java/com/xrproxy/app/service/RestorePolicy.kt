@@ -47,5 +47,16 @@ fun restoreRetryDelayMs(attempt: Int): Long =
 fun duplicateRestoreSkipped(phaseBusy: Boolean, restorePending: Boolean): Boolean =
     phaseBusy || restorePending
 
+/** Допускать ли тип location у foreground-старта этой сессии. Тип location
+ *  из while-in-use, и на Android 14+ фоновый старт с ним платформа срезает
+ *  целиком: сервис остаётся без типа, VpnService.establish() возвращает null,
+ *  и восстановление после перезагрузки умирало на «Не удалось поднять TUN»
+ *  (прогон XR-279 на эмуляторе API 35). Тип остаётся только стартам из UI,
+ *  фоновые восстановления идут одним systemExempted. Плата: SSID на фоне
+ *  восстановленной сессии закрыт, авто-пауза доверенной сети дождётся
+ *  первого открытия приложения; сам туннель от этого не зависит. */
+fun foregroundLocationTypeAllowed(startedFromUi: Boolean, locationGranted: Boolean): Boolean =
+    startedFromUi && locationGranted
+
 private const val RESTORE_RETRY_BASE_MS = 5_000L
 private const val RESTORE_RETRY_MAX_MS = 60_000L

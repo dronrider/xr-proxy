@@ -81,4 +81,19 @@ class RestorePolicyTest {
         // свободно и окна нет: вход разрешён
         assertFalse(duplicateRestoreSkipped(phaseBusy = false, restorePending = false))
     }
+
+    // Тип location у foreground-старта
+
+    @Test
+    fun locationTypeRequiresUiStartEvenWithPermission() {
+        // фоновое восстановление после перезагрузки: разрешение есть, но
+        // Android 14+ срезает while-in-use тип у фонового старта, сервис
+        // остаётся без типа и establish() ломается
+        assertFalse(foregroundLocationTypeAllowed(startedFromUi = false, locationGranted = true))
+        assertTrue(foregroundLocationTypeAllowed(startedFromUi = true, locationGranted = true))
+        // без разрешения типа быть не должно и у UI-старта: на Android 14+
+        // старт с типом без разрешения бросает исключение
+        assertFalse(foregroundLocationTypeAllowed(startedFromUi = true, locationGranted = false))
+        assertFalse(foregroundLocationTypeAllowed(startedFromUi = false, locationGranted = false))
+    }
 }

@@ -269,6 +269,16 @@ class XrVpnService : VpnService() {
     // не отменить отложенный старт и получить туннель после «Отключить».
     @Volatile private var restoreRetryJob: Job? = null
 
+    // Происхождение текущей сессии: её старт виден пользователю (кнопка
+    // в приложении, «включить здесь») или это фоновое восстановление
+    // (BOOT_COMPLETED, MY_PACKAGE_REPLACED, sticky-рестарт, повтор окна
+    // ретрая). На Android 14+ фоновый старт не имеет права на while-in-use
+    // тип location: платформа срезает тип целиком, VpnService.establish()
+    // возвращает null, и восстановление умирало на «Не удалось поднять TUN».
+    // Решение о типе ниже принимает RestorePolicy.foregroundLocationTypeAllowed,
+    // поле пишет main до запуска корутины старта.
+    @Volatile private var sessionFromUi = false
+
     // Speed tracking: previous snapshot for delta computation
     private var prevBytesUp: Long = 0
     private var prevBytesDown: Long = 0
@@ -332,6 +342,7 @@ class XrVpnService : VpnService() {
                 // ретрая восстановления, если было открыто, закрывается, иначе
                 // провал ручного коннекта уезжал бы в бесконечный повтор.
                 restorePending = false
+                sessionFromUi = true
                 scope.launch { startVpn(configJson) }
             }
             ACTION_RESTORE -> {
@@ -374,6 +385,7 @@ class XrVpnService : VpnService() {
         // восстановление уронило бы туннель в авто-паузу там, где пользователь
         // явно просил его держать.
         if (snap.overrideSsid != null) setOverrideSsid(snap.overrideSsid)
+        sessionFromUi = false
         scope.launch { startVpn(configJson) }
         return true
     }
@@ -439,6 +451,7 @@ class XrVpnService : VpnService() {
             // Пока ждали, сессию могли явно остановить или заменить свежим
             // коннектом: обе половины гасят restorePending, повтор не стартует.
             if (!restorePending) return@launch
+            sessionFromUi = false
             startVpn(configJson)
         }
     }
@@ -536,6 +549,9 @@ class XrVpnService : VpnService() {
                     NativeBridge.nativeJournalLog(
                         "INFO", "net", "«включить здесь»: туннель остановлен, поднимаю заново",
                     )
+                    // Кнопка видна пользователю, старт считается UI-ным даже
+                    // там, где конфиг взят из сохранённого желания.
+                    sessionFromUi = true
                     scope.launch { startVpn(configJson) }
                 }
             }
@@ -1528,13 +1544,20 @@ class XrVpnService : VpnService() {
 
     /**
      * Go foreground, declaring the `location` FGS type when (and only when)
-     * location permission is actually granted. A location-typed foreground
-     * service keeps foreground-level location access for as long as the tunnel
-     * runs, which is what lets the trusted-network check read the Wi-Fi SSID
-     * while the app UI is backgrounded (XR-023): without it the SSID is redacted
-     * off the foreground and auto-pause only fired after opening the app. The
-     * type MUST be omitted when location is not granted — on Android 14+ starting
-     * a location-typed FGS without the permission throws and would kill the VPN.
+     * both the session was started from the UI and location permission is
+     * actually granted. A location-typed foreground service keeps
+     * foreground-level location access for as long as the tunnel runs, which is
+     * what lets the trusted-network check read the Wi-Fi SSID while the app UI
+     * is backgrounded (XR-023): without it the SSID is redacted off the
+     * foreground and auto-pause only fired after opening the app. The type MUST
+     * be omitted when either condition fails. Without the permission Android
+     * 14+ throws on a location-typed start; from the background (restore after
+     * reboot, package replace, sticky restart) the platform strips
+     * while-in-use types, the FGS ends up with no type at all and
+     * VpnService.establish() returns null (XR-279 emulator run). The price of
+     * the omission: a restored session reads SSID only after the app is opened
+     * again, so trusted-network auto-pause on a restored session waits for
+     * that; the tunnel itself stays up.
      */
     private fun startForegroundWithLocationType() {
         val notif = buildNotification(_stateFlow.value)
@@ -1548,7 +1571,7 @@ class XrVpnService : VpnService() {
         }
         val locGranted = checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) ==
             android.content.pm.PackageManager.PERMISSION_GRANTED
-        if (locGranted) {
+        if (foregroundLocationTypeAllowed(sessionFromUi, locGranted)) {
             types = types or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
         }
         if (types != 0) {
