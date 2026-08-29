@@ -3756,4 +3756,58 @@ mod tests {
         assert_eq!(snap.bytes_total, 100);
         assert!(transfer_cancel(g.id()));
     }
+
+    /// XR-193: индекс хаба за аутентификацией, клиент обязан донести грант
+    /// до хаба. Стаб ловит запрос и отвечает индексом; пропавший заголовок
+    /// здесь краснеет раньше, чем на живом хабе.
+    #[tokio::test]
+    async fn test_list_shares_sends_bearer_to_hub_index() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut tx = Some(tx);
+        spawn_http_mock(listener, move |req| {
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(req.to_string());
+            }
+            let body = r#"[{"share_id":"s1","name":"s1","addr":"203.0.113.9","port":8443,"agent_pubkey":""}]"#;
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+        });
+
+        let hub = format!("http://{addr}");
+        let shares = list_shares(&hub, Some("grant-blob"), Duration::from_secs(5))
+            .await
+            .expect("индекс читается");
+
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].share_id, "s1");
+
+        let req = rx.await.unwrap();
+        assert!(req.starts_with("GET /api/v1/shares "), "wrong request line: {req}");
+        assert!(
+            req.to_lowercase().contains("authorization: bearer grant-blob"),
+            "grant is not sent as a Bearer header: {req}"
+        );
+    }
+
+    /// XR-193: отказ хаба доезжает до вызывающего как есть, а не тонет
+    /// в пустом списке.
+    #[tokio::test]
+    async fn test_list_shares_maps_hub_401_to_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_http_mock(listener, |_| {
+            "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".into()
+        });
+
+        let hub = format!("http://{addr}");
+        let err = list_shares(&hub, None, Duration::from_secs(5))
+            .await
+            .expect_err("анонимный запрос индекса не может пройти");
+        assert!(err.contains("http_401"), "error: {err}");
+    }
 }
