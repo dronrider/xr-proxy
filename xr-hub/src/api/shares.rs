@@ -5,22 +5,25 @@
 //! with the hub's ed25519 key. It never stores or relays file bytes — the agent
 //! (`xr-share`) holds the data and verifies tokens offline. Routes:
 //!
-//! - Public:  `GET  /api/v1/shares`              → consumer view (name+addr+key)
-//! - Admin:   `GET  /api/v1/admin/shares`        → full records
-//!            `POST /api/v1/admin/shares`        → register address:port + pubkey
-//!            `DELETE /api/v1/admin/shares/:id`  → unregister
-//!            `POST /api/v1/admin/shares/:id/token` → mint a signed access token
+//! - Public:  `GET  /api/v1/shares`              -> consumer view (name+addr+key),
+//!           auth: a live grant or invite (XR-193)
+//! - Admin:   `GET  /api/v1/admin/shares`        -> full records
+//!            `POST /api/v1/admin/shares`        -> register address:port + pubkey
+//!            `DELETE /api/v1/admin/shares/:id`  -> unregister
+//!            `POST /api/v1/admin/shares/:id/token` -> mint a signed access token
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{self, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use base64::Engine;
 use serde::Deserialize;
-use xr_proto::share::{sign_share_token, ShareInfo, ShareRecord, ShareToken, SCOPE_READ};
+use xr_proto::share::{
+    sign_share_token, verify_share_token, ShareInfo, ShareRecord, ShareToken, SCOPE_READ,
+};
 
 use crate::state::AppState;
 use crate::storage;
@@ -40,14 +43,76 @@ fn now_unix() -> u64 {
 
 // ── Public ──────────────────────────────────────────────────────────
 
+/// `GET /api/v1/shares` auth (XR-193): the index lists every agent of the
+/// fleet, so a reader must present either a live invite token (the same
+/// liveness rule as `invite_shares`) or a share-access grant, the base64url
+/// [`ShareToken`] blob, verified against the hub key with the `share:read`
+/// scope. Any valid grant opens the whole index: the token binds its own
+/// `share_id`, and refusing an otherwise-live grant over a deleted share
+/// would only lock a legitimate reader out. An absent credential is `401`,
+/// a presented-but-dead one is `403`/`410`.
+async fn authorize_index_reader(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, String)> {
+    let provided = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .trim();
+    if provided.is_empty() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "share index requires a grant or invite token".into(),
+        ));
+    }
+
+    {
+        let invites = state.invites.read().await;
+        if let Some(invite) = invites.get(provided) {
+            let now_rfc = chrono::Utc::now().to_rfc3339();
+            if invite.expires_at <= now_rfc {
+                return Err((StatusCode::GONE, "invite expired".into()));
+            }
+            if invite.consumed_at.is_some() {
+                return Err((StatusCode::GONE, "invite revoked".into()));
+            }
+            return Ok(());
+        }
+    }
+
+    let Some(signing) = state.signing.as_ref() else {
+        return Err((StatusCode::FORBIDDEN, "unknown credential".into()));
+    };
+    let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(provided)
+        .map_err(|_| (StatusCode::FORBIDDEN, "unknown credential".into()))?;
+    let token: ShareToken = serde_json::from_slice(&json)
+        .map_err(|_| (StatusCode::FORBIDDEN, "unknown credential".into()))?;
+    verify_share_token(
+        &token,
+        &signing.verifying_key(),
+        &token.share_id,
+        SCOPE_READ,
+        now_unix(),
+    )
+    .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
+    Ok(())
+}
+
 /// GET /api/v1/shares — the consumer-facing index: for every registered share,
 /// just enough to reach and pin the agent (name + addr:port + pubkey). No
 /// owner-side bookkeeping, no file listing (that comes from the agent).
-pub async fn list_shares(State(state): State<Arc<AppState>>) -> Json<Vec<ShareInfo>> {
+pub async fn list_shares(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ShareInfo>>, (StatusCode, String)> {
+    authorize_index_reader(&state, &headers).await?;
     let shares = state.shares.read().await;
     let mut list: Vec<ShareInfo> = shares.values().map(ShareRecord::info).collect();
     list.sort_by(|a, b| a.name.cmp(&b.name));
-    Json(list)
+    Ok(Json(list))
 }
 
 // ── Admin ───────────────────────────────────────────────────────────
@@ -206,4 +271,195 @@ fn validate_ed25519_pubkey(b64: &str) -> Result<(), (StatusCode, String)> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use base64::Engine;
+    use ed25519_dalek::SigningKey;
+    use tokio::sync::RwLock;
+    use tower::ServiceExt;
+    use xr_proto::preset::{Invite, InvitePayload};
+
+    use super::*;
+    use crate::api::router;
+    use crate::signing::SigningContext;
+    use crate::state::AppState;
+
+    const LIVE_UNTIL: &str = "2099-01-01T00:00:00+00:00";
+    const DEAD_SINCE: &str = "2001-01-01T00:00:00+00:00";
+
+    fn share_rec(id: &str) -> ShareRecord {
+        ShareRecord {
+            share_id: id.into(),
+            name: id.into(),
+            owner: String::new(),
+            addr: "203.0.113.9".into(),
+            addrs: Vec::new(),
+            port: 8443,
+            agent_pubkey: String::new(),
+            created_at: String::new(),
+            comment: String::new(),
+            via_relay: false,
+            writable: false,
+        }
+    }
+
+    fn invite_rec(token: &str, expires_at: &str, consumed: bool) -> Invite {
+        Invite {
+            token: token.into(),
+            created_at: DEAD_SINCE.into(),
+            expires_at: expires_at.into(),
+            consumed_at: consumed.then(|| DEAD_SINCE.into()),
+            claimed_by_ip: None,
+            claim_id: None,
+            one_time: false,
+            comment: String::new(),
+            payload: InvitePayload {
+                server_address: "203.0.113.10".into(),
+                server_port: 8443,
+                obfuscation_key: String::new(),
+                modifier: "positional_xor_rotate".into(),
+                salt: 0,
+                preset: "russia".into(),
+                hub_url: String::new(),
+                servers: Vec::new(),
+            },
+            share_ids: Vec::new(),
+            write_share_ids: Vec::new(),
+        }
+    }
+
+    fn state_with(hub: Option<SigningKey>, invites: Vec<Invite>) -> Arc<AppState> {
+        let config: crate::config::HubConfig =
+            toml::from_str("[server]\n[admin]\nusers = []").unwrap();
+        let mut invite_map = HashMap::new();
+        for i in invites {
+            invite_map.insert(i.token.clone(), i);
+        }
+        let mut share_map = HashMap::new();
+        share_map.insert("s1".to_string(), share_rec("s1"));
+        Arc::new(AppState {
+            presets: RwLock::new(HashMap::new()),
+            invites: RwLock::new(invite_map),
+            shares: RwLock::new(share_map),
+            exposes: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashMap::new()),
+            config,
+            signing: hub.map(|key| SigningContext { signing_key: key }),
+            preset_gen: tokio::sync::watch::Sender::new(0),
+            ready: std::sync::atomic::AtomicBool::new(true),
+            web_attempts: Default::default(),
+        })
+    }
+
+    fn grant_blob(hub: &SigningKey, share_id: &str, scope: &str, exp: u64) -> String {
+        let token = sign_share_token(hub, share_id, scope, exp);
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&token).unwrap())
+    }
+
+    async fn get_index(state: Arc<AppState>, bearer: Option<&str>) -> axum::response::Response {
+        let mut builder = Request::builder().uri("/api/v1/shares");
+        if let Some(b) = bearer {
+            builder = builder.header("authorization", format!("Bearer {b}"));
+        }
+        router(state)
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn index_body(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    // XR-193: индекс адресов агентов закрыт от анонима, пустой ответ 401,
+    // а не пустой список, иначе карту флота продолжали бы читать без токена.
+    #[tokio::test]
+    async fn anonymous_index_request_is_unauthorized() {
+        let state = state_with(None, Vec::new());
+        let resp = get_index(state, None).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn live_grant_reads_index() {
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let state = state_with(Some(hub.clone()), Vec::new());
+        let exp = now_unix() + 3600;
+        let blob = grant_blob(&hub, "s1", SCOPE_READ, exp);
+        let resp = get_index(state, Some(&blob)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = index_body(resp).await;
+        assert!(body.contains("\"share_id\":\"s1\""), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn expired_grant_is_forbidden() {
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let state = state_with(Some(hub.clone()), Vec::new());
+        let blob = grant_blob(&hub, "s1", SCOPE_READ, now_unix() - 1);
+        let resp = get_index(state, Some(&blob)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn write_only_grant_is_forbidden() {
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let state = state_with(Some(hub.clone()), Vec::new());
+        let exp = now_unix() + 3600;
+        let blob = grant_blob(&hub, "s1", xr_proto::share::SCOPE_WRITE, exp);
+        let resp = get_index(state, Some(&blob)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn grant_signed_by_other_key_is_forbidden() {
+        let state = state_with(Some(SigningKey::from_bytes(&[42u8; 32])), Vec::new());
+        let stranger = SigningKey::from_bytes(&[7u8; 32]);
+        let blob = grant_blob(&stranger, "s1", SCOPE_READ, now_unix() + 3600);
+        let resp = get_index(state, Some(&blob)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn live_invite_reads_index() {
+        let state = state_with(None, vec![invite_rec("invite-live", LIVE_UNTIL, false)]);
+        let resp = get_index(state, Some("invite-live")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn expired_and_revoked_invites_are_rejected() {
+        let state = state_with(
+            None,
+            vec![
+                invite_rec("invite-expired", DEAD_SINCE, false),
+                invite_rec("invite-revoked", LIVE_UNTIL, true),
+            ],
+        );
+        let resp = get_index(state.clone(), Some("invite-expired")).await;
+        assert_eq!(resp.status(), StatusCode::GONE);
+        let resp = get_index(state, Some("invite-revoked")).await;
+        assert_eq!(resp.status(), StatusCode::GONE);
+    }
+
+    // Грант переживает саму шару: токен подписан хабом и не отозван, а индекс
+    // это общий каталог, а не одна шара из него.
+    #[tokio::test]
+    async fn grant_for_deleted_share_still_reads_index() {
+        let hub = SigningKey::from_bytes(&[42u8; 32]);
+        let state = state_with(Some(hub.clone()), Vec::new());
+        let blob = grant_blob(&hub, "gone-share", SCOPE_READ, now_unix() + 3600);
+        let resp = get_index(state, Some(&blob)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }
