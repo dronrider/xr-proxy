@@ -594,12 +594,27 @@ mod tests {
             .await;
         });
 
-        let mut slow_client = TcpStream::connect(slow_addr).await.unwrap();
+        let slow_client = TcpStream::connect(slow_addr).await.unwrap();
+        let (_slow_read_half, mut slow_write_half) = slow_client.into_split();
         let oversized_payload = vec![0u8; 5000];
         let wire = codec.encode_frame(Command::Connect, &oversized_payload).unwrap();
-        slow_client.write_all(&wire[..64]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        slow_client.write_all(&wire[64..128]).await.unwrap();
+
+        // Капание непрерывное, до самого конца теста: замолкший клиент рвётся
+        // и старым покомпонентным таймаутом read, слот тогда освобождается
+        // тем же путём и тест перестаёт различать семантики. Непрерывное
+        // капанье держит permit на старом коде, и честный коннект получает
+        // отказ от try_acquire вместо ConnectAck.
+        let drip = tokio::spawn(async move {
+            loop {
+                for chunk in wire.chunks(64) {
+                    if slow_write_half.write_all(chunk).await.is_err() {
+                        // Сервер закрыл соединение - капать больше некуда.
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        });
 
         // Дедлайн медленного истёк - его таска вернулась и отдала слот.
         // JoinHandle не даёт результата: сама таска ничего не возвращает,
@@ -639,6 +654,7 @@ mod tests {
 
         drop(target);
         honest.abort();
+        drip.abort();
     }
 
     /// Мок-приёмник для детерминированной проверки разбиения кадра на два
