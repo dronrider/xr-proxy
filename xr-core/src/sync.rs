@@ -853,14 +853,23 @@ pub struct SyncResult {
     pub report: Option<ApplyReport>,
 }
 
-/// GET the hub's public share index (`GET /api/v1/shares`): for each share, the
-/// consumer-facing name + `addr:port` + pinned agent key. No token needed — the
-/// hub is just a directory; access is gated at the agent.
-pub async fn list_shares(hub_url: &str, timeout: Duration) -> Result<Vec<ShareInfo>, String> {
+/// GET the hub's share index (`GET /api/v1/shares`): for each share, the
+/// consumer-facing name + `addr:port` + pinned agent key. Since XR-193 the
+/// index hides the fleet from anonymous readers: `bearer` is either a
+/// share-access grant blob (base64url `ShareToken`) or an invite token, sent
+/// as `Authorization: Bearer`. File access itself is still gated at the agent.
+pub async fn list_shares(
+    hub_url: &str,
+    bearer: Option<&str>,
+    timeout: Duration,
+) -> Result<Vec<ShareInfo>, String> {
     let client = http_client(timeout)?;
     let url = format!("{}/api/v1/shares", hub_url.trim_end_matches('/'));
-    let resp = client
-        .get(&url)
+    let mut req = client.get(&url);
+    if let Some(bearer) = bearer {
+        req = req.bearer_auth(bearer);
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| format!("network: {e}"))?;

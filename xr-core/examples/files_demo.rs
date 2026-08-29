@@ -11,6 +11,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use base64::Engine;
 use xr_core::sync::{list_shares, sync_share};
 use xr_proto::share::ShareToken;
 
@@ -29,7 +30,11 @@ async fn main() {
     std::fs::create_dir_all(dest).unwrap();
 
     println!("=== nativeListShares (hub index) ===");
-    match list_shares(hub, t).await {
+    // XR-193: the index sits behind auth, so the demo presents its ShareToken
+    // as the same base64url blob the grants carry.
+    let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&token).unwrap());
+    match list_shares(hub, Some(blob.as_str()), t).await {
         Ok(shares) => println!("{}", serde_json::to_string_pretty(&shares).unwrap()),
         Err(e) => println!("error: {e}"),
     }
