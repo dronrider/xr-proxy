@@ -65,6 +65,12 @@ pub struct LoginAttempts {
     window_ms: u64,
 }
 
+/// Верхняя граница отслеживаемых источников. Фоновые сканеры интернета
+/// присылают по одному логину с новых адресов, и без потолка протухшие окна
+/// копились бы в карте вечно. При превышении порога `attempted` выметает
+/// протухшие окна, поэтому живой остаётся только активная в окне часть.
+const MAX_TRACKED_SOURCES: usize = 10_000;
+
 #[derive(Default)]
 struct Window {
     /// Начало текущего окна, мс от эпохи.
@@ -94,13 +100,17 @@ impl LoginAttempts {
     }
 
     /// Ещё одна попытка из источника: в свежем окне счётчик начинается заново.
+    /// Заодно выметает протухшие окна, когда карта доросла до потолка.
     pub fn attempted(&self, ip: &IpAddr, now_ms: u64) {
         if self.max_attempts == 0 {
             return;
         }
         let mut map = self.inner.lock().expect("login attempts lock");
+        if map.len() >= MAX_TRACKED_SOURCES {
+            map.retain(|_, w| now_ms.saturating_sub(w.start_ms) < self.window_ms);
+        }
         let w = map.entry(*ip).or_default();
-        if now_ms.saturating_sub(w.start_ms) >= self.window_ms {
+        if w.start_ms == 0 || now_ms.saturating_sub(w.start_ms) >= self.window_ms {
             w.start_ms = now_ms;
             w.attempts = 0;
         }
@@ -145,10 +155,23 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Потолок одновременных проверок пароля. Блокирующий пул tokio по умолчанию
+/// растёт до 512 потоков, каждая argon2-проверка держит 19 MiB, и шторм из
+/// пары десятков свежих источников (пер-IP лимит его не останавливает)
+/// загонял пик памяти к гигабайтам. Потолок по числу ядер возвращает память
+/// в зависимость от машины, а не от числа источников (ревью XR-195).
+pub fn argon2_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
 /// POST /api/v1/auth/login validates credentials and returns a session token.
 /// Попытки ограничены на источник, а argon2 уезжает в spawn_blocking: проверка
 /// пароля занимает десятки миллисекунд CPU и 19 MiB памяти, и прямо в хендлере
-/// шторм логина съедал бы воркеры рантайма (XR-195).
+/// шторм логина съедал бы воркеры рантайма (XR-195). Одновременность проверок
+/// ограничена семафором `argon2_gate`, включая фиктивную проверку для
+/// неизвестного имени.
 pub async fn login(
     State(state): State<Arc<AppState>>,
     SourceIp(ip): SourceIp,
@@ -159,10 +182,17 @@ pub async fn login(
     }
     state.login_attempts.attempted(&ip, now_ms());
 
+    let permit = state
+        .argon2_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("семафор проверок пароля не закрывается");
     let users = state.config.admin.users.clone();
     let LoginRequest { username, password } = req;
     let creds = (username.clone(), password);
     let matches = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let (name, pass) = creds;
         password_matches(&users, &name, &pass)
     })
@@ -304,5 +334,63 @@ mod tests {
             limiter.attempted(&ip(1), 1_000);
         }
         assert!(limiter.allowed(&ip(1), 1_001));
+    }
+
+    // Ревью XR-195: при доросшей до потолка карте протухшие окна выметаются,
+    // и записи фоновых сканеров не копятся до рестарта.
+    #[test]
+    fn stale_windows_are_swept_at_capacity() {
+        let limiter = LoginAttempts::new(1, 1_000);
+        for n in 0..(MAX_TRACKED_SOURCES + 5) as u16 {
+            let addr = IpAddr::V4(std::net::Ipv4Addr::new(10, (n >> 8) as u8, n as u8, 7));
+            limiter.attempted(&addr, 100);
+        }
+        assert_eq!(
+            limiter.inner.lock().expect("login attempts lock").len(),
+            MAX_TRACKED_SOURCES + 5
+        );
+
+        limiter.attempted(&ip(1), 5_000);
+        let len = limiter.inner.lock().expect("login attempts lock").len();
+        assert_eq!(len, 1, "протухшие окна обязаны уходить из карты, осталось {len}");
+    }
+
+    // Ревью XR-195: потолок одновременных проверок держит семафор, в пул
+    // без разрешения задача не уезжает.
+    #[tokio::test]
+    async fn argon2_gate_caps_concurrent_checks() {
+        use std::sync::atomic::Ordering;
+
+        let gate = Arc::new(tokio::sync::Semaphore::new(2));
+        let inside = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let permit = gate.clone().acquire_owned().await.unwrap();
+            let (inside, peak) = (inside.clone(), peak.clone());
+            tasks.push(tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let cur = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(cur, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                inside.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert!(
+            peak.load(Ordering::SeqCst) <= 2,
+            "семафор обязан держать потолок, пик {}",
+            peak.load(Ordering::SeqCst)
+        );
+    }
+
+    // Ревью XR-195: потолок по числу ядер всегда положителен, нуль разрешений
+    // запер бы вход целиком.
+    #[test]
+    fn argon2_parallelism_is_positive() {
+        assert!(argon2_parallelism() >= 1);
     }
 }

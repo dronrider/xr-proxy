@@ -36,6 +36,9 @@ pub struct AppState {
     /// Лимит попыток входа на источник для `/auth/login` (XR-195): шторм
     /// логинов упирается в отказ без argon2, а не занимает проверкой пароля.
     pub login_attempts: crate::api::auth::LoginAttempts,
+    /// Потолок одновременных argon2-проверок (ревью XR-195): числа ядер,
+    /// а не растяжимого блокирующего пула tokio.
+    pub argon2_gate: Arc<tokio::sync::Semaphore>,
     /// Готовность (XR-230): поднимается в конце [`hydrate`], когда инвайты,
     /// шары и ключ подписи уже на месте. Слушатель хаб поднимает после
     /// hydrate, поэтому наружу неготовность видна только закрытым портом,
@@ -84,6 +87,9 @@ pub fn hydrate(config: HubConfig) -> Result<Arc<AppState>> {
         config.admin.login_max_attempts,
         config.admin.login_window_secs.saturating_mul(1000),
     );
+    let argon2_gate = Arc::new(tokio::sync::Semaphore::new(
+        crate::api::auth::argon2_parallelism(),
+    ));
 
     let state = Arc::new(AppState {
         presets: RwLock::new(presets),
@@ -99,6 +105,7 @@ pub fn hydrate(config: HubConfig) -> Result<Arc<AppState>> {
         preset_gen: watch::Sender::new(0),
         web_attempts: Default::default(),
         login_attempts,
+        argon2_gate,
         ready: AtomicBool::new(false),
     });
     state.ready.store(true, Ordering::Release);

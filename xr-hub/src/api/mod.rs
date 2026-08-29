@@ -246,13 +246,19 @@ mod tests {
         config: crate::config::HubConfig,
         sessions: crate::sessions::SessionStore,
     ) -> Arc<AppState> {
-        state_full(config, sessions, Default::default())
+        state_full(
+            config,
+            sessions,
+            Default::default(),
+            Arc::new(tokio::sync::Semaphore::new(4)),
+        )
     }
 
     fn state_full(
         config: crate::config::HubConfig,
         sessions: crate::sessions::SessionStore,
         login_attempts: auth::LoginAttempts,
+        argon2_gate: Arc<tokio::sync::Semaphore>,
     ) -> Arc<AppState> {
         Arc::new(AppState {
             presets: RwLock::new(HashMap::new()),
@@ -265,6 +271,7 @@ mod tests {
             preset_gen: tokio::sync::watch::Sender::new(0),
             web_attempts: Default::default(),
             login_attempts,
+            argon2_gate,
             ready: std::sync::atomic::AtomicBool::new(true),
         })
     }
@@ -593,6 +600,7 @@ mod tests {
             config,
             sessions,
             auth::LoginAttempts::new(max_attempts, 60_000),
+            Arc::new(tokio::sync::Semaphore::new(auth::argon2_parallelism())),
         )
     }
 

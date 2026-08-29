@@ -293,6 +293,7 @@ mod tests {
             ready: std::sync::atomic::AtomicBool::new(true),
             web_attempts: Default::default(),
             login_attempts: Default::default(),
+            argon2_gate: Arc::new(tokio::sync::Semaphore::new(4)),
         })
     }
 
