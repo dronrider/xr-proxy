@@ -15,7 +15,7 @@ salt = 0xDEADBEEF                     # Must match client
 # ─── Limits ───────────────────────────────────────────────────────────
 [limits]
 max_connections = 256                 # Max simultaneous connections
-connection_timeout_sec = 300          # Idle connection timeout (seconds)
+connection_timeout_sec = 300          # Общий дедлайн хендшейка (секунды), XR-202
 
 # ─── Fallback ─────────────────────────────────────────────────────────
 # When someone connects with a browser or DPI probe sends a request,
