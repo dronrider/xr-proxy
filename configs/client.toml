@@ -151,4 +151,5 @@ log_level = "info"                    # error, warn, info, debug
 # # Assign static IPs via DHCP so these don't change!
 # exclude_dst_ports = [53, 67, 68]    # Don't relay DNS, DHCP
 # flow_timeout_sec = 120              # UDP flow expiry
+# max_flows = 1024                    # Hard cap on flow table (LRU eviction)
 # keepalive_interval_sec = 25         # Keepalive to VPS

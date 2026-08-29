@@ -40,4 +40,5 @@ level = "info"                        # error, warn, info, debug
 # listen_port = 9999                  # Must match client's vps_port
 # incoming_port_min = 45000           # Port range for incoming P2P connections
 # incoming_port_max = 65535
-# flow_timeout_sec = 120
+# flow_timeout_sec = 120              # UDP flow expiry
+# max_flows = 1024                    # Hard cap on flow table (LRU eviction)
