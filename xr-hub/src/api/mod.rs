@@ -11,11 +11,13 @@ pub mod web;
 
 use std::sync::Arc;
 
-use axum::http::StatusCode;
+use axum::http::header;
+use axum::http::{HeaderValue, StatusCode};
 use axum::middleware;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::embed::spa_service;
@@ -25,6 +27,14 @@ use crate::state::AppState;
 /// и без единой подробности: ошибки `storage` несут путь каталога данных
 /// (XR-211), а устройство каталогов хаба постороннему знать незачем.
 pub(crate) const PERSIST_FAILED: &str = "failed to persist state";
+
+/// Общий CSP ответов хаба (XR-239). Админка это SPA на том же origin, поэтому
+/// всё берём с себя: `data:` нужен QR-кодам, которые фронт рисует в картинку,
+/// инлайновые атрибуты стилей остаются у Vue-разметки. Страница инвайта
+/// (XR-192) ставит свой, более строгий CSP с nonce, и слой её не трогает.
+const DEFAULT_CSP: &str = "default-src 'self'; img-src 'self' data:; \
+     style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; \
+     form-action 'self'; frame-ancestors 'none'";
 
 /// Отказ записи для публичной ручки: наружу уходит [`PERSIST_FAILED`], полная
 /// ошибка с путём остаётся в логе оператора. Разбирать отказ по одному
@@ -134,6 +144,23 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     // SPA fallback for admin UI.
     api.fallback_service(spa_service())
+        // Защитные заголовки (XR-239): одним слоем на всё, что отвечает хаб,
+        // включая статику админки, поэтому слой стоит после fallback_service:
+        // слои, поставленные раньше, на fallback уже не ложатся. Заголовок
+        // вписывается только в пустое место, чтобы не задваивать второй CSP рядом
+        // с nonce-CSP страницы инвайта.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(DEFAULT_CSP),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ))
 }
 
 // regcheck:test-begin
@@ -196,9 +223,11 @@ mod tests {
 
     use super::*;
 
-    fn empty_state() -> Arc<AppState> {
-        let config: crate::config::HubConfig =
-            toml::from_str("[server]\n[admin]\nusers = []").unwrap();
+    fn empty_config() -> crate::config::HubConfig {
+        toml::from_str("[server]\n[admin]\nusers = []").unwrap()
+    }
+
+    fn state_from(config: crate::config::HubConfig) -> Arc<AppState> {
         Arc::new(AppState {
             presets: RwLock::new(HashMap::new()),
             invites: RwLock::new(HashMap::new()),
@@ -213,6 +242,10 @@ mod tests {
         })
     }
 
+    fn empty_state() -> Arc<AppState> {
+        state_from(empty_config())
+    }
+
     async fn get(uri: &str) -> axum::response::Response {
         router(empty_state())
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -225,6 +258,89 @@ mod tests {
             .await
             .unwrap();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Состояние с живым инвайтом: собирает его сам `build_invite`, поэтому
+    /// токен и payload такие же, как у настоящей ручки создания.
+    async fn state_with_invite() -> (Arc<AppState>, String) {
+        let dir = tempfile::tempdir().expect("временный каталог для инвайта");
+        let mut config = empty_config();
+        config.server.data_dir = dir.path().to_str().unwrap().into();
+        let state = state_from(config);
+
+        let invite = invites::build_invite(&state, None, true, String::new(), None, None)
+            .await
+            .expect("инвайт для страницы view");
+        (state, invite.token)
+    }
+
+    // XR-239: защитные заголовки ставит один слой на всё, что отвечает хаб:
+    // JSON API, верхнеуровневые ручки и статику админки из fallback. До него
+    // заголовки несла только страница инвайта (XR-192), остальное уходило
+    // голым.
+    #[tokio::test]
+    async fn security_headers_cover_all_responses() {
+        for (uri, what) in [
+            ("/healthz", "живость"),
+            ("/api/v1/presets", "JSON API"),
+            ("/invite/SOMETOKEN", "редирект инвайта"),
+            ("/no-such-route", "статика админки"),
+        ] {
+            let resp = get(uri).await;
+            let headers = resp.headers();
+            assert_eq!(
+                headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap_or_else(|| panic!("нет X-Content-Type-Options на {what}")),
+                "nosniff"
+            );
+            assert_eq!(
+                headers.get(header::REFERRER_POLICY).unwrap_or_else(|| panic!("нет Referrer-Policy на {what}")),
+                "no-referrer"
+            );
+            let csp = headers
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap_or_else(|| panic!("нет CSP на {what}"))
+                .to_str()
+                .unwrap();
+            assert!(
+                csp.starts_with("default-src 'self'"),
+                "на {what} стоит чужой CSP: {csp}"
+            );
+        }
+    }
+
+    // XR-239: страница инвайта несёт свой строгий CSP с nonce (XR-192). Общий
+    // слой обязан дополнить ответ недостающими заголовками, а не задвоить CSP:
+    // браузер выполнил бы обе политики сразу и строгая перестала бы быть
+    // единственной.
+    #[tokio::test]
+    async fn invite_view_keeps_its_own_csp() {
+        let (state, token) = state_with_invite().await;
+        let view = format!("/api/v1/invite/{token}/view");
+        let resp = router(state)
+            .oneshot(Request::builder().uri(view).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let csps: Vec<_> = resp
+            .headers()
+            .get_all(header::CONTENT_SECURITY_POLICY)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(csps.len(), 1, "CSP обязан быть один: {csps:?}");
+        assert!(
+            csps[0].starts_with("default-src 'none'") && csps[0].contains("nonce-"),
+            "строгий nonce-CSP страницы потерялся: {csps:?}"
+        );
+        assert_eq!(
+            resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            resp.headers().get(header::REFERRER_POLICY).unwrap(),
+            "no-referrer"
+        );
     }
 
     // XR-230: живость это ответ «ok» без аутентификации и без взгляда на
