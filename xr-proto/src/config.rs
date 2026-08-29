@@ -1,5 +1,7 @@
 /// Configuration parsing for client and server.
+use crate::obfuscation::ModifierStrategy;
 use serde::{Deserialize, Serialize};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 
 // ── Client config ────────────────────────────────────────────────────
@@ -466,6 +468,78 @@ pub fn load_server_config(path: &Path) -> Result<ServerConfig, Box<dyn std::erro
     Ok(config)
 }
 
+// --- Validation -------------------------------------------------------
+
+/// Сухая проверка конфига клиента (XR-227): всё, что валяет процесс на
+/// боевом старте, называется здесь по причине, до листенеров и файрвола.
+/// Проверяет то же, что потребует старт: годный для validate конфиг
+/// стартует, а конфиг, не прошедший validate, стартом падает.
+pub fn validate_client_config(config: &ClientConfig) -> Result<(), String> {
+    let entries = config.server_entries()?;
+    for entry in &entries {
+        let section = format!("servers '{}'", entry.display_name());
+        let key = entry.key.as_deref().unwrap_or(&config.obfuscation.key);
+        let modifier = entry.modifier.as_deref().unwrap_or(&config.obfuscation.modifier);
+        let salt = entry.salt.unwrap_or(config.obfuscation.salt);
+        obfuscation_reject_reason(&section, key, modifier, salt)?;
+        // Пул подключается по разобранному SocketAddr, доменное имя там не
+        // работает, поэтому адрес судится так же строго.
+        format!("{}:{}", entry.address, entry.port)
+            .parse::<SocketAddr>()
+            .map_err(|e| format!("{section}: invalid address '{}': {}", entry.address, e))?;
+    }
+    if let Some(udp) = config.udp_relay.as_ref().filter(|u| u.enabled) {
+        // Relay ходит через primary, его адрес и подставляется без своего
+        // vps_host; мусор в адресе на старте роняет только задачу relay,
+        // и без проверки это молчание неотличимо от работающего перехвата.
+        let host = udp.vps_host.as_deref().unwrap_or(&entries[0].address);
+        format!("{}:{}", host, udp.vps_port)
+            .parse::<SocketAddr>()
+            .map_err(|e| format!("udp_relay: invalid vps address '{host}': {e}"))?;
+    }
+    Ok(())
+}
+
+/// Сухая проверка конфига сервера, см. `validate_client_config`.
+pub fn validate_server_config(config: &ServerConfig) -> Result<(), String> {
+    obfuscation_reject_reason(
+        "obfuscation",
+        &config.obfuscation.key,
+        &config.obfuscation.modifier,
+        config.obfuscation.salt,
+    )?;
+    let bind = format!("{}:{}", config.server.listen, config.server.port);
+    bind.to_socket_addrs()
+        .map_err(|e| format!("server: invalid listen address '{bind}': {e}"))?;
+    Ok(())
+}
+
+/// Почему тройка ключ-модификатор-соль не годится, либо `Ok(())`.
+fn obfuscation_reject_reason(
+    section: &str,
+    key: &str,
+    modifier: &str,
+    salt: u64,
+) -> Result<(), String> {
+    decode_key(key).map_err(|e| format!("{section}.key: {e}"))?;
+    ModifierStrategy::from_str(modifier).ok_or_else(|| {
+        format!(
+            "{section}.modifier: unknown modifier strategy '{modifier}' \
+             (positional_xor_rotate, rotating_salt, substitution_table)"
+        )
+    })?;
+    // Обфускатор берёт salt как u32, большее значение молча обрезается:
+    // клиент и сервер обрежут одинаково и связи это не рвёт, но заданное
+    // в конфиге число тогда врёт, и поймать это можно только здесь.
+    if salt > u32::MAX as u64 {
+        return Err(format!(
+            "{section}.salt: {salt} does not fit in u32 and is truncated to {} at runtime",
+            salt as u32
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,6 +799,155 @@ domains = ["x.com"]
         let cfg: RoutingConfig = serde_json::from_str(stored).unwrap();
         assert!(cfg.rules[0].name.is_none());
         assert_eq!(cfg.rules[0].domains, vec!["youtube.com"]);
+    }
+
+    fn client_with(extra: &str) -> ClientConfig {
+        let toml_str = format!(
+            r#"{BASE}
+[[servers]]
+name = "primary"
+address = "192.0.2.10"
+port = 8443
+{extra}"#
+        );
+        toml::from_str(&toml_str).unwrap()
+    }
+
+    fn server_with(extra: &str) -> ServerConfig {
+        let toml_str = format!(
+            r#"[server]
+listen = "0.0.0.0"
+port = 443
+
+[obfuscation]
+key = "dGVzdA=="
+{extra}"#
+        );
+        toml::from_str(&toml_str).unwrap()
+    }
+
+    /// Годный конфиг проходит сухую проверку целиком: ложные срабатывания
+    /// здесь дороже пропусков, validate обязан соглашаться со стартом.
+    #[test]
+    fn validate_accepts_good_client_config() {
+        let cfg = client_with("");
+        validate_client_config(&cfg).unwrap();
+
+        let cfg = client_with("key = \"b3RoZXI=\"\nsalt = 42\nmodifier = \"rotating_salt\"");
+        validate_client_config(&cfg).unwrap();
+
+        let cfg: ClientConfig = toml::from_str(&format!(
+            r#"{BASE}
+[[servers]]
+address = "192.0.2.10"
+port = 8443
+
+[udp_relay]
+enabled = true
+vps_host = "198.51.100.7"
+vps_port = 9999
+"#
+        ))
+        .unwrap();
+        validate_client_config(&cfg).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_client_config_without_servers() {
+        let cfg: ClientConfig = toml::from_str(BASE).unwrap();
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("[[servers]]"), "{err}");
+    }
+
+    #[test]
+    fn validate_names_reject_reasons() {
+        // client_with несёт годный ключ и адрес, портим их точечно.
+        let mut cfg = client_with("");
+        cfg.obfuscation.key = "".into();
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("key must not be empty"), "{err}");
+
+        cfg.obfuscation.key = "не-base64!".into();
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("servers 'primary'.key"), "{err}");
+        assert!(err.contains("Invalid symbol"), "{err}");
+
+        cfg.obfuscation.key = "dGVzdA==".into();
+        cfg.obfuscation.modifier = "xor".into();
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("unknown modifier strategy 'xor'"), "{err}");
+
+        cfg.obfuscation.modifier = "rotating_salt".into();
+        cfg.obfuscation.salt = u32::MAX as u64 + 1;
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("does not fit in u32"), "{err}");
+
+        cfg.obfuscation.salt = 42;
+        cfg.servers[0].address = "vps.example.com".into();
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("invalid address 'vps.example.com'"), "{err}");
+    }
+
+    /// Override ключа в записи пула проверяется наравне с общим: у резерва
+    /// бывает свой ключ, и его мусор роняет старт так же.
+    #[test]
+    fn validate_checks_per_server_override() {
+        let mut cfg = client_with("key = \"!!!\"");
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("servers 'primary'.key"), "{err}");
+
+        cfg.servers[0].key = Some("dGVzdA==".into());
+        cfg.servers[0].modifier = Some("nope".into());
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("servers 'primary'.modifier"), "{err}");
+    }
+
+    /// Адрес VPS для relay обязателен только у включённого relay: выключенный
+    /// мусор в секции старту не мешает и validate зря ругаться не должен.
+    #[test]
+    fn validate_checks_udp_relay_vps_address_only_when_enabled() {
+        let toml_str = format!(
+            r#"{BASE}
+[[servers]]
+address = "192.0.2.10"
+port = 8443
+
+[udp_relay]
+enabled = false
+vps_host = "not an address"
+"#
+        );
+        let cfg: ClientConfig = toml::from_str(&toml_str).unwrap();
+        validate_client_config(&cfg).unwrap();
+
+        let toml_str = toml_str.replace("enabled = false", "enabled = true");
+        let cfg: ClientConfig = toml::from_str(&toml_str).unwrap();
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("invalid vps address 'not an address'"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_good_server_config() {
+        validate_server_config(&server_with("")).unwrap();
+    }
+
+    #[test]
+    fn validate_names_server_reject_reasons() {
+        let mut cfg = server_with("");
+        cfg.obfuscation.key = "".into();
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.contains("obfuscation.key"), "{err}");
+        assert!(err.contains("key must not be empty"), "{err}");
+
+        cfg.obfuscation.key = "dGVzdA==".into();
+        cfg.obfuscation.salt = 1 << 40;
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.contains("obfuscation.salt"), "{err}");
+
+        cfg.obfuscation.salt = 42;
+        cfg.server.listen = "not an address".into();
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.contains("invalid listen address"), "{err}");
     }
 }
 
