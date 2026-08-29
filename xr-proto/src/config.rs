@@ -278,6 +278,8 @@ pub struct UdpRelayClientConfig {
     pub exclude_dst_ports: Vec<u16>,
     #[serde(default = "default_flow_timeout")]
     pub flow_timeout_sec: u64,
+    #[serde(default = "default_udp_max_flows")]
+    pub max_flows: usize,
     #[serde(default = "default_keepalive_interval")]
     pub keepalive_interval_sec: u64,
 }
@@ -295,6 +297,8 @@ pub struct UdpRelayServerConfig {
     pub incoming_port_max: u16,
     #[serde(default = "default_flow_timeout")]
     pub flow_timeout_sec: u64,
+    #[serde(default = "default_udp_max_flows")]
+    pub max_flows: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -428,6 +432,9 @@ fn default_exclude_ports() -> Vec<u16> {
 }
 fn default_flow_timeout() -> u64 {
     120
+}
+fn default_udp_max_flows() -> usize {
+    1024
 }
 fn default_keepalive_interval() -> u64 {
     25

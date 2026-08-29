@@ -55,14 +55,20 @@ struct FlowTable {
     /// адрес устройства -> его туннельный порт
     ports: HashMap<SocketAddr, u16>,
     pool: std::ops::RangeInclusive<u16>,
+    /// Жёсткий потолок числа флоу. Пул один на таблицу, но и он велик
+    /// (25001 порт), а между 30-секундными чистками устройство, пишущее по
+    /// многим портам, успевает нагнать карту записей, которые таймаут ещё не
+    /// снял.
+    max_flows: usize,
 }
 
 impl FlowTable {
-    fn new(pool: std::ops::RangeInclusive<u16>) -> Self {
+    fn new(pool: std::ops::RangeInclusive<u16>, max_flows: usize) -> Self {
         FlowTable {
             flows: HashMap::new(),
             ports: HashMap::new(),
             pool,
+            max_flows,
         }
     }
 
@@ -74,6 +80,10 @@ impl FlowTable {
                 flow.last_activity = now;
             }
             return Some(port);
+        }
+
+        if self.flows.len() >= self.max_flows {
+            self.evict_stalest();
         }
 
         let port = match self.allocate(src_addr.port()) {
@@ -105,6 +115,34 @@ impl FlowTable {
             return Some(preferred);
         }
         self.pool.clone().find(|p| !self.flows.contains_key(p))
+    }
+
+    /// Снять наименее свежий флоу, вернув его туннельный порт в пул. Отказ
+    /// новому оставил бы потолок в руках одного пишущего до конца
+    /// flow_timeout: остальные устройства LAN не завели бы ни одного флоу.
+    /// Вытеснение забирает запись, которую чистка по таймауту сняла бы
+    /// первой: у живых флоу время двигается каждым пакетом в обе стороны,
+    /// и до них очередь не доходит. Спуфящие сокеты тут не трогаем, они
+    /// живут своим временем последнего использования.
+    fn evict_stalest(&mut self) {
+        let victim = self
+            .flows
+            .iter()
+            .min_by_key(|(_, flow)| flow.last_activity)
+            .map(|(port, _)| *port);
+        let port = match victim {
+            Some(port) => port,
+            None => return,
+        };
+        if let Some(flow) = self.flows.remove(&port) {
+            self.ports.remove(&flow.src_addr);
+            tracing::warn!(
+                "UDP relay: flow table full ({} flows), evicted stalest {} (tunnel port {})",
+                self.flows.len() + 1,
+                flow.src_addr,
+                port
+            );
+        }
     }
 
     /// Пакет от устройства, готовый к отправке в туннель.
@@ -235,7 +273,7 @@ pub async fn run_udp_relay(
     }
 
     let state = Arc::new(RelayState {
-        flows: Mutex::new(FlowTable::new(TUNNEL_PORT_POOL)),
+        flows: Mutex::new(FlowTable::new(TUNNEL_PORT_POOL, config.max_flows)),
         spoof_sockets: Mutex::new(SpoofCache::new()),
         obfuscator,
         vps_addr,
@@ -762,7 +800,7 @@ mod tests {
     }
 
     fn table() -> FlowTable {
-        FlowTable::new(TUNNEL_PORT_POOL)
+        FlowTable::new(TUNNEL_PORT_POOL, usize::MAX)
     }
 
     fn data(src_port: u16, dst: SocketAddr, payload: &[u8]) -> RelayPacket {
@@ -939,7 +977,7 @@ mod tests {
 
     #[test]
     fn exhausted_pool_drops_packet_instead_of_reusing_port() {
-        let mut t = FlowTable::new(40000..=40000);
+        let mut t = FlowTable::new(40000..=40000, usize::MAX);
         let now = Instant::now();
         let server = addr("203.0.113.5:3074");
 
@@ -949,6 +987,76 @@ mod tests {
             .upstream_packet(addr("192.168.1.12:3074"), server, b"c".to_vec(), now)
             .is_none());
         assert_eq!(t.len(), 2, "отброшенный пакет не оставляет флоу в таблице");
+    }
+
+    /// XR-204: потолок таблицы. Поток флоу сверх лимита не растит карту:
+    /// вытесняется наименее свежая запись, её туннельный порт возвращается
+    /// в пул, и размер держится на потолке.
+    #[test]
+    fn flood_beyond_limit_keeps_table_at_ceiling_and_returns_ports() {
+        let mut t = FlowTable::new(TUNNEL_PORT_POOL, 3);
+        let now = Instant::now();
+
+        assert_eq!(t.touch(addr("192.0.2.10:3074"), now).unwrap(), 3074);
+        assert_eq!(
+            t.touch(addr("192.0.2.11:3074"), now + Duration::from_secs(1)).unwrap(),
+            40000
+        );
+        assert_eq!(
+            t.touch(addr("192.0.2.12:3074"), now + Duration::from_secs(2)).unwrap(),
+            40001
+        );
+        assert_eq!(t.len(), 3);
+
+        // Четвёртое устройство вытесняет первое: оно наименее свежее, а его
+        // настоящий порт 3074 как раз освободился и достаётся новичку.
+        assert_eq!(
+            t.touch(addr("192.0.2.13:3074"), now + Duration::from_secs(3)).unwrap(),
+            3074,
+            "порт вытесненного флоу обязан вернуться в пул"
+        );
+        assert_eq!(t.len(), 3, "поток сверх лимита не растит таблицу");
+    }
+
+    /// XR-204: вытеснение забирает запись, которую чистка по таймауту сняла
+    /// бы первой. Флоу, по которому продолжают ходить пакеты, переживает
+    /// напор сверх лимита с портом и маппингом.
+    #[test]
+    fn eviction_spares_living_flow() {
+        let mut t = FlowTable::new(TUNNEL_PORT_POOL, 3);
+        let now = Instant::now();
+        let server = addr("203.0.113.5:3074");
+        let console = addr("192.0.2.10:3074");
+
+        let console_port = t.touch(console, now).unwrap();
+        t.touch(addr("192.0.2.11:41000"), now + Duration::from_secs(1)).unwrap();
+        t.touch(addr("192.0.2.12:41001"), now + Duration::from_secs(2)).unwrap();
+
+        // Устройство хулигана нагоняет флоу сверх лимита, а приставка тем
+        // временем продолжает играть: её пакеты двигают время, и вытеснение
+        // каждый раз забирает чей-то протухающий флоу, не её.
+        for i in 0u32..5 {
+            let stamp = now + Duration::from_secs(3 + u64::from(i));
+            let attacker = addr(&format!("192.0.2.30:{}", 50000 + i));
+            t.upstream_packet(console, server, b"ping".to_vec(), stamp).unwrap();
+            let up = t.upstream_packet(attacker, server, b"x".to_vec(), stamp).unwrap();
+            assert!(
+                t.downstream_target(&data(up.src_port, server, b"y"), stamp).is_some(),
+                "новый флоу сверх лимита получает запись, а не отказ"
+            );
+        }
+
+        assert_eq!(t.len(), 3);
+        assert_eq!(
+            t.touch(console, now + Duration::from_secs(10)).unwrap(),
+            console_port,
+            "живой флоу держит свой туннельный порт"
+        );
+        assert_eq!(
+            t.downstream_target(&data(console_port, server, b"reply"), now + Duration::from_secs(10)),
+            Some((console, server)),
+            "живой флоу продолжает получать ответы"
+        );
     }
 
     /// Входящий P2P: пакет пришёл от пира, которому мы не писали. Отдать его
