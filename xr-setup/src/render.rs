@@ -21,6 +21,16 @@ pub const UDP_TPROXY_CLEANUP: &str = include_str!("../../scripts/udp-tproxy-clea
 /// Бэкап состояния хаба (XR-224): тот же скрипт, что кладут руками.
 pub const HUB_BACKUP: &str = include_str!("../../deploy/xr-hub-backup.sh");
 
+/// Сторож crash-loop сервисов VPS (XR-226): тот же скрипт, что кладут руками.
+pub const SERVICE_ALERT: &str = include_str!("../../deploy/xr-service-alert.sh");
+
+/// Каждую минуту: RestartSec у юнитов 5 с, порог рестартов набирается
+/// за первые минуты цикла, дольше ждать значит терять время простоя.
+pub const SERVICE_ALERT_CRON: &str = "\
+# xr-proxy: алерт о crash-loop сервисов VPS (ставит xr-setup, XR-226)
+* * * * * root /usr/local/bin/xr-service-alert.sh
+";
+
 /// Раз в сутки ночью; cron.d на этих VPS уже носит cert-alert.
 pub const HUB_BACKUP_CRON: &str = "\
 # xr-hub: ежедневный бэкап состояния на второй VPS (ставит xr-setup, XR-224)
@@ -983,6 +993,224 @@ echo "$*" >> "$STAND/syslog.log"
         assert!(
             syslog.contains("No source IPs specified"),
             "причина отказа не доехала до лога: {syslog:?}"
+        );
+    }
+}
+
+/// Прогон сторожа crash-loop на стенде из заглушек (XR-226). systemctl и
+/// curl подменяются: настоящие правили бы машину с тестами и звали бы
+/// наружу. Состояние юнитов задаётся файлом строк «юнит свойство значение»,
+/// curl пишет каждый вызов, поэтому тест видит и факт отправки, и её текст.
+#[cfg(all(test, unix))]
+mod service_alert_tests {
+    use super::{SERVICE_ALERT, SERVICE_ALERT_CRON};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const STUB_SYSTEMCTL: &str = r#"#!/bin/sh
+echo "$*" >> "$STAND/systemctl-calls.log"
+grep "^$2 $4 " "$STAND/systemctl.state" | cut -d' ' -f3-
+exit 0
+"#;
+
+    const STUB_CURL: &str = r#"#!/bin/sh
+echo "$*" >> "$STAND/curl-calls.log"
+exit 0
+"#;
+
+    struct Stand {
+        dir: tempfile::TempDir,
+    }
+
+    impl Stand {
+        fn new() -> Self {
+            let stand = Stand {
+                dir: tempfile::tempdir().expect("временный каталог"),
+            };
+            fs::create_dir(stand.at("bin")).expect("каталог заглушек");
+            for (name, body) in [("systemctl", STUB_SYSTEMCTL), ("curl", STUB_CURL)] {
+                let path = stand.at("bin").join(name);
+                fs::write(&path, body).expect("заглушка стенда");
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                    .expect("права на заглушку");
+            }
+            fs::write(
+                stand.at("alert.env"),
+                "TG_TOKEN=123456:ABC\nTG_CHAT=123456789\n",
+            )
+            .expect("alert.env стенда");
+            // xr-relay живёт не на каждом VPS: стенд держит его unloaded,
+            // чтобы каждый тест прогонял и этот случай.
+            stand.set_state("xr-relay LoadState not-found");
+            write_exec(&stand.at("xr-service-alert.sh"), SERVICE_ALERT);
+            stand
+        }
+
+        fn at(&self, rel: &str) -> PathBuf {
+            self.dir.path().join(rel)
+        }
+
+        fn read(&self, rel: &str) -> String {
+            fs::read_to_string(self.at(rel)).unwrap_or_default()
+        }
+
+        /// Строка «юнит свойство значение»: новое значение того же свойства
+        /// заменяет прежнее, иначе заглушка ответила бы несколькими строками.
+        fn set_state(&self, line: &str) {
+            let mut words = line.split_whitespace();
+            let prefix = format!(
+                "{} {} ",
+                words.next().unwrap_or_default(),
+                words.next().unwrap_or_default()
+            );
+            let text = self.read("systemctl.state");
+            let mut kept: Vec<&str> = text.lines().filter(|l| !l.starts_with(&prefix)).collect();
+            kept.push(line);
+            fs::write(self.at("systemctl.state"), format!("{}\n", kept.join("\n")))
+                .expect("состояние стенда");
+        }
+
+        fn service(&self, load: &str, active: &str, restarts: u32) {
+            self.set_state(&format!("xr-proxy-server LoadState {load}"));
+            self.set_state(&format!("xr-proxy-server ActiveState {active}"));
+            self.set_state(&format!("xr-proxy-server NRestarts {restarts}"));
+        }
+
+        fn alerts_sent(&self) -> usize {
+            self.read("curl-calls.log").lines().count()
+        }
+
+        fn run(&self) -> std::process::Output {
+            Command::new("/bin/sh")
+                .arg(self.at("xr-service-alert.sh").as_os_str())
+                .env("STAND", self.dir.path())
+                .env("PATH", format!("{}:/usr/bin:/bin", self.at("bin").display()))
+                .env("ENV_FILE", self.at("alert.env"))
+                .env("STATE_DIR", self.at("state"))
+                .output()
+                .expect("запуск сторожа")
+        }
+    }
+
+    fn write_exec(path: &Path, body: &str) {
+        fs::write(path, body).expect("запись скрипта стенда");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("права на скрипт");
+    }
+
+    /// Сервис в цикле рестартов приносит один алерт за окно повторов, а не
+    /// по письму в минуту. xr-relay при этом unloaded: сторож обязан
+    /// пропускать машины, где этого сервиса нет.
+    #[test]
+    fn crash_loop_alerts_once_per_window() {
+        let stand = Stand::new();
+        stand.service("loaded", "activating", 15);
+
+        let out = stand.run();
+        assert!(
+            out.status.success(),
+            "сторож упал: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let sent = stand.read("curl-calls.log");
+        assert!(
+            sent.contains("сервис xr-proxy-server в crash-loop: NRestarts=15"),
+            "алерт о цикле не ушёл: {sent:?}"
+        );
+
+        stand.run();
+        assert_eq!(
+            stand.alerts_sent(),
+            1,
+            "повтор в пределах окна не должен уходить"
+        );
+
+        // Метка устарела на окно: теперь повтор уместен, сервис всё ещё в цикле.
+        fs::write(stand.at("state/xr-proxy-server.alert"), "0\n").expect("метка стенда");
+        stand.run();
+        assert_eq!(stand.alerts_sent(), 2, "повтор после окна не ушёл");
+    }
+
+    /// Восстановление отмечается одним сообщением и снимает метку: второй
+    /// прогон на здоровом сервисе молчит.
+    #[test]
+    fn recovery_after_loop_is_a_single_message() {
+        let stand = Stand::new();
+        stand.service("loaded", "activating", 12);
+        stand.run();
+        assert_eq!(stand.alerts_sent(), 1);
+
+        stand.service("loaded", "active", 12);
+        stand.run();
+        let sent = stand.read("curl-calls.log");
+        assert!(
+            sent.contains("сервис xr-proxy-server восстановился"),
+            "восстановление не отмечено: {sent:?}"
+        );
+
+        stand.run();
+        assert_eq!(
+            stand.alerts_sent(),
+            2,
+            "здоровый сервис после восстановления обязан молчать"
+        );
+    }
+
+    /// Ровные рестарты ниже порога, остановленный руками сервис и unloaded
+    /// юнит молча не алертят: одиночный рестарт и обслуживание это не цикл.
+    #[test]
+    fn healthy_stopped_and_unloaded_services_stay_silent() {
+        let stand = Stand::new();
+        stand.service("loaded", "active", 3);
+        stand.run();
+        stand.service("loaded", "inactive", 20);
+        stand.run();
+        stand.service("loaded", "activating", 9);
+        stand.run();
+
+        assert_eq!(
+            stand.alerts_sent(),
+            0,
+            "без цикла рестартов ушли алерты: {}",
+            stand.read("curl-calls.log")
+        );
+        assert!(
+            !stand.at("state/xr-proxy-server.alert").exists(),
+            "метка алерта появилась без алерта"
+        );
+    }
+
+    /// Без alert.env слать некуда: сторож говорит об этом в stderr и выходит
+    /// нулём, как cert-alert, чтобы каждую минуту не сыпать письмами cron.
+    #[test]
+    fn missing_alert_env_reports_and_exits_zero() {
+        let stand = Stand::new();
+        stand.service("loaded", "activating", 15);
+        fs::remove_file(stand.at("alert.env")).expect("убрать alert.env");
+
+        let out = stand.run();
+        assert!(out.status.success(), "отсутствие env это не отказ");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("алерт не настроен"),
+            "ненастроенный алерт не назван: {stderr:?}"
+        );
+        assert_eq!(stand.alerts_sent(), 0, "без токена ушёл настоящий curl");
+    }
+
+    /// Cron зовёт именно тот скрипт, что раскладывает шаг, и тот читает
+    /// общий с cert-alert env: разъехались бы пути, и сторож молча не
+    /// ходил бы вовсе.
+    #[test]
+    fn cron_line_runs_the_laid_out_script() {
+        assert!(
+            SERVICE_ALERT_CRON.contains("/usr/local/bin/xr-service-alert.sh"),
+            "строка cron не зовёт раскладываемый скрипт: {SERVICE_ALERT_CRON:?}"
+        );
+        assert!(
+            SERVICE_ALERT.contains("ENV_FILE:-/etc/xr-proxy/alert.env"),
+            "сторож ушёл от общего с cert-alert alert.env"
         );
     }
 }

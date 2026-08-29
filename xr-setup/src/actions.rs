@@ -373,6 +373,33 @@ impl Step for HubBackup {
     }
 }
 
+/// Сторож crash-loop сервисов (XR-226): скрипт и строка cron, оба это код
+/// установщика и приводятся к вшитому. Секретов тут нет: токен Telegram
+/// скрипт берёт из общего alert.env, который заполняет оператор.
+pub struct ServiceAlert {
+    pub script: PathBuf,
+    pub script_content: String,
+    pub cron: PathBuf,
+    pub cron_content: String,
+}
+
+impl Step for ServiceAlert {
+    fn name(&self) -> String {
+        "server:service-alert".into()
+    }
+
+    fn check(&self) -> Result<bool> {
+        Ok(file_is(&self.script, &self.script_content)
+            && file_is(&self.cron, &self.cron_content))
+    }
+
+    fn apply(&self) -> Result<()> {
+        write_atomic(&self.script, self.script_content.as_bytes(), 0o755)?;
+        write_atomic(&self.cron, self.cron_content.as_bytes(), 0o644)?;
+        Ok(())
+    }
+}
+
 /// Дописать раздел в чужой существующий конфиг, если его там ещё нет
 /// (LLD-38: блок `[web]` в конфиг хаба). Целиком такой конфиг не
 /// перерисовывается: из него не восстановить ни хеш пароля, ни ключи, поэтому
@@ -649,6 +676,33 @@ mod tests {
         // Пропавший cron-файл возвращает шаг в работу.
         std::fs::remove_file(&next.cron).unwrap();
         assert!(!next.check().unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn service_alert_keeps_cron_and_script_in_shape() {
+        let dir = tmpdir("alert");
+        let step = ServiceAlert {
+            script: dir.join("usr/local/bin/xr-service-alert.sh"),
+            script_content: "#!/bin/sh\necho v1\n".into(),
+            cron: dir.join("etc/cron.d/xr-service-alert"),
+            cron_content: "* * * * * root /usr/local/bin/xr-service-alert.sh\n".into(),
+        };
+        assert!(!step.check().unwrap());
+        step.apply().unwrap();
+        assert!(step.check().unwrap());
+        assert_eq!(
+            std::fs::metadata(&step.script).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "cron запускает скрипт напрямую, он обязан быть исполняемым"
+        );
+
+        // Локальная правка скрипта это не целевое состояние: сторож
+        // обновляется вместе с установщиком.
+        std::fs::write(&step.script, "#!/bin/sh\necho patched\n").unwrap();
+        assert!(!step.check().unwrap());
+        step.apply().unwrap();
+        assert_eq!(std::fs::read_to_string(&step.script).unwrap(), step.script_content);
         std::fs::remove_dir_all(&dir).ok();
     }
 

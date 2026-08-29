@@ -3,7 +3,8 @@
 //! одноразовым инвайтом - швом с онбордингом LLD-04.
 
 use crate::actions::{
-    AppendBlock, HubBackup, InstallBinary, Restart, SigningKey, Sysctl, SystemdUnit, WriteConfig,
+    AppendBlock, HubBackup, InstallBinary, Restart, ServiceAlert, SigningKey, Sysctl, SystemdUnit,
+    WriteConfig,
 };
 use crate::arch::Arch;
 use crate::fetch::BinSource;
@@ -11,7 +12,7 @@ use crate::hub_api::HubClient;
 use crate::render::{
     render_hub_toml, render_hub_web_block, render_server_toml, render_web_toml, HubTomlParams,
     ServerTomlParams, WebTomlParams, HUB_BACKUP, HUB_BACKUP_CRON, HUB_BACKUP_ENV, HUB_UNIT,
-    SERVER_UNIT, SYSCTL_CONF, WEB_UNIT,
+    SERVER_UNIT, SERVICE_ALERT, SERVICE_ALERT_CRON, SYSCTL_CONF, WEB_UNIT,
 };
 use crate::secrets;
 use crate::steps::Step;
@@ -30,6 +31,10 @@ const SIGNING_KEY_FILE: &str = "/var/lib/xr-hub/signing.key";
 const HUB_BACKUP_BIN: &str = "/usr/local/bin/xr-hub-backup.sh";
 const HUB_BACKUP_CRON_FILE: &str = "/etc/cron.d/xr-hub-backup";
 const HUB_BACKUP_ENV_FILE: &str = "/etc/xr-hub/backup.env";
+const SERVICE_ALERT_BIN: &str = "/usr/local/bin/xr-service-alert.sh";
+const SERVICE_ALERT_CRON_FILE: &str = "/etc/cron.d/xr-service-alert";
+/// Тот же env, что у cert-alert.sh: токен один на все алерты машины.
+const ALERT_ENV_FILE: &str = "/etc/xr-proxy/alert.env";
 const WEB_BIN: &str = "/usr/local/bin/xr-web";
 const WEB_CONF: &str = "/etc/xr-web/config.toml";
 const WEB_UNIT_NAME: &str = "xr-web";
@@ -297,6 +302,12 @@ pub fn plan(r: &Resolved) -> Vec<Box<dyn Step>> {
             unit: SERVER_UNIT_NAME.into(),
             content: SERVER_UNIT.into(),
         }),
+        Box::new(ServiceAlert {
+            script: PathBuf::from(SERVICE_ALERT_BIN),
+            script_content: SERVICE_ALERT.into(),
+            cron: PathBuf::from(SERVICE_ALERT_CRON_FILE),
+            cron_content: SERVICE_ALERT_CRON.into(),
+        }),
     ];
 
     if let Some(hub) = &r.hub {
@@ -422,6 +433,7 @@ pub fn finish(r: &Resolved) -> Result<()> {
         println!("  obfuscation_key = {}", r.server.key);
         println!("  salt = 0x{:08X}", r.server.salt);
         print_web_findings(r);
+        print_alert_env_finding();
         return Ok(());
     };
 
@@ -433,7 +445,36 @@ pub fn finish(r: &Resolved) -> Result<()> {
         println!();
         println!("{finding}");
     }
+    print_alert_env_finding();
     outcome
+}
+
+/// Незаполненный alert.env: сторож crash-loop ходит по cron, но слать алерт
+/// некуда, и тишину такого сторожа не отличить от здоровых сервисов. Файл
+/// общий с cert-alert.sh, на живых VPS он обычно уже стоит.
+fn print_alert_env_finding() {
+    if let Some(finding) =
+        alert_env_finding(std::fs::read_to_string(ALERT_ENV_FILE).ok().as_deref())
+    {
+        println!();
+        println!("{finding}");
+    }
+}
+
+pub fn alert_env_finding(env: Option<&str>) -> Option<String> {
+    let filled = env.is_some_and(|text| {
+        ["TG_TOKEN", "TG_CHAT"]
+            .iter()
+            .all(|key| env_value_set(text, key))
+    });
+    if filled {
+        return None;
+    }
+    Some(format!(
+        "Находка: сторож crash-loop сервисов ходит по cron, но Telegram не настроен.\n  \
+         Заполни {ALERT_ENV_FILE} (TG_TOKEN и TG_CHAT, тот же файл, что у cert-alert) и проверь:\n  \
+         {SERVICE_ALERT_BIN}"
+    ))
 }
 
 fn print_web_findings(r: &Resolved) {
@@ -638,7 +679,13 @@ mod tests {
     fn server_plan_without_hub() {
         assert_eq!(
             names(&resolved(false, false)),
-            ["binary:xr-server", "config:server", "sysctl", "service:xr-proxy-server"]
+            [
+                "binary:xr-server",
+                "config:server",
+                "sysctl",
+                "service:xr-proxy-server",
+                "server:service-alert"
+            ]
         );
     }
 
@@ -651,6 +698,7 @@ mod tests {
                 "config:server",
                 "sysctl",
                 "service:xr-proxy-server",
+                "server:service-alert",
                 "binary:xr-hub",
                 "hub:signing-key",
                 "config:hub",
@@ -689,6 +737,24 @@ mod tests {
     }
 
     #[test]
+    fn alert_finding_fires_until_telegram_is_set() {
+        for empty in [
+            None,
+            Some("#TG_TOKEN=123:ABC\n#TG_CHAT=42\n"),
+            Some("TG_TOKEN=123:ABC\n"),
+        ] {
+            let finding = alert_env_finding(empty)
+                .unwrap_or_else(|| panic!("ненастроенный Telegram обязан стать находкой: {empty:?}"));
+            assert!(finding.contains(ALERT_ENV_FILE));
+            assert!(finding.contains(SERVICE_ALERT_BIN), "в находке нужна точная команда");
+        }
+        assert!(
+            alert_env_finding(Some("TG_TOKEN=123:ABC\nTG_CHAT=42\n")).is_none(),
+            "заполненный env находкой не считается"
+        );
+    }
+
+    #[test]
     fn server_plan_with_web_appends_front_steps() {
         let mut r = resolved(true, false);
         r.web = Some(web_plan(true, false));
@@ -699,6 +765,7 @@ mod tests {
                 "config:server",
                 "sysctl",
                 "service:xr-proxy-server",
+                "server:service-alert",
                 "binary:xr-hub",
                 "hub:signing-key",
                 "config:hub",
