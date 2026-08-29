@@ -246,6 +246,14 @@ mod tests {
         config: crate::config::HubConfig,
         sessions: crate::sessions::SessionStore,
     ) -> Arc<AppState> {
+        state_full(config, sessions, Default::default())
+    }
+
+    fn state_full(
+        config: crate::config::HubConfig,
+        sessions: crate::sessions::SessionStore,
+        login_attempts: auth::LoginAttempts,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
             presets: RwLock::new(HashMap::new()),
             invites: RwLock::new(HashMap::new()),
@@ -256,6 +264,7 @@ mod tests {
             signing: None,
             preset_gen: tokio::sync::watch::Sender::new(0),
             web_attempts: Default::default(),
+            login_attempts,
             ready: std::sync::atomic::AtomicBool::new(true),
         })
     }
@@ -568,6 +577,95 @@ mod tests {
         assert_eq!(admin_get(&state, &first).await, StatusCode::UNAUTHORIZED);
         assert_eq!(admin_get(&state, &second).await, StatusCode::OK);
         assert_eq!(admin_get(&state, &third).await, StatusCode::OK);
+    }
+
+    // ===== Лимит попыток входа (XR-195) =====
+
+    /// Состояние с тремя попытками входа в минуту на источник и известным
+    /// паролем `secret` (как у `manual_state`, но часы настоящие).
+    fn login_limit_state(max_attempts: u32) -> Arc<AppState> {
+        let config = user_config(3600, 5);
+        let sessions = crate::sessions::SessionStore::new(
+            std::time::Duration::from_secs(3600),
+            config.admin.max_sessions_per_user,
+        );
+        state_full(
+            config,
+            sessions,
+            auth::LoginAttempts::new(max_attempts, 60_000),
+        )
+    }
+
+    /// Логин с явным адресом источника: слушатель кладёт адрес в соединение,
+    /// одншот-вызов кладёт его в запрос расширением. Источники различаются
+    /// последним октетом.
+    async fn login_from(state: &Arc<AppState>, source: u8, password: &str) -> StatusCode {
+        let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::new(192, 0, 2, source), 9999));
+        let body = format!("{{\"username\":\"root\",\"password\":\"{password}\"}}");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .extension(axum::extract::ConnectInfo(addr))
+            .body(Body::from(body))
+            .unwrap();
+        router(state.clone()).oneshot(req).await.unwrap().status()
+    }
+
+    // XR-195: серия неудачных логинов упирается в лимит, дальнейшие попытки
+    // отбиваются без проверки пароля, а содержательные ручки хаба под штормом
+    // отвечают.
+    #[tokio::test]
+    async fn login_storm_hits_limit_and_hub_stays_alive() {
+        let state = login_limit_state(3);
+
+        for _ in 0..3 {
+            assert_eq!(
+                login_from(&state, 1, "wrong").await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            login_from(&state, 1, "wrong").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "исчерпавший лимит источник обязан получить отказ"
+        );
+        assert_eq!(
+            login_from(&state, 1, "secret").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "отказ сидит до конца окна даже с верным паролем, argon2 не зовётся"
+        );
+
+        let req = Request::builder()
+            .uri("/api/v1/presets")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router(state.clone()).oneshot(req).await.unwrap().status(),
+            StatusCode::OK,
+            "под штормом логина пресеты обязаны отвечать"
+        );
+
+        assert_eq!(
+            login_from(&state, 2, "secret").await,
+            StatusCode::OK,
+            "лимит одного источника не запирает другого"
+        );
+    }
+
+    // XR-195: верный вход снимает счётчик, соседние промахи не копятся
+    // через успешный логин.
+    #[tokio::test]
+    async fn successful_login_resets_attempt_counter() {
+        let state = login_limit_state(2);
+
+        assert_eq!(login_from(&state, 1, "wrong").await, StatusCode::UNAUTHORIZED);
+        assert_eq!(login_from(&state, 1, "secret").await, StatusCode::OK);
+        assert_eq!(
+            login_from(&state, 1, "wrong").await,
+            StatusCode::UNAUTHORIZED,
+            "после успеха тот же источник всё ещё в лимите, а не в отказе"
+        );
     }
 }
 // regcheck:test-end
