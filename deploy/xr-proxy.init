@@ -27,6 +27,23 @@ start_service() {
         return 1
     }
 
+    # Сухая проверка конфига до старта (XR-227): отказ виден причиной
+    # в logread, а не бесконечным respawn по битому конфигу. Идёт раньше
+    # киллсвитча: правила, которые некому снять, не должны резать LAN у
+    # сервиса, который так и не поднялся.
+    if [ -x "$PROG" ]; then
+        if validate_out=$("$PROG" validate -c "$CONFIG" 2>&1); then
+            logger -t xr-proxy "config validation ok"
+        else
+            reason=$(echo "$validate_out" | head -3 | tr '\n' ' ')
+            # Печать в stderr и после logger: вызвавший со закрытым stdout
+            # не должен ронять отказ до того, как причина попала в logread.
+            echo "Config validation failed: $reason" >&2
+            logger -t xr-proxy "config validation failed: $reason"
+            return 1
+        fi
+    fi
+
     # Install watchdog cron job (backup: restarts xr-client
     # if procd somehow fails to do so)
     if [ -x "$WATCHDOG" ]; then

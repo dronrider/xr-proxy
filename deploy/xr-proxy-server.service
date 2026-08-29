@@ -4,6 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
+# Сухая проверка конфига до старта (XR-227): отказ с причиной виден в
+# systemctl status, а не тонет в цикле рестартов.
+ExecStartPre=/usr/local/bin/xr-server validate -c /etc/xr-proxy/server.toml
 ExecStart=/usr/local/bin/xr-server -c /etc/xr-proxy/server.toml
 Restart=always
 RestartSec=5

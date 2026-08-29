@@ -59,6 +59,16 @@ if [ -f "$CONFIG" ]; then
 
     info "Listen порт: $LISTEN_PORT"
     info "Default action: $DEFAULT_ACTION"
+
+    # Сухой прогон конфига самим бинарем (XR-227): точнее grep-эвристик
+    # выше, причину отказа называет тот же код, что стартует сервис.
+    if [ -x /usr/bin/xr-client ]; then
+        if validate_out=$(/usr/bin/xr-client validate -c "$CONFIG" 2>&1); then
+            ok "xr-client validate: ok"
+        else
+            fail "xr-client validate: $(echo "$validate_out" | head -2 | tr '\n' ' ')"
+        fi
+    fi
 else
     fail "Конфиг не найден: $CONFIG"
     info "Скопируйте: scp -O configs/client.toml root@ROUTER:/etc/xr-proxy/config.toml"

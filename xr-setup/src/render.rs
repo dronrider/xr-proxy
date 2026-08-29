@@ -495,7 +495,7 @@ echo "$*" >> "$STAND/syslog.log"
         /// системные sbin, а нам нужны заглушки.
         fn init_driver(&self, setup_script: &Path, config: &Path) -> PathBuf {
             let missing = self.at("no-such-file");
-            self.init_driver_with_killswitch(setup_script, config, &missing)
+            self.init_driver_with_killswitch(setup_script, config, &missing, &missing)
         }
 
         fn init_driver_with_killswitch(
@@ -503,6 +503,7 @@ echo "$*" >> "$STAND/syslog.log"
             setup_script: &Path,
             config: &Path,
             killswitch: &Path,
+            prog: &Path,
         ) -> PathBuf {
             let path = self.at("driver.sh");
             let missing = self.at("no-such-file");
@@ -513,6 +514,7 @@ echo "$*" >> "$STAND/syslog.log"
                      . '{init}'\n\
                      PATH='{path_env}'\n\
                      CONFIG='{config}'\n\
+                     PROG='{prog}'\n\
                      UDP_TPROXY='{setup}'\n\
                      WATCHDOG='{missing}'\n\
                      KILLSWITCH_SETUP='{killswitch}'\n\
@@ -524,9 +526,32 @@ echo "$*" >> "$STAND/syslog.log"
                     init = self.write_init().display(),
                     path_env = self.path_env(),
                     config = config.display(),
+                    prog = prog.display(),
                     setup = setup_script.display(),
                     killswitch = killswitch.display(),
                     missing = missing.display(),
+                ),
+            );
+            path
+        }
+
+        /// Заглушка xr-client для init: отвечает на validate как настоящий,
+        /// успех или отказ задаётся параметром. Вызовы помнит, чтобы тест
+        /// видел, как init ходил в бинарь.
+        fn prog_stub(&self, refuse: bool) -> PathBuf {
+            let path = self.at("xr-client");
+            let verdict = if refuse {
+                "if [ \"$1\" = validate ]; then\n\
+                 \x20   echo \"config invalid: obfuscation.key: key must not be empty\" >&2\n\
+                 \x20   exit 1\n\
+                 fi\n"
+            } else {
+                "[ \"$1\" = validate ] && echo ok && exit 0\n"
+            };
+            write_exec(
+                &path,
+                &format!(
+                    "#!/bin/sh\necho \"$*\" >> \"$STAND/prog-calls.log\"\n{verdict}exit 0\n"
                 ),
             );
             path
@@ -601,6 +626,87 @@ echo "$*" >> "$STAND/syslog.log"
         assert!(
             !syslog.contains("WARNING"),
             "успешная установка отмечена предупреждением: {syslog:?}"
+        );
+    }
+
+    /// Регрессия XR-227: init судит конфиг сухим прогоном бинаря до старта.
+    /// Годный конфиг проходит проверку и доезжает до киллсвитча и правил,
+    /// а сама проверка отмечается в логе: молчание неотличимо от
+    /// пропущенной проверки.
+    #[test]
+    fn init_validates_config_before_start() {
+        let stand = Stand::new();
+        let config = stand.write_config("\"192.0.2.10\"");
+        let setup = stand.setup_script(&config);
+        let killswitch = stand.killswitch_script();
+        let prog = stand.prog_stub(false);
+        let driver = stand.init_driver_with_killswitch(&setup, &config, &killswitch, &prog);
+
+        let out = stand.run_without_stdout(&driver, "");
+        assert!(
+            out.status.success(),
+            "init отвалился на годном конфиге: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let syslog = stand.read("syslog.log");
+        assert!(
+            syslog.contains("config validation ok"),
+            "проверка конфига не отметилась в логе: {syslog:?}"
+        );
+        let ruleset = stand.read("ruleset.txt");
+        assert!(
+            ruleset.contains("tproxy to :1081"),
+            "перехват после проверки не встал: {ruleset:?}"
+        );
+        let calls = stand.read("calls.log");
+        assert!(
+            calls.contains("add table ip xr_killswitch"),
+            "киллсвитч после проверки не встал: {calls:?}"
+        );
+        let calls = stand.read("prog-calls.log");
+        assert!(
+            calls.contains("validate -c"),
+            "init не ходил в бинарь за проверкой: {calls:?}"
+        );
+    }
+
+    /// Битый конфиг это отказ с причиной в logread, а не бесконечный
+    /// respawn. Киллсвитч при этом не встаёт: сервис не поднялся, и снимать
+    /// правила было бы некому, LAN остаётся с прямым выходом.
+    #[test]
+    fn init_refuses_invalid_config_before_killswitch() {
+        let stand = Stand::new();
+        let config = stand.write_config("\"192.0.2.10\"");
+        let setup = stand.setup_script(&config);
+        let killswitch = stand.killswitch_script();
+        let prog = stand.prog_stub(true);
+        let driver = stand.init_driver_with_killswitch(&setup, &config, &killswitch, &prog);
+
+        let out = stand.run_without_stdout(&driver, "");
+        assert!(
+            !out.status.success(),
+            "init поднял сервис по конфигу, не прошедшему проверку"
+        );
+
+        let syslog = stand.read("syslog.log");
+        assert!(
+            syslog.contains("config validation failed"),
+            "отказ не доехал до лога: {syslog:?}"
+        );
+        assert!(
+            syslog.contains("key must not be empty"),
+            "причина из бинаря не доехала до лога: {syslog:?}"
+        );
+        let ruleset = stand.read("ruleset.txt");
+        assert!(
+            !ruleset.contains("tproxy to :1081"),
+            "по битому конфигу встал перехват: {ruleset:?}"
+        );
+        let calls = stand.read("calls.log");
+        assert!(
+            !calls.contains("xr_killswitch"),
+            "по битому конфигу встал киллсвитч: {calls:?}"
         );
     }
 
@@ -708,7 +814,8 @@ echo "$*" >> "$STAND/syslog.log"
         );
         let setup = stand.setup_script(&config);
         let killswitch = stand.killswitch_script();
-        let driver = stand.init_driver_with_killswitch(&setup, &config, &killswitch);
+        let prog = stand.prog_stub(false);
+        let driver = stand.init_driver_with_killswitch(&setup, &config, &killswitch, &prog);
 
         let out = stand.run_without_stdout(&driver, "");
         assert!(
