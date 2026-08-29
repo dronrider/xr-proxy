@@ -108,9 +108,17 @@ pub struct AdminConfig {
     /// вытесняет старейшую. Ноль снимает ограничение.
     #[serde(default = "default_max_sessions_per_user")]
     pub max_sessions_per_user: usize,
+    /// Сколько попыток входа один источник делает за окно (XR-195): после
+    /// исчерпания login отвечает отказом без проверки пароля до конца окна.
+    /// Ноль снимает ограничение.
+    #[serde(default = "default_login_max_attempts")]
+    pub login_max_attempts: u32,
+    /// Окно учёта попыток входа в секундах (XR-195).
+    #[serde(default = "default_login_window_secs")]
+    pub login_window_secs: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct UserConfig {
     pub username: String,
     pub password_hash: String,
@@ -214,6 +222,12 @@ fn default_session_ttl_secs() -> u64 {
 }
 fn default_max_sessions_per_user() -> usize {
     5
+}
+fn default_login_max_attempts() -> u32 {
+    10
+}
+fn default_login_window_secs() -> u64 {
+    60
 }
 fn default_modifier() -> String {
     "positional_xor_rotate".into()

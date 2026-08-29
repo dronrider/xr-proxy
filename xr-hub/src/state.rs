@@ -33,6 +33,9 @@ pub struct AppState {
     /// Счётчик неверных паролей на ручке браузерного входа (LLD-38 п. 3.2):
     /// перебор гасится задержкой на стороне хаба, а не только на фронте.
     pub web_attempts: crate::api::web::PasswordAttempts,
+    /// Лимит попыток входа на источник для `/auth/login` (XR-195): шторм
+    /// логинов упирается в отказ без argon2, а не занимает проверкой пароля.
+    pub login_attempts: crate::api::auth::LoginAttempts,
     /// Готовность (XR-230): поднимается в конце [`hydrate`], когда инвайты,
     /// шары и ключ подписи уже на месте. Слушатель хаб поднимает после
     /// hydrate, поэтому наружу неготовность видна только закрытым портом,
@@ -77,6 +80,11 @@ pub fn hydrate(config: HubConfig) -> Result<Arc<AppState>> {
         .map(|s| SigningContext::from_file(&s.private_key))
         .transpose()?;
 
+    let login_attempts = crate::api::auth::LoginAttempts::new(
+        config.admin.login_max_attempts,
+        config.admin.login_window_secs.saturating_mul(1000),
+    );
+
     let state = Arc::new(AppState {
         presets: RwLock::new(presets),
         invites: RwLock::new(invites),
@@ -90,6 +98,7 @@ pub fn hydrate(config: HubConfig) -> Result<Arc<AppState>> {
         signing,
         preset_gen: watch::Sender::new(0),
         web_attempts: Default::default(),
+        login_attempts,
         ready: AtomicBool::new(false),
     });
     state.ready.store(true, Ordering::Release);

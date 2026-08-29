@@ -430,7 +430,7 @@ pub fn verify_password_at(
             format!("слишком много попыток, повторить через {secs} с"),
         ));
     }
-    if crate::api::auth::password_matches(&state.config, &req.username, &req.password) {
+    if crate::api::auth::password_matches(&state.config.admin.users, &req.username, &req.password) {
         state.web_attempts.succeeded(&req.username);
         Ok(Json(VerifyPasswordResp { ok: true }))
     } else {
@@ -649,6 +649,7 @@ mod tests {
             preset_gen: tokio::sync::watch::Sender::new(0),
             ready: std::sync::atomic::AtomicBool::new(true),
             web_attempts: Default::default(),
+            login_attempts: Default::default(),
         })
     }
 

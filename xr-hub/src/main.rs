@@ -456,7 +456,9 @@ async fn main() -> Result<()> {
 
     // Hydrate state from disk.
     let app_state = state::hydrate(hub_config)?;
-    let app = api::router(app_state);
+    // Адрес источника нужен лимиту попыток входа (XR-195), поэтому слушатель
+    // кладёт его в каждое соединение.
+    let app = api::router(app_state).into_make_service_with_connect_info::<SocketAddr>();
 
     match tls_config {
         Some(tls) => {
@@ -469,7 +471,7 @@ async fn main() -> Result<()> {
             .context("loading TLS certificates")?;
 
             axum_server::bind_rustls(bind_addr, rustls_config)
-                .serve(app.into_make_service())
+                .serve(app)
                 .await
                 .context("running TLS server")?;
         }

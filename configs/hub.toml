@@ -20,6 +20,11 @@ password_hash = "$argon2id$..."   # xr-hub hash-password <password>
 # session_ttl_secs = 43200          # 12h, срок жизни одного Bearer-токена
 # max_sessions_per_user = 5         # 0 снимает ограничение
 
+# Лимит попыток входа на источник (XR-195): после login_max_attempts
+# попыток за окно login отвечает 429 без проверки пароля до конца окна.
+# login_max_attempts = 10           # 0 снимает ограничение
+# login_window_secs = 60
+
 # [signing]
 # private_key = "/var/lib/xr-hub/signing_key"
 
