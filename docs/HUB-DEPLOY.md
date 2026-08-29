@@ -352,7 +352,11 @@ systemctl enable --now xr-hub
 ## 6. Проверка
 
 ```bash
-# API
+# Живость процесса (XR-230)
+curl -k https://localhost:8080/healthz
+# Ожидаемый ответ: ok
+
+# Содержимое: список пресетов
 curl -k https://localhost:8080/api/v1/presets
 # Ожидаемый ответ: []
 
