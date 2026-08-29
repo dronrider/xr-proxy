@@ -4,6 +4,7 @@ use std::io;
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio::time::Duration;
 use xr_proto::protocol::{Codec, Command, Frame, TargetAddr};
 
@@ -20,35 +21,106 @@ fn configure_socket(stream: &TcpStream) {
     let _ = sock_ref.set_tcp_keepalive(&ka);
 }
 
+/// Принятое соединение от accept-петли: permit лимита коннектов живёт ровно
+/// столько, сколько соединение в руках `handle_client`, включая хендшейк.
+/// Вынесено из main (XR-202), чтобы тест мог занять слот приёма медленным
+/// клиентом и убедиться, что дедлайн хендшейка слот освобождает.
+pub async fn serve_connection(
+    client: TcpStream,
+    client_addr: SocketAddr,
+    codec: Codec,
+    handshake_timeout: Duration,
+    fallback_response: Option<Vec<u8>>,
+    limits: crate::mux_handler::StreamLimits,
+    connections: &Semaphore,
+) {
+    let _permit = match connections.try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::warn!("Connection limit reached, rejecting {}", client_addr);
+            return;
+        }
+    };
+
+    if let Err(e) =
+        handle_client(client, client_addr, codec, handshake_timeout, fallback_response, limits).await
+    {
+        tracing::warn!("Client {} error: {}", client_addr, e);
+    }
+}
+
 /// Handle a single client connection end-to-end.
 pub async fn handle_client(
     mut client: TcpStream,
     client_addr: SocketAddr,
     codec: Codec,
-    timeout: Duration,
+    handshake_timeout: Duration,
     fallback_response: Option<Vec<u8>>,
     limits: crate::mux_handler::StreamLimits,
 ) -> io::Result<()> {
     configure_socket(&client);
 
-    // Read first frame (Connect command) with timeout
     let mut buf = vec![0u8; 4096];
 
-    let (connect_frame, filled) = match read_first_frame(&mut client, &mut buf, &codec, timeout).await? {
+    // XR-202: хендшейк идёт под одним общим дедлайном, а не под таймаутом на
+    // каждый read по отдельности. Медленный клиент, капающий байты с паузами
+    // короче таймаута, держал permit из max_connections неограниченно долго:
+    // каждый read укладывался в свой срок, и 256 таких коннектов запирали
+    // приём новых туннелей. Дедлайн отсчитывается от accept и накрывает весь
+    // путь до релея: первый кадр, DNS и connect к цели.
+    let outcome = tokio::time::timeout(
+        handshake_timeout,
+        handshake(&mut client, client_addr, &codec, &mut buf, fallback_response),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake deadline"))??;
+
+    match outcome {
+        HandshakeOutcome::Done => Ok(()),
+        HandshakeOutcome::Mux(connect_frame) => {
+            crate::mux_handler::handle_mux_client(
+                client, client_addr, codec, &connect_frame, limits,
+            )
+            .await
+        }
+        HandshakeOutcome::Relay { mut target, leftover } => {
+            relay_obfuscated(&mut client, &mut target, &codec, &buf[..leftover]).await
+        }
+    }
+}
+
+/// Куда девать соединение, договорившееся с хендшейком.
+enum HandshakeOutcome {
+    /// Первый кадр это MuxInit: сессия уходит в mux-обработчик.
+    Mux(Frame),
+    /// Одиночный Connect: ConnectAck отправлен, цель подключена. `leftover` -
+    /// байты после кадра, уже лежащие в начале `buf`.
+    Relay { target: TcpStream, leftover: usize },
+    /// Соединение закончено на стороне хендшейка (отдан fallback-ответ).
+    Done,
+}
+
+async fn handshake(
+    client: &mut TcpStream,
+    client_addr: SocketAddr,
+    codec: &Codec,
+    buf: &mut Vec<u8>,
+    fallback_response: Option<Vec<u8>>,
+) -> io::Result<HandshakeOutcome> {
+    let (connect_frame, filled) = match read_first_frame(client, buf, codec).await? {
         FirstFrameOutcome::Ready(frame, leftover) => (frame, leftover),
         FirstFrameOutcome::NeedFallback(reason) => {
             if reason == FallbackReason::InvalidFrame {
                 tracing::debug!("Invalid frame from {}, sending fallback", client_addr);
             }
-            return send_fallback_and_close(&mut client, fallback_response).await;
+            send_fallback_and_close(client, fallback_response).await?;
+            return Ok(HandshakeOutcome::Done);
         }
     };
 
     // Multiplexed or legacy single-stream?
     if connect_frame.command == Command::MuxInit {
-        return crate::mux_handler::handle_mux_client(
-            client, client_addr, codec, &connect_frame, limits,
-        ).await;
+        return Ok(HandshakeOutcome::Mux(connect_frame));
     }
 
     if connect_frame.command != Command::Connect {
@@ -58,7 +130,7 @@ pub async fn handle_client(
 
     let (target_addr, _) = TargetAddr::decode(&connect_frame.payload)?;
 
-    // Send ConnectAck IMMEDIATELY — before DNS resolution and target connect.
+    // Send ConnectAck IMMEDIATELY, before DNS resolution and target connect.
     let ack = codec.encode_frame(Command::ConnectAck, &[0])?;
     client.write_all(&ack).await?;
     tracing::info!("{} ack sent for {}", client_addr, addr_display(&target_addr));
@@ -66,7 +138,7 @@ pub async fn handle_client(
     let target_sockaddr = resolve_target(&target_addr).await?;
     tracing::info!("{} -> {} ({})", client_addr, target_sockaddr, addr_display(&target_addr));
 
-    let mut target = tokio::time::timeout(
+    let target = tokio::time::timeout(
         Duration::from_secs(5),
         TcpStream::connect(target_sockaddr),
     )
@@ -75,7 +147,7 @@ pub async fn handle_client(
 
     configure_socket(&target);
 
-    relay_obfuscated(&mut client, &mut target, &codec, &buf[..filled]).await
+    Ok(HandshakeOutcome::Relay { target, leftover: filled })
 }
 
 fn addr_display(addr: &TargetAddr) -> String {
@@ -130,24 +202,22 @@ enum FallbackReason {
     InvalidFrame,
 }
 
-/// Копит первый кадр хендшейка из `reader` в `buf`, по одному `read` за раз, с
-/// таймаутом на каждый read. Обобщена по `AsyncRead`, а не завязана на
-/// `TcpStream`: тесту счастливого пути на разбиение кадра между двумя read
-/// нужен приёмник, у которого границы чтений заданы явно, а не тем, что
-/// успеет накопиться в сокете к моменту вызова `read` - на живом `TcpStream`
-/// это гонка (см. XR-215).
+/// Копит первый кадр хендшейка из `reader` в `buf`, по одному `read` за раз.
+/// Дедлайна внутри нет: срок всему хендшейку ставит вызывающий (XR-202), и
+/// висящий здесь вечно `read` рвётся его общим `timeout`. Обобщена по
+/// `AsyncRead`, а не завязана на `TcpStream`: тесту счастливого пути на
+/// разбиение кадра между двумя read нужен приёмник, у которого границы
+/// чтений заданы явно, а не тем, что успеет накопиться в сокете к моменту
+/// вызова `read` - на живом `TcpStream` это гонка (см. XR-215).
 async fn read_first_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut Vec<u8>,
     codec: &Codec,
-    timeout: Duration,
 ) -> io::Result<FirstFrameOutcome> {
     let mut filled = 0;
 
     loop {
-        let n = tokio::time::timeout(timeout, reader.read(&mut buf[filled..]))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))??;
+        let n = reader.read(&mut buf[filled..]).await?;
 
         if n == 0 {
             return Err(io::Error::new(io::ErrorKind::ConnectionReset, "client closed"));
@@ -418,6 +488,159 @@ mod tests {
         drop(target);
     }
 
+    /// XR-202: медленный клиент капает валидные байты незавершённого кадра
+    /// порциями, каждая из которых укладывается в старый покомпонентный
+    /// таймаут read. Хендшейк обязан оборваться по общему дедлайну: сервер
+    /// закрывает соединение, а не копит кадр неограниченно долго.
+    #[tokio::test]
+    async fn slow_drip_handshake_is_cut_by_total_deadline() {
+        let codec = make_codec();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_codec = codec.clone();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_client(
+                stream,
+                peer,
+                server_codec,
+                Duration::from_secs(1),
+                None,
+                crate::mux_handler::StreamLimits::new(1024, 1024),
+            )
+            .await
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (mut read_half, mut write_half) = client.into_split();
+
+        // Заголовок честно обещает большой payload, но по проводу идут лишь
+        // первые байты, порциями по 64 с паузой 50 мс: любой одиночный read
+        // укладывался бы в прежний таймаут на сам read.
+        let oversized_payload = vec![0xCDu8; 5000];
+        let wire = codec.encode_frame(Command::Connect, &oversized_payload).unwrap();
+
+        let drip = tokio::spawn(async move {
+            for chunk in wire.chunks(64) {
+                if write_half.write_all(chunk).await.is_err() {
+                    // Сервер закрыл соединение - капать больше некуда.
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+
+        let mut received = Vec::new();
+        let closed = tokio::time::timeout(Duration::from_secs(3), read_half.read_to_end(&mut received))
+            .await
+            .expect("сервер обязан закрыть соединение по дедлайну хендшейка, а не висеть");
+        // Reset вместо чистого EOF допустим: непрочитанные байты дропа ещё
+        // лежат в сокете, и закрытие отдаётся как RST.
+       match closed {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            Err(e) => panic!("неожиданная ошибка чтения после дедлайна: {}", e),
+        }
+
+        drip.abort();
+
+        let err = server
+            .await
+            .unwrap()
+            .expect_err("недоговоривший хендшейк обязан вернуть ошибку");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::TimedOut,
+            "причиной отказа должен быть общий дедлайн хендшейка"
+        );
+    }
+
+    /// XR-202: слот приёма (permit из max_connections) освобождается по
+    /// дедлайну хендшейка, а не по сумме покомпонентных таймаутов. Семфор на
+    /// один коннект: медленный клиент занимает единственный слот, и честный
+    /// коннект следом обязан быть обслужен, как только дедлайн первого
+    /// истёк.
+    #[tokio::test]
+    async fn deadline_releases_connection_slot_for_next_client() {
+        let codec = make_codec();
+
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+
+        let slow_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_addr = slow_listener.local_addr().unwrap();
+        let honest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let honest_addr = honest_listener.local_addr().unwrap();
+
+        let connections = std::sync::Arc::new(Semaphore::new(1));
+        let limits = crate::mux_handler::StreamLimits::new(1024, 1024);
+
+        // Медленный клиент занимает единственный слот приёма.
+        let slow_codec = codec.clone();
+        let slow_sem = connections.clone();
+        let mut slow = tokio::spawn(async move {
+            let (stream, peer) = slow_listener.accept().await.unwrap();
+            serve_connection(
+                stream,
+                peer,
+                slow_codec,
+                Duration::from_secs(1),
+                None,
+                limits,
+                &slow_sem,
+            )
+            .await;
+        });
+
+        let mut slow_client = TcpStream::connect(slow_addr).await.unwrap();
+        let oversized_payload = vec![0u8; 5000];
+        let wire = codec.encode_frame(Command::Connect, &oversized_payload).unwrap();
+        slow_client.write_all(&wire[..64]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        slow_client.write_all(&wire[64..128]).await.unwrap();
+
+        // Дедлайн медленного истёк - его таска вернулась и отдала слот.
+        // JoinHandle не даёт результата: сама таска ничего не возвращает,
+        // интересен только факт её завершения.
+        let _ = tokio::time::timeout(Duration::from_secs(3), &mut slow)
+            .await
+            .expect("таска медленного клиента обязана вернуться по дедлайну хендшейка");
+
+        // Честный коннект через ту же обёртку приёма должен получить слот.
+        let honest_codec = codec.clone();
+        let honest_sem = connections.clone();
+        let honest = tokio::spawn(async move {
+            let (stream, peer) = honest_listener.accept().await.unwrap();
+            serve_connection(
+                stream,
+                peer,
+                honest_codec,
+                Duration::from_secs(2),
+                None,
+                crate::mux_handler::StreamLimits::new(1024, 1024),
+                &honest_sem,
+            )
+            .await;
+        });
+
+        let mut honest_client = TcpStream::connect(honest_addr).await.unwrap();
+        let payload = TargetAddr::Ip(target_addr).encode().unwrap();
+        let connect_wire = codec.encode_frame(Command::Connect, &payload).unwrap();
+        honest_client.write_all(&connect_wire).await.unwrap();
+
+        let frame = read_one_frame(&mut honest_client, &codec).await;
+        assert_eq!(
+            frame.command,
+            Command::ConnectAck,
+            "после дедлайна медленного клиента слот приёма должен достаться честному"
+        );
+
+        drop(target);
+        honest.abort();
+    }
+
     /// Мок-приёмник для детерминированной проверки разбиения кадра на два
     /// read: границы чтений заданы явно списком чанков, а не тем, что успеет
     /// накопиться на живом сокете к моменту вызова read. На реальном
@@ -472,7 +695,7 @@ mod tests {
         let mut reader = ChunkedReader::new(vec![wire[..split].to_vec(), wire[split..].to_vec()]);
         let mut buf = vec![0u8; 4096];
 
-        let outcome = read_first_frame(&mut reader, &mut buf, &codec, Duration::from_secs(2))
+        let outcome = read_first_frame(&mut reader, &mut buf, &codec)
             .await
             .expect("кадр, пришедший двумя read, должен дособраться без ошибки");
 

@@ -125,19 +125,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let limits = stream_limits.clone();
 
             tokio::spawn(async move {
-                let _permit = match sem.try_acquire() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        tracing::warn!("Connection limit reached, rejecting {}", addr);
-                        return;
-                    }
-                };
-
-                if let Err(e) =
-                    handler::handle_client(stream, addr, codec, timeout, fallback, limits).await
-                {
-                    tracing::warn!("Client {} error: {}", addr, e);
-                }
+                handler::serve_connection(stream, addr, codec, timeout, fallback, limits, &sem)
+                    .await;
             });
             std::future::ready(())
         },

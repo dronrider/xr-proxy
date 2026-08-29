@@ -308,6 +308,9 @@ pub struct ServerListenConfig {
 pub struct LimitsConfig {
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+    /// Общий дедлайн хендшейка сервера в секундах (XR-202): не договоривший
+    /// вовремя клиент теряет коннект и permit из `max_connections`, а не
+    /// продлевает свой срок каждым пришедшим байтом.
     #[serde(default = "default_timeout")]
     pub connection_timeout_sec: u64,
     /// Кап стримов на весь сервер (XR-199). `max_connections` считает
