@@ -96,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     udp_config.listen_port,
                     udp_obfs,
                     udp_config.flow_timeout_sec,
+                    udp_config.max_flows,
                     udp_config.incoming_port_min,
                     udp_config.incoming_port_max,
                 ).await {

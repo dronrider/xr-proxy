@@ -8,7 +8,9 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
-use tokio::time::Duration;
+// Под мок-часами тестов свежесть записи обязана идти по виртуальному времени,
+// иначе времена слипаются и жертва вытеснения выбирается произвольно.
+use tokio::time::{Duration, Instant};
 use xr_proto::obfuscation::Obfuscator;
 use xr_proto::udp_relay::{self, RelayPacket, RelayType};
 
@@ -27,11 +29,13 @@ struct FlowPacket {
     payload: Vec<u8>,
 }
 
-/// Поток одного src_port со стороны таблицы: только отправной конец очереди.
-/// Сокет и его судьба целиком у таска потока, поэтому владелец сокета всегда
-/// ровно один и второй bind того же src_port сделать просто некому.
+/// Поток одного src_port со стороны таблицы: отправной конец очереди и время
+/// последнего пакета в неё. Сокет и его судьба целиком у таска потока,
+/// поэтому владелец сокета всегда ровно один и второй bind того же src_port
+/// сделать просто некому.
 struct Flow {
     tx: mpsc::Sender<FlowPacket>,
+    last_seen: Instant,
 }
 
 /// Чей это поток: адрес пира из туннеля плюс его src_port. Ключ обфускации на
@@ -45,6 +49,9 @@ struct ServerState {
     flows: Mutex<HashMap<FlowKey, Flow>>,
     obfuscator: Obfuscator,
     flow_timeout: Duration,
+    /// Жёсткий потолок числа потоков: между уходами по простою таблица растёт
+    /// без границы, а каждый поток это ещё и таск с сокетом.
+    max_flows: usize,
     #[allow(dead_code)]
     incoming_port_min: u16,
     #[allow(dead_code)]
@@ -57,6 +64,7 @@ pub async fn run_udp_relay_server(
     listen_port: u16,
     obfuscator: Obfuscator,
     flow_timeout_sec: u64,
+    max_flows: usize,
     incoming_port_min: u16,
     incoming_port_max: u16,
 ) -> io::Result<()> {
@@ -68,6 +76,7 @@ pub async fn run_udp_relay_server(
         flows: Mutex::new(HashMap::new()),
         obfuscator,
         flow_timeout: Duration::from_secs(flow_timeout_sec),
+        max_flows,
         incoming_port_min,
         incoming_port_max,
     });
@@ -142,11 +151,41 @@ async fn handle_data_packet<F, Fut>(
     };
 
     let mut flows = state.flows.lock().await;
-    let tx = match flows.get(&key) {
-        Some(flow) => flow.tx.clone(),
+    let tx = match flows.get_mut(&key) {
+        Some(flow) => {
+            flow.last_seen = Instant::now();
+            flow.tx.clone()
+        }
         None => {
+            if flows.len() >= state.max_flows {
+                // Потолок таблицы. Отказ новому оставил бы его в руках одного
+                // пишущего до конца flow_timeout, поэтому вытесняем наименее
+                // свежий поток: чистка по простою сняла бы его первым. Слот
+                // уходит из таблицы вместе с отправным концом очереди, таск
+                // потока видит закрытый канал и выходит тем же путём, что и по
+                // простою, забирая сокет с собой.
+                let victim = flows
+                    .iter()
+                    .min_by_key(|(_, flow)| flow.last_seen)
+                    .map(|(key, _)| *key);
+                if let Some(victim) = victim {
+                    flows.remove(&victim);
+                    tracing::warn!(
+                        "UDP relay: flow table full ({} flows), evicted flow {} of {}",
+                        state.max_flows,
+                        victim.1,
+                        victim.0
+                    );
+                }
+            }
             let (tx, rx) = mpsc::channel(FLOW_QUEUE);
-            flows.insert(key, Flow { tx: tx.clone() });
+            flows.insert(
+                key,
+                Flow {
+                    tx: tx.clone(),
+                    last_seen: Instant::now(),
+                },
+            );
 
             let flow_state = state.clone();
             let flow_relay = relay_socket.clone();
@@ -305,10 +344,15 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(5);
 
     fn test_state(flow_timeout: Duration) -> Arc<ServerState> {
+        limited_state(flow_timeout, usize::MAX)
+    }
+
+    fn limited_state(flow_timeout: Duration, max_flows: usize) -> Arc<ServerState> {
         Arc::new(ServerState {
             flows: Mutex::new(HashMap::new()),
             obfuscator: Obfuscator::new(b"test-key".to_vec(), 7, ModifierStrategy::PositionalXorRotate),
             flow_timeout,
+            max_flows,
             incoming_port_min: 0,
             incoming_port_max: 0,
         })
@@ -841,6 +885,167 @@ mod tests {
             state.flows.lock().await.contains_key(&(any_peer(), src_port)),
             "переполнение очереди не снимает поток"
         );
+    }
+
+    /// XR-204: потолок таблицы потоков. Пачка датаграмм сверх лимита не
+    /// растит карту: лишний поток вытесняет наименее свежий, и размер держится
+    /// на потолке вместо роста до чистки по простою.
+    #[tokio::test(start_paused = true)]
+    async fn flood_beyond_limit_keeps_table_at_ceiling() {
+        let state = limited_state(Duration::from_secs(3600), 4);
+        let relay = local_socket().await;
+        let dst = local_socket().await.local_addr().unwrap();
+
+        for i in 0u16..8 {
+            handle_data_packet(
+                &state,
+                &relay,
+                any_peer(),
+                data_packet(41000 + i, dst, b"x"),
+                |_port| bind_ephemeral(),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            state.flows.lock().await.len(),
+            4,
+            "потоки сверх лимита не растят таблицу"
+        );
+    }
+
+    /// XR-204: вытеснение забирает наименее свежий поток, а не живой. Поток,
+    /// по которому продолжают идти пакеты, переживает напор сверх лимита и
+    /// продолжает носить пакеты наружу. Времена здесь настоящие: последний
+    /// пакет ждём на реальном сокете, и мок-часы обгоняли бы его доставку
+    /// виртуальным таймаутом.
+    #[tokio::test]
+    async fn living_flow_survives_flood_beyond_limit() {
+        let state = limited_state(Duration::from_secs(3600), 4);
+        let relay = local_socket().await;
+        let dst_socket = local_socket().await;
+        let dst = dst_socket.local_addr().unwrap();
+
+        // Живой поток плюс три потока напора заполняют потолок.
+        handle_data_packet(
+            &state,
+            &relay,
+            any_peer(),
+            data_packet(3074, dst, b"hello"),
+            |_port| bind_ephemeral(),
+        )
+        .await;
+        for i in 0u16..3 {
+            handle_data_packet(
+                &state,
+                &relay,
+                any_peer(),
+                data_packet(42000 + i, dst, b"flood"),
+                |_port| bind_ephemeral(),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Дальше чередуем: свежий пакет живого потока, затем новый поток сверх
+        // лимита. Жертвой становится поток напора, а не живой.
+        for i in 0u16..3 {
+            handle_data_packet(
+                &state,
+                &relay,
+                any_peer(),
+                data_packet(3074, dst, b"still-here"),
+                |_port| bind_ephemeral(),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            handle_data_packet(
+                &state,
+                &relay,
+                any_peer(),
+                data_packet(43000 + i, dst, b"flood"),
+                |_port| bind_ephemeral(),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            state.flows.lock().await.contains_key(&(any_peer(), 3074)),
+            "живой поток не вытесняется"
+        );
+        assert_eq!(state.flows.lock().await.len(), 4);
+
+        let mut seen_still_here = false;
+        let mut buf = [0u8; 64];
+        loop {
+            match timeout(WAIT, dst_socket.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => {
+                    if &buf[..n] == b"still-here" {
+                        seen_still_here = true;
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(seen_still_here, "живой поток продолжает ходить наружу");
+    }
+
+    /// XR-204: вытесненный поток возвращает и слот, и сокет. Слот уходит из
+    /// таблицы сразу, а таск видит закрытый канал, выходит и отпускает порт.
+    #[tokio::test(start_paused = true)]
+    async fn evicted_flow_releases_its_socket() {
+        let state = limited_state(Duration::from_secs(3600), 2);
+        let relay = local_socket().await;
+        let dst = local_socket().await.local_addr().unwrap();
+
+        // Фиксированный порт для потока-жертвы: способность занять его снова
+        // и есть свидетельство, что сокет потока умер.
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fixed = probe.local_addr().unwrap();
+        drop(probe);
+        let bind_fixed = move |_port| async move { UdpSocket::bind(fixed).await };
+
+        handle_data_packet(&state, &relay, any_peer(), data_packet(41010, dst, b"a"), bind_fixed)
+            .await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        handle_data_packet(
+            &state,
+            &relay,
+            any_peer(),
+            data_packet(41011, dst, b"b"),
+            |_port| bind_ephemeral(),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Третий поток вытесняет первый: тот наименее свежий.
+        handle_data_packet(
+            &state,
+            &relay,
+            any_peer(),
+            data_packet(41012, dst, b"c"),
+            |_port| bind_ephemeral(),
+        )
+        .await;
+
+        assert!(
+            !state.flows.lock().await.contains_key(&(any_peer(), 41010)),
+            "слот вытесненного потока освобождён"
+        );
+
+        timeout(WAIT, async {
+            loop {
+                if UdpSocket::bind(fixed).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("сокет вытесненного потока обязан освободиться");
     }
 
     /// Занятый порт не повод потерять поток: сокет садится на соседний номер.
