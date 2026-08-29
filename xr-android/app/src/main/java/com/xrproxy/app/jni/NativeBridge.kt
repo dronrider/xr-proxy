@@ -254,9 +254,11 @@ object NativeBridge {
     // supplies storage paths and a schedule. The token is a ShareToken JSON the
     // owner handed out (out-of-band); the agent verifies it offline.
 
-    /** GET the hub's public share index. Returns
+    /** GET the hub's share index (XR-193: the index is behind auth, an empty
+     *  `bearer` asks anonymously and comes back with a 401 error). `bearer` is
+     *  a grant blob or an invite token. Returns
      *  `{"shares":[{share_id,name,addr,port,agent_pubkey}...]}` or `{"error":..}`. */
-    external fun nativeListShares(hubUrl: String, timeoutMs: Long): String
+    external fun nativeListShares(hubUrl: String, bearer: String, timeoutMs: Long): String
 
     /** Публичный список пресетов хаба (сводки, XR-119). */
     external fun nativeListPresets(hubUrl: String, timeoutMs: Long): String
