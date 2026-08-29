@@ -98,9 +98,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/web/verify-password", post(web::verify_password))
         .route("/web/status", get(web::status));
 
-    // Auth (no session required).
+    // Auth: login без сессии, logout только с живым Bearer (XR-194).
     let auth_routes = Router::new()
-        .route("/auth/login", post(auth::login));
+        .route("/auth/login", post(auth::login))
+        .route(
+            "/auth/logout",
+            post(auth::logout).layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth::require_admin,
+            )),
+        );
 
     // Admin API routes (require session token).
     let admin = Router::new()
@@ -228,12 +235,23 @@ mod tests {
     }
 
     fn state_from(config: crate::config::HubConfig) -> Arc<AppState> {
+        let sessions = crate::sessions::SessionStore::new(
+            std::time::Duration::from_secs(config.admin.session_ttl_secs),
+            config.admin.max_sessions_per_user,
+        );
+        state_with_sessions(config, sessions)
+    }
+
+    fn state_with_sessions(
+        config: crate::config::HubConfig,
+        sessions: crate::sessions::SessionStore,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
             presets: RwLock::new(HashMap::new()),
             invites: RwLock::new(HashMap::new()),
             shares: RwLock::new(HashMap::new()),
             exposes: RwLock::new(HashMap::new()),
-            sessions: RwLock::new(HashMap::new()),
+            sessions,
             config,
             signing: None,
             preset_gen: tokio::sync::watch::Sender::new(0),
@@ -435,6 +453,121 @@ mod tests {
                 "неизвестный путь должен отдавать SPA админки"
             );
         }
+    }
+
+    // ===== Admin-сессии (XR-194) =====
+
+    /// Конфиг с одним оператором и известным паролем. Хэш считается на месте:
+    /// вбитый в тест аргон2-блоб устарел бы при смене параметров по умолчанию.
+    fn user_config(ttl_secs: u64, max_sessions: usize) -> crate::config::HubConfig {
+        let hash = auth::hash_password("secret").expect("хэш пароля для теста");
+        toml::from_str(&format!(
+            "[server]\n[admin]\nsession_ttl_secs = {ttl_secs}\nmax_sessions_per_user = {max_sessions}\n\
+             [[admin.users]]\nusername = \"root\"\npassword_hash = \"{hash}\"\n"
+        ))
+        .unwrap()
+    }
+
+    /// Состояние с ручными часами: тест двигает время сдвигом, а не сном на
+    /// длину TTL.
+    fn manual_state(
+        ttl_secs: u64,
+        max_sessions: usize,
+    ) -> (
+        Arc<AppState>,
+        Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        let offset = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clock = {
+            let offset = offset.clone();
+            Arc::new(move || {
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs(offset.load(std::sync::atomic::Ordering::SeqCst))
+            }) as crate::sessions::Clock
+        };
+        let sessions = crate::sessions::SessionStore::with_clock(
+            std::time::Duration::from_secs(ttl_secs),
+            max_sessions,
+            clock,
+        );
+        let state = state_with_sessions(user_config(ttl_secs, max_sessions), sessions);
+        (state, offset)
+    }
+
+    async fn login(state: &Arc<AppState>, username: &str, password: &str) -> String {
+        let body = format!("{{\"username\":\"{username}\",\"password\":\"{password}\"}}");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = router(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = body_text(resp).await;
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["token"].as_str().expect("token в ответе входа").into()
+    }
+
+    /// Ответ админской ручки по Bearer-токену: живой ли он ещё.
+    async fn admin_get(state: &Arc<AppState>, bearer: &str) -> StatusCode {
+        let req = Request::builder()
+            .uri("/api/v1/admin/invites")
+            .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap();
+        router(state.clone()).oneshot(req).await.unwrap().status()
+    }
+
+    async fn logout(state: &Arc<AppState>, bearer: &str) -> StatusCode {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/logout")
+            .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap();
+        router(state.clone()).oneshot(req).await.unwrap().status()
+    }
+
+    // XR-194: сессия истекает по TTL, и после этого Bearer отвергается,
+    // а не живёт до рестарта процесса.
+    #[tokio::test]
+    async fn expired_session_is_rejected() {
+        let (state, offset) = manual_state(60, 5);
+        let bearer = login(&state, "root", "secret").await;
+
+        assert_eq!(admin_get(&state, &bearer).await, StatusCode::OK);
+        offset.store(61, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            admin_get(&state, &bearer).await,
+            StatusCode::UNAUTHORIZED,
+            "истёкший по TTL Bearer обязан отвергаться"
+        );
+    }
+
+    // XR-194: logout гасит токен, повторный logout тем же Bearer уже не
+    // проходит, потому что токен мёртв.
+    #[tokio::test]
+    async fn logout_revokes_bearer() {
+        let (state, _offset) = manual_state(3600, 5);
+        let bearer = login(&state, "root", "secret").await;
+
+        assert_eq!(logout(&state, &bearer).await, StatusCode::NO_CONTENT);
+        assert_eq!(admin_get(&state, &bearer).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(logout(&state, &bearer).await, StatusCode::UNAUTHORIZED);
+    }
+
+    // XR-194: число сессий на оператора ограничено, новая вытесняет старейшую.
+    #[tokio::test]
+    async fn session_limit_evicts_oldest() {
+        let (state, _offset) = manual_state(3600, 2);
+        let first = login(&state, "root", "secret").await;
+        let second = login(&state, "root", "secret").await;
+        let third = login(&state, "root", "secret").await;
+
+        assert_eq!(admin_get(&state, &first).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(admin_get(&state, &second).await, StatusCode::OK);
+        assert_eq!(admin_get(&state, &third).await, StatusCode::OK);
     }
 }
 // regcheck:test-end

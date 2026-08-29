@@ -4,6 +4,7 @@ mod config;
 mod embed;
 mod password_reset;
 mod release;
+mod sessions;
 mod signing;
 mod state;
 mod storage;

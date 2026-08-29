@@ -15,6 +15,11 @@ password_hash = "$argon2id$..."   # xr-hub hash-password <password>
 
 # allowed_origins = ["https://xr-hub.example.com"]
 
+# Сессии админки (XR-194): вход живёт ограниченно, logout гасит токен на
+# сервере, а лимит вытесняет старейшую сессию оператора.
+# session_ttl_secs = 43200          # 12h, срок жизни одного Bearer-токена
+# max_sessions_per_user = 5         # 0 снимает ограничение
+
 # [signing]
 # private_key = "/var/lib/xr-hub/signing_key"
 

@@ -21,7 +21,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   })
 
   if (!resp.ok) {
-    if (resp.status === 401 && !path.includes('/auth/login')) {
+    if (resp.status === 401 && !path.includes('/auth/')) {
       // Session expired — clear and redirect to login.
       localStorage.removeItem('xr-hub-token')
       localStorage.removeItem('xr-hub-username')
@@ -46,6 +46,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ username, password }),
     }),
+
+  // Гасит сессию на сервере (XR-194): локальной очистки мало, токен обязан
+  // перестать работать и за пределами этого браузера.
+  logout: () => request<void>('/auth/logout', { method: 'POST' }),
 
   // Public
   listPresets: () => request<PresetSummary[]>('/presets'),

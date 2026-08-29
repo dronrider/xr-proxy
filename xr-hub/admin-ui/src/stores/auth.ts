@@ -15,6 +15,10 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   function logout() {
+    // Сессию гасим и на сервере (XR-194), иначе токен жил бы до конца TTL.
+    // Сессия уже мёртва и logout падает, локальный токен всё равно снимается
+    // ниже, а страницу входа уже ведёт сам вызывающий.
+    void api.logout().catch(() => {})
     token.value = ''
     username.value = ''
     localStorage.removeItem('xr-hub-token')

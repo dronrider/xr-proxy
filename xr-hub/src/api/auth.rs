@@ -59,42 +59,62 @@ pub async fn login(
     // Generate session token.
     let mut token_bytes = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut token_bytes);
-    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let key = b64.encode(token_bytes);
 
-    // Store session.
-    let mut sessions = state.sessions.write().await;
-    sessions.insert(token.clone(), req.username.clone());
+    // Store session: TTL и лимит на оператора применяет сам стор (XR-194).
+    state
+        .sessions
+        .insert(key.clone(), req.username.clone())
+        .await;
 
     Ok(Json(LoginResponse {
-        token,
+        token: key,
         username: req.username,
     }))
 }
 
-/// Middleware that requires a valid session token.
+/// Bearer-токен из заголовка или пустая строка, если его нет.
+fn bearer_token(request: &Request) -> &str {
+    request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .unwrap_or("")
+}
+
+/// Middleware that requires a valid session token. Просроченную сессию
+/// отвергает и снимает с карты сам стор (XR-194).
 pub async fn require_admin(
     State(state): State<Arc<AppState>>,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let header = request
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let provided = header.strip_prefix("Bearer ").unwrap_or("");
+    let provided = bearer_token(&request);
 
     if provided.is_empty() {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let sessions = state.sessions.read().await;
-    if sessions.contains_key(provided) {
-        drop(sessions);
+    if state.sessions.validate(provided).await.is_some() {
         Ok(next.run(request).await)
     } else {
         Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+/// POST /api/v1/auth/logout гасит Bearer из заголовка (XR-194). Ручка сидит
+/// за `require_admin`, поэтому сюда доезжают только живые токены, и повторный
+/// logout тем же токеном уже не проходит.
+pub async fn logout(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> StatusCode {
+    if state.sessions.remove(bearer_token(&request)).await {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::UNAUTHORIZED
     }
 }
 
