@@ -629,6 +629,22 @@ class XrVpnService : VpnService() {
             .setMtu(1280)
             .setBlocking(true)
         excludeAndroidAuto(builder)
+        // Слот подготовленного VPN-пакета живёт в системе только до
+        // перезагрузки: согласие пользователя (appop ACTIVATE_VPN) переживает
+        // ребут, а сам слот возвращается приложению лениво, очередным
+        // prepare(). Без этого вызова establish() после загрузки молча
+        // возвращает null для всех, включая уже согласованное приложение
+        // (XR-279); UI-путь тот же prepare() делает из VpnViewModel.
+        if (VpnService.prepare(this) != null) {
+            NativeBridge.nativeJournalLog(
+                "ERROR", "vpn", "согласие на VPN не выдано, поднять TUN нельзя",
+            )
+            handleSessionFailure(
+                RestoreFailureKind.TUN_ESTABLISH,
+                getString(R.string.service_error_tun_failed),
+            )
+            return false
+        }
         val iface = builder.establish()
 
         if (iface == null) {
@@ -1553,15 +1569,16 @@ class XrVpnService : VpnService() {
      * without the permission Android 14+ throws on a location-typed start,
      * and a background start has no right to while-in-use types anyway.
      *
-     * The base type is `specialUse`, not `systemExempted`: the emulator run
-     * of XR-279 showed the platform strips systemExempted for an app that is
-     * neither a system UID, nor a Device Owner, nor a VPN configured as
-     * always-on, so every background start (reboot, package replace, restart
-     * of the killed service) was left with an empty type set and
-     * VpnService.establish() returned null («Не удалось поднять TUN»).
-     * specialUse is the one type a regular app is allowed to hold from the
-     * background; the manifest pairs it with the
-     * FOREGROUND_SERVICE_SPECIAL_USE permission and the subtype property.
+     * The base type is `specialUse`, not `systemExempted`: the latter is
+     * documented for system UIDs, Device Owners and VPNs configured as
+     * always-on, and this app is none of those. specialUse is the type a
+     * regular app may honestly declare, and it survives background starts
+     * (reboot restore, package replace, restart of the killed service); the
+     * «does not have any types» log lines come from
+     * ForegroundServiceTypeLoggerModule and are emitted for any service
+     * without while-in-use types, including successful specialUse starts.
+     * The manifest pairs the type with the FOREGROUND_SERVICE_SPECIAL_USE
+     * permission and the subtype property.
      *
      * The price of the location omission: a restored session reads SSID only
      * after the app is opened again, so trusted-network auto-pause on a

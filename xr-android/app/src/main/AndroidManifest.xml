@@ -5,11 +5,9 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <!-- specialUse FGS type: единственный тип, который стороннее VPN-приложение
-         держит на фоновом старте (BOOT_COMPLETED, рестарт убитого сервиса).
-         systemExempted платформа срезала: он для системных UID, Device Owner и
-         VPN, настроенных как always-on, и фоновый старт оставался без типов
-         вовсе (XR-279). -->
+    <!-- specialUse FGS type: честный тип foreground-сервиса стороннего VPN.
+         systemExempted документально положен системным UID, Device Owner и
+         VPN, настроенным как always-on, а это приложение стороннее (XR-279). -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- location FGS type: пока туннель работает, держит foreground-доступ к гео,
          чтобы читать SSID доверенной сети в фоне (XR-023). -->
