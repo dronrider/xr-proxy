@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -29,6 +30,18 @@ pub struct AppState {
     /// Счётчик неверных паролей на ручке браузерного входа (LLD-38 п. 3.2):
     /// перебор гасится задержкой на стороне хаба, а не только на фронте.
     pub web_attempts: crate::api::web::PasswordAttempts,
+    /// Готовность (XR-230): поднимается в конце [`hydrate`], когда инвайты,
+    /// шары и ключ подписи уже на месте. Слушатель хаб поднимает после
+    /// hydrate, поэтому наружу неготовность видна только закрытым портом,
+    /// но мониторингу ручка `/readyz` обязана отвечать той же правдой, а не
+    /// «процесс вообще жив».
+    pub ready: AtomicBool,
+}
+
+impl AppState {
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
 }
 
 /// Load state from disk and build AppState.
@@ -61,7 +74,7 @@ pub fn hydrate(config: HubConfig) -> Result<Arc<AppState>> {
         .map(|s| SigningContext::from_file(&s.private_key))
         .transpose()?;
 
-    Ok(Arc::new(AppState {
+    let state = Arc::new(AppState {
         presets: RwLock::new(presets),
         invites: RwLock::new(invites),
         shares: RwLock::new(shares),
@@ -71,5 +84,27 @@ pub fn hydrate(config: HubConfig) -> Result<Arc<AppState>> {
         signing,
         preset_gen: watch::Sender::new(0),
         web_attempts: Default::default(),
-    }))
+        ready: AtomicBool::new(false),
+    });
+    state.ready.store(true, Ordering::Release);
+    Ok(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // XR-230: флаг готовности поднимает сам hydrate, а не старт сервера,
+    // поэтому состояние «поднято» и «слушатель открыт» не разъезжаются.
+    #[test]
+    fn hydrate_ends_ready() {
+        let dir = std::env::temp_dir().join(format!("xr-hub-ready-{}", std::process::id()));
+        let toml = format!("[server]\ndata_dir = \"{}\"\n[admin]\nusers = []\n", dir.display());
+        let config: HubConfig = toml::from_str(&toml).unwrap();
+
+        let state = hydrate(config).unwrap();
+
+        assert!(state.is_ready());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

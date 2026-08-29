@@ -287,6 +287,7 @@ mod tests {
             config,
             signing: None,
             preset_gen: tokio::sync::watch::Sender::new(0),
+            ready: std::sync::atomic::AtomicBool::new(true),
             web_attempts: Default::default(),
         })
     }

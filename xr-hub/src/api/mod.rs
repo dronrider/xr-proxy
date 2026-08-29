@@ -1,6 +1,7 @@
 pub mod app;
 pub mod auth;
 pub mod dist;
+pub mod health;
 pub mod invites;
 pub mod presets;
 pub mod register;
@@ -119,6 +120,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .nest("/api/v1/admin", admin)
         // Top-level so the install one-liner is a clean URL (xr-share dist).
         .route("/share/{file}", get(dist::serve))
+        // Живость и готовность (XR-230): верхний уровень, без аутентификации,
+        // чтобы мониторинг и failover не трогали содержательные ручки.
+        .route("/healthz", get(health::liveness))
+        .route("/readyz", get(health::readiness))
         // Красивый путь инвайта из QR/шаринга: в браузере ведём на HTML-view
         // (сама ручка живёт под /api/v1, голый путь иначе уходит в SPA админки).
         .route("/invite/{token}", get(invites::redirect_to_view))
@@ -204,6 +209,7 @@ mod tests {
             signing: None,
             preset_gen: tokio::sync::watch::Sender::new(0),
             web_attempts: Default::default(),
+            ready: std::sync::atomic::AtomicBool::new(true),
         })
     }
 
@@ -212,6 +218,46 @@ mod tests {
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap()
+    }
+
+    async fn body_text(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    // XR-230: живость это ответ «ok» без аутентификации и без взгляда на
+    // состояние, поэтому аптайм-чек и failover не дёргают содержательные
+    // ручки. Запрос идёт без единого заголовка.
+    #[tokio::test]
+    async fn healthz_answers_ok_without_auth() {
+        let resp = get("/healthz").await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_text(resp).await, "ok");
+    }
+
+    // XR-230: готовность держит 503, пока hydrate не загрузил инвайты, шары
+    // и ключ подписи, и отпускает после его конца.
+    #[tokio::test]
+    async fn readyz_reflects_hydrate() {
+        let state = empty_state();
+        state.ready.store(false, std::sync::atomic::Ordering::Release);
+        let not_ready = router(state.clone())
+            .oneshot(Request::builder().uri("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_text(not_ready).await, "not ready");
+
+        state.ready.store(true, std::sync::atomic::Ordering::Release);
+        let ready = router(state)
+            .oneshot(Request::builder().uri("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+        assert_eq!(body_text(ready).await, "ready");
     }
 
     // Регрессия XR-130: голый путь /invite/<token> проваливался в SPA-заглушку
