@@ -1,4 +1,4 @@
-//! JNI bridge: Kotlin ↔ xr-core VPN engine.
+//! JNI-мост: Kotlin и движок xr-core.
 
 use jni::objects::{JClass, JObjectArray, JString, GlobalRef};
 use jni::sys::{jboolean, jint, jlong, jmethodID, jstring};
@@ -24,6 +24,9 @@ use xr_proto::share::{RelayGrant, ShareGrant, ShareManifest, ShareManifestEntry,
 use base64::Engine as _;
 use std::collections::HashSet;
 
+#[macro_use]
+mod guard;
+
 /// Global engine instance.
 static ENGINE: OnceLock<Mutex<Option<EngineHandle>>> = OnceLock::new();
 
@@ -34,7 +37,7 @@ static JOURNAL: OnceLock<xr_core::journal::Journal> = OnceLock::new();
 
 /// Дописать запись в журнал, если он уже инициализирован. До инициализации
 /// записи молча теряются (только первые миллисекунды жизни процесса).
-fn journal_log(level: &str, source: &str, msg: &str) {
+pub(crate) fn journal_log(level: &str, source: &str, msg: &str) {
     if let Some(j) = JOURNAL.get() {
         j.append(level, source, msg);
     }
@@ -64,7 +67,7 @@ fn init_tracing(journal: Option<&xr_core::journal::Journal>) {
 /// Global JVM reference.
 static JVM: OnceLock<JavaVM> = OnceLock::new();
 
-/// Cached class reference and method ID — resolved on main thread, safe to use from any thread.
+/// Cached class reference and method ID, resolved on main thread, safe to use from any thread.
 static PROTECT_METHOD: OnceLock<ProtectMethodCache> = OnceLock::new();
 
 /// Cached method ID for `NativeBridge.resolveDomain(String): String?`.
@@ -99,6 +102,19 @@ struct EngineHandle {
 
 fn get_engine() -> &'static Mutex<Option<EngineHandle>> {
     ENGINE.get_or_init(|| Mutex::new(None))
+}
+
+/// Взять лок, переживший панику под ним. С unwind-границей у JNI (XR-220)
+/// паника больше не убивает процесс, и отравленный лок без этой помощи
+/// остался бы ядовитым навсегда: первая же паника под локом навечно закрыла
+/// бы движок до ручного убийства приложения. Под локами здесь лежат
+/// готовые значения (`Option<EngineHandle>`, счётчики здоровья),
+/// полуразобранного состояния под ними не бывает.
+fn lock_surviving_poison<'a, T>(mutex: &'a Mutex<T>, what: &str) -> std::sync::MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::error!("лок {} отравлен паникой, вхожу мимо яда", what);
+        poisoned.into_inner()
+    })
 }
 
 /// Create a ProtectSocketFn that calls VpnService.protect(fd) via cached JNI references.
@@ -145,7 +161,7 @@ fn make_protect_fn() -> ProtectSocketFn {
 ///
 /// Kotlin returns either an IPv4 literal (e.g. "93.184.216.34") or null
 /// when the underlying non-VPN network is unknown / host resolution fails.
-/// We only accept IPv4 — direct-mode connect is IPv4-only downstream
+/// We only accept IPv4, direct-mode connect is IPv4-only downstream
 /// anyway (see `session.rs` dst.ip() branch).
 fn make_system_resolver_fn() -> SystemResolverFn {
     Arc::new(|host: &str| -> Option<Ipv4Addr> {
@@ -190,25 +206,24 @@ fn humanize_config_error(e: &std::io::Error) -> String {
     let raw = e.to_string();
     if raw.contains("invalid symbol") || raw.contains("Invalid padding") ||
        raw.contains("Invalid byte") {
-        "Неверный ключ шифрования — проверьте, что вставлена только base64-строка без лишних символов".to_string()
+        "Неверный ключ шифрования, проверьте, что вставлена только base64-строка без лишних символов".to_string()
     } else if raw.contains("key must not be empty") {
         "Ключ шифрования не указан".to_string()
     } else if raw.contains("unknown modifier") {
         "Неизвестный модификатор обфускации".to_string()
     } else if raw.contains("invalid socket address") || raw.contains("invalid IP address") {
-        "Неверный адрес сервера — проверьте IP и порт".to_string()
+        "Неверный адрес сервера, проверьте IP и порт".to_string()
     } else {
         format!("Ошибка настроек: {}", raw)
     }
 }
 
-/// Собрать JSON конфига движка из профиля активного сервера. Сборка живёт в
-/// ядре (`xr_core::client_config`), а не в приложении: дефолты, порядок пула,
-/// чистка резолверов и экранирование одни на все платформы (XR-271).
-/// Возвращает готовый конфиг либо `{"error":".."}` (профиль без сервера,
-/// нечитаемый JSON).
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeBuildConfig(
+// Собрать JSON конфига движка из профиля активного сервера. Сборка живёт в
+// ядре (`xr_core::client_config`), а не в приложении: дефолты, порядок пула,
+// чистка резолверов и экранирование одни на все платформы (XR-271).
+// Возвращает готовый конфиг либо `{"error":".."}` (профиль без сервера,
+// нечитаемый JSON).
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeBuildConfig(
     mut env: JNIEnv,
     _class: JClass,
     profile_json: JString,
@@ -221,13 +236,12 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeBuildConfig(
         .and_then(|p| client_config::build_config_json(&p))
         .unwrap_or_else(|e| json_error(&e));
     jstring_into_raw(&mut env, json)
-}
+});
 
-// ── JNI exports ─────────────────────────────────────────────────────
+// -- JNI exports -----------------------------------------------------
 
-/// Start the VPN engine. Returns null on success, or an error message string on failure.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
+// Start the VPN engine. Returns null on success, or an error message string on failure.
+jni_entry!(jstring_into_raw(&mut env, JNI_PANIC_START.to_string()); fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
     mut env: JNIEnv,
     _class: JClass,
     _tun_fd: jint,
@@ -283,7 +297,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
                             }
                         }
                         Err(e) => {
-                            // Not fatal — direct mode will fall back to UDP:53
+                            // Not fatal, direct mode will fall back to UDP:53
                             // probes. Older builds without the Kotlin bridge
                             // method keep working.
                             tracing::warn!("resolveDomain not found, UDP-only DNS: {:?}", e);
@@ -341,7 +355,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
     let _guard = runtime.enter();
     match engine.start(queue.clone(), protect) {
         Ok(()) => {
-            let mut lock = get_engine().lock().unwrap();
+            let mut lock = lock_surviving_poison(get_engine(), "engine");
             *lock = Some(EngineHandle { engine, queue, runtime });
             tracing::info!("VPN engine started");
             std::ptr::null_mut() // null = success
@@ -355,33 +369,31 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStart(
             err(&mut env, &user_msg)
         }
     }
-}
+});
 
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeStop(
+jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativeStop(
     _env: JNIEnv, _class: JClass,
 ) {
-    let mut lock = get_engine().lock().unwrap();
+    let mut lock = lock_surviving_poison(get_engine(), "engine");
     if let Some(mut handle) = lock.take() {
         handle.engine.stop();
         tracing::info!("VPN engine stopped");
     }
-}
+});
 
-/// Notify the engine that the underlying network switched (LTE↔Wi-Fi).
-/// Recycles the mux pool and drops live sessions so the tunnel re-binds onto
-/// the new uplink without a manual off/on. No-op if the engine isn't running.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeOnNetworkChanged(
+// Notify the engine that the underlying network switched (LTE<->Wi-Fi).
+// Recycles the mux pool and drops live sessions so the tunnel re-binds onto
+// the new uplink without a manual off/on. No-op if the engine isn't running.
+jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativeOnNetworkChanged(
     _env: JNIEnv, _class: JClass,
 ) {
-    let lock = get_engine().lock().unwrap();
+    let lock = lock_surviving_poison(get_engine(), "engine");
     if let Some(ref handle) = *lock {
         // Enter the engine's runtime: on_network_changed spawns a recycle task.
         let _guard = handle.runtime.enter();
         handle.engine.on_network_changed();
     }
-}
+});
 
 /// Разобрать массив `user_rules` (тот же, что уезжает в конфиг движка).
 /// Битые записи выбрасываются молча, они и в конфиге не выживают.
@@ -403,14 +415,13 @@ fn effective_default_action(raw: &str) -> String {
     }
 }
 
-/// Применить правки экрана правил к живому туннелю (XR-180). `rules_json` это
-/// тот же массив `user_rules`, что уезжает в конфиг при старте, `default_action`
-/// строка рядом с ним. Движок пересобирает merged-роутер тем же путём, каким
-/// подхватывает новую версию пресета, поэтому переподключения правило не ждёт.
-/// Возвращает `false`, когда движок не запущен: правила тогда уедут в него
-/// ближайшим стартом.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeApplyUserRules(
+// Применить правки экрана правил к живому туннелю (XR-180). `rules_json` это
+// тот же массив `user_rules`, что уезжает в конфиг при старте, `default_action`
+// строка рядом с ним. Движок пересобирает merged-роутер тем же путём, каким
+// подхватывает новую версию пресета, поэтому переподключения правило не ждёт.
+// Возвращает `false`, когда движок не запущен: правила тогда уедут в него
+// ближайшим стартом.
+jni_entry!(jni::sys::JNI_FALSE; fn Java_com_xrproxy_app_jni_NativeBridge_nativeApplyUserRules(
     mut env: JNIEnv,
     _class: JClass,
     rules_json: JString,
@@ -431,7 +442,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeApplyUserRule
     };
     let routing = xr_proto::user_rule::to_routing_config(&rules, &effective_default_action(&default_action));
 
-    let mut lock = get_engine().lock().unwrap();
+    let mut lock = lock_surviving_poison(get_engine(), "engine");
     let Some(ref mut handle) = *lock else {
         return 0;
     };
@@ -441,7 +452,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeApplyUserRule
     } else {
         0
     }
-}
+});
 
 /// Read a Java `String[]` into a `Vec<String>`, skipping null/unreadable
 /// elements. Used by the trusted-network SSID bridge below.
@@ -462,13 +473,12 @@ fn read_jstring_array(env: &mut JNIEnv, arr: &JObjectArray) -> Vec<String> {
     out
 }
 
-/// True if the raw current SSID (as returned by `WifiInfo.getSSID()`) matches
-/// any entry in the trusted list. Pure string logic — works whether or not the
-/// engine is running (the auto-pause watcher calls it while paused). See
-/// `xr_core::trusted`. Errors / unreadable args degrade to `false` (no match
-/// → never auto-pause), matching the "fail soft" contract of the feature.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSsidMatches(
+// True if the raw current SSID (as returned by `WifiInfo.getSSID()`) matches
+// any entry in the trusted list. Pure string logic, works whether or not the
+// engine is running (the auto-pause watcher calls it while paused). See
+// `xr_core::trusted`. Errors / unreadable args degrade to `false` (no match
+// -> never auto-pause), matching the "fail soft" contract of the feature.
+jni_entry!(jni::sys::JNI_FALSE; fn Java_com_xrproxy_app_jni_NativeBridge_nativeSsidMatches(
     mut env: JNIEnv,
     _class: JClass,
     current: JString,
@@ -484,13 +494,12 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSsidMatches(
     } else {
         0
     }
-}
+});
 
-/// Normalize a raw `WifiInfo.getSSID()` value for display (strip the quote
-/// wrapping Android adds). Returns the clean SSID, or null for an
-/// unavailable/hidden network. See `xr_core::trusted::normalize_ssid`.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeNormalizeSsid(
+// Normalize a raw `WifiInfo.getSSID()` value for display (strip the quote
+// wrapping Android adds). Returns the clean SSID, or null for an
+// unavailable/hidden network. See `xr_core::trusted::normalize_ssid`.
+jni_entry!(std::ptr::null_mut(); fn Java_com_xrproxy_app_jni_NativeBridge_nativeNormalizeSsid(
     mut env: JNIEnv,
     _class: JClass,
     raw: JString,
@@ -506,25 +515,23 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeNormalizeSsid
             .unwrap_or(std::ptr::null_mut()),
         None => std::ptr::null_mut(),
     }
-}
+});
 
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetState(
-    env: JNIEnv, _class: JClass,
+jni_entry!(jstring_into_raw(&mut env, JNI_PANIC_STATE.to_string()); fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetState(
+    mut env: JNIEnv, _class: JClass,
 ) -> jstring {
-    let lock = get_engine().lock().unwrap();
+    let lock = lock_surviving_poison(get_engine(), "engine");
     let state_str = match *lock {
         Some(ref h) => h.engine.state().get().to_string(),
         None => "Disconnected".to_string(),
     };
     env.new_string(&state_str).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
-}
+});
 
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetStats(
-    env: JNIEnv, _class: JClass,
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetStats(
+    mut env: JNIEnv, _class: JClass,
 ) -> jstring {
-    let lock = get_engine().lock().unwrap();
+    let lock = lock_surviving_poison(get_engine(), "engine");
     let json = match *lock {
         Some(ref h) => {
             let s = h.engine.stats().snapshot();
@@ -547,7 +554,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeGetStats(
         None => "{\"bytes_up\":0,\"bytes_down\":0,\"active\":0,\"total\":0,\"uptime\":0,\"dns\":0,\"syns\":0,\"smol_recv\":0,\"smol_send\":0,\"relay_warn\":0,\"relay_err\":0,\"debug\":\"\"}".into(),
     };
     env.new_string(&json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
-}
+});
 
 // -- Здоровье сессии (LLD-06) ----------------------------------------
 // Скользящее окно по счётчикам движка живёт в ядре (XR-271), здесь только
@@ -560,54 +567,46 @@ fn health() -> &'static Mutex<xr_core::health::HealthTracker> {
     HEALTH.get_or_init(|| Mutex::new(xr_core::health::HealthTracker::new()))
 }
 
-/// Обновить здоровье накопительными счётчиками движка, вернуть имя ступени
-/// ("healthy", "good", "watching", "hurt", "critical").
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeHealthUpdate(
+// Обновить здоровье накопительными счётчиками движка, вернуть имя ступени
+// ("healthy", "good", "watching", "hurt", "critical").
+jni_entry!(jstring_into_raw(&mut env, "critical".to_string()); fn Java_com_xrproxy_app_jni_NativeBridge_nativeHealthUpdate(
     mut env: JNIEnv,
     _class: JClass,
     relay_errors: jlong,
     relay_warnings: jlong,
 ) -> jstring {
-    let level = health()
-        .lock()
-        .unwrap()
+    let level = lock_surviving_poison(health(), "health")
         .update(relay_errors.max(0) as u64, relay_warnings.max(0) as u64);
     jstring_into_raw(&mut env, level.as_str().to_string())
-}
+});
 
-/// Сети нет (XR-183): подтянуть базовую линию к текущим счётчикам, не портя
-/// здоровье ошибками, которые про отсутствие связи, а не про прокси.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeHealthFreeze(
+// Сети нет (XR-183): подтянуть базовую линию к текущим счётчикам, не портя
+// здоровье ошибками, которые про отсутствие связи, а не про прокси.
+jni_entry!(jstring_into_raw(&mut env, "critical".to_string()); fn Java_com_xrproxy_app_jni_NativeBridge_nativeHealthFreeze(
     mut env: JNIEnv,
     _class: JClass,
     relay_errors: jlong,
     relay_warnings: jlong,
 ) -> jstring {
-    let level = health()
-        .lock()
-        .unwrap()
+    let level = lock_surviving_poison(health(), "health")
         .freeze_at(relay_errors.max(0) as u64, relay_warnings.max(0) as u64);
     jstring_into_raw(&mut env, level.as_str().to_string())
-}
+});
 
-/// Сброс перед новой сессией туннеля.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeHealthReset(
+// Сброс перед новой сессией туннеля.
+jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativeHealthReset(
     _env: JNIEnv,
     _class: JClass,
 ) {
-    health().lock().unwrap().reset();
-}
+    lock_surviving_poison(health(), "health").reset();
+});
 
-// ── Журнал приложения (XR-042) ──────────────────────────────────────
+// -- Журнал приложения (XR-042) --------------------------------------
 
-/// Инициализировать персистентный журнал в `dir` (повторный вызов только
-/// обновляет параметры ротации: настройки поменяли на лету). Вызывается из
-/// `Application.onCreate`, до любых других обращений к журналу.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalInit(
+// Инициализировать персистентный журнал в `dir` (повторный вызов только
+// обновляет параметры ротации: настройки поменяли на лету). Вызывается из
+// `Application.onCreate`, до любых других обращений к журналу.
+jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalInit(
     mut env: JNIEnv,
     _class: JClass,
     dir: JString,
@@ -627,12 +626,11 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalInit(
             init_tracing(JOURNAL.get());
         }
     }
-}
+});
 
-/// Запись из Kotlin-слоя (пробы, смены сети/режима, жизненный цикл сервиса).
-/// `level` из {"INFO","WARN","ERROR"}, `source` это короткий тег источника.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalLog(
+// Запись из Kotlin-слоя (пробы, смены сети/режима, жизненный цикл сервиса).
+// `level` из {"INFO","WARN","ERROR"}, `source` это короткий тег источника.
+jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalLog(
     mut env: JNIEnv,
     _class: JClass,
     level: JString,
@@ -652,66 +650,61 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalLog(
         Err(_) => return,
     };
     journal_log(&level, &source, &message);
-}
+});
 
-/// Хвост журнала (последние строки, от старых к новым) одной строкой с `\n`.
-/// Работает независимо от того, запущен ли движок.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalTail(
-    env: JNIEnv, _class: JClass,
+// Хвост журнала (последние строки, от старых к новым) одной строкой с `\n`.
+// Работает независимо от того, запущен ли движок.
+jni_entry!(jstring_into_raw(&mut env, String::new()); fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalTail(
+    mut env: JNIEnv, _class: JClass,
 ) -> jstring {
     let text = match JOURNAL.get() {
         Some(j) => j.tail().join("\n"),
         None => String::new(),
     };
     env.new_string(&text).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
-}
+});
 
-/// Полное содержимое журнала с диска (экспорт/шаринг), от старых записей к новым.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalDump(
-    env: JNIEnv, _class: JClass,
+// Полное содержимое журнала с диска (экспорт/шаринг), от старых записей к новым.
+jni_entry!(jstring_into_raw(&mut env, String::new()); fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalDump(
+    mut env: JNIEnv, _class: JClass,
 ) -> jstring {
     let text = match JOURNAL.get() {
         Some(j) => j.dump(),
         None => String::new(),
     };
     env.new_string(&text).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
-}
+});
 
-/// Очистить журнал (кнопка Clear на вкладке Log). Заодно сбрасывает
-/// кумулятивные счётчики WARN/ERROR движка, если тот запущен, чтобы бадж
-/// и заголовок вкладки начали счёт заново.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalClear(
+// Очистить журнал (кнопка Clear на вкладке Log). Заодно сбрасывает
+// кумулятивные счётчики WARN/ERROR движка, если тот запущен, чтобы бадж
+// и заголовок вкладки начали счёт заново.
+jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativeJournalClear(
     _env: JNIEnv, _class: JClass,
 ) {
-    let lock = get_engine().lock().unwrap();
+    let lock = lock_surviving_poison(get_engine(), "engine");
     if let Some(ref h) = *lock {
         // clear_errors чистит подключённый журнал (тот же буфер) и счётчики.
         h.engine.stats().clear_errors();
     } else if let Some(j) = JOURNAL.get() {
         j.clear();
     }
-}
+});
 
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePushPacket(
+jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativePushPacket(
     env: JNIEnv, _class: JClass, packet: jni::objects::JByteArray,
 ) {
-    let lock = get_engine().lock().unwrap();
+    let lock = lock_surviving_poison(get_engine(), "engine");
     if let Some(ref handle) = *lock {
         if let Ok(bytes) = env.convert_byte_array(&packet) {
             handle.queue.push_inbound(bytes);
         }
     }
-}
+});
 
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePopPacket(
+jni_entry!(std::ptr::null_mut(); fn Java_com_xrproxy_app_jni_NativeBridge_nativePopPacket(
     env: JNIEnv, _class: JClass,
 ) -> jni::sys::jbyteArray {
-    let lock = get_engine().lock().unwrap();
+    let lock = lock_surviving_poison(get_engine(), "engine");
     if let Some(ref handle) = *lock {
         if let Some(packet) = handle.queue.pop_outbound() {
             if let Ok(arr) = env.byte_array_from_slice(&packet) {
@@ -720,9 +713,9 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePopPacket(
         }
     }
     std::ptr::null_mut()
-}
+});
 
-// ── Onboarding bridge ───────────────────────────────────────────────
+// -- Onboarding bridge -----------------------------------------------
 
 fn jstring_into_raw(env: &mut JNIEnv, s: String) -> jstring {
     env.new_string(&s).map(|js| js.into_raw()).unwrap_or(std::ptr::null_mut())
@@ -732,6 +725,27 @@ fn read_jstring(env: &mut JNIEnv, js: &JString) -> Result<String, String> {
     env.get_string(js)
         .map(|s| s.into())
         .map_err(|e| format!("jstring: {e}"))
+}
+
+/// Тексты запасных ответов на панику в границе JNI (XR-220). Java-сторона
+/// получает их вместо значения, которое не успело родиться: JSON-функции
+/// отвечают своим обычным `{error}`, `nativeStart` сообщением об ошибке
+/// запуска, `nativeGetState` строкой `Error:`, по которой Kotlin гасит сессию.
+const JNI_PANIC_TEXT: &str = "внутренняя ошибка (паника нативного кода)";
+const JNI_PANIC_START: &str = "Внутренняя ошибка при запуске движка, попробуйте ещё раз";
+const JNI_PANIC_STATE: &str = "Error: паника нативного кода";
+
+fn panic_json_reply(env: &mut JNIEnv) -> jstring {
+    jstring_into_raw(env, json_error(JNI_PANIC_TEXT))
+}
+
+/// Классификация паттерна отвечает JSON с полем `kind`, по нему UI и решает,
+/// что показывать; голый `{error}` остался бы неопознанным ответом.
+fn panic_invalid_pattern_reply(env: &mut JNIEnv) -> jstring {
+    jstring_into_raw(
+        env,
+        serde_json::json!({"kind": "invalid", "error": JNI_PANIC_TEXT}).to_string(),
+    )
 }
 
 fn json_error(msg: &str) -> String {
@@ -749,11 +763,10 @@ where
     Ok(rt.block_on(f))
 }
 
-/// Parse a raw invite URL (scanned / pasted / deep-linked). Returns JSON:
-/// success → `{"kind":"https|custom","hub_url":..,"token":..}`,
-/// failure → `{"error":".."}`.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeParseInviteLink(
+// Parse a raw invite URL (scanned / pasted / deep-linked). Returns JSON:
+// success -> `{"kind":"https|custom","hub_url":..,"token":..}`,
+// failure -> `{"error":".."}`.
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeParseInviteLink(
     mut env: JNIEnv,
     _class: JClass,
     raw: JString,
@@ -769,17 +782,16 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeParseInviteLi
         Err(e) => json_error(&e.to_string()),
     };
     jstring_into_raw(&mut env, json)
-}
+});
 
-/// Fetch invite metadata (no consume). Returns InviteInfo JSON on
-/// success (contains `status`: "active" | "consumed" | "expired" и
-/// `reclaimable`: потреблённый инвайт принадлежит этой установке, XR-216),
-/// or `{"error":".."}` on failure (network, 404, parse).
-///
-/// `cache_dir` тот же, что у Apply: там лежит ключ установки, и запрос
-/// сведений обязан нести его, иначе хаб не отличит владельца от постороннего.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeFetchInviteInfo(
+// Fetch invite metadata (no consume). Returns InviteInfo JSON on
+// success (contains `status`: "active" | "consumed" | "expired" и
+// `reclaimable`: потреблённый инвайт принадлежит этой установке, XR-216),
+// or `{"error":".."}` on failure (network, 404, parse).
+//
+// `cache_dir` тот же, что у Apply: там лежит ключ установки, и запрос
+// сведений обязан нести его, иначе хаб не отличит владельца от постороннего.
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeFetchInviteInfo(
     mut env: JNIEnv,
     _class: JClass,
     hub_url: JString,
@@ -811,14 +823,13 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeFetchInviteIn
         Err(e) => json_error(&e),
     };
     jstring_into_raw(&mut env, json)
-}
+});
 
-/// Claim the invite + TOFU public key + pre-warm preset cache.
-/// Always returns a structured JSON:
-/// `{"payload":..?,"public_key":..?,"preset_cached":bool,"errors":[..]}`.
-/// `payload` null means the whole apply failed (check `errors`).
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeApplyInvite(
+// Claim the invite + TOFU public key + pre-warm preset cache.
+// Always returns a structured JSON:
+// `{"payload":..?,"public_key":..?,"preset_cached":bool,"errors":[..]}`.
+// `payload` null means the whole apply failed (check `errors`).
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeApplyInvite(
     mut env: JNIEnv,
     _class: JClass,
     hub_url: JString,
@@ -884,16 +895,15 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeApplyInvite(
         .to_string(),
     };
     jstring_into_raw(&mut env, json)
-}
+});
 
-// ── Редактор правил (LLD-05, XR-047) ────────────────────────────────
+// -- Редактор правил (LLD-05, XR-047) --------------------------------
 
-/// Классифицировать паттерн пользовательского правила. Валидация одна на
-/// Rust и Kotlin, поэтому UI зовёт её сюда, а не дублирует regex'ами.
-/// Возвращает JSON: `{"kind":"domain|wildcard|cidr4|cidr6","normalized":".."}`
-/// либо `{"kind":"invalid","error":"текст для пользователя"}`.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeClassifyPattern(
+// Классифицировать паттерн пользовательского правила. Валидация одна на
+// Rust и Kotlin, поэтому UI зовёт её сюда, а не дублирует regex'ами.
+// Возвращает JSON: `{"kind":"domain|wildcard|cidr4|cidr6","normalized":".."}`
+// либо `{"kind":"invalid","error":"текст для пользователя"}`.
+jni_entry!(panic_invalid_pattern_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeClassifyPattern(
     mut env: JNIEnv,
     _class: JClass,
     raw: JString,
@@ -916,16 +926,15 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeClassifyPatte
         .to_string(),
     };
     jstring_into_raw(&mut env, json)
-}
+});
 
-/// Форсированный fetch пресета с хаба («Обновить сейчас» на карточке
-/// пресета). Обновляет тот же дисковый кэш, из которого движок собирает
-/// merged-роутер при старте и фоновом рефреше. Пресет сверяется с ключом
-/// профиля (`trustedPublicKey`, XR-207): неверная или отсутствующая подпись
-/// это `{"error":"signature.."}` и прежний пресет остаётся в кэше.
-/// Возвращает JSON: `{"updated":bool,"version":N}` либо `{"error":".."}`.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeRefreshPreset(
+// Форсированный fetch пресета с хаба («Обновить сейчас» на карточке
+// пресета). Обновляет тот же дисковый кэш, из которого движок собирает
+// merged-роутер при старте и фоновом рефреше. Пресет сверяется с ключом
+// профиля (`trustedPublicKey`, XR-207): неверная или отсутствующая подпись
+// это `{"error":"signature.."}` и прежний пресет остаётся в кэше.
+// Возвращает JSON: `{"updated":bool,"version":N}` либо `{"error":".."}`.
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeRefreshPreset(
     mut env: JNIEnv,
     _class: JClass,
     hub_url: JString,
@@ -974,16 +983,15 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeRefreshPreset
         }
     };
     jstring_into_raw(&mut env, json)
-}
+});
 
-/// Кэшированный пресет для карточки экрана правил. Кэш пишет только ядро,
-/// оно же его и читает (XR-271): формат файла наружу не выходит. Пресет
-/// проходит проверку подписи ключом профиля (XR-207), поэтому карточка не
-/// показывает то, что движок применять откажется. Возвращает
-/// `{"name","version","updated_at","default_action","rules":[..]}` либо
-/// `{"error":"no_cache"}`, когда пресета в кэше нет.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeCachedPreset(
+// Кэшированный пресет для карточки экрана правил. Кэш пишет только ядро,
+// оно же его и читает (XR-271): формат файла наружу не выходит. Пресет
+// проходит проверку подписи ключом профиля (XR-207), поэтому карточка не
+// показывает то, что движок применять откажется. Возвращает
+// `{"name","version","updated_at","default_action","rules":[..]}` либо
+// `{"error":"no_cache"}`, когда пресета в кэше нет.
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeCachedPreset(
     mut env: JNIEnv,
     _class: JClass,
     cache_dir: JString,
@@ -1007,14 +1015,13 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeCachedPreset(
     )
     .unwrap_or_else(|| json_error("no_cache"));
     jstring_into_raw(&mut env, json)
-}
+});
 
-/// Превью `[routing]` из моих правил и пресета хаба (кнопка `{ }` на экране
-/// правил). Собирается в ядре рядом с самим кэшем пресета, пустое
-/// `default_action` берёт общий дефолт клиента. Пресет из кэша сверяется с
-/// ключом профиля (XR-207) тем же фильтром, что и у движка.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeMergedToml(
+// Превью `[routing]` из моих правил и пресета хаба (кнопка `{ }` на экране
+// правил). Собирается в ядре рядом с самим кэшем пресета, пустое
+// `default_action` берёт общий дефолт клиента. Пресет из кэша сверяется с
+// ключом профиля (XR-207) тем же фильтром, что и у движка.
+jni_entry!(jstring_into_raw(&mut env, String::new()); fn Java_com_xrproxy_app_jni_NativeBridge_nativeMergedToml(
     mut env: JNIEnv,
     _class: JClass,
     cache_dir: JString,
@@ -1041,20 +1048,19 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeMergedToml(
     );
     let toml = presets::merged_toml(&rules, &default_action, preset.as_ref());
     jstring_into_raw(&mut env, toml)
-}
+});
 
-// ── APK self-update bridge (LLD-12) ─────────────────────────────────
+// -- APK self-update bridge (LLD-12) ---------------------------------
 
-/// Check the hub for a newer signed release. The manifest signature is
-/// verified with the **pinned** release public key (passed in from
-/// `BuildConfig.RELEASE_PUBLIC_KEY` — never fetched from the network) inside
-/// Rust before anything is reported. Returns JSON:
-///   newer available → `{"available":true,"manifest":{...}}`
-///   up-to-date/older → `{"available":false}`
-///   any failure      → `{"available":false,"error":".."}`
-///   (network, bad signature, wrong key, unparseable manifest)
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeCheckUpdate(
+// Check the hub for a newer signed release. The manifest signature is
+// verified with the **pinned** release public key (passed in from
+// `BuildConfig.RELEASE_PUBLIC_KEY`, never fetched from the network) inside
+// Rust before anything is reported. Returns JSON:
+//   newer available -> `{"available":true,"manifest":{...}}`
+//   up-to-date/older -> `{"available":false}`
+//   any failure      -> `{"available":false,"error":".."}`
+//   (network, bad signature, wrong key, unparseable manifest)
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeCheckUpdate(
     mut env: JNIEnv,
     _class: JClass,
     hub_url: JString,
@@ -1082,7 +1088,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeCheckUpdate(
         return unavailable(&mut env, Some("no_hub".into()));
     }
     if pinned_key.trim().is_empty() {
-        // No release key compiled into this build — feature disabled.
+        // No release key compiled into this build, feature disabled.
         return unavailable(&mut env, Some("no_release_key".into()));
     }
     let current = current_code.max(0) as u64;
@@ -1097,7 +1103,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeCheckUpdate(
 
     let manifest = match update::verify_manifest(&signed, &pinned_key) {
         Ok(m) => m,
-        // A failed signature/SHA is a security event — log WARN (§2.2).
+        // A failed signature/SHA is a security event, log WARN (раздел 2.2).
         Err(e) => {
             tracing::warn!("update manifest rejected: {e}");
             return unavailable(&mut env, Some(format!("verify: {e}")));
@@ -1114,13 +1120,12 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeCheckUpdate(
         "manifest": manifest_value,
     });
     jstring_into_raw(&mut env, json.to_string())
-}
+});
 
-/// Verify a downloaded APK's SHA-256 against `sha256_hex` (from the already
-/// signature-verified manifest). Returns `false` on any I/O error or mismatch
-/// — a truncated download is rejected and the file must be deleted.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeVerifyApk(
+// Verify a downloaded APK's SHA-256 against `sha256_hex` (from the already
+// signature-verified manifest). Returns `false` on any I/O error or mismatch, so a truncated
+// download is rejected and the file must be deleted.
+jni_entry!(jni::sys::JNI_FALSE; fn Java_com_xrproxy_app_jni_NativeBridge_nativeVerifyApk(
     mut env: JNIEnv,
     _class: JClass,
     path: JString,
@@ -1139,15 +1144,15 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeVerifyApk(
     } else {
         0
     }
-}
+});
 
-// ── File-sharing bridge (LLD-19) ────────────────────────────────────
+// -- File-sharing bridge (LLD-19) ------------------------------------
 //
 // The Kotlin "Files" screen drives the one-way mirror engine in xr-core: list
 // shares from the hub, browse a share's manifest, download selected files, or
 // run a full mirror sync. All file/diff logic lives in Rust (`xr_core::sync`);
 // Kotlin only supplies storage paths and a schedule. The token (a ShareToken
-// JSON the owner handed out) is verified by the agent offline — never here.
+// JSON the owner handed out) is verified by the agent offline, never here.
 //
 // NOTE: token blobs are never logged. TLS pinning of a self-signed agent
 // identity is an Android-side follow-up; today the engine works over HTTP and
@@ -1164,7 +1169,7 @@ fn parse_token(json: &str) -> Result<ShareToken, String> {
 }
 
 /// Parse the optional relay leg (a [`RelayGrant`] JSON, or empty for
-/// direct-only, LLD-23 §2.4). A malformed leg is treated as absent: a share must
+/// direct-only, LLD-23, п. 2.4). A malformed leg is treated as absent: a share must
 /// still work on its direct address if the relay descriptor is somehow broken.
 fn parse_relay(json: &str) -> Option<RelayGrant> {
     let s = json.trim();
@@ -1196,11 +1201,10 @@ fn parse_selection(json: &str) -> Result<Option<HashSet<String>>, String> {
         .map_err(|e| format!("bad selection json: {e}"))
 }
 
-/// GET the hub's share index (XR-193: behind a grant or invite token, sent as
-/// `Authorization: Bearer`; an empty string means no credential). Returns
-/// `{"shares":[{name,addr,port,agent_pubkey,share_id}...]}` or `{"error":".."}`.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeListShares(
+// GET the hub's share index (XR-193: behind a grant or invite token, sent as
+// `Authorization: Bearer`; an empty string means no credential). Returns
+// `{"shares":[{name,addr,port,agent_pubkey,share_id}...]}` or `{"error":".."}`.
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeListShares(
     mut env: JNIEnv,
     _class: JClass,
     hub_url: JString,
@@ -1223,12 +1227,11 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeListShares(
         Ok(Err(e)) | Err(e) => json_error(&e),
     };
     jstring_into_raw(&mut env, json)
-}
+});
 
-/// GET the hub's public preset list (summaries, XR-119). Returns
-/// `{"presets":[{name,version,updated_at,rules_count}...]}` or `{"error":".."}`.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeListPresets(
+// GET the hub's public preset list (summaries, XR-119). Returns
+// `{"presets":[{name,version,updated_at,rules_count}...]}` or `{"error":".."}`.
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeListPresets(
     mut env: JNIEnv,
     _class: JClass,
     hub_url: JString,
@@ -1245,15 +1248,14 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeListPresets(
         Ok(Err(e)) | Err(e) => json_error(&e),
     };
     jstring_into_raw(&mut env, json)
-}
+});
 
-/// GET the shares attached to an invite (the access anchor, §9.5). Returns
-/// `{"shares":[{share_id,name,addr,port,agent_pubkey,token,exp}...]}` where
-/// `token` is the **decoded ShareToken JSON** (ready for `nativeFetchManifest` /
-/// `nativeDownloadFile`, which select the share by the token via the agent's
-/// legacy routes). `{"error":".."}` on failure (a 410 means invite expired).
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeInviteShares(
+// GET the shares attached to an invite (the access anchor, п. 9.5). Returns
+// `{"shares":[{share_id,name,addr,port,agent_pubkey,token,exp}...]}` where
+// `token` is the **decoded ShareToken JSON** (ready for `nativeFetchManifest` /
+// `nativeDownloadFile`, which select the share by the token via the agent's
+// legacy routes). `{"error":".."}` on failure (a 410 means invite expired).
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeInviteShares(
     mut env: JNIEnv,
     _class: JClass,
     hub_url: JString,
@@ -1294,7 +1296,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeInviteShares(
                         "token": token_json,
                         "exp": g.exp,
                     });
-                    // The relay leg (LLD-23 §2.4), passed through verbatim so the
+                    // The relay leg (LLD-23, п. 2.4), passed through verbatim so the
                     // consumer stores it and falls back to the relay when the
                     // direct address is unreachable. Absent for a direct share.
                     if let Some(relay) = &g.relay {
@@ -1318,16 +1320,15 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeInviteShares(
         }
     };
     jstring_into_raw(&mut env, json)
-}
+});
 
-/// Fetch a share's manifest from the agent (presenting the token). Returns the
-/// ShareManifest JSON (`{"entries":[{path,size,mtime,sha256}...]}`) or
-/// `{"error":".."}`. Used to populate the file picker for one-time download.
-/// `agent_pubkey` is the base64 identity key from the grant; the agent's
-/// manifest signature is verified against it, fail-closed (XR-046). Empty
-/// string skips the pinning (no key to check against).
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeFetchManifest(
+// Fetch a share's manifest from the agent (presenting the token). Returns the
+// ShareManifest JSON (`{"entries":[{path,size,mtime,sha256}...]}`) or
+// `{"error":".."}`. Used to populate the file picker for one-time download.
+// `agent_pubkey` is the base64 identity key from the grant; the agent's
+// manifest signature is verified against it, fail-closed (XR-046). Empty
+// string skips the pinning (no key to check against).
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeFetchManifest(
     mut env: JNIEnv,
     _class: JClass,
     agent_url: JString,
@@ -1363,13 +1364,12 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeFetchManifest
         }
     };
     jstring_into_raw(&mut env, json)
-}
+});
 
-/// Download a single manifest entry to `dest_dir` (one-time download). The
-/// entry is a ShareManifestEntry JSON; the file is SHA-256-verified before being
-/// published. Returns `{"ok":true}` or `{"error":".."}`.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeDownloadFile(
+// Download a single manifest entry to `dest_dir` (one-time download). The
+// entry is a ShareManifestEntry JSON; the file is SHA-256-verified before being
+// published. Returns `{"ok":true}` or `{"error":".."}`.
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeDownloadFile(
     mut env: JNIEnv,
     _class: JClass,
     agent_url: JString,
@@ -1434,16 +1434,15 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeDownloadFile(
         }
     };
     jstring_into_raw(&mut env, json)
-}
+});
 
-/// Pure diff for SAF storage: the consumer enumerates its local copy from the
-/// SAF tree (in Kotlin) and passes it as `local_json` (a `[{path,sha256}...]`
-/// array) along with the agent's `manifest_json`. Returns the plan JSON
-/// (`{"fetch":[...],"delete":[...]}`). No network, no filesystem — Kotlin then
-/// downloads fetches (via `nativeDownloadFile` to a temp file) and applies the
-/// deletes against the SAF tree.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePlanSync(
+// Pure diff for SAF storage: the consumer enumerates its local copy from the
+// SAF tree (in Kotlin) and passes it as `local_json` (a `[{path,sha256}...]`
+// array) along with the agent's `manifest_json`. Returns the plan JSON
+// (`{"fetch":[...],"delete":[...]}`). No network, no filesystem, Kotlin then
+// downloads fetches (via `nativeDownloadFile` to a temp file) and applies the
+// deletes against the SAF tree.
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativePlanSync(
     mut env: JNIEnv,
     _class: JClass,
     manifest_json: JString,
@@ -1477,16 +1476,15 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativePlanSync(
     let json =
         serde_json::to_string(&plan).unwrap_or_else(|e| json_error(&format!("serialize: {e}")));
     jstring_into_raw(&mut env, json)
-}
+});
 
-/// Drop `target` (a file or folder path) from a selection, splitting a covering
-/// folder prefix into its sibling branches (XR-044, `sync::expand_deselect`).
-/// `selection_json` and `manifest_json` are JSON string arrays (selection
-/// entries and manifest paths); returns the reworked selection as a JSON array.
-/// Pure logic, no I/O; lives in Rust so the split and the mirror planner agree
-/// on what a selection entry covers.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeExpandDeselect(
+// Drop `target` (a file or folder path) from a selection, splitting a covering
+// folder prefix into its sibling branches (XR-044, `sync::expand_deselect`).
+// `selection_json` and `manifest_json` are JSON string arrays (selection
+// entries and manifest paths); returns the reworked selection as a JSON array.
+// Pure logic, no I/O; lives in Rust so the split and the mirror planner agree
+// on what a selection entry covers.
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeExpandDeselect(
     mut env: JNIEnv,
     _class: JClass,
     selection_json: JString,
@@ -1509,20 +1507,19 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeExpandDeselec
     out.sort_unstable();
     let json = serde_json::to_string(&out).unwrap_or_else(|e| json_error(&format!("serialize: {e}")));
     jstring_into_raw(&mut env, json)
-}
+});
 
-/// Mirror a share into `dest_dir` (background sync). With `dry_run` true, returns
-/// only the plan (`{"plan":{"fetch":[...],"delete":[...]}}`) so the UI can warn
-/// about deletions; with `dry_run` false it applies and also returns the report
-/// (`{"plan":..,"report":{"fetched":[...],"deleted":[...],"failed":[...]}}`).
-/// `agent_pubkey` pins the agent identity for the manifest fetch (XR-046), as
-/// in `nativeFetchManifest`. `index_path` names the persistent hash-index file
-/// (XR-098) so a warm rescan skips re-hashing; empty = scan without an index.
-/// `selection_json` picks the subset to mirror: absent / empty / `null` = the
-/// whole share, `"[]"` = an empty selection (delete-only), else the chosen
-/// paths (XR-135, see `parse_selection`).
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
+// Mirror a share into `dest_dir` (background sync). With `dry_run` true, returns
+// only the plan (`{"plan":{"fetch":[...],"delete":[...]}}`) so the UI can warn
+// about deletions; with `dry_run` false it applies and also returns the report
+// (`{"plan":..,"report":{"fetched":[...],"deleted":[...],"failed":[...]}}`).
+// `agent_pubkey` pins the agent identity for the manifest fetch (XR-046), as
+// in `nativeFetchManifest`. `index_path` names the persistent hash-index file
+// (XR-098) so a warm rescan skips re-hashing; empty = scan without an index.
+// `selection_json` picks the subset to mirror: absent / empty / `null` = the
+// whole share, `"[]"` = an empty selection (delete-only), else the chosen
+// paths (XR-135, see `parse_selection`).
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
     mut env: JNIEnv,
     _class: JClass,
     agent_url: JString,
@@ -1609,7 +1606,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeSyncShare(
         }
     };
     jstring_into_raw(&mut env, json)
-}
+});
 
 /// Rebuild the [`ShareGrant`] the import calls take from the pieces Kotlin
 /// stores per share (LLD-29): the decoded token JSON goes back to its blob
@@ -1649,13 +1646,12 @@ fn grant_from_parts(
     }
 }
 
-/// Start a URL-import job on a share (LLD-29): the agent downloads the page's
-/// content with its plugin into `dest` (share-relative dir, "" = root).
-/// `height` is the wanted frame height, `<= 0` means "the owner's cap".
-/// Returns `{"job_id":".."}` or `{"error":".."}`; the scope check runs before
-/// any network, so a read-only grant fails fast with a human message.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeImportUrl(
+// Start a URL-import job on a share (LLD-29): the agent downloads the page's
+// content with its plugin into `dest` (share-relative dir, "" = root).
+// `height` is the wanted frame height, `<= 0` means "the owner's cap".
+// Returns `{"job_id":".."}` or `{"error":".."}`; the scope check runs before
+// any network, so a read-only grant fails fast with a human message.
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeImportUrl(
     mut env: JNIEnv,
     _class: JClass,
     addr: JString,
@@ -1697,14 +1693,13 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeImportUrl(
         }
     };
     jstring_into_raw(&mut env, json)
-}
+});
 
-/// Poll an import job: returns the agent's status JSON
-/// (`{"state":"..","progress":..,"files":[..],"error":".."}`) or
-/// `{"error":".."}`. A lost job (agent restart) comes back as the named
-/// `job_lost: ...` error, worded in Rust.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeImportStatus(
+// Poll an import job: returns the agent's status JSON
+// (`{"state":"..","progress":..,"files":[..],"error":".."}`) or
+// `{"error":".."}`. A lost job (agent restart) comes back as the named
+// `job_lost: ...` error, worded in Rust.
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeImportStatus(
     mut env: JNIEnv,
     _class: JClass,
     addr: JString,
@@ -1736,12 +1731,11 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeImportStatus(
         Ok(Err(e)) | Err(e) => json_error(&e),
     };
     jstring_into_raw(&mut env, json)
-}
+});
 
-/// Cancel an import job (the agent kills the plugin and forgets the job).
-/// Returns `{"ok":true}` or `{"error":".."}`.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeImportCancel(
+// Cancel an import job (the agent kills the plugin and forgets the job).
+// Returns `{"ok":true}` or `{"error":".."}`.
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeImportCancel(
     mut env: JNIEnv,
     _class: JClass,
     addr: JString,
@@ -1776,7 +1770,7 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeImportCancel(
         Ok(Err(e)) | Err(e) => json_error(&e),
     };
     jstring_into_raw(&mut env, json)
-}
+});
 
 /// The file a delete asks for. An empty name is refused before the network: no
 /// agent route matches it, and the `not_found` that would come back reads as
@@ -1799,15 +1793,14 @@ fn optional_hash(raw: &str) -> Option<String> {
     }
 }
 
-/// Delete `path` from the share (LLD-28, XR-250): the agent drops the file, so
-/// it leaves every holder of the share, not just this device. `expected_sha` is
-/// the hash of the manifest row the user acted on and travels as `If-Match`, so
-/// a file the owner replaced meanwhile answers `412` instead of being wiped; an
-/// empty string deletes whatever is there now. Returns `{"ok":true}` or
-/// `{"error":".."}`; the scope check runs before any network, so a read-only
-/// grant fails fast with a human message.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeDeleteFile(
+// Delete `path` from the share (LLD-28, XR-250): the agent drops the file, so
+// it leaves every holder of the share, not just this device. `expected_sha` is
+// the hash of the manifest row the user acted on and travels as `If-Match`, so
+// a file the owner replaced meanwhile answers `412` instead of being wiped; an
+// empty string deletes whatever is there now. Returns `{"ok":true}` or
+// `{"error":".."}`; the scope check runs before any network, so a read-only
+// grant fails fast with a human message.
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeDeleteFile(
     mut env: JNIEnv,
     _class: JClass,
     addr: JString,
@@ -1850,16 +1843,15 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeDeleteFile(
         }
     };
     jstring_into_raw(&mut env, json)
-}
+});
 
-/// Move a share's downloaded files from `src_dir` to `dst_dir` after a storage-
-/// directory change (XR-043), without re-downloading. Holds the single-transfer
-/// lock so it can't race the mirror engine (`"busy"` if one is running) and feeds
-/// the same progress controller the UI polls. Synchronous (a same-volume move is
-/// renames). Returns the report `{"moved":N,"bytes":N,"conflicts":[..],
-/// "failed":[[path,reason]..],"cancelled":bool}` or `{"error":".."}`.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeMigrateShareDir(
+// Move a share's downloaded files from `src_dir` to `dst_dir` after a storage-
+// directory change (XR-043), without re-downloading. Holds the single-transfer
+// lock so it can't race the mirror engine (`"busy"` if one is running) and feeds
+// the same progress controller the UI polls. Synchronous (a same-volume move is
+// renames). Returns the report `{"moved":N,"bytes":N,"conflicts":[..],
+// "failed":[[path,reason]..],"cancelled":bool}` or `{"error":".."}`.
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeMigrateShareDir(
     mut env: JNIEnv,
     _class: JClass,
     src_dir: JString,
@@ -1899,37 +1891,35 @@ pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeMigrateShareD
         },
     };
     jstring_into_raw(&mut env, json)
-}
+});
 
-/// Poll the running transfer's progress as JSON (`{active,cancelled,file,
-/// files_done,files_total,bytes_done,bytes_total}`); `active:false` when idle.
-/// The UI polls this for a progress bar and computes speed from the byte delta.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeTransferProgress(
+// Poll the running transfer's progress as JSON (`{active,cancelled,file,
+// files_done,files_total,bytes_done,bytes_total}`); `active:false` when idle.
+// The UI polls this for a progress bar and computes speed from the byte delta.
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeTransferProgress(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
     let json = serde_json::to_string(&sync::transfer_snapshot())
         .unwrap_or_else(|e| json_error(&format!("serialize: {e}")));
     jstring_into_raw(&mut env, json)
-}
+});
 
-/// Request cancellation of the running sync/download. It aborts at the next
-/// chunk and discards any half-written file.
-///
-/// `id` это номер передачи из последнего снимка прогресса, и отмена доходит
-/// только до неё: пока номера не было, решение UI («идёт то, что я хочу
-/// остановить») успевало устареть между чтением снимка и вызовом, и отмена
-/// обрывала уже следующую передачу (XR-217). Возвращает `false`, когда просьба
-/// никуда не попала, то есть названная передача уже закончилась.
-#[no_mangle]
-pub extern "system" fn Java_com_xrproxy_app_jni_NativeBridge_nativeCancelTransfer(
+// Request cancellation of the running sync/download. It aborts at the next
+// chunk and discards any half-written file.
+//
+// `id` это номер передачи из последнего снимка прогресса, и отмена доходит
+// только до неё: пока номера не было, решение UI («идёт то, что я хочу
+// остановить») успевало устареть между чтением снимка и вызовом, и отмена
+// обрывала уже следующую передачу (XR-217). Возвращает `false`, когда просьба
+// никуда не попала, то есть названная передача уже закончилась.
+jni_entry!(jni::sys::JNI_FALSE; fn Java_com_xrproxy_app_jni_NativeBridge_nativeCancelTransfer(
     _env: JNIEnv,
     _class: JClass,
     id: jlong,
 ) -> jboolean {
     u8::from(sync::transfer_cancel(id.max(0) as u64))
-}
+});
 
 #[cfg(test)]
 mod tests {
@@ -2098,5 +2088,19 @@ mod tests {
         assert!(tail[0].contains("мост диагностики движка включён"), "unexpected: {}", tail[0]);
         assert!(tail[1].contains("  WARN ["), "unexpected: {}", tail[1]);
         assert!(tail[1].contains("разбор правил не удался"), "unexpected: {}", tail[1]);
+    }
+
+    /// Отравленный паникой лок не закрывает движок навсегда (XR-220): после
+    /// паники под локом следующее обращение берёт лок через into_inner, а не
+    /// падает на яде, как было бы с `lock().unwrap()`.
+    #[test]
+    fn lock_survives_poison_after_panic() {
+        let mutex: Mutex<Option<u32>> = Mutex::new(Some(1));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("отравить лок");
+        }));
+        assert!(mutex.is_poisoned());
+        assert_eq!(*lock_surviving_poison(&mutex, "тест"), Some(1));
     }
 }

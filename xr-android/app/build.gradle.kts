@@ -147,7 +147,7 @@ tasks.register<Exec>("buildRustRelease") {
         "-t", "aarch64-linux-android",
         "-t", "x86_64-linux-android",
         "-o", "${projectDir}/src/main/jniLibs",
-        "build", "-p", "xr-android-jni", "--release"
+        "build", "-p", "xr-android-jni", "--profile", "android-release"
     )
 }
 

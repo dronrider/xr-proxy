@@ -13,10 +13,10 @@
 #   cd xr-android && ./build.sh -r           # то же короче
 #
 # Rust native libraries (libxr_proxy.so) всегда собираются в release-профиле
-# — дебажный Rust-слой на мобильном замедляет даже direct-трафик в 5-10x
-# из-за smoltcp и per-packet обработки. Отдельный режим для Rust-debug мы
-# не делаем: если нужно отладить нативу, её проще прогнать под cargo test
-# на хосте.
+# (android-release: те же оптимизации плюс unwind) - дебажный Rust-слой на
+# мобильном замедляет даже direct-трафик в 5-10x из-за smoltcp и per-packet
+# обработки. Отдельный режим для Rust-debug мы не делаем: если нужно отладить
+# нативу, её проще прогнать под cargo test на хосте.
 #
 # APK paths:
 #   debug:   app/build/outputs/apk/debug/app-debug.apk
@@ -77,10 +77,13 @@ cd "$PROJECT_ROOT"
 # cargo clean трогает только host (target/debug, target/release), не
 # трогая target/<triple>/release/, где лежат наши JNI .so. Без
 # --release чистится только debug-профиль того же target'а.
+# Профиль android-release (panic=unwind): паника ядра ловится границей JNI
+# в xr-android-jni, а не убивает процесс приложения (XR-220). Каталог артефактов
+# у него свой: target/<triple>/android-release/.
 cargo clean -p xr-proto -p xr-core -p xr-android-jni \
-    --target aarch64-linux-android --release
+    --target aarch64-linux-android --profile android-release
 cargo clean -p xr-proto -p xr-core -p xr-android-jni \
-    --target x86_64-linux-android --release
+    --target x86_64-linux-android --profile android-release
 
 echo ""
 echo "=== Building Rust native libraries (release) ==="
@@ -88,7 +91,7 @@ cargo ndk \
     -t aarch64-linux-android \
     -t x86_64-linux-android \
     -o "$SCRIPT_DIR/app/src/main/jniLibs" \
-    build -p xr-android-jni --release
+    build -p xr-android-jni --profile android-release
 
 echo ""
 echo "=== Building Android APK ($BUILD_LABEL) ==="

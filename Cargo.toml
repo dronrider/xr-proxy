@@ -13,3 +13,10 @@ lto = true               # link-time optimization
 codegen-units = 1        # single codegen unit for best optimization
 panic = "abort"          # smaller binary, no unwinding
 strip = true             # strip debug symbols
+
+# Android-либа живёт в процессе приложения, где паника обязана дойти до
+# границы JNI и там быть пойманной (XR-220), поэтому её релиз собирается
+# с раскруткой стека. Всё остальное (сервер, клиент, хаб) остаётся на abort.
+[profile.android-release]
+inherits = "release"
+panic = "unwind"
