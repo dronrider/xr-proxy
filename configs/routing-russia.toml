@@ -12,7 +12,7 @@
 # правило без имени работает как раньше.
 #
 # Файл держится в соответствии с боевым пресетом `russia` на хабе
-# (сверен на версии 37): те же группы, те же имена, тот же состав.
+# (сверен на версии 43): те же группы, те же имена, тот же состав.
 # Запись `*.example.com` покрывает и поддомены, и сам `example.com`,
 # поэтому голая форма рядом со звёздочной не нужна.
 
@@ -31,7 +31,8 @@ domains = [
   "*.kimi.com", "*.xmpp.org", "*.youtube.ru",
   "*.youtube.com", "*.youtu.be", "*.googlevideo.com",
   "*.ytimg.com", "*.youtube-nocookie.com", "*.youtube-ui.l.google.com",
-  "*.ggpht.com",
+  "*.ggpht.com", "*.daisyui.com", "*.kokonutui.com",
+  "*.openrouter.ai",
 ]
 
 # --- Meta и WhatsApp ---
@@ -135,7 +136,12 @@ action = "proxy"
 domains = [
   "*.openai.com", "*.chatgpt.com", "*.claude.ai",
   "*.anthropic.com", "*.perplexity.ai", "gemini.google.com",
-  "bard.google.com", "stripe.com",
+  "bard.google.com", "stripe.com", "*.z.ai",
+  "aistudio.google.com",
+  "alkalimakersuite-pa.clients6.google.com", "generativelanguage.googleapis.com",
+  "proactivebackend-pa.googleapis.com", "geller-pa.googleapis.com",
+  "cloudcode-pa.googleapis.com", "aiplatform.googleapis.com",
+  "*.ai.google.dev",
 ]
 
 # --- Claude ---
