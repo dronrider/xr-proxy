@@ -1021,7 +1021,7 @@ jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_
 // правил). Собирается в ядре рядом с самим кэшем пресета, пустое
 // `default_action` берёт общий дефолт клиента. Пресет из кэша сверяется с
 // ключом профиля (XR-207) тем же фильтром, что и у движка.
-jni_entry!(jstring_into_raw(&mut env, String::new()); fn Java_com_xrproxy_app_jni_NativeBridge_nativeMergedToml(
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeMergedToml(
     mut env: JNIEnv,
     _class: JClass,
     cache_dir: JString,

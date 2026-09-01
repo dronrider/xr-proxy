@@ -105,26 +105,55 @@ mod tests {
         assert!(last.contains("ядро сломалось"), "строка: {last}");
     }
 
-    /// Инвариант покрытия: во всём lib.rs нет ни одной extern-функции мимо
-    /// макроса, и экспорт символа тоже даёт только макрос. Новая входная точка
-    /// без защиты не скомпилируется молча: её заметит этот тест.
+    /// Инвариант покрытия: ни в одном исходнике крейта нет extern-функции мимо
+    /// макроса, и экспорт символа тоже даёт только макрос. Тест обходит все
+    /// исходники src целиком, поэтому входная точка в новом модуле крейта без
+    /// защиты не останется незамеченной.
     #[test]
     fn every_entry_point_is_generated_by_the_macro() {
-        let lib = include_str!("lib.rs");
+        fn collect_rust(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).expect("каталог src читается") {
+                let entry = entry.expect("чтение записи каталога");
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_rust(&path, out);
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".rs") {
+                    let text = std::fs::read_to_string(&path).expect("исходник читается");
+                    out.push((name, text));
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = Vec::new();
+        collect_rust(&src, &mut sources);
+        sources.sort();
+        assert!(sources.len() >= 2, "в обход должны попасть все исходники крейта");
+        let mut entries = 0;
+        for (name, text) in &sources {
+            if name == "guard.rs" {
+                assert_eq!(
+                    text.matches("pub extern \"system\"").count(),
+                    2,
+                    "extern-объявления живут только в двух ветках самого макроса"
+                );
+            } else {
+                assert!(
+                    !text.contains("pub extern"),
+                    "{name}: голая extern-функция обходит границу паник, входная точка объявляется только jni_entry!"
+                );
+                assert!(
+                    !text.contains("#[no_mangle]"),
+                    "{name}: экспорт символа даёт тот же макрос"
+                );
+            }
+            entries += text.matches("jni_entry!").count();
+        }
         assert!(
-            !lib.contains("pub extern"),
-            "голая extern-функция в lib.rs обходит границу паник, входная точка объявляется только jni_entry!"
-        );
-        assert!(!lib.contains("#[no_mangle]"), "экспорт символа даёт тот же макрос");
-        assert!(
-            lib.matches("jni_entry!").count() >= 40,
+            entries >= 40,
             "макрос должен накрывать все входные точки NativeBridge"
-        );
-        let guard_src = include_str!("guard.rs");
-        assert_eq!(
-            guard_src.matches("pub extern \"system\"").count(),
-            2,
-            "extern-объявления живут только в двух ветках самого макроса"
         );
     }
 }
