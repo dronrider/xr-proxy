@@ -2667,7 +2667,7 @@ mod tests {
         assert!(ok, "{text}");
         assert_eq!(std::fs::read(repo.join("note.md")).unwrap(), "первая".as_bytes());
 
-        // Правка на стороне клиента -> push -> updateInstead кладёт файл в
+        // Правка на стороне клиента -> push -> post-receive кладёт файл в
         // рабочую папку агента и двигает канал HEAD.
         std::fs::write(repo.join("from-client.md"), "толчок").unwrap();
         let (ok, text) = run_git(&repo, &["add", "-A"]).await;
