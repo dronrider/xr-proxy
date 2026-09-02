@@ -18,8 +18,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_compression::tokio::bufread::GzipDecoder;
 use axum::body::Body;
 use axum::extract::{Path as AxPath, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -30,15 +31,16 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use http_body_util::BodyExt;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use xr_proto::share::{
-    sign_share_manifest, verify_share_token, ShareManifest, MANIFEST_SIGNED_AT_HEADER,
-    MANIFEST_SIG_HEADER, SCOPE_IMPORT, SCOPE_READ, SCOPE_WRITE,
+    sign_git_head, sign_share_manifest, verify_share_token, ShareManifest,
+    MANIFEST_SIGNED_AT_HEADER, MANIFEST_SIG_HEADER, SCOPE_IMPORT, SCOPE_READ, SCOPE_WRITE,
 };
 
 use crate::auth::extract_token;
+use crate::gitrepo::{GitManager, GitShare};
 use crate::import::{self, ImportManager, JobSpec};
 use crate::manifest::{
     build_listing, build_listing_for_file, build_manifest, build_manifest_for_file, HashCache,
@@ -56,6 +58,10 @@ pub struct ShareRoot {
     /// URL-import jobs are accepted into this share (LLD-29): the local opt-in
     /// on top of `writable`, valid only for a writable directory.
     pub import: bool,
+    /// The git contour is on for this share (LLD-33): auto-commit of working
+    /// folder edits, smart-HTTP git transport and the signed HEAD. A local
+    /// opt-in on top of `writable`, same shape as import.
+    pub git: bool,
 }
 
 impl ShareRoot {
@@ -121,7 +127,13 @@ pub fn build_shares(entries: &[crate::config::ShareEntry]) -> SharesMap {
                 if e.import && !writable {
                     tracing::warn!("share {}: import ignored, share is not writable", e.share_id);
                 }
-                map.insert(e.share_id.clone(), ShareRoot { path: canon, is_file, writable, import });
+                // So is the git contour (LLD-33): co-editing is writing by
+                // definition, and its transport gates on share:write.
+                let git = e.git && writable;
+                if e.git && !writable {
+                    tracing::warn!("share {}: git ignored, share is not writable", e.share_id);
+                }
+                map.insert(e.share_id.clone(), ShareRoot { path: canon, is_file, writable, import, git });
             }
             Err(err) => {
                 tracing::warn!("share {}: path unreadable ({err}), skipping: {}", e.share_id, e.path)
@@ -147,6 +159,9 @@ pub struct AgentState {
     /// URL-import job registry + plugin config (LLD-29). Always present; with no
     /// `[import]` block it just answers that import is off.
     pub import: Arc<ImportManager>,
+    /// Live repositories of git-enabled shares (LLD-33): handles for the
+    /// transport, refilled by the same config reload that swaps `shares`.
+    pub git: Arc<GitManager>,
     /// Публикации локальных сервисов (LLD-38 п. 2.1). Меняется горячо тем же
     /// перечитыванием конфига, что и шары: `expose add` не должен требовать
     /// перезапуска агента.
@@ -201,6 +216,12 @@ pub fn router(state: Arc<AgentState>) -> Router {
             "/{share_id}/import/{job_id}",
             get(import_status).delete(import_cancel),
         )
+        // git contour (LLD-33): smart-HTTP transport plus the signed head.
+        // The whole contour, fetch included, gates on share:write.
+        .route("/{share_id}/git/info/refs", get(git_info_refs))
+        .route("/{share_id}/git/git-upload-pack", axum::routing::post(git_upload_pack))
+        .route("/{share_id}/git/git-receive-pack", axum::routing::post(git_receive_pack))
+        .route("/{share_id}/git/head", get(git_head))
         // legacy: share selected by the token (single-share v1 consumers).
         .route("/manifest", get(get_manifest_legacy))
         .route("/file/{*path}", get(serve_file_legacy))
@@ -656,6 +677,433 @@ async fn import_cancel(
     }
 }
 
+// -- git contour (LLD-33) -------------------------------------------
+
+/// Whole-exchange deadline for one git RPC (fetch or push): a wedged client
+/// must not pin the receive lock or a git process forever.
+const GIT_RPC_DEADLINE: Duration = Duration::from_secs(5 * 60);
+
+/// Which smart-HTTP service a git route talks to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GitRpc {
+    UploadPack,
+    ReceivePack,
+}
+
+impl GitRpc {
+    /// The git subcommand behind the service name.
+    fn sub(&self) -> &'static str {
+        match self {
+            GitRpc::UploadPack => "upload-pack",
+            GitRpc::ReceivePack => "receive-pack",
+        }
+    }
+
+    fn service(&self) -> &'static str {
+        match self {
+            GitRpc::UploadPack => "git-upload-pack",
+            GitRpc::ReceivePack => "git-receive-pack",
+        }
+    }
+}
+
+/// The gate ladder every git route climbs (LLD-33 п. 2.3): the share must
+/// exist (`404`), have the contour on (`403`), be writable (`403`), and the
+/// token must carry `share:write` (`401`/`403`). Fetch lives under
+/// `share:write` too: the repository is the owner's private history, not a
+/// published binding. Resolves to the live repository handle.
+fn git_gates(
+    state: &AgentState,
+    share_id: &str,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+) -> Result<Arc<GitShare>, (StatusCode, &'static str)> {
+    let shares = state.snapshot();
+    let share = shares.get(share_id).ok_or((StatusCode::NOT_FOUND, "no such share"))?;
+    if !share.git {
+        return Err((StatusCode::FORBIDDEN, "git is off for this share"));
+    }
+    if !share.writable {
+        return Err((StatusCode::FORBIDDEN, "share is not writable"));
+    }
+    check_token_parts(state, share_id, SCOPE_WRITE, headers, uri)?;
+    state
+        .git
+        .get(share_id)
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "git repository unavailable"))
+}
+
+/// One value of a query parameter, if present. The git routes only take hex
+/// shas and digits, so no percent-decoding is needed.
+fn query_param(uri: &axum::http::Uri, name: &str) -> Option<String> {
+    uri.query()?.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == name).then(|| v.to_string())
+    })
+}
+
+/// One pkt-line record of the smart-HTTP protocol: four hex digits naming the
+/// payload length (itself included), then the payload.
+fn pkt_line(payload: &[u8]) -> Vec<u8> {
+    let len = (payload.len() + 4) as u32;
+    let mut out = Vec::with_capacity(payload.len() + 4);
+    out.extend_from_slice(format!("{len:04x}").as_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// `GET /{share_id}/git/info/refs?service=...`: the smart-HTTP ref
+/// advertisement. Without `service` this is the dumb-protocol probe; the
+/// contour only speaks smart HTTP, so that answers `400` naming the parameter.
+async fn git_info_refs(
+    State(state): State<Arc<AgentState>>,
+    AxPath(share_id): AxPath<String>,
+    req: Request,
+) -> Response {
+    let uri = req.uri().clone();
+    let rpc = match query_param(&uri, "service").as_deref() {
+        Some("git-upload-pack") => GitRpc::UploadPack,
+        Some("git-receive-pack") => GitRpc::ReceivePack,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "smart HTTP only: pass ?service=git-upload-pack|git-receive-pack",
+            )
+                .into_response()
+        }
+    };
+    let share = match git_gates(&state, &share_id, req.headers(), &uri) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let out = tokio::process::Command::new("git")
+        .arg(rpc.sub())
+        .arg("--stateless-rpc")
+        .arg("--advertise-refs")
+        .arg(&share.git_dir)
+        .output()
+        .await;
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            tracing::error!(
+                "git {} advertise-refs failed: {}",
+                rpc.sub(),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, "git advertise failed").into_response();
+        }
+        Err(e) => {
+            tracing::error!("git {} spawn failed: {e}", rpc.sub());
+            return (StatusCode::INTERNAL_SERVER_ERROR, "git not available").into_response();
+        }
+    };
+    // Protocol preamble: the service announcement as one pkt-line, a flush,
+    // then the raw advertisement.
+    let mut body = pkt_line(format!("# service={}\n", rpc.service()).as_bytes());
+    body.extend_from_slice(b"0000");
+    body.extend_from_slice(&out.stdout);
+    (
+        [(header::CONTENT_TYPE, format!("application/x-{}-advertisement", rpc.service()))],
+        body,
+    )
+        .into_response()
+}
+
+async fn git_upload_pack(
+    State(state): State<Arc<AgentState>>,
+    AxPath(share_id): AxPath<String>,
+    req: Request,
+) -> Response {
+    git_rpc(state, share_id, req, GitRpc::UploadPack).await
+}
+
+async fn git_receive_pack(
+    State(state): State<Arc<AgentState>>,
+    AxPath(share_id): AxPath<String>,
+    req: Request,
+) -> Response {
+    git_rpc(state, share_id, req, GitRpc::ReceivePack).await
+}
+
+/// `POST /{share_id}/git/git-{upload,receive}-pack`: the request body streams
+/// into git's stdin, git's stdout streams back as the response, one process
+/// exchange per request (`--stateless-rpc`, no connection reuse). A push is
+/// serialized against the auto-commit loop by the repository's op lock, held
+/// for the whole exchange and therefore moved into the finisher task that
+/// outlives the handler.
+async fn git_rpc(state: Arc<AgentState>, share_id: String, req: Request, rpc: GitRpc) -> Response {
+    let (parts, body) = req.into_parts();
+    let share = match git_gates(&state, &share_id, &parts.headers, &parts.uri) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let op_guard = if rpc == GitRpc::ReceivePack {
+        Some(share.op_lock.clone().lock_owned().await)
+    } else {
+        None
+    };
+    // A client may gzip the request body (git does for large pushes when the
+    // server offers it); harmless to accept unconditionally.
+    let gzipped = header_str(&parts.headers, "content-encoding")
+        .map(|v| v.eq_ignore_ascii_case("gzip"))
+        .unwrap_or(false);
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg(rpc.sub())
+        .arg("--stateless-rpc")
+        .arg(&share.git_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("git {} spawn failed: {e}", rpc.sub());
+            return (StatusCode::INTERNAL_SERVER_ERROR, "git not available").into_response();
+        }
+    };
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+
+    // Request body -> git stdin. A client that hangs up mid-body becomes a
+    // broken pipe here and an EOF for git (the stdin handle drops with the
+    // task), so the exchange still unwinds through the finisher.
+    let reader = BodyReader::new(body);
+    let mut input: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if gzipped {
+        Box::new(GzipDecoder::new(tokio::io::BufReader::new(reader)))
+    } else {
+        Box::new(reader)
+    };
+    let feed = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut input, &mut stdin).await;
+    });
+
+    // Keep the tail of git's stderr for the failure log.
+    let err_tail = tokio::spawn(async move {
+        let mut tail: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match stderr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    tail.extend_from_slice(&buf[..n]);
+                    let over = tail.len().saturating_sub(4096);
+                    if over > 0 {
+                        tail.drain(..over);
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&tail).into_owned()
+    });
+
+    // First byte of git's answer under the deadline: a process that dies
+    // before saying anything must surface as a 5xx with its stderr, not as an
+    // empty 200 the client cannot diagnose.
+    let mut probe = [0u8; 8192];
+    let first = match tokio::time::timeout(GIT_RPC_DEADLINE, stdout.read(&mut probe)).await {
+        Err(_) => {
+            kill_git_tree(&mut child);
+            return (StatusCode::GATEWAY_TIMEOUT, "git rpc deadline").into_response();
+        }
+        Ok(Err(e)) => {
+            kill_git_tree(&mut child);
+            tracing::error!("git {} stdout: {e}", rpc.sub());
+            return (StatusCode::INTERNAL_SERVER_ERROR, "git rpc failed").into_response();
+        }
+        Ok(Ok(0)) => {
+            let _ = feed.await;
+            let tail = err_tail.await.unwrap_or_default();
+            tracing::error!(
+                "git {} died before answering ({:?}): {}",
+                rpc.sub(),
+                child.wait().await,
+                tail
+            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, "git rpc failed").into_response();
+        }
+        Ok(Ok(n)) => Vec::from(&probe[..n]),
+    };
+
+    let started = std::time::Instant::now();
+    // The rest of stdout streams as the response body; the Cursor replays the
+    // probe read above ahead of the pipe.
+    let response = Body::new(ReaderBody::new(std::io::Cursor::new(first).chain(stdout)));
+
+    let share_fin = share.clone();
+    tokio::spawn(async move {
+        // Hold the receive lock until the exchange ends, not just the handler.
+        let _op_guard = op_guard;
+        let _ = feed.await;
+        let left = GIT_RPC_DEADLINE.saturating_sub(started.elapsed());
+        let status = match tokio::time::timeout(left, child.wait()).await {
+            Ok(s) => s,
+            Err(_) => {
+                tracing::warn!("git {}: exchange overran the deadline, killed", rpc.sub());
+                kill_git_tree(&mut child);
+                return;
+            }
+        };
+        let tail = err_tail.await.unwrap_or_default();
+        if let Ok(st) = &status {
+            if !st.success() {
+                tracing::warn!("git {} exited with {st}: {}", rpc.sub(), tail);
+            }
+        }
+        // Refs may already have moved when the report itself failed to go
+        // out, so the head channel catches up on any receive outcome.
+        if rpc == GitRpc::ReceivePack {
+            if let Err(e) = share_fin.clone().after_receive().await {
+                tracing::error!("share {share_id}: post-receive update failed: {e:#}");
+            }
+        }
+    });
+
+    (
+        [(header::CONTENT_TYPE, format!("application/x-{}-result", rpc.service()))],
+        response,
+    )
+        .into_response()
+}
+
+/// `GET /{share_id}/git/head?since=<sha>&wait=<sec>`: the current `main`
+/// head, signed by the agent identity. `since` equal to the current head
+/// parks the request for up to `wait` seconds (capped at a minute) waiting
+/// for the next commit or push, so a watcher polls with second-sharp latency
+/// at a request per minute. An unborn `main` reports an empty string.
+async fn git_head(
+    State(state): State<Arc<AgentState>>,
+    AxPath(share_id): AxPath<String>,
+    req: Request,
+) -> Response {
+    let uri = req.uri().clone();
+    let share = match git_gates(&state, &share_id, req.headers(), &uri) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let mut rx = share.head_tx.subscribe();
+    let since = query_param(&uri, "since");
+    let wait = query_param(&uri, "wait")
+        .and_then(|w| w.parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(60);
+    let head = if wait > 0 && since.as_deref() == Some(rx.borrow().as_str()) {
+        match tokio::time::timeout(Duration::from_secs(wait), rx.changed()).await {
+            Ok(Ok(())) => rx.borrow().clone(),
+            // Timeout or the sender gone: the current state is the answer.
+            _ => rx.borrow().clone(),
+        }
+    } else {
+        rx.borrow().clone()
+    };
+    let signed_at = now_unix();
+    let sig = state
+        .identity
+        .as_ref()
+        .map(|k| sign_git_head(k, &share_id, signed_at, &head));
+    Json(serde_json::json!({ "head": head, "signed_at": signed_at, "sig": sig })).into_response()
+}
+
+/// Request body as an `AsyncRead` for a git process's stdin: data frames yield
+/// their bytes, a mid-body error (a client that hung up) surfaces as an io
+/// error so the copy stops, and the end of the body reads as EOF.
+struct BodyReader {
+    body: std::pin::Pin<Box<Body>>,
+    pending: axum::body::Bytes,
+}
+
+impl BodyReader {
+    fn new(body: Body) -> Self {
+        Self { body: Box::pin(body), pending: axum::body::Bytes::new() }
+    }
+}
+
+impl tokio::io::AsyncRead for BodyReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use http_body::Body as _;
+        loop {
+            if !self.pending.is_empty() {
+                let n = self.pending.len().min(buf.remaining());
+                let chunk = self.pending.split_to(n);
+                buf.put_slice(&chunk);
+                return std::task::Poll::Ready(Ok(()));
+            }
+            match std::task::ready!(self.body.as_mut().poll_frame(cx)) {
+                // End of the body: EOF for git.
+                None => return std::task::Poll::Ready(Ok(())),
+                // Data goes to `pending`; anything else (trailers) is skipped.
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        self.pending = data;
+                    }
+                }
+                Some(Err(_)) => {
+                    return std::task::Poll::Ready(Err(std::io::Error::other(
+                        "request body failed",
+                    )));
+                }
+            }
+        }
+    }
+}
+
+/// The other direction: git's stdout as an HTTP body. Each read chunk becomes
+/// one data frame, EOF ends the body and with it the response.
+struct ReaderBody<R: tokio::io::AsyncRead + Unpin> {
+    reader: R,
+    buf: Box<[u8]>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> ReaderBody<R> {
+    fn new(reader: R) -> Self {
+        Self { reader, buf: vec![0u8; 16 * 1024].into_boxed_slice() }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> http_body::Body for ReaderBody<R> {
+    type Data = axum::body::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::io::Result<http_body::Frame<axum::body::Bytes>>>> {
+        let Self { reader, buf } = self.get_mut();
+        let mut rb = tokio::io::ReadBuf::new(&mut **buf);
+        match std::task::ready!(std::pin::Pin::new(reader).poll_read(cx, &mut rb)) {
+            Ok(()) if rb.filled().is_empty() => std::task::Poll::Ready(None),
+            Ok(()) => std::task::Poll::Ready(Some(Ok(http_body::Frame::data(
+                axum::body::Bytes::copy_from_slice(rb.filled()),
+            )))),
+            Err(e) => std::task::Poll::Ready(Some(Err(e))),
+        }
+    }
+}
+
+/// Kill the git process and whatever it spawned (`pack-objects` and friends):
+/// the child runs in its own process group, so the group signal reaches both.
+#[cfg(unix)]
+fn kill_git_tree(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    }
+    let _ = child.start_kill();
+}
+
+#[cfg(windows)]
+fn kill_git_tree(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+}
+
 /// Optimistic-concurrency preconditions for a `PUT` (LLD-28 п. 3.7):
 /// `If-None-Match: *` requires the target not to exist; `If-Match: <sha>`
 /// requires the target's current content hash to equal `<sha>`. A violated
@@ -832,6 +1280,8 @@ mod tests {
     use tower::ServiceExt;
     use xr_proto::share::{sign_share_token, ShareToken};
 
+    use crate::gitrepo::GitSettings;
+
     fn blob(t: &ShareToken) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(t).unwrap())
     }
@@ -842,6 +1292,9 @@ mod tests {
 
     fn state_with_cap(shares: SharesMap, key: &SigningKey, max_file_mb: Option<u64>) -> Arc<AgentState> {
         let cache = Arc::new(HashCache::new());
+        // The git table gets its own throwaway state dir: only the git tests
+        // call rebuild, the rest of the suite never touches a repository.
+        let state_dir = tempfile::tempdir().unwrap().keep();
         Arc::new(AgentState {
             shares: RwLock::new(Arc::new(shares)),
             hub_key: key.verifying_key(),
@@ -849,13 +1302,27 @@ mod tests {
             identity: Some(SigningKey::from_bytes(&[77u8; 32])),
             max_file_mb,
             import: ImportManager::new(None, cache),
+            git: Arc::new(GitManager::with_settings(&state_dir, GitSettings {
+                author: ("tester".into(), "tester@xr-share".into()),
+                max_file_mb: 10,
+            })),
             expose: RwLock::new(Arc::new(Vec::new())),
         })
     }
 
+    /// A git table for hand-built states: its own throwaway state dir, no
+    /// shares registered (those tests never touch the git routes).
+    fn git_manager_for_tests() -> Arc<GitManager> {
+        let state_dir = tempfile::tempdir().unwrap().keep();
+        Arc::new(GitManager::with_settings(&state_dir, GitSettings {
+            author: ("tester".into(), "tester@xr-share".into()),
+            max_file_mb: 10,
+        }))
+    }
+
     /// A directory share; `writable` opts into the write path (LLD-28).
     fn dir_share(path: PathBuf, writable: bool) -> ShareRoot {
-        ShareRoot { path, is_file: false, writable, import: false }
+        ShareRoot { path, is_file: false, writable, import: false, git: false }
     }
 
     fn get_with_token(uri: &str, tok: Option<&ShareToken>) -> HttpRequest<Body> {
@@ -943,7 +1410,7 @@ mod tests {
         let file = dir.path().join("report.pdf");
         std::fs::write(&file, b"hello").unwrap();
         let mut shares = SharesMap::new();
-        shares.insert("F".into(), ShareRoot { path: file.canonicalize().unwrap(), is_file: true, writable: false, import: false });
+        shares.insert("F".into(), ShareRoot { path: file.canonicalize().unwrap(), is_file: true, writable: false, import: false, git: false });
         let app = router(state_with(shares, &key));
         let tok = sign_share_token(&key, "F", SCOPE_READ, now_unix() + 1000);
 
@@ -1017,6 +1484,7 @@ mod tests {
             identity: None,
             max_file_mb: None,
             import: ImportManager::new(None, cache),
+            git: git_manager_for_tests(),
             expose: RwLock::new(Arc::new(Vec::new())),
         });
         let app = router(state);
@@ -1319,6 +1787,7 @@ mod tests {
             name: None,
             writable: true,
             import: false,
+            git: false,
             attached: false,
         }];
         let shares = build_shares(&entries);
@@ -1373,7 +1842,7 @@ mod tests {
         let mut shares = SharesMap::new();
         shares.insert(
             "I".into(),
-            ShareRoot { path: dir.canonicalize().unwrap(), is_file: false, writable: true, import: true },
+            ShareRoot { path: dir.canonicalize().unwrap(), is_file: false, writable: true, import: true, git: false },
         );
         let cache = Arc::new(HashCache::new());
         let state = Arc::new(AgentState {
@@ -1383,6 +1852,7 @@ mod tests {
             identity: Some(SigningKey::from_bytes(&[77u8; 32])),
             max_file_mb,
             import: ImportManager::new(cfg, cache),
+            git: git_manager_for_tests(),
             expose: RwLock::new(Arc::new(Vec::new())),
         });
         state.import.spawn_runner();
@@ -1682,7 +2152,7 @@ mod tests {
         let mut shares = SharesMap::new();
         shares.insert(
             "I".into(),
-            ShareRoot { path: share.path().canonicalize().unwrap(), is_file: false, writable: true, import: false },
+            ShareRoot { path: share.path().canonicalize().unwrap(), is_file: false, writable: true, import: false, git: false },
         );
         let cache = Arc::new(HashCache::new());
         let no_flag = router(Arc::new(AgentState {
@@ -1692,6 +2162,7 @@ mod tests {
             identity: None,
             max_file_mb: None,
             import: ImportManager::new(Some(cfg), cache),
+            git: git_manager_for_tests(),
             expose: RwLock::new(Arc::new(Vec::new())),
         }));
         let (status, _) = post_import(&no_flag, Some(&tok), "/I/import", body.clone()).await;
@@ -1949,7 +2420,7 @@ mod tests {
         for (id, dir) in [("I", dir_i.path()), ("J", dir_j.path())] {
             shares.insert(
                 id.into(),
-                ShareRoot { path: dir.canonicalize().unwrap(), is_file: false, writable: true, import: true },
+                ShareRoot { path: dir.canonicalize().unwrap(), is_file: false, writable: true, import: true, git: false },
             );
         }
         let cache = Arc::new(HashCache::new());
@@ -1960,6 +2431,7 @@ mod tests {
             identity: None,
             max_file_mb: None,
             import: ImportManager::new(Some(one_plugin(&script, &["{url}"], &["*"], 1080)), cache),
+            git: git_manager_for_tests(),
             expose: RwLock::new(Arc::new(Vec::new())),
         });
         state.import.spawn_runner();
@@ -2024,5 +2496,291 @@ mod tests {
         assert!(!share.path().join(".xr-хитрость").exists());
         assert!(!share.path().join("sub").exists());
         assert!(no_job_dirs(share.path()));
+    }
+
+    // -- git contour (LLD-33) --------------------------------------------
+
+    /// A one-share app with the git contour on, plus its read+write token and
+    /// the state (the tests drive commits by hand instead of waiting out the
+    /// watcher debounce). The watcher itself is live, as after a real reload.
+    fn git_app(key: &SigningKey, dir: &Path) -> (Router, ShareToken, Arc<AgentState>) {
+        let mut shares = SharesMap::new();
+        let mut root = dir_share(dir.canonicalize().unwrap(), true);
+        root.git = true;
+        shares.insert("W".into(), root);
+        let state = state_with(shares, key);
+        state.git.rebuild(&state.snapshot());
+        let tok = sign_share_token(key, "W", &rw_scope(), now_unix() + 1000);
+        (router(state.clone()), tok, state)
+    }
+
+    /// Клиентский git с герметичным конфигом: ни глобального конфига машины,
+    /// ни её identity, чтобы тест не зависел от окружения. Blocking-обёртка
+    /// для async-тестов.
+    async fn run_git(dir: &Path, args: &[&str]) -> (bool, String) {
+        let dir = dir.to_path_buf();
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        tokio::task::spawn_blocking(move || {
+            let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            let out = std::process::Command::new("git")
+                .args(&refs)
+                .current_dir(&dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "client")
+                .env("GIT_AUTHOR_EMAIL", "client@example.com")
+                .env("GIT_COMMITTER_NAME", "client")
+                .env("GIT_COMMITTER_EMAIL", "client@example.com")
+                .output()
+                .expect("git runs");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            (out.status.success(), text)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_git_transport_gates() {
+        let key = SigningKey::from_bytes(&[40u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let (app, wtok, _) = git_app(&key, dir.path());
+
+        // Чужая шара -> 404.
+        let r = app
+            .clone()
+            .oneshot(get_with_token(
+                "/N/git/info/refs?service=git-upload-pack",
+                Some(&wtok),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+
+        // Контур выключен -> 403, до разговора о токене (LLD-33 п. 2.3).
+        let mut shares = SharesMap::new();
+        shares.insert("W".into(), dir_share(dir.path().canonicalize().unwrap(), true));
+        let plain = router(state_with(shares, &key));
+        let r = plain
+            .clone()
+            .oneshot(get_with_token(
+                "/W/git/info/refs?service=git-upload-pack",
+                Some(&wtok),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+        // git=true на неписабельной шаре из ручного состояния -> тот же 403:
+        // лестница не зависит от того, кто построил таблицу.
+        let mut shares = SharesMap::new();
+        let mut root = dir_share(dir.path().canonicalize().unwrap(), false);
+        root.git = true;
+        shares.insert("W".into(), root);
+        let ro = router(state_with(shares, &key));
+        let r = ro
+            .clone()
+            .oneshot(get_with_token(
+                "/W/git/info/refs?service=git-upload-pack",
+                Some(&wtok),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+        // Нет токена -> 401; токен без write -> 403: весь контур, fetch
+        // включительно, живёт под share:write (LLD-33 п. 2.3).
+        let r = app
+            .clone()
+            .oneshot(get_with_token("/W/git/info/refs?service=git-upload-pack", None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        let rtok = sign_share_token(&key, "W", SCOPE_READ, now_unix() + 1000);
+        let r = app
+            .clone()
+            .oneshot(get_with_token(
+                "/W/git/info/refs?service=git-upload-pack",
+                Some(&rtok),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let r = app
+            .clone()
+            .oneshot(get_with_token("/W/git/head", Some(&rtok)))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+        // Dumb-protocol probe without service -> 400 with the parameter named.
+        let r = app
+            .clone()
+            .oneshot(get_with_token("/W/git/info/refs", Some(&wtok)))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+        // Годный запрос -> pkt-line преамбула и advertisement.
+        let r = app
+            .clone()
+            .oneshot(get_with_token(
+                "/W/git/info/refs?service=git-upload-pack",
+                Some(&wtok),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            r.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/x-git-upload-pack-advertisement"
+        );
+        let adv = r.into_body().collect().await.unwrap().to_bytes();
+        assert!(adv.starts_with(b"001e# service=git-upload-pack\n0000"), "{adv:?}");
+    }
+
+    /// Полный круг штатным git-клиентом против живого сервера: клон, fetch
+    /// автокоммита, push с материализацией в рабочую папку и канал HEAD.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_git_clone_push_roundtrip() {
+        let key = SigningKey::from_bytes(&[41u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let client = tempfile::tempdir().unwrap();
+        let (app, wtok, state) = git_app(&key, dir.path());
+
+        // Первый коммит до клона, чтобы у клиента была живая ветка main.
+        std::fs::write(dir.path().join("note.md"), "первая").unwrap();
+        state.git.get("W").unwrap().commit_scan().await.unwrap().expect("commit");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+
+        let repo = client.path().join("repo");
+        let url = format!("http://{addr}/W/git");
+        let header = format!("http.extraHeader=Authorization: Bearer {}", blob(&wtok));
+        let (ok, text) = run_git(client.path(), &["-c", &header, "clone", &url, "repo"]).await;
+        assert!(ok, "{text}");
+        assert_eq!(std::fs::read(repo.join("note.md")).unwrap(), "первая".as_bytes());
+
+        // Правка на стороне клиента -> push -> updateInstead кладёт файл в
+        // рабочую папку агента и двигает канал HEAD.
+        std::fs::write(repo.join("from-client.md"), "толчок").unwrap();
+        let (ok, text) = run_git(&repo, &["add", "-A"]).await;
+        assert!(ok, "{text}");
+        let (ok, text) = run_git(&repo, &["commit", "-m", "client edit"]).await;
+        assert!(ok, "{text}");
+        let (ok, text) = run_git(&repo, &["-c", &header, "push", "origin", "HEAD:refs/heads/main"]).await;
+        assert!(ok, "{text}");
+        assert_eq!(std::fs::read(dir.path().join("from-client.md")).unwrap(), "толчок".as_bytes());
+
+        let (ok, text) = run_git(&repo, &["rev-parse", "HEAD"]).await;
+        assert!(ok, "{text}");
+        let expected = text.trim().to_string();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if *state.git.get("W").unwrap().head_tx.borrow() == expected {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "HEAD не догнал push: {:?}",
+                state.git.get("W").unwrap().head_tx.borrow()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_head_signed_longpoll() {
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let (app, wtok, state) = git_app(&key, dir.path());
+
+        // Нерождённая main: пустой head и проверяемая подпись (XR-046 identity
+        // фиксирован в state_with).
+        let r = app.clone().oneshot(get_with_token("/W/git/head", Some(&wtok))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&r.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(v["head"], "");
+        let signed_at = v["signed_at"].as_u64().unwrap();
+        let sig = v["sig"].as_str().unwrap();
+        let agent_key = SigningKey::from_bytes(&[77u8; 32]).verifying_key();
+        xr_proto::share::verify_git_head(sig, &agent_key, "W", signed_at, "").unwrap();
+        assert!(xr_proto::share::verify_git_head(sig, &agent_key, "N", signed_at, "").is_err());
+
+        // Припаркованный опрос с since=<текущий> просыпается на новом коммите,
+        // а не отрабатывает таймаутом.
+        let app2 = app.clone();
+        let tok2 = wtok.clone();
+        let parked = tokio::spawn(async move {
+            app2
+                .oneshot(get_with_token("/W/git/head?since=&wait=30", Some(&tok2)))
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        std::fs::write(dir.path().join("a.md"), "a").unwrap();
+        state.git.get("W").unwrap().commit_scan().await.unwrap().expect("commit");
+
+        let started = std::time::Instant::now();
+        let r = parked.await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10), "long-poll не проснулся сам");
+        let v: serde_json::Value =
+            serde_json::from_slice(&r.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let head = v["head"].as_str().unwrap().to_string();
+        assert!(!head.is_empty());
+        let signed_at = v["signed_at"].as_u64().unwrap();
+        let sig = v["sig"].as_str().unwrap();
+        xr_proto::share::verify_git_head(sig, &agent_key, "W", signed_at, &head).unwrap();
+    }
+
+    /// Сжатое тело запроса (git шлёт gzip на больших пушах) распаковывается и
+    /// доходит до git: ручной v0-запрос upload-pack через gzip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_git_rpc_accepts_gzip_body() {
+        let key = SigningKey::from_bytes(&[43u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let (app, wtok, state) = git_app(&key, dir.path());
+
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        state.git.get("W").unwrap().commit_scan().await.unwrap().expect("commit");
+
+        // v0-объявление: oid до " HEAD" в первой строке.
+        let r = app
+            .clone()
+            .oneshot(get_with_token(
+                "/W/git/info/refs?service=git-upload-pack",
+                Some(&wtok),
+            ))
+            .await
+            .unwrap();
+        let adv = r.into_body().collect().await.unwrap().to_bytes();
+        let idx = adv.windows(5).position(|w| w == b" HEAD").expect("HEAD in advertisement");
+        let oid = String::from_utf8_lossy(&adv[idx - 40..idx]).into_owned();
+
+        let payload = format!("0032want {oid}\n00000009done\n");
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, payload.as_bytes()).unwrap();
+        let gz = enc.finish().unwrap();
+
+        let req = write_req(
+            "POST",
+            "/W/git/git-upload-pack",
+            Some(&wtok),
+            &[("content-encoding", "gzip".into())],
+            &gz,
+        );
+        let r = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers().get(header::CONTENT_TYPE).unwrap(), "application/x-git-upload-pack-result");
+        let body = r.into_body().collect().await.unwrap().to_bytes();
+        // Ответ на done без haves начинается NAK-строкой, дальше packfile.
+        assert!(body.starts_with(b"0008NAK\n"), "{}", String::from_utf8_lossy(&body));
     }
 }

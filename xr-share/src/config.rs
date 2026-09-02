@@ -57,6 +57,17 @@ pub struct AgentConfig {
     /// refused with `413` before it is written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_file_mb: Option<u64>,
+    /// Author of the auto-commits the git contour makes on the agent (LLD-33
+    /// п. 2.2). A name, or a full `Name <email>` git author string; defaults to
+    /// the hostname with `<hostname>@xr-share` as the email, so co-authors see
+    /// whose machine pushed a change without any setup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_author: Option<String>,
+    /// Per-file size cap of the git contour, in mebibytes (LLD-33 п. 2.6).
+    /// `None` means the shared default (`GIT_MAX_FILE_MB`). Files over it stay
+    /// out of history but keep flowing through the manifest surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_max_file_mb: Option<u64>,
     /// URL-import settings + plugin registry (LLD-29). Absent block means no
     /// import anywhere: the local opt-in on top of the `share:import` scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,6 +111,13 @@ pub struct ShareEntry {
     /// write. Set by `xr-share share --writable --import`.
     #[serde(default)]
     pub import: bool,
+    /// The git contour is on for this share (LLD-33): a repository outside the
+    /// working folder, auto-commit of local edits, smart-HTTP git transport and
+    /// the signed-HEAD long-poll. Off by default and only valid together with
+    /// `writable`: co-editing is writing by definition. Set by `xr-share share
+    /// --writable --git`.
+    #[serde(default)]
+    pub git: bool,
     /// Хоть раз привязывалась к инвайту (XR-162). Взводится успешным `attach`
     /// в `xr-share share`, живёт в конфиге только ради одного: повторный
     /// `share` вытесняет запись вместе с её привязками, и по этому признаку
@@ -311,6 +329,7 @@ impl AgentConfig {
                     // Legacy single-share configs predate writable shares.
                     writable: false,
                     import: false,
+                    git: false,
                     attached: false,
                 });
             }
@@ -355,6 +374,32 @@ impl AgentConfig {
             }
         }
         Ok(())
+    }
+
+    /// Fail-fast checks for the git contour (LLD-33 п. 2.1): `git = true`
+    /// without `writable` must stop the agent at startup, and a nonsense cap
+    /// must not silently mean "no history at all". The `git` flag on a read-only
+    /// share is dropped (with a warning) in `build_shares`, but a hand-edited
+    /// config deserves a named refusal, same as import.
+    pub fn validate_git(&self) -> Result<()> {
+        for s in self.resolved_shares() {
+            if s.git && !s.writable {
+                anyhow::bail!("share {}: git = true requires writable = true", s.share_id);
+            }
+        }
+        if let Some(cap) = self.git_max_file_mb {
+            if cap == 0 {
+                anyhow::bail!("git_max_file_mb must be at least 1, got 0");
+            }
+        }
+        Ok(())
+    }
+
+    /// The effective per-file cap of the git contour, in mebibytes: the shared
+    /// default unless the config overrides it. One resolution point so the
+    /// agent never computes it twice and drifts between transport and commit.
+    pub fn effective_git_max_file_mb(&self) -> u64 {
+        self.git_max_file_mb.unwrap_or(xr_proto::share::GIT_MAX_FILE_MB)
     }
 
     /// Проверки публикаций на старте (LLD-38 п. 2.1). Кривое имя или апстрим
@@ -440,6 +485,35 @@ mod tests {
         assert!(back.resolved_shares()[0].attached, "признак обязан пережить перезапись конфига");
     }
 
+    // Git-контур (LLD-33 п. 2.1): флаг в конфиге без writable это отказ на
+    // старте, а не молчаливо неработающая история; колпак живёт своим полем и
+    // без него берётся общим дефолтом xr-proto, чтобы агент и харнесс не
+    // разошлись в умолчаниях.
+    #[test]
+    fn git_flag_needs_writable_and_cap_has_floor() {
+        let toml = r#"
+            listen = "0.0.0.0:8443"
+            hub_pubkey = "QQ=="
+            [[share]]
+            share_id = "a"
+            path = "/srv/docs"
+            writable = true
+            git = true
+        "#;
+        let cfg: AgentConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.validate_git().is_ok());
+        assert!(cfg.resolved_shares()[0].git);
+        assert_eq!(cfg.effective_git_max_file_mb(), xr_proto::share::GIT_MAX_FILE_MB);
+
+        let read_only = toml.replace("            writable = true\n", "");
+        let cfg: AgentConfig = toml::from_str(&read_only).unwrap();
+        assert!(cfg.validate_git().is_err(), "git без writable обязан валить старт");
+
+        let zero_cap = format!("git_max_file_mb = 0\n{toml}");
+        let cfg: AgentConfig = toml::from_str(&zero_cap).unwrap();
+        assert!(cfg.validate_git().is_err(), "колпак в ноль это отказ, а не пустая история");
+    }
+
     #[test]
     fn folds_legacy_single_share() {
         let toml = r#"
@@ -496,8 +570,10 @@ mod tests {
             relay: None,
             default_invite: Some("inv123".into()),
             max_file_mb: Some(100),
+            git_author: None,
+            git_max_file_mb: None,
             import: None,
-            shares: vec![ShareEntry { share_id: "a".into(), path: "/srv/x".into(), name: Some("X".into()), writable: true, import: true, attached: true }],
+            shares: vec![ShareEntry { share_id: "a".into(), path: "/srv/x".into(), name: Some("X".into()), writable: true, import: true, git: false, attached: true }],
             exposes: vec![ExposeEntry { name: "dash".into(), upstream: "127.0.0.1:8765".into() }],
             dir: None,
             share_id: None,

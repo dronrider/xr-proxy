@@ -138,6 +138,10 @@ the token. The write routes are v2 only.
 | `POST /{id}/import`            | `share:import`| start a URL-import job; `202 {"job_id"}`           |
 | `GET /{id}/import/{job}`       | `share:import`| poll: `state`, `progress`, `files`/`error`         |
 | `DELETE /{id}/import/{job}`    | `share:import`| cancel the job (kills the plugin); `204`           |
+| `GET /{id}/git/info/refs`      | `share:write`| smart-HTTP ref advertisement                       |
+| `POST /{id}/git/git-upload-pack`| `share:write`| fetch, one process per request                    |
+| `POST /{id}/git/git-receive-pack`| `share:write`| push, one process per request                     |
+| `GET /{id}/git/head`           | `share:write`| signed `main` head, long-poll via `since`/`wait`  |
 
 Token is presented as a URL-safe base64 blob of the hub's `ShareToken` JSON, via
 `Authorization: Bearer <blob>`, `X-Share-Token: <blob>`, or `?token=<blob>`
@@ -241,6 +245,55 @@ signature over the exact body bytes plus the share id, and consumers verify it
 against the `agent_pubkey` pinned from the grant. Without the identity key
 (config `identity_key` or `identity.key` next to the config) the agent serves
 unsigned and pinning consumers refuse the listing.
+
+### Git contour (LLD-33)
+
+A writable share can also carry a **git repository** as its history. Every edit
+of the folder becomes a commit. A co-author with the write token clones, pulls
+and pushes with a stock git client over the same HTTP surface. The repository
+lives **outside the folder** (`<state dir>/git/<share_id>`, next to the config
+and identity). The folder stays clean: no `.git`, no service files, and its
+owner keeps editing it in any editor without ever seeing git. Enable per
+share, with git in `PATH` on the agent's machine:
+
+```sh
+sudo xr-share share /srv/notes --writable --git
+```
+
+Every change of the folder passes through one loop, whatever its origin: an
+editor save, a `PUT`/`DELETE`, an import publish. A filesystem watcher commits
+after a two-second debounce. A five-minute safety scan catches what watchers
+miss on network filesystems. Commits are authored as `git_author` from the
+config, or the hostname, so co-authors see whose machine made them. Files over
+`git_max_file_mb` (default 10 MiB) and the reserved `.xr-*` service names stay
+out of history; they keep flowing through the manifest surface.
+
+The gate ladder matches the write path: the share exists (`404`), the contour
+is on (`403`), the share is writable (`403`), the token carries `share:write`
+(`401`/`403`). **Fetch lives under `share:write` too**: the repository is the
+owner's private history, not a published binding. A plain git client passes
+the token with `git -c http.extraHeader=...`:
+
+```sh
+git -c http.extraHeader="Authorization: Bearer <token>" \
+    clone http://agent:8443/<share_id>/git notes
+```
+
+A push lands in the folder itself: once the pack is accepted, the new `main`
+is materialized into the working folder. This is git's `updateInstead`
+semantics, run through receive hooks, because the bare-style layout cannot use
+the config switch. A dirty folder refuses the push with a named error instead
+of discarding local edits. Non-fast-forward pushes and ref deletions are
+denied, and a push bigger than `8x git_max_file_mb + 64` MiB is cut. Pushes
+serialize against the commit loop, so a materialization and an auto-commit
+never interleave. `unshare` leaves the repository on disk, and prints where:
+the folder may come back, and its history should not vanish with the flag.
+
+`GET /{id}/git/head` answers the current `main` SHA with an ed25519 signature
+by the same identity key that signs manifests. The route also long-polls:
+pass the head you already know as `since` and a `wait` budget in seconds. It
+parks until the next commit or push, so change notifications cost a request
+per minute instead of a poll storm. An unborn `main` reports an empty string.
 
 ## Manual setup (no installer)
 

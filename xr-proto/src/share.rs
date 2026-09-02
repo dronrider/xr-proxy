@@ -142,6 +142,14 @@ pub fn scope_contains(scope: &str, name: &str) -> bool {
     scope.split(' ').any(|s| s == name)
 }
 
+/// Default per-file size cap of the git contour, in mebibytes (LLD-33 п. 2.6).
+/// Files over the cap never enter history, on the agent or in the harness, but
+/// keep flowing through the manifest surface as before. One constant shared by
+/// both sides so their defaults cannot drift apart; md notes with small
+/// attachments stay well under it, the cap exists to keep gigabytes out of
+/// history, not pictures.
+pub const GIT_MAX_FILE_MB: u64 = 10;
+
 /// A long-lived **bearer mandate** the hub issues to an agent once at install
 /// time (§9.2), so the agent can self-register shares and mint access tokens
 /// without an admin action each time. It is the hub's ed25519 signature over
@@ -590,6 +598,16 @@ pub fn manifest_signing_bytes(share_id: &str, signed_at: u64, manifest_json: &[u
     bytes
 }
 
+/// The exact bytes a signed-HEAD reply covers (LLD-33 п. 2.4). Git's fetch has
+/// no manifest to sign, so the authority is one value: the SHA of the head
+/// commit. Hash-chaining carries that to every object it reaches, so a MITM
+/// cannot rewrite history without breaking this signature (the same move as
+/// XR-046 for manifests, onto git's object model). `head` is the hex SHA-1 of
+/// `refs/heads/main`, or an empty string for a repo with no commits yet.
+pub fn git_head_signing_bytes(share_id: &str, signed_at: u64, head: &str) -> Vec<u8> {
+    format!("xr-share-git-head\nv1\n{share_id}\n{signed_at}\n{head}").into_bytes()
+}
+
 /// Why a [`verify_share_token`] check failed. Distinct variants so the agent can
 /// log/diagnose without leaking the token itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -772,10 +790,11 @@ impl std::error::Error for RelayRegisterError {}
 #[cfg(any(feature = "share", test))]
 mod crypto {
     use super::{
-        agent_credential_signing_bytes, expose_token_signing_bytes, manifest_signing_bytes,
-        relay_register_signing_bytes, relay_token_signing_bytes, token_signing_bytes,
-        AgentCredential, AgentCredentialError, ExposeToken, ExposeTokenError, ManifestSigError,
-        RelayRegister, RelayRegisterError, RelayToken, RelayTokenError, ShareToken, ShareTokenError,
+        agent_credential_signing_bytes, expose_token_signing_bytes, git_head_signing_bytes,
+        manifest_signing_bytes, relay_register_signing_bytes, relay_token_signing_bytes,
+        token_signing_bytes, AgentCredential, AgentCredentialError, ExposeToken,
+        ExposeTokenError, ManifestSigError, RelayRegister, RelayRegisterError, RelayToken,
+        RelayTokenError, ShareToken, ShareTokenError,
     };
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
@@ -1032,6 +1051,38 @@ mod crypto {
         base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())
     }
 
+    /// Sign a git HEAD reply as served (LLD-33 п. 2.4): the agent's identity
+    /// key over [`git_head_signing_bytes`]. Returns the base64 signature for
+    /// the `/git/head` JSON body; `head` is the hex SHA of `refs/heads/main`
+    /// (empty for a repo with no commits yet).
+    pub fn sign_git_head(key: &SigningKey, share_id: &str, signed_at: u64, head: &str) -> String {
+        let sig = key.sign(&git_head_signing_bytes(share_id, signed_at, head));
+        base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())
+    }
+
+    /// Verify a signed HEAD against the pinned agent key, for the share the
+    /// consumer actually requested. After a fetch the harness additionally
+    /// checks that `refs/heads/main` equals the signed `head`; hash chaining
+    /// makes that one check the authority over the whole history. Fails closed.
+    pub fn verify_git_head(
+        sig_b64: &str,
+        agent_key: &VerifyingKey,
+        share_id: &str,
+        signed_at: u64,
+        head: &str,
+    ) -> Result<(), ManifestSigError> {
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(sig_b64.trim())
+            .map_err(|_| ManifestSigError::MalformedSignature)?;
+        let sig_arr: [u8; 64] = sig_bytes
+            .try_into()
+            .map_err(|_| ManifestSigError::MalformedSignature)?;
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        agent_key
+            .verify(&git_head_signing_bytes(share_id, signed_at, head), &signature)
+            .map_err(|_| ManifestSigError::BadSignature)
+    }
+
     /// Decode a pinned base64 `agent_pubkey` (as carried by a `ShareGrant` /
     /// `ShareInfo`) into a verifying key. Single decode point for consumers.
     pub fn parse_agent_pubkey(b64: &str) -> Result<VerifyingKey, ManifestSigError> {
@@ -1068,10 +1119,10 @@ mod crypto {
 
 #[cfg(any(feature = "share", test))]
 pub use crypto::{
-    parse_agent_pubkey, sign_agent_credential, sign_expose_token, sign_relay_register,
-    sign_relay_token, sign_share_manifest, sign_share_token, verify_agent_credential,
-    verify_expose_token, verify_relay_register, verify_relay_token, verify_share_manifest,
-    verify_share_token,
+    parse_agent_pubkey, sign_agent_credential, sign_expose_token, sign_git_head,
+    sign_relay_register, sign_relay_token, sign_share_manifest, sign_share_token,
+    verify_agent_credential, verify_expose_token, verify_git_head, verify_relay_register,
+    verify_relay_token, verify_share_manifest, verify_share_token,
 };
 
 #[cfg(test)]
@@ -1376,6 +1427,57 @@ mod tests {
         ] {
             assert!(!m.is_empty(), "{m:?}");
         }
+    }
+
+    #[test]
+    fn test_git_head_sign_verify() {
+        let agent = SigningKey::from_bytes(&[3u8; 32]);
+        let vk = agent.verifying_key();
+        let sig = sign_git_head(&agent, "share-1", 7000, "0123abcd0123abcd0123abcd0123abcd0123abcd");
+
+        // Valid: right key, right share, exact head.
+        assert!(verify_git_head(&sig, &vk, "share-1", 7000, "0123abcd0123abcd0123abcd0123abcd0123abcd").is_ok());
+
+        // An unborn repo signs an empty head; that must round-trip too, so the
+        // long-poll handshake works before the first commit exists.
+        let unborn = sign_git_head(&agent, "share-1", 7000, "");
+        assert!(verify_git_head(&unborn, &vk, "share-1", 7000, "").is_ok());
+
+        // A different head (a MITM swapping in another history) -> BadSignature.
+        assert_eq!(
+            verify_git_head(&sig, &vk, "share-1", 7000, "ffffffffffffffffffffffffffffffffffffffff"),
+            Err(ManifestSigError::BadSignature)
+        );
+
+        // Another share's signed HEAD replayed here -> BadSignature.
+        assert_eq!(
+            verify_git_head(&sig, &vk, "share-2", 7000, "0123abcd0123abcd0123abcd0123abcd0123abcd"),
+            Err(ManifestSigError::BadSignature)
+        );
+
+        // Shifted timestamp without re-signing -> BadSignature.
+        assert_eq!(
+            verify_git_head(&sig, &vk, "share-1", 7001, "0123abcd0123abcd0123abcd0123abcd0123abcd"),
+            Err(ManifestSigError::BadSignature)
+        );
+
+        // Wrong signer (a MITM's own key) -> BadSignature.
+        let other = SigningKey::from_bytes(&[4u8; 32]).verifying_key();
+        assert_eq!(
+            verify_git_head(&sig, &other, "share-1", 7000, "0123abcd0123abcd0123abcd0123abcd0123abcd"),
+            Err(ManifestSigError::BadSignature)
+        );
+
+        // Malformed signature -> MalformedSignature, not a panic.
+        assert_eq!(
+            verify_git_head("@@@", &vk, "share-1", 7000, "0123abcd"),
+            Err(ManifestSigError::MalformedSignature)
+        );
+        let short = base64::engine::general_purpose::STANDARD.encode([0u8; 10]);
+        assert_eq!(
+            verify_git_head(&short, &vk, "share-1", 7000, "0123abcd"),
+            Err(ManifestSigError::MalformedSignature)
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod auth;
 mod cli;
 mod config;
 mod expose;
+mod gitrepo;
 mod import;
 mod manifest;
 mod meta;
@@ -187,6 +188,8 @@ async fn run(path: &Path) -> Result<()> {
     // То же для публикаций (LLD-38): кривое имя или апстрим валят старт, а не
     // первый запрос из браузера.
     cfg.validate_expose()?;
+    // И для git-контура (LLD-33): git без writable или нулевой колпак файла.
+    cfg.validate_git()?;
 
     // Resolve the configured shares. An empty set is allowed (the agent runs and
     // waits for `xr-share share <path>` to add one, picked up by hot-reload).
@@ -211,6 +214,11 @@ async fn run(path: &Path) -> Result<()> {
     let hash_cache = Arc::new(manifest::HashCache::new());
     let import_mgr = import::ImportManager::new(cfg.import.clone(), hash_cache.clone());
     import_mgr.spawn_runner();
+    // Git repositories of the contour live next to the config (same state dir
+    // as identity.key), never inside the working folders.
+    let state_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let git_mgr = Arc::new(gitrepo::GitManager::new(&state_dir, &cfg));
+    git_mgr.rebuild(&shares);
     let state = Arc::new(AgentState {
         shares: RwLock::new(Arc::new(shares)),
         hub_key,
@@ -218,6 +226,7 @@ async fn run(path: &Path) -> Result<()> {
         identity,
         max_file_mb: cfg.max_file_mb,
         import: import_mgr,
+        git: git_mgr,
         expose: RwLock::new(Arc::new(cfg.exposes.clone())),
     });
     // Публикации видно в логе на старте: молчание тут неотличимо от «наружу не
@@ -326,6 +335,9 @@ fn spawn_config_watcher(state: Arc<AgentState>, path: PathBuf) {
                 Ok(cfg) => {
                     let map = server::build_shares(&cfg.resolved_shares());
                     let n = map.len();
+                    // Repositories of new git shares open here, retired ones
+                    // stop their auto-commit loops (LLD-33 п. 2.2).
+                    state.git.rebuild(&map);
                     *state.shares.write().expect("shares lock poisoned") = Arc::new(map);
                     // `share --import` bootstraps the [import] block into the
                     // config while the agent runs; pick it up the same way.
@@ -369,6 +381,7 @@ fn reload_config(path: &Path) -> Result<AgentConfig> {
     // previous config instead of half-applying.
     cfg.validate_import()?;
     cfg.validate_expose()?;
+    cfg.validate_git()?;
     Ok(cfg)
 }
 

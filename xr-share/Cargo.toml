@@ -35,6 +35,7 @@ tower-http = { version = "0.6", features = ["fs"] }
 # Stream a PUT request body frame by frame (LLD-28 upload path) without buffering
 # a multi-GB file in memory. Pure Rust, already in the tree via axum/hyper, so it
 # does not weigh down the Windows/musl cross-build.
+http-body = "1"
 http-body-util = "0.1"
 # Прокси публикации на локальный апстрим (LLD-38): клиент hyper на одно
 # соединение, тело идёт потоком в обе стороны. Не за фичей `relay`: hyper и так
@@ -51,6 +52,15 @@ rand = "0.8"
 sha2 = "0.10"
 walkdir = "2"
 mime_guess = "2"
+# Git-контур шары (LLD-33): события рабочей папки для авто-коммита с дебаунсом.
+# Чистая обвязка над inotify/FSEvents/kqueue, без транзитивных C-зависимостей.
+notify = "8"
+# Мосты тела запроса/ответа в AsyncRead/AsyncWrite для спавна upload-pack и
+# receive-pack: запрос стримится в stdin процесса, stdout уезжает в ответ без
+# буферизации целиком.
+# Штатный git-клиент жмёт тела запросов Content-Encoding: gzip, транспорт
+# обязан принимать обоих (LLD-33 п. 2.3).
+async-compression = { version = "0.4", default-features = false, features = ["gzip", "tokio"] }
 # Lightweight blocking HTTP client — only for `init` to fetch the hub's public
 # key once. Keeps the agent off the heavy reqwest stack.
 ureq = { version = "2", features = ["tls"] }
@@ -75,6 +85,9 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+# Сжать тело запроса upload-pack руками для теста gunzip-ветки транспорта:
+# маленький клон git не жмёт, а путь обязан работать (LLD-33 п. 2.3).
+flate2 = "1"
 # Full relay data-path e2e (relay.rs tests, only built with `--features relay`):
 # a real relay, the agent uplink, and a pinned-TLS consumer over the loopback
 # forwarder. reqwest is the Android consumer's transport (xr-core).

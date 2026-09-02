@@ -128,6 +128,15 @@ pub struct ShareArgs {
     /// yt-dlp и ffmpeg стоят в PATH.
     #[arg(long)]
     pub import: bool,
+    /// Включить git-контур этой шары (LLD-33): правки в папке уезжают в
+    /// историю сами (авто-коммит), соавторы с write-токеном работают штатным
+    /// git-клиентом или харнессом `xr-share sync`, правки с их стороны сами
+    /// появляются в папке. Только вместе с --writable и только для папки; на
+    /// машине агента нужен git в PATH, репозиторий живёт вне папки и папку не
+    /// засоряет. Повторный `share` без флага выключает контур, репозиторий с
+    /// историей остаётся на диске.
+    #[arg(long)]
+    pub git: bool,
 }
 
 /// `xr-share install` — set up the binary + service with **no** folder binding.
@@ -229,6 +238,8 @@ pub fn install(config_path: &Path, args: InstallArgs) -> Result<()> {
         relay: relay_cfg,
         default_invite: setup_invite,
         max_file_mb: None,
+        git_author: None,
+        git_max_file_mb: None,
         import: None,
         shares: Vec::new(),
         exposes: Vec::new(),
@@ -293,6 +304,11 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     if args.import && !args.writable {
         bail!("--import работает только вместе с --writable");
     }
+    // Git-контур тоже подвид записи (LLD-33): история и правки друг друга
+    // без права записи не терпят.
+    if args.git && !args.writable {
+        bail!("--git работает только вместе с --writable");
+    }
     if args.import {
         bootstrap_import(&mut cfg, &|bin| crate::import::which(bin).is_some())?;
     }
@@ -350,6 +366,24 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
         cfg.relay = Some(crate::config::RelayAgentConfig::from_descriptor(&desc));
     }
 
+    // Git-контур (LLD-33): git обязан стоять в PATH до записи в конфиг, а
+    // репозиторий получает первый коммит сразу, чтобы clone видел папку с
+    // первой минуты, не дожидаясь перечитывания конфига агентом. Без флага
+    // контур мог быть включён раньше: репозиторий переживает выключение, и
+    // владелец должен про него знать.
+    if args.git {
+        bootstrap_git(&cfg, config_path, &share_id, &canon, &|bin| {
+            crate::import::which(bin).is_some()
+        })?;
+    } else if let Ok(dir) = crate::gitrepo::git_dir_for(
+        config_path.parent().unwrap_or(Path::new(".")),
+        &share_id,
+    ) {
+        if dir.exists() {
+            println!("  заметка: у шары остаётся репозиторий истории: {}", dir.display());
+        }
+    }
+
     // Persist the share locally; the running agent hot-reloads it. Тот же путь
     // обновляет свою запись, а не заводит вторую (XR-162).
     normalize_legacy(&mut cfg);
@@ -361,6 +395,7 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
             name: Some(name.clone()),
             writable: args.writable,
             import: args.import,
+            git: args.git,
             attached: false,
         },
     );
@@ -462,6 +497,34 @@ fn bootstrap_import(cfg: &mut AgentConfig, has_bin: &dyn Fn(&str) -> bool) -> Re
     Ok(())
 }
 
+/// Завести репозиторий git-контура при `share --git` (LLD-33): git обязан
+/// находиться в PATH, иначе контур «включён», но не работает ни у кого.
+/// Репозиторий живёт вне рабочей папки и получает первый коммит тут же, чтобы
+/// штатный clone видел папку целиком уже в момент регистрации шары.
+fn bootstrap_git(
+    cfg: &AgentConfig,
+    config_path: &Path,
+    share_id: &str,
+    worktree: &Path,
+    has_bin: &dyn Fn(&str) -> bool,
+) -> Result<()> {
+    if !has_bin("git") {
+        bail!("для git-контура нужен git (не найден в PATH). Поставь git и повтори команду");
+    }
+    let state_dir = config_path.parent().unwrap_or(Path::new("."));
+    let share = crate::gitrepo::GitShare::open(
+        state_dir,
+        share_id,
+        worktree,
+        crate::gitrepo::GitSettings::from_config(cfg),
+    )?;
+    match share.commit_all_blocking()? {
+        Some(head) => println!("  репозиторий заведён, первый коммит {}", &head[..12.min(head.len())]),
+        None => println!("  репозиторий заведён (папка пуста, первый коммит сделает агент)"),
+    }
+    Ok(())
+}
+
 /// Best-effort local address(es) of this host (XR-050), advertised as extra
 /// share candidates so a consumer on the same network reaches the agent by
 /// LAN-IP without router hairpin. Uses the no-send UDP-connect trick: connecting
@@ -539,6 +602,7 @@ pub fn unshare(config_path: &Path, target: &str) -> Result<()> {
         bail!("шара не найдена по id или пути: {target}");
     };
     let share_id = cfg.shares[idx].share_id.clone();
+    let had_git = cfg.shares[idx].git;
 
     // Best-effort hub removal so the index entry disappears. Keep going on
     // failure (hub down): the local removal still stops serving the bytes.
@@ -552,6 +616,19 @@ pub fn unshare(config_path: &Path, target: &str) -> Result<()> {
     cfg.shares.remove(idx);
     write_config(config_path, &cfg)?;
     println!("✓ Шара {share_id} убрана из раздачи");
+    // Репозиторий истории переживает снятие шары (LLD-33 п. 2.1): папка может
+    // вернуться в раздачу, и история не должна пропасть вместе с отключением.
+    if had_git {
+        let state_dir = config_path.parent().unwrap_or(Path::new("."));
+        if let Ok(dir) = crate::gitrepo::git_dir_for(state_dir, &share_id) {
+            if dir.exists() {
+                println!(
+                    "  репозиторий истории оставлен: {} (удали руками, если не нужен)",
+                    dir.display()
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1007,7 +1084,7 @@ fn same_path(a: &str, b: &str) -> bool {
 fn normalize_legacy(cfg: &mut AgentConfig) {
     if let (Some(dir), Some(id)) = (cfg.dir.take(), cfg.share_id.take()) {
         if !cfg.shares.iter().any(|s| s.share_id == id) {
-            cfg.shares.push(ShareEntry { share_id: id, path: dir, name: None, writable: false, import: false, attached: false });
+            cfg.shares.push(ShareEntry { share_id: id, path: dir, name: None, writable: false, import: false, git: false, attached: false });
         }
     }
 }
@@ -1065,8 +1142,10 @@ mod tests {
             relay: None,
             default_invite: None,
             max_file_mb: None,
+            git_author: None,
+            git_max_file_mb: None,
             import: None,
-            shares: vec![ShareEntry { share_id: "s1".into(), path: "/srv/x".into(), name: None, writable: false, import: false, attached: false }],
+            shares: vec![ShareEntry { share_id: "s1".into(), path: "/srv/x".into(), name: None, writable: false, import: false, git: false, attached: false }],
             exposes: Vec::new(),
             dir: None,
             share_id: None,
@@ -1230,6 +1309,29 @@ mod tests {
         assert_eq!(cfg.import.unwrap().plugins[0].name, "свой");
     }
 
+    // Git-контур (LLD-33): bootstrap без git в PATH отказывает с подсказкой,
+    // а с git заводит репозиторий первым коммитом вне рабочей папки.
+    #[test]
+    fn test_git_bootstrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "listen = \"0.0.0.0:0\"\n").unwrap();
+
+        let cfg = minimal_cfg();
+        let err = bootstrap_git(&cfg, &config_path, "W", &work, &|_| false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("git"), "подсказка называет причину: {err}");
+        assert!(!dir.path().join("git/W").exists(), "при отказе репозиторий не заводится");
+
+        std::fs::write(work.join("a.txt"), "a").unwrap();
+        bootstrap_git(&cfg, &config_path, "W", &work, &|bin| bin == "git").unwrap();
+        assert!(dir.path().join("git/W/HEAD").exists(), "репозиторий живёт в state dir");
+        assert!(!work.join(".git").exists(), "рабочая папка остаётся чистой");
+    }
+
     // Признак привязки (XR-162) взводится успешным attach, переживает
     // перезапись конфига и не наследуется вытесняющей записью: после
     // перерегистрации без --invite шара действительно висит ни на чём.
@@ -1311,6 +1413,8 @@ mod share_upsert_tests {
             relay: None,
             default_invite: None,
             max_file_mb: None,
+            git_author: None,
+            git_max_file_mb: None,
             import: None,
             shares: Vec::new(),
             exposes: Vec::new(),
@@ -1444,6 +1548,7 @@ mod share_upsert_tests {
             no_relay: true,
             writable,
             import: false,
+            git: false,
         }
     }
 
