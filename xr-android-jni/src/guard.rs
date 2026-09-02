@@ -70,6 +70,10 @@ macro_rules! jni_entry {
 mod tests {
     jni_entry!(-1i32; fn probe_ok(left: i32, right: i32) -> i32 { left + right });
     jni_entry!(-1i32; fn probe_panics() -> i32 { panic!("ядро сломалось") });
+    // Журнал один на процесс, и тесты бинаря идут параллельно: этот probe
+    // зовёт только сам тест журнала, чтобы искать в хвосте свою строку, а не
+    // чужую от соседа, тоже паниковавшего через probe_panics.
+    jni_entry!(-1i32; fn probe_journal_panics() -> i32 { panic!("журнальная паника") });
     jni_entry!(fn probe_unit_panics() { panic!("без возврата") });
     jni_entry!(-1i64; fn probe_block_on_panics() -> i64 {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -97,12 +101,15 @@ mod tests {
             crate::JOURNAL.set(xr_core::journal::Journal::memory()).is_ok(),
             "журнал в тестах ставится один раз"
         );
-        assert_eq!(probe_panics(), -1);
+        assert_eq!(probe_journal_panics(), -1);
         let tail = crate::JOURNAL.get().unwrap().tail();
-        let last = tail.last().expect("паника не дошла до журнала");
+        let last = tail
+            .iter()
+            .rev()
+            .find(|line| line.contains("probe_journal_panics"))
+            .expect("паника не дошла до журнала");
         assert!(last.contains("ERROR"), "строка: {last}");
-        assert!(last.contains("probe_panics"), "строка: {last}");
-        assert!(last.contains("ядро сломалось"), "строка: {last}");
+        assert!(last.contains("журнальная паника"), "строка: {last}");
     }
 
     /// Инвариант покрытия: ни в одном исходнике крейта нет extern-функции мимо
