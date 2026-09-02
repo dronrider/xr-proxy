@@ -56,7 +56,7 @@ mkdir -p "$S/notes" && echo 'первая заметка' > "$S/notes/a.md"
 ./target/debug/xr-share -c "$S/agent.toml" install --hub http://127.0.0.1:18099 \
   --token "$REG" --listen 127.0.0.1:18443 --no-service --non-interactive >/dev/null
 ./target/debug/xr-share -c "$S/agent.toml" share "$S/notes" \
-  --writable --git --invite "$INVITE" --name notes >/dev/null
+  --writable --git --invite "$INVITE" --name notes --addr 127.0.0.1 >/dev/null
 ./target/debug/xr-share -c "$S/agent.toml" >/dev/null 2>&1 &
 wait_http http://127.0.0.1:18443/healthz ok
 curl -s "$B/invite/$INVITE/shares" > "$S/grants.json"
@@ -98,7 +98,7 @@ RTOK=$(curl -s -H 'content-type: application/json' \
 test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $RTOK" \
   "http://127.0.0.1:18443/$SID/git/info/refs?service=git-upload-pack")" = 403
 mkdir -p "$S/plain" && echo x > "$S/plain/x.txt"
-./target/debug/xr-share -c "$S/agent.toml" share "$S/plain" --writable --invite "$INVITE" --name plain >/dev/null
+./target/debug/xr-share -c "$S/agent.toml" share "$S/plain" --writable --invite "$INVITE" --name plain --addr 127.0.0.1 >/dev/null
 code=""
 for _ in $(seq 1 20); do
   curl -s "$B/invite/$INVITE/shares" > "$S/grants2.json"

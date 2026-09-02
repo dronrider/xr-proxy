@@ -61,7 +61,7 @@ pub fn git_dir_for(state_dir: &Path, share_id: &str) -> Result<PathBuf> {
 
 /// Author identity of the agent's auto-commits and the size cap, resolved once
 /// from the config so every commit sees the same values.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GitSettings {
     /// `(name, email)` in git's terms.
     pub author: (String, String),
@@ -633,23 +633,37 @@ impl GitManager {
     /// repositories of git-enabled shares, spawn their autocommit loops, stop
     /// the loops of shares that dropped out (a disabled or unshared share
     /// stops committing; its repository stays on disk, LLD-33 п. 2.1).
+    ///
+    /// An unchanged share keeps its running instance: the config is rewritten
+    /// by any `share`/`expose` call, and a re-opened instance would detach the
+    /// live contour, leaving the transport and the `/git/head` long-poll on a
+    /// fresh HEAD channel while the old autocommit loop keeps feeding the
+    /// dropped one. Only a changed path or changed settings restart the loop.
     pub fn rebuild(&self, map: &SharesMap) {
+        let current: HashMap<String, Arc<GitShare>> = {
+            let live = self.shares.read().expect("git table lock poisoned");
+            live.clone()
+        };
         let mut next: HashMap<String, Arc<GitShare>> = HashMap::new();
         for (id, root) in map.iter().filter(|(_, root)| root.git) {
+            if let Some(old) = current.get(id) {
+                if old.worktree == root.path && old.settings == self.settings {
+                    next.insert(id.clone(), Arc::clone(old));
+                    continue;
+                }
+                tracing::info!("share {id}: git contour reconfigured, auto-commit restarted");
+                let _ = old.alive_tx.send(false);
+            }
             match GitShare::open(&self.state_dir, id, &root.path, self.settings.clone()) {
                 Ok(share) => {
+                    tracing::info!("share {id}: git contour on, auto-commit running");
+                    share.spawn_autocommit(AUTOCOMMIT_DEBOUNCE, SAFETY_SCAN_EVERY);
                     next.insert(id.clone(), share);
                 }
                 Err(e) => tracing::error!("share {id}: git repository unavailable: {e:#}"),
             }
         }
         let mut live = self.shares.write().expect("git table lock poisoned");
-        for (id, share) in &next {
-            if !live.contains_key(id) {
-                tracing::info!("share {id}: git contour on, auto-commit running");
-                share.spawn_autocommit(AUTOCOMMIT_DEBOUNCE, SAFETY_SCAN_EVERY);
-            }
-        }
         for (id, old) in live.iter() {
             if !next.contains_key(id) {
                 tracing::info!("share {id}: git contour off, auto-commit stopped");
@@ -862,5 +876,61 @@ mod tests {
         assert!(!ok, "push в грязную папку прошёл: {text}");
         assert_eq!(std::fs::read(share.worktree.join("a.txt")).unwrap(), "черновик".as_bytes());
         assert!(!share.worktree.join("b.txt").exists());
+    }
+
+    #[test]
+    fn rebuild_keeps_channel_across_unrelated_config_reload() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("a.md"), "заметка").unwrap();
+        let root = |path: &Path| crate::server::ShareRoot {
+            path: path.to_path_buf(),
+            is_file: false,
+            writable: true,
+            import: false,
+            git: true,
+        };
+        let mgr = GitManager::with_settings(state.path(), settings());
+        let mut map = crate::server::SharesMap::new();
+        map.insert("W".into(), root(work.path()));
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            mgr.rebuild(&map);
+        });
+        let w1 = mgr.get("W").unwrap();
+        let rx = w1.head_tx.subscribe();
+
+        // Конфиг переписала чужая шара: W обязана остаться тем же экземпляром,
+        // иначе long-poll (подписка на прежний канал) глухнет, а авто-коммит
+        // кормит уже снятый с таблицы объект.
+        let other = tempfile::tempdir().unwrap();
+        map.insert("X".into(), root(other.path()));
+        rt.block_on(async {
+            mgr.rebuild(&map);
+        });
+        let w2 = mgr.get("W").unwrap();
+        assert!(
+            Arc::ptr_eq(&w1, &w2),
+            "перезагрузка конфига подменила живой экземпляр шары W"
+        );
+
+        // Коммит после перезагрузки будит подписку, взятую до неё.
+        std::fs::write(work.path().join("b.md"), "вторая").unwrap();
+        rt.block_on(async {
+            let head = w2.clone().commit_scan().await.unwrap();
+            assert!(head.is_some(), "правка b.md обязана коммититься");
+        });
+        assert!(rx.has_changed().unwrap(), "канал HEAD не двинулся");
+
+        // Смена папки это сознательный рестарт: новый экземпляр, не тот же.
+        let moved = tempfile::tempdir().unwrap();
+        map.remove("X");
+        map.insert("W".into(), root(moved.path()));
+        rt.block_on(async {
+            mgr.rebuild(&map);
+        });
+        let w3 = mgr.get("W").unwrap();
+        assert!(!Arc::ptr_eq(&w1, &w3), "смена папки должна перезапустить контур");
     }
 }
