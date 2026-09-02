@@ -137,7 +137,41 @@ PY
 $SSL pkeyutl -verify -pubin -keyform DER -inkey "$S/head.json.der" \
   -rawin -in "$S/head.json.msg" -sigfile "$S/head.json.sig"
 
-# Шаг 5: long-poll head просыпается на авто-коммите
+# Шаг 5: первый пуш в шару, пустовавшую при --git, проходит (unborn main)
+mkdir -p "$S/empty"
+./target/debug/xr-share -c "$S/agent.toml" share "$S/empty" \
+  --writable --git --invite "$INVITE" --name emptygit --addr 127.0.0.1 >/dev/null
+ESID=""
+for _ in $(seq 1 20); do
+  curl -s "$B/invite/$INVITE/shares" > "$S/grants3.json"
+  ESID=$(python3 -c "
+import json
+g = [g for g in json.load(open('$S/grants3.json')) if g['name'] == 'emptygit']
+print(g[0]['share_id'] if g else '')
+")
+  test -n "$ESID" && break
+  sleep 0.5
+done
+ETOK=$(python3 -c "
+import json
+g = [g for g in json.load(open('$S/grants3.json')) if g['name'] == 'emptygit'][0]
+print(g['token'])
+")
+CLONED=""
+for _ in $(seq 1 20); do
+  rm -rf "$S/eclone"
+  if git -c http.extraHeader="Authorization: Bearer $ETOK" clone -q \
+      "http://127.0.0.1:18443/$ESID/git" "$S/eclone" 2>/dev/null; then CLONED=1; break; fi
+  sleep 1
+done
+test -n "$CLONED"
+echo 'первый файл' > "$S/eclone/first.md"
+git -C "$S/eclone" add -A
+git -C "$S/eclone" -c user.name=co -c user.email=co@example.com commit -qm first
+git -C "$S/eclone" -c http.extraHeader="Authorization: Bearer $ETOK" push -q origin main
+test "$(cat "$S/empty/first.md")" = 'первый файл'
+
+# Шаг 6: long-poll head просыпается на авто-коммите
 curl -s --max-time 30 -o "$S/lp.json" -H "Authorization: Bearer $WTOK" \
   "http://127.0.0.1:18443/$SID/git/head?since=$H1&wait=20" &
 LP=$!
@@ -150,7 +184,7 @@ h = json.load(open('$S/lp.json'))['head']
 assert h and h != '$H1', h
 "
 
-# Шаг 6: файл в 100 МБ живёт манифест-контуром, в истории его нет
+# Шаг 7: файл в 100 МБ живёт манифест-контуром, в истории его нет
 dd if=/dev/urandom of="$S/notes/big.bin" bs=1048576 count=100 2>/dev/null
 sleep 6
 curl -s -H "Authorization: Bearer $WTOK" "http://127.0.0.1:18443/$SID/manifest" | grep -q big.bin

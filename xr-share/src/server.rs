@@ -1292,9 +1292,6 @@ mod tests {
 
     fn state_with_cap(shares: SharesMap, key: &SigningKey, max_file_mb: Option<u64>) -> Arc<AgentState> {
         let cache = Arc::new(HashCache::new());
-        // The git table gets its own throwaway state dir: only the git tests
-        // call rebuild, the rest of the suite never touches a repository.
-        let state_dir = tempfile::tempdir().unwrap().keep();
         Arc::new(AgentState {
             shares: RwLock::new(Arc::new(shares)),
             hub_key: key.verifying_key(),
@@ -1302,22 +1299,22 @@ mod tests {
             identity: Some(SigningKey::from_bytes(&[77u8; 32])),
             max_file_mb,
             import: ImportManager::new(None, cache),
-            git: Arc::new(GitManager::with_settings(&state_dir, GitSettings {
-                author: ("tester".into(), "tester@xr-share".into()),
-                max_file_mb: 10,
-            })),
+            git: git_manager_for_tests(),
             expose: RwLock::new(Arc::new(Vec::new())),
         })
     }
 
     /// A git table for hand-built states: its own throwaway state dir, no
-    /// shares registered (those tests never touch the git routes).
+    /// shares registered (the git tests register theirs via `rebuild`, the
+    /// rest of the suite never touches a repository).
     fn git_manager_for_tests() -> Arc<GitManager> {
         let state_dir = tempfile::tempdir().unwrap().keep();
-        Arc::new(GitManager::with_settings(&state_dir, GitSettings {
-            author: ("tester".into(), "tester@xr-share".into()),
-            max_file_mb: 10,
-        }))
+        Arc::new(GitManager::new(&state_dir))
+    }
+
+    /// The contour settings the git tests build their table with.
+    fn git_settings() -> GitSettings {
+        GitSettings { author: ("tester".into(), "tester@xr-share".into()), max_file_mb: 10 }
     }
 
     /// A directory share; `writable` opts into the write path (LLD-28).
@@ -2509,7 +2506,7 @@ mod tests {
         root.git = true;
         shares.insert("W".into(), root);
         let state = state_with(shares, key);
-        state.git.rebuild(&state.snapshot());
+        state.git.rebuild(&state.snapshot(), &git_settings());
         let tok = sign_share_token(key, "W", &rw_scope(), now_unix() + 1000);
         (router(state.clone()), tok, state)
     }
@@ -2738,6 +2735,67 @@ mod tests {
         let signed_at = v["signed_at"].as_u64().unwrap();
         let sig = v["sig"].as_str().unwrap();
         xr_proto::share::verify_git_head(sig, &agent_key, "W", signed_at, &head).unwrap();
+    }
+
+    /// Первый пуш в шару, пустовавшую при `share --git`, проходит и живым
+    /// транспортом: unborn main не считается грязью, материализация кладёт
+    /// файл коллеги в папку владельца.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_push_into_empty_share_over_http() {
+        let key = SigningKey::from_bytes(&[44u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let client = tempfile::tempdir().unwrap();
+        let (app, wtok, _state) = git_app(&key, dir.path());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+
+        let repo = client.path().join("repo");
+        let url = format!("http://{addr}/W/git");
+        let header = format!("http.extraHeader=Authorization: Bearer {}", blob(&wtok));
+        let (ok, text) = run_git(client.path(), &["-c", &header, "clone", &url, "repo"]).await;
+        assert!(ok, "клон пустой шары упал: {text}");
+        std::fs::write(repo.join("first.md"), "издалека").unwrap();
+        let (ok, text) = run_git(&repo, &["add", "-A"]).await;
+        assert!(ok, "{text}");
+        let (ok, text) = run_git(&repo, &["commit", "-m", "first"]).await;
+        assert!(ok, "{text}");
+        let (ok, text) = run_git(&repo, &["-c", &header, "push", "origin", "HEAD:refs/heads/main"]).await;
+        assert!(ok, "первый пуш в пустовавшую шару отклонён: {text}");
+        assert_eq!(
+            std::fs::read(dir.path().join("first.md")).unwrap(),
+            "издалека".as_bytes()
+        );
+    }
+
+    /// Push и авто-коммит сериализуются общим op_lock: пока он занят, обе
+    /// стороны ждут, а не гоняют материализацию и коммит по папке наперегонки.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_receive_pack_serialized_by_op_lock() {
+        let key = SigningKey::from_bytes(&[45u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let (app, wtok, state) = git_app(&key, dir.path());
+        let share = state.git.get("W").unwrap();
+
+        std::fs::write(dir.path().join("locked.md"), "x").unwrap();
+        let guard = share.op_lock.clone().lock_owned().await;
+        let committing = {
+            let s = share.clone();
+            tokio::spawn(async move { s.commit_scan().await })
+        };
+        let pushing = tokio::spawn(async move {
+            app.oneshot(write_req("POST", "/W/git/git-receive-pack", Some(&wtok), &[], b""))
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!committing.is_finished(), "commit_scan не ждёт op_lock");
+        assert!(!pushing.is_finished(), "receive-pack не ждёт op_lock");
+
+        drop(guard);
+        committing.await.unwrap().unwrap().expect("commit");
+        let _ = pushing.await.unwrap();
     }
 
     /// Сжатое тело запроса (git шлёт gzip на больших пушах) распаковывается и

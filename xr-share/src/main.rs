@@ -217,8 +217,8 @@ async fn run(path: &Path) -> Result<()> {
     // Git repositories of the contour live next to the config (same state dir
     // as identity.key), never inside the working folders.
     let state_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let git_mgr = Arc::new(gitrepo::GitManager::new(&state_dir, &cfg));
-    git_mgr.rebuild(&shares);
+    let git_mgr = Arc::new(gitrepo::GitManager::new(&state_dir));
+    git_mgr.rebuild(&shares, &gitrepo::GitSettings::from_config(&cfg));
     let state = Arc::new(AgentState {
         shares: RwLock::new(Arc::new(shares)),
         hub_key,
@@ -336,8 +336,10 @@ fn spawn_config_watcher(state: Arc<AgentState>, path: PathBuf) {
                     let map = server::build_shares(&cfg.resolved_shares());
                     let n = map.len();
                     // Repositories of new git shares open here, retired ones
-                    // stop their auto-commit loops (LLD-33 п. 2.2).
-                    state.git.rebuild(&map);
+                    // stop their auto-commit loops; the fresh settings travel
+                    // with the call, so a new author or cap applies without a
+                    // restart (LLD-33 п. 2.2).
+                    state.git.rebuild(&map, &gitrepo::GitSettings::from_config(&cfg));
                     *state.shares.write().expect("shares lock poisoned") = Arc::new(map);
                     // `share --import` bootstraps the [import] block into the
                     // config while the agent runs; pick it up the same way.

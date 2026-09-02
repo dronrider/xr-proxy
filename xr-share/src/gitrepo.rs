@@ -258,8 +258,9 @@ impl GitShare {
 
     /// The push half of the contour (LLD-33 п. 3.4), as receive hooks inside
     /// the repository: `pre-receive` refuses a push into a dirty working
-    /// folder (git's `updateInstead` semantics, which git itself cannot run on
-    /// this layout), `post-receive` materializes the accepted `main` into the
+    /// folder or over a local file outside the history (together this is
+    /// git's `updateInstead` semantics, which git itself cannot run on this
+    /// layout), `post-receive` materializes the accepted `main` into the
     /// folder with `read-tree -u`. Both run with `GIT_DIR` set by receive-pack
     /// and the worktree taken from `core.worktree`, so plain `git` calls see
     /// the share folder. Rewritten on every open, like the config above.
@@ -267,17 +268,35 @@ impl GitShare {
         let hooks = self.git_dir.join("hooks");
         std::fs::create_dir_all(&hooks)
             .with_context(|| format!("creating {}", hooks.display()))?;
-        let pre = "#!/bin/sh\n\
-             # xr-share: push materializes into the working folder; a dirty one refuses.\n\
-             while read -r old new ref; do\n\
-             \x20   case \"$ref\" in refs/heads/*) ;; *) continue ;; esac\n\
-             \x20   if ! git diff-files --quiet --ignore-submodules -- || \\\n\
-             \x20      ! git diff-index --quiet --cached --ignore-submodules HEAD --; then\n\
-             \x20       echo \"xr-share: working folder has uncommitted changes, push rejected\" >&2\n\
-             \x20       exit 1\n\
-             \x20   fi\n\
-             done\n\
-             exit 0\n";
+        let pre = r#"#!/bin/sh
+# xr-share: push materializes into the working folder; a dirty one refuses.
+# An unborn HEAD has no baseline to diff against, so only the untracked
+# check below guards the very first push.
+head=$(git rev-parse --verify -q HEAD) || head=
+while read -r old new ref; do
+    case "$ref" in refs/heads/*) ;; *) continue ;; esac
+    if [ -n "$head" ] && { ! git diff-files --quiet --ignore-submodules -- ||
+        ! git diff-index --quiet --cached --ignore-submodules HEAD --; }; then
+        echo "xr-share: working folder has uncommitted changes, push rejected" >&2
+        exit 1
+    fi
+    case "$ref" in refs/heads/main) ;; *) continue ;; esac
+    # Materialization overwrites whatever sits in the folder, so a local
+    # untracked file under a path from the push refuses it, the way
+    # updateInstead did. Paths are compared through git on both sides: the
+    # hook runs with its cwd in GIT_DIR, not the worktree.
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        if git cat-file -e "$new:$path" 2>/dev/null; then
+            echo "xr-share: $path exists outside the history and the push would overwrite it" >&2
+            exit 1
+        fi
+    done <<LIST
+$(git -c core.quotepath=false ls-files --others)
+LIST
+done
+exit 0
+"#;
         let post = "#!/bin/sh\n\
              # xr-share: materialize the accepted main into the working folder.\n\
              while read -r old new ref; do\n\
@@ -614,19 +633,12 @@ fn commit_subject(paths: &[String]) -> String {
 /// and the rest of the agent keeps working.
 pub struct GitManager {
     state_dir: PathBuf,
-    settings: GitSettings,
     shares: RwLock<HashMap<String, Arc<GitShare>>>,
 }
 
 impl GitManager {
-    pub fn new(state_dir: &Path, cfg: &AgentConfig) -> Self {
-        Self::with_settings(state_dir, GitSettings::from_config(cfg))
-    }
-
-    /// The same manager with settings resolved by hand (tests build the table
-    /// without a full agent config).
-    pub fn with_settings(state_dir: &Path, settings: GitSettings) -> Self {
-        Self { state_dir: state_dir.to_path_buf(), settings, shares: RwLock::new(HashMap::new()) }
+    pub fn new(state_dir: &Path) -> Self {
+        Self { state_dir: state_dir.to_path_buf(), shares: RwLock::new(HashMap::new()) }
     }
 
     /// Sync the live table with a freshly built share map: open/init the
@@ -634,12 +646,16 @@ impl GitManager {
     /// the loops of shares that dropped out (a disabled or unshared share
     /// stops committing; its repository stays on disk, LLD-33 п. 2.1).
     ///
+    /// The settings travel with every call, resolved from the config that
+    /// built the map, so a hot reload of `git_author` or the cap reaches the
+    /// running contour.
+    ///
     /// An unchanged share keeps its running instance: the config is rewritten
     /// by any `share`/`expose` call, and a re-opened instance would detach the
     /// live contour, leaving the transport and the `/git/head` long-poll on a
     /// fresh HEAD channel while the old autocommit loop keeps feeding the
     /// dropped one. Only a changed path or changed settings restart the loop.
-    pub fn rebuild(&self, map: &SharesMap) {
+    pub fn rebuild(&self, map: &SharesMap, settings: &GitSettings) {
         let current: HashMap<String, Arc<GitShare>> = {
             let live = self.shares.read().expect("git table lock poisoned");
             live.clone()
@@ -647,14 +663,14 @@ impl GitManager {
         let mut next: HashMap<String, Arc<GitShare>> = HashMap::new();
         for (id, root) in map.iter().filter(|(_, root)| root.git) {
             if let Some(old) = current.get(id) {
-                if old.worktree == root.path && old.settings == self.settings {
+                if old.worktree == root.path && old.settings == *settings {
                     next.insert(id.clone(), Arc::clone(old));
                     continue;
                 }
                 tracing::info!("share {id}: git contour reconfigured, auto-commit restarted");
                 let _ = old.alive_tx.send(false);
             }
-            match GitShare::open(&self.state_dir, id, &root.path, self.settings.clone()) {
+            match GitShare::open(&self.state_dir, id, &root.path, settings.clone()) {
                 Ok(share) => {
                     tracing::info!("share {id}: git contour on, auto-commit running");
                     share.spawn_autocommit(AUTOCOMMIT_DEBOUNCE, SAFETY_SCAN_EVERY);
@@ -713,7 +729,11 @@ mod tests {
         assert!(cfg.contains("denyCurrentBranch = ignore"));
         assert!(cfg.contains("denyNonFastForwards = true"));
         assert!(cfg.contains("denyDeletes = true"));
-        assert!(cfg.contains("maxInputSize"));
+        // Push ceiling: 8x the per-file cap plus 64 MiB of framing headroom,
+        // and the value is bytes, not the mebibytes it is derived from.
+        let out = share.git(&["config", "receive.maxInputSize"]).unwrap();
+        let cap = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(cap.trim(), ((8 + 64) * 1024 * 1024).to_string());
         let pre = std::fs::read_to_string(share.git_dir.join("hooks/pre-receive")).unwrap();
         assert!(pre.contains("push rejected"));
         let post = std::fs::read_to_string(share.git_dir.join("hooks/post-receive")).unwrap();
@@ -878,6 +898,65 @@ mod tests {
         assert!(!share.worktree.join("b.txt").exists());
     }
 
+    /// Первый пуш в шару, пустовавшую при `share --git`: unborn main это не
+    /// грязь (сравнивать не с чем), pre-receive пропускает, а post-receive
+    /// материализует дерево коллеги в папку владельца.
+    #[test]
+    fn test_push_into_unborn_main_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = tempfile::tempdir().unwrap();
+        let share = open_share(dir.path(), "abc123");
+        assert_eq!(share.current_head_blocking(), "", "папка пуста, истории нет");
+
+        let repo = client.path().join("repo");
+        let url = share.git_dir.display().to_string();
+        let (ok, text) = client_git(client.path(), &["clone", &url, "repo"]);
+        assert!(ok, "клон пустого репозитория упал: {text}");
+
+        std::fs::write(repo.join("first.md"), "издалека").unwrap();
+        client_git(&repo, &["add", "-A"]);
+        let (ok, text) = client_git(&repo, &["commit", "-m", "first"]);
+        assert!(ok, "{text}");
+        let (ok, text) = client_git(&repo, &["push", "origin", "HEAD:refs/heads/main"]);
+        assert!(ok, "первый пуш в пустовавшую шару отклонён: {text}");
+        assert_eq!(
+            std::fs::read(share.worktree.join("first.md")).unwrap(),
+            "издалека".as_bytes()
+        );
+        assert!(!share.current_head_blocking().is_empty(), "HEAD не родился");
+    }
+
+    /// Пуш поверх локального файла вне истории отклоняется: read-tree в
+    /// post-receive молча затёр бы черновик владельца, которого авто-коммит
+    /// ещё не забрал (окно дебаунса, файл сверх колпака, `.xr-*`).
+    #[test]
+    fn test_push_refuses_over_untracked_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = tempfile::tempdir().unwrap();
+        let share = open_share(dir.path(), "abc123");
+        std::fs::write(share.worktree.join("a.md"), "v1").unwrap();
+        let head = share.commit_all_blocking().unwrap().expect("first commit");
+
+        // Черновик владельца вне истории и индекса: авто-коммит не звали.
+        std::fs::write(share.worktree.join("draft.md"), "черновик владельца").unwrap();
+
+        let repo = client.path().join("repo");
+        let url = share.git_dir.display().to_string();
+        let (ok, text) = client_git(client.path(), &["clone", &url, "repo"]);
+        assert!(ok, "{text}");
+        std::fs::write(repo.join("draft.md"), "версия коллеги").unwrap();
+        client_git(&repo, &["add", "-A"]);
+        let (ok, text) = client_git(&repo, &["commit", "-m", "overwrite"]);
+        assert!(ok, "{text}");
+        let (ok, text) = client_git(&repo, &["push", "origin", "HEAD:refs/heads/main"]);
+        assert!(!ok, "пуш поверх не-прошедшего в историю файла прошёл: {text}");
+        assert_eq!(
+            std::fs::read(share.worktree.join("draft.md")).unwrap(),
+            "черновик владельца".as_bytes()
+        );
+        assert_eq!(share.current_head_blocking(), head, "HEAD обязан остаться прежним");
+    }
+
     #[test]
     fn rebuild_keeps_channel_across_unrelated_config_reload() {
         let state = tempfile::tempdir().unwrap();
@@ -890,13 +969,13 @@ mod tests {
             import: false,
             git: true,
         };
-        let mgr = GitManager::with_settings(state.path(), settings());
+        let mgr = GitManager::new(state.path());
         let mut map = crate::server::SharesMap::new();
         map.insert("W".into(), root(work.path()));
 
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            mgr.rebuild(&map);
+            mgr.rebuild(&map, &settings());
         });
         let w1 = mgr.get("W").unwrap();
         let rx = w1.head_tx.subscribe();
@@ -907,7 +986,7 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         map.insert("X".into(), root(other.path()));
         rt.block_on(async {
-            mgr.rebuild(&map);
+            mgr.rebuild(&map, &settings());
         });
         let w2 = mgr.get("W").unwrap();
         assert!(
@@ -928,9 +1007,23 @@ mod tests {
         map.remove("X");
         map.insert("W".into(), root(moved.path()));
         rt.block_on(async {
-            mgr.rebuild(&map);
+            mgr.rebuild(&map, &settings());
         });
         let w3 = mgr.get("W").unwrap();
         assert!(!Arc::ptr_eq(&w1, &w3), "смена папки должна перезапустить контур");
+
+        // Смена настроек в конфиге доезжает до живого репозитория тем же
+        // рестартом: колпак пуша пересчитан, автор авто-коммитов свежий.
+        let mut tuned = settings();
+        tuned.author = ("другой".into(), "other@xr-share".into());
+        tuned.max_file_mb = 3;
+        rt.block_on(async {
+            mgr.rebuild(&map, &tuned);
+        });
+        let w4 = mgr.get("W").unwrap();
+        assert!(!Arc::ptr_eq(&w3, &w4), "смена настроек должна перезапустить контур");
+        let out = w4.git(&["config", "receive.maxInputSize"]).unwrap();
+        let cap = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(cap.trim(), ((3 * 8 + 64) * 1024 * 1024).to_string(), "колпак не доехал");
     }
 }
