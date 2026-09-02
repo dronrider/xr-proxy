@@ -34,6 +34,17 @@ hub_pubkey = "REPLACE_WITH_HUB_PUBLIC_KEY"
 # before it is written; applies only to writable shares.
 # max_file_mb = 2048
 
+# Git contour, agent-global knobs (LLD-33). The contour itself is per share
+# (`git = true` below); these apply to every such share. Author of the
+# auto-commits this machine makes: a bare name or a full "Name <email>" string;
+# the default is the hostname, so co-authors see whose machine pushed a change
+# without any setup.
+# git_author = "Kitchen Mac"
+# Per-file history cap, MiB (default 10). Files over it keep flowing through the
+# manifest surface but never enter history; a pack push is cut at 8x this plus
+# 64 MiB. Zero is rejected at startup rather than meaning an empty history.
+# git_max_file_mb = 10
+
 # One share per [[share]] block: an opaque share_id (the token binding) and a
 # path that is EITHER a directory (its tree is served) OR a single file.
 [[share]]
@@ -50,6 +61,12 @@ name = "Photos"
 # write-invite holders start URL-import jobs into this share; the download runs
 # on this machine by a plugin from the [import] block below. Set by
 # `xr-share share <dir> --writable --import`.
+# `git = true` (LLD-33, only valid together with writable) turns on the git
+# contour: every edit of the folder becomes a commit (the repository lives
+# outside the folder, in the agent's state dir), and a co-author with the
+# write token can clone, pull and push over the agent's HTTP surface. The
+# whole contour, fetch included, gates on share:write. Set by
+# `xr-share share <dir> --writable --git`; git must be in PATH on this machine.
 [[share]]
 share_id = "REPLACE_WITH_ANOTHER_SHARE_ID"
 path = "/srv/dropbox"
