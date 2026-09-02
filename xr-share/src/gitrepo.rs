@@ -281,19 +281,19 @@ while read -r old new ref; do
         exit 1
     fi
     case "$ref" in refs/heads/main) ;; *) continue ;; esac
-    # Materialization overwrites whatever sits in the folder, so a local
-    # untracked file under a path from the push refuses it, the way
-    # updateInstead did. Paths are compared through git on both sides: the
-    # hook runs with its cwd in GIT_DIR, not the worktree.
-    while IFS= read -r path; do
-        [ -n "$path" ] || continue
-        if git cat-file -e "$new:$path" 2>/dev/null; then
-            echo "xr-share: $path exists outside the history and the push would overwrite it" >&2
-            exit 1
-        fi
-    done <<LIST
-$(git -c core.quotepath=false ls-files --others)
-LIST
+    # Materialization overwrites whatever sits in the folder, so a local file
+    # under a path from the push refuses it, the way updateInstead did. The
+    # pushed tree and the untracked files are compared as two name lists in
+    # git's own quoting: a path with a quote or a control character comes out
+    # C-quoted, but from both sides the same way, so the lines match verbatim.
+    tree=.xr-receive-tree.$$
+    git -c core.quotepath=false ls-tree -r --name-only "$new" > "$tree"
+    if git -c core.quotepath=false ls-files --others | grep -qFx -f "$tree"; then
+        rm -f "$tree"
+        echo "xr-share: the push would overwrite a local file outside the history" >&2
+        exit 1
+    fi
+    rm -f "$tree"
 done
 exit 0
 "#;
@@ -953,6 +953,37 @@ mod tests {
         assert_eq!(
             std::fs::read(share.worktree.join("draft.md")).unwrap(),
             "черновик владельца".as_bytes()
+        );
+        assert_eq!(share.current_head_blocking(), head, "HEAD обязан остаться прежним");
+    }
+
+    /// Имя с кавычкой git печатает C-цитированием даже с quotepath=false, и
+    /// поиск пути по выводу ломается. Сравнение двух списков в одинаковой
+    /// цитированной форме ловит коллизию и на таких именах.
+    #[test]
+    fn test_push_refuses_over_untracked_quoted_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = tempfile::tempdir().unwrap();
+        let share = open_share(dir.path(), "abc123");
+        std::fs::write(share.worktree.join("a.md"), "v1").unwrap();
+        let head = share.commit_all_blocking().unwrap().expect("first commit");
+
+        let name = "we\"ird.md";
+        std::fs::write(share.worktree.join(name), "черновик со спецсимволом").unwrap();
+
+        let repo = client.path().join("repo");
+        let url = share.git_dir.display().to_string();
+        let (ok, text) = client_git(client.path(), &["clone", &url, "repo"]);
+        assert!(ok, "{text}");
+        std::fs::write(repo.join(name), "версия коллеги").unwrap();
+        client_git(&repo, &["add", "-A"]);
+        let (ok, text) = client_git(&repo, &["commit", "-m", "quoted"]);
+        assert!(ok, "{text}");
+        let (ok, text) = client_git(&repo, &["push", "origin", "HEAD:refs/heads/main"]);
+        assert!(!ok, "пуш поверх цитированного имени прошёл: {text}");
+        assert_eq!(
+            std::fs::read(share.worktree.join(name)).unwrap(),
+            "черновик со спецсимволом".as_bytes()
         );
         assert_eq!(share.current_head_blocking(), head, "HEAD обязан остаться прежним");
     }
