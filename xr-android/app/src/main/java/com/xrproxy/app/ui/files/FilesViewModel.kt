@@ -1100,11 +1100,22 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             )
         }
         viewModelScope.launch {
+            // Ответ сверяется с открытым путём: на медленной сети поздний
+            // ответ прошлого запроса иначе подменял бы историю соседнего
+            // файла, к которому экран уже перешёл.
             withContext(Dispatchers.IO) { repo.gitLog(config, entry.path) }.fold(
-                onSuccess = { rows -> _ui.update { it.copy(history = rows, historyLoading = false) } },
+                onSuccess = { rows ->
+                    _ui.update { st ->
+                        if (st.historyPath == entry.path) st.copy(history = rows, historyLoading = false) else st
+                    }
+                },
                 onFailure = { e ->
-                    _ui.update {
-                        it.copy(historyLoading = false, historyError = humanGitError(e.message.orEmpty()))
+                    _ui.update { st ->
+                        if (st.historyPath == entry.path) {
+                            st.copy(historyLoading = false, historyError = humanGitError(e.message.orEmpty()))
+                        } else {
+                            st
+                        }
                     }
                 },
             )
@@ -1123,14 +1134,25 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
             it.copy(editPath = entry.path, editSha = entry.sha256, editText = "", editLoading = true)
         }
         viewModelScope.launch {
+            // Та же сверка, что у истории: чтение качает файл до минуты, и
+            // без неё текст предыдущего файла ложился бы в редактор
+            // следующего, а сохранение уносил бы его в чужой путь.
             withContext(Dispatchers.IO) { repo.readShareText(config, entry) }.fold(
-                onSuccess = { content -> _ui.update { it.copy(editText = content, editLoading = false) } },
+                onSuccess = { content ->
+                    _ui.update { st ->
+                        if (st.editPath == entry.path) st.copy(editText = content, editLoading = false) else st
+                    }
+                },
                 onFailure = { e ->
-                    _ui.update {
-                        it.copy(
-                            editPath = null, editLoading = false,
-                            message = text(R.string.files_edit_load_failed, humanGitError(e.message.orEmpty())),
-                        )
+                    _ui.update { st ->
+                        if (st.editPath != entry.path) {
+                            st
+                        } else {
+                            st.copy(
+                                editPath = null, editLoading = false,
+                                message = text(R.string.files_edit_load_failed, humanGitError(e.message.orEmpty())),
+                            )
+                        }
                     }
                 },
             )
