@@ -740,13 +740,41 @@ fn git_gates(
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "git repository unavailable"))
 }
 
-/// One value of a query parameter, if present. The git routes only take hex
-/// shas and digits, so no percent-decoding is needed.
+/// One value of a query parameter, if present, raw (undecoded). The git
+/// routes' own parameters are hex shas and digits, which need no decoding;
+/// the `path` parameter decodes itself, see [percent_decode].
 fn query_param(uri: &axum::http::Uri, name: &str) -> Option<String> {
     uri.query()?.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
         (k == name).then(|| v.to_string())
     })
+}
+
+/// Percent-decode a query parameter's value. Both senders of the `path`
+/// filter encode it: the web page with `encodeURIComponent`, `xr-core` with
+/// its own encoder, so a file in a subfolder arrives as `sub%2Fnotes.md`.
+/// Decoding happens before any validation: an encoded `..` or a `:` must not
+/// slip past the lexical checks. `+` stays a literal plus, unlike form
+/// encoding: both encoders write a real plus as `%2B`.
+fn percent_decode(v: &str) -> Result<String, (StatusCode, &'static str)> {
+    let b = v.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'%' {
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
+        let h = v
+            .get(i + 1..i + 3)
+            .ok_or((StatusCode::BAD_REQUEST, "bad query encoding"))?;
+        let byte = u8::from_str_radix(h, 16)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "bad query encoding"))?;
+        out.push(byte);
+        i += 3;
+    }
+    String::from_utf8(out).map_err(|_| (StatusCode::BAD_REQUEST, "bad query encoding"))
 }
 
 /// One pkt-line record of the smart-HTTP protocol: four hex digits naming the
@@ -1075,6 +1103,19 @@ async fn git_log(
     let out = match out {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
+            // Нерождённый main (контур только что включён, коммитов ещё нет)
+            // это пустая история, а не ошибка: git log отказывает с exit 128
+            // на репозитории без HEAD. Голову проверяем тем же спавном, каким
+            // её читает /git/head.
+            let head = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&share.git_dir)
+                .args(["rev-parse", "-q", "--verify", "HEAD"])
+                .output()
+                .await;
+            if matches!(&head, Ok(h) if !h.status.success()) {
+                return Json(Vec::<GitLogRow>::new()).into_response();
+            }
             tracing::error!(
                 "share {share_id}: git log failed: {}",
                 String::from_utf8_lossy(&o.stderr)
@@ -1179,7 +1220,13 @@ fn history_path_arg(share: &GitShare, uri: &axum::http::Uri) -> Result<Option<St
     let Some(raw) = query_param(uri, "path").filter(|p| !p.is_empty()) else {
         return Ok(None);
     };
-    if raw.starts_with(':') {
+    // Декод до проверок: закодированный `..` или `:` обязаны увидеть фильтры,
+    // а не проскочить мимо них в спавн git.
+    let raw = match percent_decode(&raw) {
+        Ok(p) => p,
+        Err(e) => return Err(e.into_response()),
+    };
+    if raw.is_empty() || raw.starts_with(':') {
         return Err((StatusCode::BAD_REQUEST, "bad path").into_response());
     }
     match resolve_within(&share.worktree, &raw) {
@@ -3152,6 +3199,58 @@ mod tests {
 
         // Плохие пути отбиваются до git: обход и магия pathspec.
         for bad in ["../x", "a/../../x", ":/"] {
+            let r = app
+                .clone()
+                .oneshot(get_with_token(&format!("/W/git/log?path={bad}"), Some(&wtok)))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+    }
+
+    /// Нерождённый main git/log: контур включён, коммитов ещё нет. Пустая
+    /// история это `[]`, а не 500 от git с exit 128 (тот же случай, который
+    /// /git/head признаёт пустой строкой).
+    #[tokio::test]
+    async fn test_git_log_unborn_main_is_empty() {
+        let key = SigningKey::from_bytes(&[54u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let (app, wtok, _) = git_app(&key, dir.path());
+
+        let r = app.clone().oneshot(get_with_token("/W/git/log", Some(&wtok))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// Кодирование параметра path: подпапка едет к обоим клиентам
+    /// закодированной (encodeURIComponent страницы, свой энкодер xr-core) и
+    /// обязана фильтроваться по настоящему имени, а закодированный обход и
+    /// магия pathspec обязаны видеть фильтры, а не проскакивать мимо них.
+    #[tokio::test]
+    async fn test_git_log_path_decoding() {
+        let key = SigningKey::from_bytes(&[55u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let (app, wtok, state) = git_app(&key, dir.path());
+
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/notes.md"), "текст").unwrap();
+        state.git.get("W").unwrap().commit_scan().await.unwrap().expect("commit");
+
+        for q in ["sub/notes.md", "sub%2Fnotes.md", "sub%2fnotes.md"] {
+            let r = app
+                .clone()
+                .oneshot(get_with_token(&format!("/W/git/log?path={q}"), Some(&wtok)))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{q}");
+            let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+            let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+            assert_eq!(rows.len(), 1, "{q}: {rows:?}");
+            assert!(rows[0]["subject"].as_str().unwrap().contains("notes.md"), "{q}");
+        }
+        for bad in ["%zz", "%2e%2e%2fx", "%3a"] {
             let r = app
                 .clone()
                 .oneshot(get_with_token(&format!("/W/git/log?path={bad}"), Some(&wtok)))
