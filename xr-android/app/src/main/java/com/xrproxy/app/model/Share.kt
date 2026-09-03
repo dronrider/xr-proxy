@@ -1,6 +1,7 @@
 package com.xrproxy.app.model
 
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -168,6 +169,41 @@ data class ManifestEntry(
             sha256 = o.getString("sha256"),
             meta = o.optJSONObject("meta")?.let { FileMeta.fromJson(it) }?.takeIf { !it.isEmpty },
         )
+    }
+}
+
+/** Одна строка истории шары (LLD-33, фаза 3): коммит, который агент положил
+ *  в git-репозиторий авто-коммитом. [date] приходит от git как ISO-метка
+ *  (`%aI`), показываем как есть. */
+data class GitLogEntry(
+    val sha: String,
+    val author: String,
+    val date: String,
+    val subject: String,
+) {
+    companion object {
+        /** Разбор ответа `nativeGitLog`: голый массив строк либо объект
+         *  `{"error":..}`, потому что ядро отдаёт истории массив без обёртки. */
+        fun parseList(json: String): Result<List<GitLogEntry>> = runCatching {
+            val arr = try {
+                JSONArray(json)
+            } catch (_: JSONException) {
+                val o = JSONObject(json)
+                o.optString("error").takeIf { it.isNotBlank() && it != "null" }?.let {
+                    throw IllegalStateException(it)
+                }
+                throw IllegalStateException("parse")
+            }
+            (0 until arr.length()).map {
+                val o = arr.getJSONObject(it)
+                GitLogEntry(
+                    sha = o.getString("sha"),
+                    author = o.getString("author"),
+                    date = o.getString("date"),
+                    subject = o.getString("subject"),
+                )
+            }
+        }
     }
 }
 

@@ -248,6 +248,7 @@
     <string name="files_action_open">Открыть шару</string>
     <string name="files_action_sync">Синхронизация</string>
     <string name="files_action_storage">Папка на устройстве</string>
+    <string name="files_action_web">Открыть в браузере</string>
     <string name="files_action_remove">Удалить шару</string>
 
     <!-- Папка хранения -->
@@ -315,6 +316,16 @@
     <string name="files_delete_remote">Удалить из шары</string>
     <string name="files_delete_remote_title">Удалить из шары?</string>
     <string name="files_delete_remote_text">«%1$s» пропадёт у всех, у кого есть доступ к шаре, и с этого устройства. Вернуть файл сможет только владелец.</string>
+    <string name="files_history">История изменений</string>
+    <string name="files_history_failed">Не удалось загрузить историю: %1$s</string>
+    <string name="files_history_empty">Изменений пока не было</string>
+    <string name="files_edit">Править</string>
+    <string name="files_edit_title">Правка «%1$s»</string>
+    <string name="files_edit_save">Сохранить</string>
+    <string name="files_edit_saving">Сохранение...</string>
+    <string name="files_edit_saved">Правка сохранена</string>
+    <string name="files_edit_failed">Не удалось сохранить: %1$s</string>
+    <string name="files_edit_load_failed">Не удалось открыть файл: %1$s</string>
     <string name="files_open_with">Открыть файл</string>
     <string name="files_no_opener">Нет приложения, чтобы открыть этот файл</string>
     <string name="files_no_browser">Нет приложения, чтобы открыть ссылку</string>
@@ -401,6 +412,8 @@
     <string name="share_error_delete_not_found">файла уже нет в шаре</string>
     <string name="share_error_delete_forbidden">агент не разрешает запись в эту шару</string>
     <string name="share_error_delete_changed">файл на агенте изменился, обновите список</string>
+    <string name="share_error_edit_changed">файл изменился у агента, список обновлён, откройте правку заново</string>
+    <string name="share_error_git_off">история изменений выключена у этой шары</string>
     <string name="share_error_no_write_scope">нет права записи на эту шару</string>
 
     <!-- Размер файла -->

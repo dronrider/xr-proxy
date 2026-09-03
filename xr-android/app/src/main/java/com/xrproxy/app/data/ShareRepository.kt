@@ -2,6 +2,7 @@ package com.xrproxy.app.data
 
 import android.content.Context
 import com.xrproxy.app.jni.NativeBridge
+import com.xrproxy.app.model.GitLogEntry
 import com.xrproxy.app.model.ImportState
 import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
@@ -335,6 +336,76 @@ class ShareRepository(private val context: Context) {
         }
     }
 
+    /** История коммитов одного файла шары (LLD-33, фаза 3): те же строки, что
+     *  видит соавтор штатным git-клиентом, но через git-роут агента. Просмотр
+     *  истории требует share:write, поэтому зовётся только из-под canWrite. */
+    fun gitLog(config: ShareConfig, path: String, limit: Int = GIT_LOG_LIMIT): Result<List<GitLogEntry>> {
+        val tok = config.tokenJson
+            ?: return Result.failure(IllegalStateException("no token"))
+        return GitLogEntry.parseList(
+            NativeBridge.nativeGitLog(
+                config.importAddrArg, config.port, tok, config.agentPubkey, config.relayArg,
+                path, limit, GIT_TIMEOUT_MS,
+            ),
+        )
+    }
+
+    /** Прочитать файл шары как текст для мелкой правки (LLD-33). Качаем через
+     *  тот же проверенный контур загрузки в свой подкаталог кэша и читаем
+     *  байты: правка это PUT целиком, поэтому нужен полный текст, а не кусок.
+     *  Подкаталог чистим и до, и после: файл правки не должен оставлять за
+     *  собой мусор в кэше. */
+    fun readShareText(config: ShareConfig, entry: ManifestEntry): Result<String> = runCatching {
+        val tok = config.tokenJson ?: throw IllegalStateException("no token")
+        val dir = File(File(context.cacheDir, "edit").apply { deleteRecursively(); mkdirs() }, config.shareId)
+            .apply { mkdirs() }
+        val err = NativeBridge.nativeDownloadFile(
+            config.agentBaseUrls, tok, entry.toJson(), dir.absolutePath,
+            config.agentPubkey, config.relayArg, READ_TEXT_TIMEOUT_MS,
+        ).let { res ->
+            val o = JSONObject(res)
+            if (o.optBoolean("ok", false)) null
+            else o.optString("error").takeIf { it.isNotBlank() && it != "null" } ?: "download failed"
+        }
+        if (err != null) throw IllegalStateException(err)
+        val f = File(dir, entry.path)
+        try {
+            f.readText()
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    /** Отправить правку текстового файла в шару (LLD-33): текст пишется во
+     *  временный файл и уезжает тем же PUT-контуром, что правка со страницы,
+     *  с хешем строки манифеста в If-Match. Отказ http_412 значит, что файл
+     *  на агенте менялся после нашего листинга. */
+    fun uploadText(
+        config: ShareConfig,
+        path: String,
+        text: String,
+        expectedSha: String,
+    ): Result<Unit> = runCatching {
+        val tok = config.tokenJson ?: throw IllegalStateException("no token")
+        val dir = File(File(context.cacheDir, "edit").apply { mkdirs() }, config.shareId)
+            .apply { mkdirs() }
+        val tmp = File(dir, "edit.txt")
+        try {
+            tmp.writeText(text)
+            val res = NativeBridge.nativeUploadFile(
+                config.importAddrArg, config.port, tok, config.agentPubkey, config.relayArg,
+                path, tmp.absolutePath, expectedSha, WRITE_TIMEOUT_MS,
+            )
+            val o = JSONObject(res)
+            o.optString("error").takeIf { it.isNotBlank() && it != "null" }?.let {
+                throw IllegalStateException(it)
+            }
+            if (!o.optBoolean("ok", false)) throw IllegalStateException("upload failed")
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
     /** The share's persistent hash-index file (XR-098). Lives in the app's
      *  private [Context.getFilesDir], never inside the share directory: that one
      *  is walked by [localPaths]/[localManifest] for the UI, cleaned by the
@@ -361,6 +432,13 @@ class ShareRepository(private val context: Context) {
         /** Удаление файла из шары это короткий запрос к агенту, качать нечего;
          *  держим тот же порядок ожидания, что у джоб импорта. */
         private const val WRITE_TIMEOUT_MS = 30_000L
+        /** Столько строк истории просим у агента: экран показывает коммиты
+         *  файла, а не весь журнал шары, и 50 хватает с запасом. */
+        private const val GIT_LOG_LIMIT = 50
+        /** История это один спавн git у агента, а чтение файла для правки
+         *  качает текст целиком: оба укладываются в короткое ожидание. */
+        private const val GIT_TIMEOUT_MS = 30_000L
+        private const val READ_TEXT_TIMEOUT_MS = 60_000L
         /** Starting and polling an import job are short metadata calls: the
          *  agent downloads on its own machine, not the phone, so no long
          *  timeout is needed here. */

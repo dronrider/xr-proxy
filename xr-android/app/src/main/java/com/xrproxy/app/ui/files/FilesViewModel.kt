@@ -13,6 +13,7 @@ import com.xrproxy.app.data.StorageAccess
 import com.xrproxy.app.jni.NativeBridge
 import com.xrproxy.app.model.FileGrouping
 import com.xrproxy.app.model.FileSort
+import com.xrproxy.app.model.GitLogEntry
 import com.xrproxy.app.model.ManifestEntry
 import com.xrproxy.app.model.ShareConfig
 import com.xrproxy.app.model.ShareGrant
@@ -148,6 +149,21 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
          *  путь, а не саму строку: экран берёт её из свежего манифеста, поэтому
          *  переживает обновление списка, а пропавший из шары файл его закрывает. */
         val detailsPath: String? = null,
+        /** Путь файла, чей экран истории коммитов открыт (LLD-33), или null.
+         *  История видна только с правом записи: git-роуты агента стоят за
+         *  share:write, и точечный отказ читателю чище, чем прятать кнопку. */
+        val historyPath: String? = null,
+        val history: List<GitLogEntry> = emptyList(),
+        val historyLoading: Boolean = false,
+        val historyError: String? = null,
+        /** Путь файла, чей диалог правки открыт (LLD-33), или null. [editSha]
+         *  это хеш строки манифеста на момент открытия: он уезжает в If-Match,
+         *  и агент, чей файл менялся, отвечает 412, а не молча перетирает. */
+        val editPath: String? = null,
+        val editSha: String = "",
+        val editText: String = "",
+        val editLoading: Boolean = false,
+        val editBusy: Boolean = false,
         /** Share whose storage-directory dialog is open (XR-043), or null. */
         val storageDialogFor: String? = null,
         /** True when the dialog is the first-sync prompt (auto-continues the
@@ -828,10 +844,14 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { store().setGrouping(mode) }
     }
 
-    /** Кнопка «Назад» и системный жест: сначала закрывается экран информации о
-     *  файле, он лежит поверх открытой папки, и только потом идёт подъём по
-     *  дереву. */
+    /** Кнопка «Назад» и системный жест: сначала закрывается экран истории, он
+     *  лежит поверх экрана информации о файле, потом сам экран информации, он
+     *  лежит поверх открытой папки, и только потом идёт подъём по дереву. */
     fun navigateUp() {
+        if (_ui.value.historyPath != null) {
+            closeHistory()
+            return
+        }
         if (_ui.value.detailsPath != null) {
             closeDetails()
             return
@@ -1063,6 +1083,102 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         e == "http_412" -> text(R.string.share_error_delete_changed)
         // Хвост после категории пишет агент, и он уже человеческий; голая
         // категория остаётся на наших словах, как и в [shareErrorOf].
+        e.startsWith("no_write_scope") ->
+            e.substringAfter(": ", "").ifBlank { text(R.string.share_error_no_write_scope) }
+        else -> humanError(e)
+    }
+
+    /** Экран истории коммитов файла (LLD-33, фаза 3). Держится на пути
+     *  открытого файла, как экран информации: строки приезжают одним запросом,
+     *  перезагрузки по ходу просмотра нет. Отказ не закрывает экран: причина
+     *  остаётся на нём, кнопка «назад» работает и без истории. */
+    fun openHistory(config: ShareConfig, entry: ManifestEntry) {
+        _ui.update {
+            it.copy(
+                historyPath = entry.path, history = emptyList(),
+                historyError = null, historyLoading = true,
+            )
+        }
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { repo.gitLog(config, entry.path) }.fold(
+                onSuccess = { rows -> _ui.update { it.copy(history = rows, historyLoading = false) } },
+                onFailure = { e ->
+                    _ui.update {
+                        it.copy(historyLoading = false, historyError = humanGitError(e.message.orEmpty()))
+                    }
+                },
+            )
+        }
+    }
+
+    fun closeHistory() = _ui.update {
+        it.copy(historyPath = null, history = emptyList(), historyError = null)
+    }
+
+    /** Диалог мелкой правки (LLD-33): текст файла читается целиком, потому что
+     *  правка это PUT целиком. Пока текст едет, диалог показывает ожидание и
+     *  без текста не даёт сохранить пустоту вместо содержимого. */
+    fun openEditor(config: ShareConfig, entry: ManifestEntry) {
+        _ui.update {
+            it.copy(editPath = entry.path, editSha = entry.sha256, editText = "", editLoading = true)
+        }
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { repo.readShareText(config, entry) }.fold(
+                onSuccess = { content -> _ui.update { it.copy(editText = content, editLoading = false) } },
+                onFailure = { e ->
+                    _ui.update {
+                        it.copy(
+                            editPath = null, editLoading = false,
+                            message = text(R.string.files_edit_load_failed, humanGitError(e.message.orEmpty())),
+                        )
+                    }
+                },
+            )
+        }
+    }
+
+    fun updateEditText(s: String) = _ui.update { it.copy(editText = s) }
+
+    fun closeEditor() = _ui.update { it.copy(editPath = null, editBusy = false) }
+
+    /** Отправить правку в шару тем же PUT-контуром, что и страница (LLD-33).
+     *  Успех обновляет манифест: хеш строки изменился, и следом открытая
+     *  правка без обновления немедленно словила бы 412. Отказ 412 значит, что
+     *  файл менялся у агента: правку закрываем, текст в поле уже устарел. */
+    fun saveEdit(config: ShareConfig, entry: ManifestEntry) {
+        val newText = _ui.value.editText
+        _ui.update { it.copy(editBusy = true) }
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                repo.uploadText(config, entry.path, newText, _ui.value.editSha)
+            }.fold(
+                onSuccess = {
+                    _ui.update {
+                        it.copy(editPath = null, editBusy = false, message = text(R.string.files_edit_saved))
+                    }
+                    refreshManifest(config)
+                },
+                onFailure = { e ->
+                    _ui.update {
+                        it.copy(
+                            editPath = null, editBusy = false,
+                            message = text(R.string.files_edit_failed, humanGitError(e.message.orEmpty())),
+                        )
+                    }
+                    // При 412 файл на агенте уже другой: без обновления каждая
+                    // следующая правка билась бы в тот же отказ.
+                    refreshManifest(config)
+                },
+            )
+        }
+    }
+
+    /** Отказы git-контура и правки (LLD-33) поверх общего [humanError]:
+     *  категории приходят от xr-core и агента, у приложения на каждую свои
+     *  слова. */
+    private fun humanGitError(e: String): String = when {
+        e == "git_off" -> text(R.string.share_error_git_off)
+        e == "http_412" -> text(R.string.share_error_edit_changed)
         e.startsWith("no_write_scope") ->
             e.substringAfter(": ", "").ifBlank { text(R.string.share_error_no_write_scope) }
         else -> humanError(e)

@@ -247,6 +247,7 @@
     <string name="files_action_open">Open the share</string>
     <string name="files_action_sync">Sync</string>
     <string name="files_action_storage">Folder on the device</string>
+    <string name="files_action_web">Open in the browser</string>
     <string name="files_action_remove">Remove the share</string>
 
     <!-- Storage folder -->
@@ -312,6 +313,16 @@
     <string name="files_delete_remote">Delete from the share</string>
     <string name="files_delete_remote_title">Delete from the share?</string>
     <string name="files_delete_remote_text">"%1$s" will disappear for everyone with access to the share, and from this device. Only the owner can bring it back.</string>
+    <string name="files_history">Change history</string>
+    <string name="files_history_failed">Could not load the history: %1$s</string>
+    <string name="files_history_empty">No changes yet</string>
+    <string name="files_edit">Edit</string>
+    <string name="files_edit_title">Edit "%1$s"</string>
+    <string name="files_edit_save">Save</string>
+    <string name="files_edit_saving">Saving...</string>
+    <string name="files_edit_saved">Edit saved</string>
+    <string name="files_edit_failed">Could not save: %1$s</string>
+    <string name="files_edit_load_failed">Could not open the file: %1$s</string>
     <string name="files_open_with">Open the file</string>
     <string name="files_no_opener">No app to open this file</string>
     <string name="files_no_browser">No app to open the link</string>
@@ -398,6 +409,8 @@
     <string name="share_error_delete_not_found">the file is no longer in the share</string>
     <string name="share_error_delete_forbidden">the agent does not allow writing to this share</string>
     <string name="share_error_delete_changed">the file changed on the agent, refresh the list</string>
+    <string name="share_error_edit_changed">the file changed on the agent, the list is refreshed, reopen the editor</string>
+    <string name="share_error_git_off">change history is off for this share</string>
     <string name="share_error_no_write_scope">no write permission for this share</string>
 
     <!-- File size -->

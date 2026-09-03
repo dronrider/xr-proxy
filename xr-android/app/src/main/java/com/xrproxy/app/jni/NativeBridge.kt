@@ -398,6 +398,40 @@ object NativeBridge {
         timeoutMs: Long,
     ): String
 
+    /** Commit history of one file (LLD-33): rows `[{sha,author,date,subject}]`
+     *  from the agent's git repository, newest first, [path]-filtered (empty
+     *  = the whole share). Needs share:write in the token, like the other git
+     *  routes. Returns the rows or `{"error":".."}` (`git_off` when the share
+     *  has no git contour). */
+    external fun nativeGitLog(
+        addr: String,
+        port: Int,
+        tokenJson: String,
+        agentPubkey: String,
+        relayJson: String,
+        path: String,
+        limit: Int,
+        timeoutMs: Long,
+    ): String
+
+    /** Upload a local file into the share (LLD-33, small on-device edits): the
+     *  bytes at [srcPath] go out as the same authenticated PUT the web page
+     *  uses, with [expectedSha] (the manifest row's hash) as `If-Match`, so a
+     *  file the owner replaced meanwhile answers `http_412` instead of being
+     *  overwritten; empty string writes unconditionally. Returns `{"ok":true}`
+     *  or `{"error":".."}`. */
+    external fun nativeUploadFile(
+        addr: String,
+        port: Int,
+        tokenJson: String,
+        agentPubkey: String,
+        relayJson: String,
+        path: String,
+        srcPath: String,
+        expectedSha: String,
+        timeoutMs: Long,
+    ): String
+
     /** Move a share's downloaded files from [srcDir] to [dstDir] after a storage-
      *  directory change (XR-043), without re-downloading. Same-volume moves are
      *  renames; cross-volume is copy+remove, pre-checked against free space. Holds

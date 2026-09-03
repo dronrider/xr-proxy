@@ -46,6 +46,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Replay
@@ -66,6 +67,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
@@ -113,6 +115,7 @@ import com.xrproxy.app.ui.components.XrPullToRefresh
 import com.xrproxy.app.model.ExplorerRow
 import com.xrproxy.app.model.FileGrouping
 import com.xrproxy.app.model.FileSort
+import com.xrproxy.app.model.GitLogEntry
 import com.xrproxy.app.model.GroupKind
 import com.xrproxy.app.model.GroupTitle
 import com.xrproxy.app.model.ManifestEntry
@@ -125,6 +128,9 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.text.DateFormat
 import java.text.SimpleDateFormat
+import java.time.OffsetDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Date
 import java.util.Locale
 
@@ -244,10 +250,24 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
     LaunchedEffect(ui.detailsPath, detailsEntry) {
         if (ui.detailsPath != null && detailsEntry == null) vm.closeDetails()
     }
+    // Экран истории (LLD-33) лежит поверх экрана информации: он отвечает тому
+    // же файлу, и возврат из него возвращает к сведениям о файле.
+    val historyEntry = ui.historyPath?.let { p -> ui.manifest.firstOrNull { it.path == p } }
+    LaunchedEffect(ui.historyPath, historyEntry) {
+        if (ui.historyPath != null && historyEntry == null) vm.closeHistory()
+    }
+    // Диалог правки (LLD-33) открывается из экрана информации, но держится на
+    // состоянии: путь и хеш живут в UiState, а не в аргументах кнопки.
+    val editEntry = ui.editPath?.let { p -> ui.manifest.firstOrNull { it.path == p } }
+    LaunchedEffect(ui.editPath, editEntry) {
+        if (ui.editPath != null && editEntry == null) vm.closeEditor()
+    }
 
     Box(modifier = modifier) {
         if (openConfig != null) {
-            if (detailsEntry != null) {
+            if (historyEntry != null) {
+                HistoryScreen(vm, ui, historyEntry, Modifier)
+            } else if (detailsEntry != null) {
                 FileInfoScreen(vm, ui, openConfig, detailsEntry, Modifier)
             } else {
                 ExplorerView(vm, ui, openConfig, context, Modifier)
@@ -259,6 +279,10 @@ fun FilesScreen(hubUrl: String?, inviteToken: String?, modifier: Modifier = Modi
             snackbarHost,
             modifier = Modifier.align(Alignment.BottomCenter),
         )
+    }
+
+    if (editEntry != null && openConfig != null) {
+        EditFileDialog(vm, ui, openConfig, editEntry)
     }
 
     val storageCfg = configs.firstOrNull { it.shareId == ui.storageDialogFor }
@@ -601,6 +625,26 @@ private fun ShareActionsSheet(
             chevron = true,
             onClick = { dismissThen { vm.openStorageDialog(cfg.shareId) } },
         )
+        // Браузерный вход (LLD-33): вшитая страница шары у агента с историей
+        // и правкой. Пункт стоит за write-грантом: ссылка несёт токен целиком,
+        // и держателю read-гранта открывать в браузере нечего, кроме как
+        // заново ввести токен руками на странице.
+        if (cfg.canWrite && cfg.hasToken) {
+            val context = LocalContext.current
+            val tok = cfg.tokenJson
+            SheetActionRow(
+                icon = { Icon(Icons.Default.OpenInNew, contentDescription = null) },
+                title = stringResource(R.string.files_action_web),
+                chevron = true,
+                onClick = {
+                    if (tok != null) {
+                        dismissThen {
+                            openLink(context, shareWebUrl(cfg.agentBaseUrl, cfg.shareId, tok))
+                        }
+                    }
+                },
+            )
+        }
         HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
         SheetActionRow(
             icon = {
@@ -1015,6 +1059,22 @@ private fun FileInfoScreen(
                     modifier = Modifier.fillMaxWidth(),
                 ) { Text(stringResource(R.string.files_remove_local)) }
             }
+            // История и мелкая правка (LLD-33) стоят за share:write, как и
+            // удаление: без права записи кнопок нет вовсе, а не «нажми и
+            // получи отказ». Правка дополнительно только для текстовых
+            // файлов, список тот же, что у страницы шары.
+            if (cfg.canWrite) {
+                TextButton(
+                    onClick = { vm.openHistory(cfg, entry) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text(stringResource(R.string.files_history)) }
+                if (isEditableTextPath(path)) {
+                    TextButton(
+                        onClick = { vm.openEditor(cfg, entry) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text(stringResource(R.string.files_edit)) }
+                }
+            }
             // Удаление из шары (XR-250) необратимо и видно только с правом
             // записи в токене; подтверждение с него не снимаем.
             if (cfg.canWrite) {
@@ -1065,6 +1125,147 @@ private fun FileInfoScreen(
             },
         )
     }
+}
+
+/** Экран истории коммитов одного файла (LLD-33, фаза 3): строки git-журнала
+ *  агента, свежие сверху. Дифф здесь не строится: он остаётся странице шары,
+ *  а экран отвечает на вопрос «кто, когда и что менял» словом коммита.
+ *  Авто-коммит называет автора настройкой агента, поэтому имя человека в
+ *  строке это норма, а не аномалия. */
+@Composable
+private fun HistoryScreen(
+    vm: FilesViewModel,
+    ui: FilesViewModel.UiState,
+    entry: ManifestEntry,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier.fillMaxSize().padding(horizontal = 12.dp)
+            .verticalScroll(rememberScrollState()),
+    ) {
+        Row(modifier = Modifier.fillMaxWidth().padding(top = 6.dp)) {
+            TextButton(
+                onClick = { vm.closeHistory() },
+                contentPadding = PaddingValues(horizontal = 8.dp),
+            ) { Text(stringResource(R.string.files_back)) }
+        }
+        Column(modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
+            Text(
+                displayFileName(entry.path.substringAfterLast('/')),
+                fontSize = 18.sp, fontWeight = FontWeight.SemiBold, lineHeight = 23.sp,
+            )
+            Text(
+                entry.path,
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            when {
+                ui.historyLoading -> Box(
+                    modifier = Modifier.fillMaxWidth().padding(top = 40.dp),
+                    contentAlignment = Alignment.Center,
+                ) { CircularProgressIndicator() }
+                ui.historyError != null -> Text(
+                    stringResource(R.string.files_history_failed, ui.historyError),
+                    fontSize = 13.sp, lineHeight = 18.sp,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(top = 24.dp),
+                )
+                ui.history.isEmpty() -> Text(
+                    stringResource(R.string.files_history_empty),
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 24.dp),
+                )
+                else -> Column(modifier = Modifier.padding(top = 16.dp)) {
+                    ui.history.forEachIndexed { i, row ->
+                        CommitRow(row, top = i == 0)
+                    }
+                }
+            }
+            Spacer(Modifier.height(24.dp))
+        }
+    }
+}
+
+/** Одна строка истории: слово коммита, под ним автор, дата и короткий хеш. */
+@Composable
+private fun CommitRow(row: GitLogEntry, top: Boolean) {
+    Column(modifier = Modifier.fillMaxWidth().padding(top = if (top) 0.dp else 14.dp)) {
+        Text(row.subject, fontSize = 14.sp, lineHeight = 19.sp)
+        Text(
+            buildList {
+                add(row.author)
+                add(humanCommitDate(row.date))
+                add(row.sha.take(7))
+            }.joinToString(SEP),
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 3.dp),
+        )
+    }
+}
+
+/** Дата коммита приходит ISO-меткой с зоной; показываем её системным языком в
+ *  зоне устройства. Неразобранную строку оставляем как есть: сутки в истории
+ *  важнее идеального формата. */
+private fun humanCommitDate(iso: String): String = runCatching {
+    val fmt = DateTimeFormatter.ofPattern("d MMM yyyy, HH:mm", Locale.getDefault())
+    fmt.format(OffsetDateTime.parse(iso).atZoneSameInstant(ZoneId.systemDefault()))
+}.getOrDefault(iso)
+
+/** Диалог мелкой правки (LLD-33): текст файла в многострочном поле, сохранение
+ *  уезжает тем же PUT с If-Match, что и правка со страницы шары. Поле держится
+ *  в состоянии вью-модели, а не в remember: поворот экрана не должен стирать
+ *  набранное, а закрывается диалог только по явной кнопке. */
+@Composable
+private fun EditFileDialog(
+    vm: FilesViewModel,
+    ui: FilesViewModel.UiState,
+    cfg: ShareConfig,
+    entry: ManifestEntry,
+) {
+    AlertDialog(
+        onDismissRequest = { if (!ui.editBusy) vm.closeEditor() },
+        title = {
+            Text(stringResource(R.string.files_edit_title, entry.path.substringAfterLast('/')))
+        },
+        text = {
+            if (ui.editLoading) {
+                Box(
+                    modifier = Modifier.fillMaxWidth().height(160.dp),
+                    contentAlignment = Alignment.Center,
+                ) { CircularProgressIndicator() }
+            } else {
+                OutlinedTextField(
+                    value = ui.editText,
+                    onValueChange = { vm.updateEditText(it) },
+                    modifier = Modifier.fillMaxWidth().height(280.dp),
+                    textStyle = LocalTextStyle.current.copy(
+                        fontFamily = FontFamily.Monospace, fontSize = 13.sp,
+                    ),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !ui.editLoading && !ui.editBusy,
+                onClick = { vm.saveEdit(cfg, entry) },
+            ) {
+                Text(
+                    stringResource(
+                        if (ui.editBusy) R.string.files_edit_saving else R.string.files_edit_save,
+                    ),
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(
+                enabled = !ui.editBusy,
+                onClick = { vm.closeEditor() },
+            ) { Text(stringResource(R.string.files_cancel)) }
+        },
+    )
 }
 
 /** Карточка блока экрана информации: заголовок капслоком и строки под ним. */
