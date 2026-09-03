@@ -177,7 +177,7 @@ function esc(s) {
   });
 }
 function fileUrl(path) {
-  return path.split("/").map(encodeURIComponent).join("/");
+  return "file/" + path.split("/").map(encodeURIComponent).join("/");
 }
 function fmtSize(n) {
   if (n >= 1048576) return (n / 1048576).toFixed(1) + " МБ";
@@ -195,7 +195,7 @@ function note(text) { $("edit-note").textContent = text || ""; }
 // токена (blob это base64url от JSON), сервер всё равно перепроверит подпись.
 function tokenScope() {
   try {
-    var json = atob(token.replace(/-/g, "+").replace(/_/g, "/"));
+    var json = atob(blob.replace(/-/g, "+").replace(/_/g, "/"));
     return (JSON.parse(json).scope || "").split(" ");
   } catch (e) { return []; }
 }
