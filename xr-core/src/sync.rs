@@ -1192,15 +1192,21 @@ async fn git_log_with(
     path: Option<&str>,
     limit: u32,
 ) -> Result<Vec<GitLogEntry>, String> {
-    let url = format!("{}/git/log", base_url.trim_end_matches('/'));
-    let mut req = client
+    // The path goes through the same unambiguous percent-encoder as the file
+    // routes: reqwest's form-encoding would write a space as `+`, while the
+    // agent's decoder leaves a literal plus alone, so a file "a b.md" would
+    // be filtered under "a+b.md".
+    let mut url = format!("{}/git/log?limit={}", base_url.trim_end_matches('/'), limit);
+    if let Some(p) = path {
+        url.push_str("&path=");
+        url.push_str(&encode_path(p));
+    }
+    let resp = client
         .get(&url)
         .bearer_auth(token_blob(token))
-        .query(&[("limit", limit.to_string())]);
-    if let Some(p) = path {
-        req = req.query(&[("path", p)]);
-    }
-    let resp = req.send().await.map_err(|e| format!("network: {e}"))?;
+        .send()
+        .await
+        .map_err(|e| format!("network: {e}"))?;
     match resp.status().as_u16() {
         200 => resp.json().await.map_err(|e| format!("parse: {e}")),
         403 => Err(ERR_GIT_OFF.to_string()),
@@ -2516,6 +2522,32 @@ mod tests {
         assert!(req.contains("limit=30"), "{req}");
         assert!(req.contains("path=notes.md"), "{req}");
         assert!(req.to_lowercase().contains("authorization: bearer"), "{req}");
+    }
+
+    #[tokio::test]
+    async fn test_git_log_path_encoding() {
+        // Путь с подпапкой и пробелом едет однозначным percent-кодированием,
+        // как его ждёт декодер агента: слеш не превращается в %2F (энкодер его
+        // хранит), а пробел в `+` (форма reqwest) или сырой пробел в строке
+        // запроса ломали бы фильтр истории на другом конце.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut tx = Some(tx);
+        spawn_http_mock(listener, move |req| {
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(req.to_string());
+            }
+            http_response(LOG_BODY, "")
+        });
+        let grant = write_grant(addr, "share:read share:write");
+        let _ = git_log(&grant, Some("sub/мои заметки.md"), 10, Duration::from_secs(5)).await;
+        let req = rx.await.unwrap();
+        let line = req.lines().next().unwrap_or_default();
+        let query = line.split_once('?').map(|(_, q)| q.split(" HTTP").next().unwrap_or(q)).unwrap_or("");
+        assert!(query.contains("path=sub/%D0%BC%D0%BE%D0%B8%20%D0%B7%D0%B0%D0%BC%D0%B5%D1%82%D0%BA%D0%B8.md"), "{req}");
+        assert!(!query.contains('+'), "{req}");
+        assert!(!query.contains(' '), "raw space inside query: {req}");
     }
 
     #[tokio::test]
