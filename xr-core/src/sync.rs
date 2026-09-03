@@ -1140,6 +1140,75 @@ async fn delete_with(
     }
 }
 
+/// One commit of the share's history, as the agent's `git/log` route returns
+/// it (LLD-33 п. 2.8). `date` is git's ISO 8601 (`%aI`), shown as-is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitLogEntry {
+    pub sha: String,
+    pub author: String,
+    pub date: String,
+    pub subject: String,
+}
+
+/// The agent answered the history route with `403`: either the share has no
+/// git contour, or it is not writable. Named so the app can say «no history»
+/// instead of a bare permission error.
+pub const ERR_GIT_OFF: &str = "git_off";
+
+/// Fetch the share's commit history (LLD-33 п. 2.8): the `git/log` route of
+/// the agent, newest first. Same transport and gates as the write contour:
+/// the scope is checked locally before the network (history is a co-author's
+/// tool, readers live on the manifest), and the agent re-checks everything.
+pub async fn git_log(
+    grant: &ShareGrant,
+    path: Option<&str>,
+    limit: u32,
+    timeout: Duration,
+) -> Result<Vec<GitLogEntry>, String> {
+    let tok = decode_share_token(&grant.token)?;
+    if !scope_contains(&tok.scope, SCOPE_WRITE) {
+        return Err(ERR_NO_WRITE_SCOPE.to_string());
+    }
+    let candidates = grant_direct_bases(grant);
+    let tok = &tok; // the reference is Copy: each candidate retry reuses it
+    direct_then_relay(
+        &candidates,
+        &grant.agent_pubkey,
+        grant.relay.as_ref(),
+        &tok.share_id,
+        timeout,
+        |client, base| async move { git_log_with(&client, &base, tok, path, limit).await },
+    )
+    .await
+}
+
+/// [`git_log`] over an already-chosen transport. `403` from the agent is
+/// named [`ERR_GIT_OFF`] (not retried elsewhere: the agent spoke
+/// authoritatively about this share).
+async fn git_log_with(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &ShareToken,
+    path: Option<&str>,
+    limit: u32,
+) -> Result<Vec<GitLogEntry>, String> {
+    let url = format!("{}/git/log", base_url.trim_end_matches('/'));
+    let mut req = client
+        .get(&url)
+        .bearer_auth(token_blob(token))
+        .query(&[("limit", limit.to_string())]);
+    if let Some(p) = path {
+        req = req.query(&[("path", p)]);
+    }
+    let resp = req.send().await.map_err(|e| format!("network: {e}"))?;
+    match resp.status().as_u16() {
+        200 => resp.json().await.map_err(|e| format!("parse: {e}")),
+        403 => Err(ERR_GIT_OFF.to_string()),
+        404 => Err("not_found".to_string()),
+        code => Err(format!("http_{code}")),
+    }
+}
+
 // -- import path (LLD-29) -------------------------------------------
 
 /// Returned by the import calls when the grant's token has no `share:import`
@@ -2413,6 +2482,61 @@ mod tests {
 
         let req = rx.await.unwrap();
         assert!(req.starts_with("DELETE /S/file/old.txt "), "wrong request line: {req}");
+    }
+
+    const LOG_BODY: &str = r#"[
+        {"sha":"ffffffffffffffffffffffffffffffffffffffff","author":"tester","date":"2026-09-03T10:00:00+03:00","subject":"notes.md"},
+        {"sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","author":"otherhost","date":"2026-09-02T09:00:00+03:00","subject":"readme.md"}
+    ]"#;
+
+    #[tokio::test]
+    async fn test_git_log_via_grant() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut tx = Some(tx);
+        spawn_http_mock(listener, move |req| {
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(req.to_string());
+            }
+            http_response(LOG_BODY, "")
+        });
+        let grant = write_grant(addr, "share:read share:write");
+
+        let rows = git_log(&grant, Some("notes.md"), 30, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].sha, "ffffffffffffffffffffffffffffffffffffffff");
+        assert_eq!(rows[1].author, "otherhost");
+
+        // Запрос собран верно: путь и потолок в query, токен заголовком.
+        let req = rx.await.unwrap();
+        assert!(req.starts_with("GET /S/git/log?"), "wrong request line: {req}");
+        assert!(req.contains("limit=30"), "{req}");
+        assert!(req.contains("path=notes.md"), "{req}");
+        assert!(req.to_lowercase().contains("authorization: bearer"), "{req}");
+    }
+
+    #[tokio::test]
+    async fn test_git_log_refusals() {
+        // Читатель узнаёт об отказе до сети: локальная проверка скоупа.
+        let grant = write_grant("127.0.0.1:1".parse().unwrap(), "share:read");
+        let err = git_log(&grant, None, 10, Duration::from_secs(5)).await.unwrap_err();
+        assert_eq!(err, ERR_NO_WRITE_SCOPE);
+
+        // Ответ агента 403 назван: у шары нет git-контура.
+        let url = serve_canned(
+            "HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
+        )
+        .await;
+        let addr: std::net::SocketAddr = url
+            .trim_start_matches("http://")
+            .parse()
+            .unwrap();
+        let grant = write_grant(addr, "share:read share:write");
+        let err = git_log(&grant, None, 10, Duration::from_secs(5)).await.unwrap_err();
+        assert_eq!(err, ERR_GIT_OFF);
     }
 
     #[tokio::test]
