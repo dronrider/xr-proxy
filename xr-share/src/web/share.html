@@ -466,8 +466,12 @@ function saveEdit(ev) {
   ev.preventDefault();
   var path = state.current;
   var sha = state.shaByPath[path];
-  if (sha === undefined) { say("Нет текущего хеша файла, перечитайте манифест", true); return; }
-  var opts = { method: "PUT", headers: Object.assign({ "If-Match": sha }, AUTH),
+  // Пустой хеш значит «агент его ещё не посчитал» (листинг не греет кеш,
+  // XR-039): без предусловия правка идёт как last-write-wins, а не притворяется
+  // защищённой пустым If-Match.
+  var headers = Object.assign({}, AUTH);
+  if (sha) { headers["If-Match"] = sha; }
+  var opts = { method: "PUT", headers: headers,
                body: new Blob([$("edit-text").value]) };
   fetch(fileUrl(path), opts)
     .then(function (r) {

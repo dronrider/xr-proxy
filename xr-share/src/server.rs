@@ -996,6 +996,19 @@ async fn git_rpc(state: Arc<AgentState>, share_id: String, req: Request, rpc: Gi
             if let Err(e) = share_fin.clone().after_receive().await {
                 tracing::error!("share {share_id}: post-receive update failed: {e:#}");
             }
+            // The receive hook materialized pushed files straight into the
+            // folder, and the hash cache would only notice on its minute
+            // tick: until then /manifest serves an empty sha256 for those
+            // files (XR-039), and an If-Match editor degrades to a blind
+            // overwrite exactly after a colleague's push. Hash the share
+            // right here so the cold window is the push's own latency.
+            let warm_state = state.clone();
+            let warm_share = share_fin.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ =
+                    crate::manifest::build_manifest(&warm_share.worktree, &warm_state.hash_cache);
+            })
+            .await;
         }
     });
 
@@ -2941,6 +2954,63 @@ mod tests {
                 "HEAD не догнал push: {:?}",
                 state.git.get("W").unwrap().head_tx.borrow()
             );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Материализация пуша обязана греть кеш хешей сразу, а не ждать
+    /// минутного тика подогрева: листинг XR-039 отдаёт пустой sha256, и
+    /// редактор с If-Match после пуша коллеги слепо перезаписывал бы файл.
+    /// Пуш живым транспортом -> файл в папке -> /manifest отдаёт его хеш.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_push_warms_manifest_hashes() {
+        let key = SigningKey::from_bytes(&[45u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let client = tempfile::tempdir().unwrap();
+        let (app, wtok, state) = git_app(&key, dir.path());
+
+        std::fs::write(dir.path().join("note.md"), "первая").unwrap();
+        state.git.get("W").unwrap().commit_scan().await.unwrap().expect("commit");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let poller = app.clone();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+
+        let repo = client.path().join("repo");
+        let url = format!("http://{addr}/W/git");
+        let header = format!("http.extraHeader=Authorization: Bearer {}", blob(&wtok));
+        let (ok, text) = run_git(client.path(), &["-c", &header, "clone", &url, "repo"]).await;
+        assert!(ok, "{text}");
+        std::fs::write(repo.join("from-push.md"), "толчок").unwrap();
+        let (ok, text) = run_git(&repo, &["add", "-A"]).await;
+        assert!(ok, "{text}");
+        let (ok, text) = run_git(&repo, &["commit", "-m", "client edit"]).await;
+        assert!(ok, "{text}");
+        let (ok, text) = run_git(&repo, &["-c", &header, "push", "origin", "HEAD:refs/heads/main"]).await;
+        assert!(ok, "{text}");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let r = poller.clone()
+                .oneshot(get_with_token("/W/manifest", Some(&wtok)))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            let body = r.into_body().collect().await.unwrap().to_bytes();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let sha = v["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["path"] == "from-push.md")
+                .and_then(|e| e["sha256"].as_str())
+                .unwrap_or("")
+                .to_string();
+            if !sha.is_empty() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "хеш материализованного файла не согрелся");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
