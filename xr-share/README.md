@@ -142,6 +142,9 @@ the token. The write routes are v2 only.
 | `POST /{id}/git/git-upload-pack`| `share:write`| fetch, one process per request                    |
 | `POST /{id}/git/git-receive-pack`| `share:write`| push, one process per request                     |
 | `GET /{id}/git/head`           | `share:write`| signed `main` head, long-poll via `since`/`wait`  |
+| `GET /{id}/git/log`            | `share:write`| commit rows `[{sha,author,date,subject}]`, `path`/`limit` |
+| `GET /{id}/git/diff`           | `share:write`| `git diff` text, `from`/`to`/`path`, capped at 1 MiB |
+| `GET /{id}/web`                | `share:read` | the share's built-in web page (see below)         |
 
 Token is presented as a URL-safe base64 blob of the hub's `ShareToken` JSON, via
 `Authorization: Bearer <blob>`, `X-Share-Token: <blob>`, or `?token=<blob>`
@@ -294,6 +297,33 @@ by the same identity key that signs manifests. The route also long-polls:
 pass the head you already know as `since` and a `wait` budget in seconds. It
 parks until the next commit or push, so change notifications cost a request
 per minute instead of a poll storm. An unborn `main` reports an empty string.
+
+### Web page (LLD-33)
+
+Every share serves a **built-in web page** at `GET /{id}/web`. The page is a
+single-file view embedded in the binary: no CDN, no external requests. The
+token rides the URL as `?token=<blob>`, the same blob `Bearer` uses. So the
+link opens on any machine with a browser, no app or git client needed.
+
+A **read token** shows the file tree from the manifest and renders Markdown
+files in place. A **write token** unlocks the rest of the page. That is the
+history of a file (commit list via `git/log`, diffs between adjacent commits
+via `git/diff`) and in-place editing of text files. The edit box PUTs with
+`If-Match`. A file that changed on the agent answers `412`, and the page
+offers to re-read instead of overwriting someone else's edit. The page decodes
+the token's scope client-side to know what to show; the routes behind each
+action hold the real gates.
+
+The holder of a write grant prints the link without touching the mint:
+
+```sh
+xr-share weblink --invite <invite> --share <share_id>
+```
+
+`weblink` reuses the token the grant already carries, so no new channel for
+write scope appears. The printed URL carries that token in full. Treat it like
+the token itself, and remember the browser history keeps it (the command says
+so too). Add `--https` when the agent serves TLS.
 
 ## Manual setup (no installer)
 

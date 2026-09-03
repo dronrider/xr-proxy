@@ -18,6 +18,7 @@ mod relay;
 mod safepath;
 mod server;
 mod setup;
+mod web_page;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -73,6 +74,9 @@ enum Commands {
     Push(push::PushArgs),
     /// Remove a file from a writable share on an invite (desktop).
     Rm(push::RmArgs),
+    /// Print the share's web page URL from a write grant (LLD-33): the page
+    /// shows files, history and diff, and edits with `If-Match`.
+    Weblink(push::WeblinkArgs),
     /// Start a URL-import job on a writable share and poll it to completion
     /// (LLD-29): the agent downloads the page's content with its plugin.
     Import(cli::ImportArgs),
@@ -121,6 +125,7 @@ fn main() -> Result<()> {
         Some(Commands::Pull(args)) => return pull::pull(args),
         Some(Commands::Push(args)) => return push::push(args),
         Some(Commands::Rm(args)) => return push::rm(args),
+        Some(Commands::Weblink(args)) => return push::weblink(args),
         Some(Commands::Import(args)) => return cli::import(args),
         Some(Commands::Expose { command }) => return expose::run(&config_path, command),
         Some(Commands::Service { action }) => {

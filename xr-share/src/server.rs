@@ -222,6 +222,13 @@ pub fn router(state: Arc<AgentState>) -> Router {
         .route("/{share_id}/git/git-upload-pack", axum::routing::post(git_upload_pack))
         .route("/{share_id}/git/git-receive-pack", axum::routing::post(git_receive_pack))
         .route("/{share_id}/git/head", get(git_head))
+        // history for the web page (LLD-33 п. 2.8), the same write gate as
+        // the rest of the contour.
+        .route("/{share_id}/git/log", get(git_log))
+        .route("/{share_id}/git/diff", get(git_diff))
+        // the share's embedded web page (LLD-33 п. 2.8): read view for
+        // readers, history and editing for write holders.
+        .route("/{share_id}/web", get(share_web))
         // legacy: share selected by the token (single-share v1 consumers).
         .route("/manifest", get(get_manifest_legacy))
         .route("/file/{*path}", get(serve_file_legacy))
@@ -1007,6 +1014,205 @@ async fn git_head(
         .as_ref()
         .map(|k| sign_git_head(k, &share_id, signed_at, &head));
     Json(serde_json::json!({ "head": head, "signed_at": signed_at, "sig": sig })).into_response()
+}
+
+/// Commits per `git/log` response (LLD-33 п. 2.8), one JSON object each.
+#[derive(serde::Serialize)]
+struct GitLogRow {
+    sha: String,
+    author: String,
+    date: String,
+    subject: String,
+}
+
+/// Default and maximum number of commits `git/log` reports.
+const GIT_LOG_LIMIT_DEFAULT: u32 = 50;
+const GIT_LOG_LIMIT_MAX: u32 = 500;
+/// A diff body past this size is cut with a marker line: the page renders it
+/// as text, and a pathological rename history must not balloon the response.
+const GIT_DIFF_MAX_BYTES: usize = 1024 * 1024;
+
+/// `GET /{share_id}/git/log?path=&limit=`: `main`'s commits as a JSON array,
+/// newest first, optionally narrowed to one share-relative path. The page
+/// (LLD-33 п. 2.8) is the only consumer; the gate ladder is the transport's,
+/// history being a co-author's tool. The path filter is validated lexically
+/// but need not exist on disk: history remembers deleted files too.
+async fn git_log(
+    State(state): State<Arc<AgentState>>,
+    AxPath(share_id): AxPath<String>,
+    req: Request,
+) -> Response {
+    let uri = req.uri().clone();
+    let share = match git_gates(&state, &share_id, req.headers(), &uri) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let path = match history_path_arg(&share, &uri) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let limit = query_param(&uri, "limit")
+        .and_then(|l| l.parse::<u32>().ok())
+        .unwrap_or(GIT_LOG_LIMIT_DEFAULT)
+        .min(GIT_LOG_LIMIT_MAX);
+    let mut args: Vec<String> = vec![
+        "log".into(),
+        format!("-n{limit}"),
+        // Unit separators keep one `git` call parseable without quoting: \x1e
+        // between commits, \x1f between fields. A subject cannot carry either.
+        "--format=%H%x1f%an%x1f%aI%x1f%s%x1e".into(),
+    ];
+    if let Some(p) = &path {
+        args.push("--".into());
+        args.push(p.clone());
+    }
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&share.git_dir)
+        .args(&args)
+        .output()
+        .await;
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            tracing::error!(
+                "share {share_id}: git log failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, "git log failed").into_response();
+        }
+        Err(e) => {
+            tracing::error!("share {share_id}: git log spawn failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "git not available").into_response();
+        }
+    };
+    let rows: Vec<GitLogRow> = String::from_utf8_lossy(&out.stdout)
+        .split('\x1e')
+        .filter(|rec| !rec.trim().is_empty())
+        .filter_map(|rec| {
+            let mut f = rec.trim().split('\x1f');
+            Some(GitLogRow {
+                sha: f.next()?.to_string(),
+                author: f.next()?.to_string(),
+                date: f.next()?.to_string(),
+                subject: f.next()?.to_string(),
+            })
+        })
+        .collect();
+    Json(rows).into_response()
+}
+
+/// `GET /{share_id}/git/diff?from=&to=&path=`: the unified diff between two
+/// commits, as plain text for `<pre>` rendering. Both ends must be hex shas
+/// (the page passes adjacent commits from `git/log`); a bad sha is `400`, not
+/// a git error. Read-only, so no share op lock.
+async fn git_diff(
+    State(state): State<Arc<AgentState>>,
+    AxPath(share_id): AxPath<String>,
+    req: Request,
+) -> Response {
+    let uri = req.uri().clone();
+    let share = match git_gates(&state, &share_id, req.headers(), &uri) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let bad_arg = |name: &str| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("{name} must be a hex commit sha"),
+        )
+            .into_response()
+    };
+    let Some(from) = query_param(&uri, "from").filter(|v| commit_sha_arg(v)) else {
+        return bad_arg("from");
+    };
+    let Some(to) = query_param(&uri, "to").filter(|v| commit_sha_arg(v)) else {
+        return bad_arg("to");
+    };
+    let path = match history_path_arg(&share, &uri) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let mut args: Vec<String> = vec!["diff".into(), "--no-color".into(), from, to];
+    if let Some(p) = &path {
+        args.push("--".into());
+        args.push(p.clone());
+    }
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&share.git_dir)
+        .args(&args)
+        .output()
+        .await;
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            // A sha that names nothing in this repository is a client error.
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing::warn!("share {share_id}: git diff rejected: {stderr}");
+            return (StatusCode::BAD_REQUEST, "unknown commit").into_response();
+        }
+        Err(e) => {
+            tracing::error!("share {share_id}: git diff spawn failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "git not available").into_response();
+        }
+    };
+    let mut body = out.stdout;
+    if body.len() > GIT_DIFF_MAX_BYTES {
+        body.truncate(GIT_DIFF_MAX_BYTES);
+        body.extend_from_slice(b"\n[diff truncated]\n");
+    }
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
+}
+
+/// A `from`/`to` value fit to hand git on the command line: 4-40 hex digits
+/// (git's own abbreviation window), nothing else.
+fn commit_sha_arg(v: &str) -> bool {
+    (4..=40).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The validated `path` query parameter of `git/log` and `git/diff`: a
+/// share-relative path (`resolve_within`'s lexical layer rejects traversal and
+/// the reserved namespace), empty meaning all of history. A leading `:` is
+/// git pathspec magic and gets the same `400`.
+fn history_path_arg(share: &GitShare, uri: &axum::http::Uri) -> Result<Option<String>, Response> {
+    let Some(raw) = query_param(uri, "path").filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    if raw.starts_with(':') {
+        return Err((StatusCode::BAD_REQUEST, "bad path").into_response());
+    }
+    match resolve_within(&share.worktree, &raw) {
+        // The validated form need not exist; only containment matters, so the
+        // original string (git's own `/`-separated notation) goes to git.
+        Ok(_) => Ok(Some(raw)),
+        Err(_) => Err((StatusCode::BAD_REQUEST, "bad path").into_response()),
+    }
+}
+
+/// `GET /{share_id}/web`: the share's one-page web view, embedded in the
+/// binary at build time (LLD-33 п. 2.8). No CDN, no external requests: the
+/// page fetches the manifest, files and history from this same origin with
+/// the token from its own URL. Gated like a read: a read token shows the
+/// files, a write token additionally unlocks history and editing (the page
+/// probes `git/log` and hides both on a `403`, so a share without the git
+/// contour still gets a working read view).
+async fn share_web(
+    State(state): State<Arc<AgentState>>,
+    AxPath(share_id): AxPath<String>,
+    req: Request,
+) -> Response {
+    if !state.snapshot().contains_key(&share_id) {
+        return (StatusCode::NOT_FOUND, "no such share").into_response();
+    }
+    if let Err(e) = check_token(&state, &share_id, SCOPE_READ, &req) {
+        return e.into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        crate::web_page::SHARE_WEB_HTML,
+    )
+        .into_response()
 }
 
 /// Request body as an `AsyncRead` for a git process's stdin: data frames yield
@@ -2840,5 +3046,182 @@ mod tests {
         let body = r.into_body().collect().await.unwrap().to_bytes();
         // Ответ на done без haves начинается NAK-строкой, дальше packfile.
         assert!(body.starts_with(b"0008NAK\n"), "{}", String::from_utf8_lossy(&body));
+    }
+
+    /// Страница шары (LLD-33 п. 2.8): лестница гейтов как у чтения, сама
+    /// страница вшита и не тянет ничего снаружи.
+    #[tokio::test]
+    async fn test_web_page_gates_and_embedded() {
+        let key = SigningKey::from_bytes(&[50u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let (app, wtok, _) = git_app(&key, dir.path());
+        let rtok = sign_share_token(&key, "W", SCOPE_READ, now_unix() + 1000);
+
+        // Чужая шара -> 404, токен без шары -> 401, чужая привязка -> 403.
+        let r = app.clone().oneshot(get_with_token("/N/web", Some(&wtok))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let r = app.clone().oneshot(get_with_token("/W/web", None)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        let other = sign_share_token(&key, "X", &rw_scope(), now_unix() + 1000);
+        let r = app.clone().oneshot(get_with_token("/W/web", Some(&other))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+        // Read-токен видит страницу; контур git для неё не обязателен.
+        let r = app.clone().oneshot(get_with_token("/W/web", Some(&rtok))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            r.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let page = String::from_utf8_lossy(&body).into_owned();
+        assert!(page.contains("</html>"), "страница доезжает целиком");
+        for needle in ["src=\"http", "href=\"http", "<script src=", "<link "] {
+            assert!(!page.contains(needle), "внешний запрос {needle} в странице");
+        }
+
+        // Шара без git-контура отдаёт ту же страницу: просмотр живёт чтением.
+        let mut shares = SharesMap::new();
+        shares.insert("W".into(), dir_share(dir.path().canonicalize().unwrap(), true));
+        let plain = router(state_with(shares, &key));
+        let r = plain.oneshot(get_with_token("/W/web", Some(&rtok))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    /// Роут git/log (LLD-33 п. 2.8): та же лестница гейтов, что у транспорта,
+    /// и честные строки истории после живых коммитов.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_git_log_route() {
+        let key = SigningKey::from_bytes(&[51u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let (app, wtok, state) = git_app(&key, dir.path());
+
+        // Лестница: чужая шара 404, контур выключен 403, без токена 401,
+        // read-only 403.
+        let r = app.clone().oneshot(get_with_token("/N/git/log", Some(&wtok))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let mut shares = SharesMap::new();
+        shares.insert("W".into(), dir_share(dir.path().canonicalize().unwrap(), true));
+        let plain = router(state_with(shares, &key));
+        let r = plain.clone().oneshot(get_with_token("/W/git/log", Some(&wtok))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let r = app.clone().oneshot(get_with_token("/W/git/log", None)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        let rtok = sign_share_token(&key, "W", SCOPE_READ, now_unix() + 1000);
+        let r = app.clone().oneshot(get_with_token("/W/git/log", Some(&rtok))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+        // Два коммита по разным файлам.
+        std::fs::write(dir.path().join("a.md"), "один").unwrap();
+        state.git.get("W").unwrap().commit_scan().await.unwrap().expect("commit 1");
+        std::fs::write(dir.path().join("b.md"), "два").unwrap();
+        state.git.get("W").unwrap().commit_scan().await.unwrap().expect("commit 2");
+
+        let r = app
+            .clone()
+            .oneshot(get_with_token("/W/git/log", Some(&wtok)))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["sha"].as_str().unwrap().len(), 40);
+        assert_eq!(rows[0]["author"].as_str().unwrap(), "tester");
+        assert!(rows[0]["subject"].as_str().unwrap().contains("b.md"));
+        assert!(rows[1]["subject"].as_str().unwrap().contains("a.md"));
+
+        // Фильтр по пути и потолок limit.
+        let r = app
+            .clone()
+            .oneshot(get_with_token("/W/git/log?path=a.md", Some(&wtok)))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0]["subject"].as_str().unwrap().contains("a.md"));
+        let r = app
+            .clone()
+            .oneshot(get_with_token("/W/git/log?limit=1", Some(&wtok)))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // Плохие пути отбиваются до git: обход и магия pathspec.
+        for bad in ["../x", "a/../../x", ":/"] {
+            let r = app
+                .clone()
+                .oneshot(get_with_token(&format!("/W/git/log?path={bad}"), Some(&wtok)))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+    }
+
+    /// Роут git/diff (LLD-33 п. 2.8): дифф между соседними коммитами, фильтр
+    /// по пути, отказ на плохом sha.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_git_diff_route() {
+        let key = SigningKey::from_bytes(&[52u8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let (app, wtok, state) = git_app(&key, dir.path());
+
+        std::fs::write(dir.path().join("a.md"), "первая").unwrap();
+        state.git.get("W").unwrap().commit_scan().await.unwrap().expect("commit 1");
+        std::fs::write(dir.path().join("a.md"), "первая\nвторая").unwrap();
+        state.git.get("W").unwrap().commit_scan().await.unwrap().expect("commit 2");
+
+        let log = app
+            .clone()
+            .oneshot(get_with_token("/W/git/log", Some(&wtok)))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(log.into_body(), 1 << 20).await.unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let (new, old) = (rows[0]["sha"].as_str().unwrap(), rows[1]["sha"].as_str().unwrap());
+
+        let r = app
+            .clone()
+            .oneshot(get_with_token(&format!("/W/git/diff?from={old}&to={new}"), Some(&wtok)))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            r.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("+++ b/a.md"), "{text}");
+        assert!(text.contains("+вторая"), "{text}");
+
+        // Bad sha и плохой путь -> 400, а не ошибка git.
+        let r = app
+            .clone()
+            .oneshot(get_with_token("/W/git/diff?from=zzzz&to=1234", Some(&wtok)))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let r = app
+            .clone()
+            .oneshot(get_with_token(
+                &format!("/W/git/diff?from={old}&to={new}&path=../x"),
+                Some(&wtok),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+        // Read-токен историю не видит.
+        let rtok = sign_share_token(&key, "W", SCOPE_READ, now_unix() + 1000);
+        let r = app
+            .clone()
+            .oneshot(get_with_token(&format!("/W/git/diff?from={old}&to={new}"), Some(&rtok)))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 }

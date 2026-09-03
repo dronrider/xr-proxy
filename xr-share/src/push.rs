@@ -145,6 +145,46 @@ pub fn rm(args: RmArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Args)]
+pub struct WeblinkArgs {
+    /// Invite token granting access (the access anchor, LLD-19 п. 9.5).
+    #[arg(long)]
+    pub invite: String,
+    /// Hub base URL (default https://xr-hub.zoobr.top).
+    #[arg(long)]
+    pub hub: Option<String>,
+    /// Which share to link, by its share_id or name.
+    #[arg(long)]
+    pub share: String,
+    /// Reach the agent over https (default http).
+    #[arg(long)]
+    pub https: bool,
+}
+
+/// Print the share's web page URL with the write token already in it (the
+/// `weblink` subcommand, LLD-33 п. 2.8). The link is minted by no one: the
+/// holder of a write grant builds it from the grant's own token, so the
+/// «links carry share:read only» rule of LLD-28 stands and no new minting
+/// channel for write scope appears. The base is the same reachable candidate
+/// the `push` harness would use (LAN before public, XR-050), verified by the
+/// manifest signature along the way.
+pub fn weblink(args: WeblinkArgs) -> Result<()> {
+    let hub = args.hub.clone().unwrap_or_else(|| HUB_DEFAULT.to_string());
+    let share = select_share(&hub, &args.invite, &args.share)?;
+    ensure_writable_grant(&share)?;
+
+    let scheme = if args.https { "https" } else { "http" };
+    let (base, _manifest) = crate::pull::resolve_base(scheme, &share)
+        .with_context(|| format!("шара «{}» недоступна", share.name))?;
+    println!("{base}/web?token={}", share.token);
+    println!();
+    println!(
+        "ссылка несёт write-токен шары и открывает страницу правки: \
+         история браузера её запомнит, передавай только тем, кому доверяешь запись"
+    );
+    Ok(())
+}
+
 /// Fetch the invite's shares and pick the one named by `--share` (id or name).
 /// Shared with the `import` harness (`crate::cli`), which selects the same way.
 pub(crate) fn select_share(hub: &str, invite: &str, want: &str) -> Result<InviteShareDto> {

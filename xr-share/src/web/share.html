@@ -1,0 +1,536 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Шара</title>
+<style>
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 15px/1.55 -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+header {
+  display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+  padding: 10px 16px; border-bottom: 1px solid rgba(128,128,128,.35);
+}
+header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+header .badge {
+  font-size: 12px; padding: 1px 8px; border-radius: 10px;
+  border: 1px solid rgba(128,128,128,.5); color: inherit; opacity: .85;
+}
+main { display: flex; min-height: calc(100vh - 47px); }
+nav {
+  width: 280px; flex: none; overflow-y: auto; padding: 8px 0;
+  border-right: 1px solid rgba(128,128,128,.25);
+}
+nav .dir {
+  padding: 4px 14px; font-size: 12px; opacity: .6; margin-top: 6px;
+  word-break: break-all;
+}
+nav a {
+  display: block; padding: 4px 14px; cursor: pointer; color: inherit;
+  text-decoration: none; word-break: break-all;
+}
+nav a:hover { background: rgba(128,128,128,.15); }
+nav a.sel { background: rgba(128,128,128,.25); font-weight: 600; }
+nav a .size { opacity: .55; font-size: 12px; margin-left: 6px; }
+section { flex: 1; min-width: 0; padding: 12px 18px 40px; }
+#tabs { display: none; gap: 4px; margin-bottom: 8px; }
+body.write #tabs { display: flex; }
+#tabs button {
+  border: 1px solid rgba(128,128,128,.4); background: transparent; color: inherit;
+  border-radius: 6px; padding: 3px 14px; cursor: pointer; font: inherit; font-size: 13px;
+}
+#tabs button.on { background: rgba(128,128,128,.25); font-weight: 600; }
+#actions { float: right; display: flex; gap: 6px; }
+#actions button {
+  border: 1px solid rgba(128,128,128,.4); background: transparent; color: inherit;
+  border-radius: 6px; padding: 3px 12px; cursor: pointer; font: inherit; font-size: 13px;
+}
+article.md { max-width: 46rem; }
+article.md h1, article.md h2, article.md h3 { line-height: 1.3; margin: 1.1em 0 .4em; }
+article.md h1:first-child, article.md h2:first-child { margin-top: .2em; }
+article.md pre {
+  background: rgba(128,128,128,.12); padding: 10px 12px; border-radius: 6px;
+  overflow-x: auto; font-size: 13px;
+}
+article.md code { font-size: 13px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+article.md blockquote {
+  margin: .6em 0; padding: .1em 12px; border-left: 3px solid rgba(128,128,128,.5);
+  opacity: .85;
+}
+article.md img { max-width: 100%; }
+article pre.raw {
+  background: rgba(128,128,128,.12); padding: 10px 12px; border-radius: 6px;
+  overflow-x: auto; font-size: 13px;
+}
+#history ul { list-style: none; margin: 0; padding: 0; max-width: 46rem; }
+#history li {
+  padding: 8px 10px; border: 1px solid rgba(128,128,128,.3); border-radius: 6px;
+  margin-bottom: 6px; cursor: pointer;
+}
+#history li:hover { background: rgba(128,128,128,.12); }
+#history .meta { font-size: 12px; opacity: .7; display: flex; gap: 10px; flex-wrap: wrap; }
+#history .sha { font-family: ui-monospace, Menlo, Consolas, monospace; }
+#diffbox pre {
+  max-width: 52rem; background: rgba(128,128,128,.12); padding: 10px 12px;
+  border-radius: 6px; overflow-x: auto; font-size: 13px;
+  font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre;
+}
+#diffbox .add { color: #1a7f37; }
+#diffbox .del { color: #cf222e; }
+#diffbox .hunk { opacity: .6; }
+#overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.45);
+  display: none; align-items: center; justify-content: center; padding: 16px;
+}
+#overlay.open { display: flex; }
+#editor {
+  background: var(--bg, #fff); color: var(--fg, #111);
+  width: min(760px, 100%); max-height: 92vh; display: flex; flex-direction: column;
+  border-radius: 8px; padding: 14px; gap: 10px;
+}
+#editor textarea {
+  flex: 1; min-height: 46vh; resize: vertical; font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace;
+}
+#editor .row { display: flex; gap: 8px; justify-content: flex-end; align-items: center; flex-wrap: wrap; }
+#editor button, #msg button {
+  border: 1px solid rgba(128,128,128,.5); background: transparent; color: inherit;
+  border-radius: 6px; padding: 5px 16px; cursor: pointer; font: inherit;
+}
+#msg {
+  position: fixed; left: 50%; transform: translateX(-50%); bottom: 18px;
+  background: rgba(40,40,40,.92); color: #fff; border-radius: 8px;
+  padding: 10px 16px; display: none; gap: 12px; align-items: center; max-width: 90vw;
+}
+#msg.open { display: flex; }
+#msg.err { background: rgba(140,20,20,.95); }
+.note { opacity: .65; font-size: 13px; }
+@media (prefers-color-scheme: dark) {
+  #editor { --bg: #222; --fg: #eee; }
+  #editor textarea { background: #1b1b1b; color: #eee; }
+}
+@media (max-width: 720px) {
+  main { flex-direction: column; }
+  nav { width: auto; max-height: 34vh; border-right: none; border-bottom: 1px solid rgba(128,128,128,.25); }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Шара</h1>
+  <span class="badge" id="mode"></span>
+  <span class="note" id="count"></span>
+</header>
+<main>
+  <nav id="files"></nav>
+  <section>
+    <div id="actions">
+      <button id="btn-history" hidden>История</button>
+      <button id="btn-edit" hidden>Править</button>
+    </div>
+    <div id="tabs">
+      <button id="tab-file" class="on">Файл</button>
+      <button id="tab-history">История</button>
+    </div>
+    <article id="content"></article>
+    <div id="history" hidden></div>
+    <div id="diffbox"></div>
+  </section>
+</main>
+<div id="overlay">
+  <form id="editor">
+    <div id="edit-path" style="font-size:13px;opacity:.7;word-break:break-all"></div>
+    <textarea id="edit-text" spellcheck="false"></textarea>
+    <div class="row">
+      <span class="note" id="edit-note"></span>
+      <button type="button" id="edit-cancel">Отмена</button>
+      <button type="submit" id="edit-save">Сохранить</button>
+    </div>
+  </form>
+</div>
+<div id="msg"><span id="msg-text"></span><button id="msg-close" type="button">Закрыть</button></div>
+<script>
+"use strict";
+
+// Шара и токен берутся из собственного URL страницы; дальше каждый запрос
+// идёт с заголовком Authorization, и токен в новые URL не попадает.
+var params = new URLSearchParams(location.search);
+var blob = params.get("token");
+if (blob === null) blob = "";
+var AUTH = { "Authorization": "Bearer " + blob };
+var shareId = decodeURIComponent(
+  location.pathname.replace(/\/web\/?$/, "").split("/").filter(Boolean).pop() || "");
+
+var TEXTY = /\.(md|markdown|txt|json|toml|yaml|yml|csv|log)$/i;
+var state = {
+  entries: [], shaByPath: {}, current: null, canEdit: false,
+  hasHistory: false, hist: [], tab: "file",
+};
+
+function $(id) { return document.getElementById(id); }
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  });
+}
+function fileUrl(path) {
+  return path.split("/").map(encodeURIComponent).join("/");
+}
+function fmtSize(n) {
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + " МБ";
+  if (n >= 1024) return Math.round(n / 1024) + " КБ";
+  return n + " Б";
+}
+function say(text, err) {
+  $("msg-text").textContent = text;
+  $("msg").classList.toggle("err", !!err);
+  $("msg").classList.add("open");
+}
+function note(text) { $("edit-note").textContent = text || ""; }
+
+// Правка видна только держателю write-токена: страница читает scope своего
+// токена (blob это base64url от JSON), сервер всё равно перепроверит подпись.
+function tokenScope() {
+  try {
+    var json = atob(token.replace(/-/g, "+").replace(/_/g, "/"));
+    return (JSON.parse(json).scope || "").split(" ");
+  } catch (e) { return []; }
+}
+
+function showTab(which) {
+  state.tab = which;
+  $("tab-file").classList.toggle("on", which === "file");
+  $("tab-history").classList.toggle("on", which === "history");
+  $("content").hidden = which !== "file";
+  $("history").hidden = which !== "history";
+  $("btn-edit").hidden = !(which === "file" && editable(state.current));
+  $("btn-history").hidden = !(which === "file" && state.canEdit);
+}
+function editable(path) {
+  return state.canEdit && path && TEXTY.test(path);
+}
+
+function renderList() {
+  var nav = $("files");
+  nav.textContent = "";
+  var lastDir = null;
+  state.entries.forEach(function (e) {
+    var dir = e.path.includes("/") ? e.path.slice(0, e.path.lastIndexOf("/")) : "";
+    if (dir !== lastDir) {
+      var d = document.createElement("div");
+      d.className = "dir"; d.textContent = dir || "/";
+      nav.appendChild(d); lastDir = dir;
+    }
+    var a = document.createElement("a");
+    var base = e.path.slice(dir.length ? dir.length + 1 : 0);
+    a.textContent = base;
+    var sz = document.createElement("span");
+    sz.className = "size"; sz.textContent = fmtSize(e.size);
+    a.appendChild(sz);
+    if (e.path === state.current) a.className = "sel";
+    a.onclick = function () { select(e.path); };
+    nav.appendChild(a);
+  });
+  $("count").textContent = state.entries.length
+    ? state.entries.length + " файл(ов)" : "пусто";
+}
+
+function renderMarkdown(src, dir) {
+  // Минимальный рендер без зависимостей: сначала весь текст экранирован,
+  // разметка строится поверх безопасных строк.
+  var lines = esc(src).split(/\r?\n/);
+  var out = [], i = 0, para = [];
+  function flush() {
+    if (para.length) { out.push("<p>" + para.join("<br>") + "</p>"); para = []; }
+  }
+  function inline(s) {
+    s = s.replace(/`([^`]+)`/g, function (_, c) { return "<code>" + c + "</code>"; });
+    s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    s = s.replace(/(^|\W)\*([^*\s][^*]*)\*/g, "$1<em>$2</em>");
+    s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, function (_, alt, href) {
+      var u = relUrl(href, dir); return u ? '<img alt="' + alt + '" src="' + u + '">' : alt;
+    });
+    s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function (_, text, href) {
+      var u = relUrl(href, dir);
+      if (!u) return text;
+      if (/\.md?($|\?)/i.test(u) && u.indexOf("#") < 0 && u.startsWith("file/")) {
+        var p = decodeURIComponent(u.slice(5).split("?")[0]);
+        return '<a data-goto="' + esc(p) + '">' + text + "</a>";
+      }
+      return '<a href="' + u + '" rel="noopener">' + text + "</a>";
+    });
+    return s;
+  }
+  while (i < lines.length) {
+    var l = lines[i];
+    if (/^```/.test(l)) {
+      flush();
+      var buf = [];
+      i++;
+      while (i < lines.length && !/^```/.test(lines[i])) { buf.push(lines[i]); i++; }
+      i++;
+      out.push("<pre><code>" + buf.join("\n") + "</code></pre>");
+      continue;
+    }
+    var h = /^(#{1,6})\s+(.*)$/.exec(l);
+    if (h) { flush(); out.push("<h" + h[1].length + ">" + inline(h[2]) + "</h" + h[1].length + ">"); i++; continue; }
+    if (/^\s*(---|\*\*\*)\s*$/.test(l)) { flush(); out.push("<hr>"); i++; continue; }
+    if (/^\s*&gt;/.test(l)) {
+      flush();
+      var q = [];
+      while (i < lines.length && /^\s*&gt;/.test(lines[i])) { q.push(inline(lines[i].replace(/^\s*&gt;\s?/, ""))); i++; }
+      out.push("<blockquote><p>" + q.join("<br>") + "</p></blockquote>");
+      continue;
+    }
+    var ul = /^\s*[-*+]\s+/.exec(l), ol = /^\s*\d+[.)]\s+/.exec(l);
+    if (ul || ol) {
+      flush();
+      var items = [], tag = ul ? "ul" : "ol";
+      while (i < lines.length) {
+        var m = ul ? /^\s*[-*+]\s+(.*)$/.exec(lines[i]) : /^\s*\d+[.)]\s+(.*)$/.exec(lines[i]);
+        if (!m) break;
+        items.push("<li>" + inline(m[1]) + "</li>"); i++;
+        ul = /^\s*[-*+]\s+/.test(lines[i] || "") && ul;
+        ol = !ul && /^\s*\d+[.)]\s+/.test(lines[i] || "") && ol;
+      }
+      out.push("<" + tag + ">" + items.join("") + "</" + tag + ">");
+      continue;
+    }
+    if (!l.trim()) { flush(); i++; continue; }
+    para.push(inline(l)); i++;
+  }
+  flush();
+  return out.join("\n");
+}
+
+// Относительные ссылки и картинки из md ведут в эту же шару (роут file),
+// внешние допускаются только http и https.
+function relUrl(href, dir) {
+  if (/^https?:\/\//i.test(href)) return href;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith("//")) return null;
+  var clean = href.replace(/^[./]+/, "");
+  var full = dir ? dir + "/" + clean : clean;
+  var q = "";
+  var qi = full.indexOf("?");
+  if (qi >= 0) { q = full.slice(qi); full = full.slice(0, qi); }
+  return "file/" + full.split("/").map(encodeURIComponent).join("/") + q + (q ? "&" : "?") + "token=" + encodeURIComponent(blob);
+}
+
+function select(path, keepTab) {
+  state.current = path;
+  renderList();
+  if (!keepTab) showTab("file");
+  var art = $("content");
+  art.textContent = "";
+  $("diffbox").textContent = "";
+  var e = state.entries.find(function (x) { return x.path === path; });
+  if (!e) return;
+  if (!TEXTY.test(path)) {
+    var p = document.createElement("p");
+    p.textContent = "Бинарный файл, просмотр недоступен. ";
+    var a = document.createElement("a");
+    a.href = fileUrl(path) + "?token=" + encodeURIComponent(blob);
+    a.textContent = "Скачать (" + fmtSize(e.size) + ")";
+    p.appendChild(a);
+    art.appendChild(p);
+    $("btn-edit").hidden = true;
+    return;
+  }
+  fetch(fileUrl(path), { headers: AUTH })
+    .then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.text();
+    })
+    .then(function (text) {
+      if (state.current !== path) return;
+      var dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+      var wrap = document.createElement("article");
+      wrap.className = "md";
+      if (/\.md$|\.markdown$/i.test(path)) {
+        wrap.innerHTML = renderMarkdown(text, dir);
+        wrap.querySelectorAll("a[data-goto]").forEach(function (a) {
+          a.onclick = function () {
+            var p2 = a.getAttribute("data-goto");
+            if (state.shaByPath[p2] !== undefined) select(p2); else say("Файла «" + p2 + "» нет в манифесте");
+          };
+        });
+      } else {
+        var pre = document.createElement("pre");
+        pre.className = "raw"; pre.textContent = text;
+        wrap.appendChild(pre);
+      }
+      art.appendChild(wrap);
+      $("btn-edit").hidden = !editable(path);
+    })
+    .catch(function (e2) { say("Не удалось открыть файл: " + e2.message, true); });
+}
+
+function loadHistory() {
+  var box = $("history");
+  box.textContent = "";
+  if (!state.hasHistory) {
+    var p = document.createElement("p");
+    p.className = "note";
+    p.textContent = "У шары нет истории: git-контур у неё выключен.";
+    box.appendChild(p);
+    return;
+  }
+  var path = state.current;
+  var url = "git/log?limit=51" + (path ? "&path=" + encodeURIComponent(path) : "");
+  fetch(url, { headers: AUTH })
+    .then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    })
+    .then(function (rows) {
+      if (state.current !== path) return;
+      state.hist = rows;
+      var ul = document.createElement("ul");
+      rows.forEach(function (c, idx) {
+        var li = document.createElement("li");
+        var s = document.createElement("div"); s.textContent = c.subject;
+        var m = document.createElement("div"); m.className = "meta";
+        var sha = document.createElement("span"); sha.className = "sha";
+        sha.textContent = c.sha.slice(0, 7);
+        var d = document.createElement("span"); d.textContent = c.date.replace("T", " ").slice(0, 16);
+        var a = document.createElement("span"); a.textContent = c.author;
+        m.append(sha, d, a);
+        li.append(s, m);
+        li.onclick = function () { showDiff(idx); };
+        ul.appendChild(li);
+      });
+      if (!rows.length) {
+        var e2 = document.createElement("p");
+        e2.className = "note"; e2.textContent = "Коммитов по этому пути нет.";
+        box.appendChild(e2);
+      } else box.appendChild(ul);
+    })
+    .catch(function (e3) { say("История не загрузилась: " + e3.message, true); });
+}
+
+function showDiff(idx) {
+  var older = state.hist[idx + 1];
+  var cur = state.hist[idx];
+  if (!older) { say("Это самый старый коммит в выборке, раньше изменений не видно"); return; }
+  var url = "git/diff?from=" + older.sha + "&to=" + cur.sha +
+    (state.current ? "&path=" + encodeURIComponent(state.current) : "");
+  fetch(url, { headers: AUTH })
+    .then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.text();
+    })
+    .then(function (text) {
+      var box = $("diffbox");
+      box.textContent = "";
+      if (state.tab !== "history") showTab("history");
+      var head = document.createElement("p");
+      head.className = "note";
+      head.textContent = "Изменения " + older.sha.slice(0, 7) + " -> " + cur.sha.slice(0, 7) + ":";
+      var pre = document.createElement("pre");
+      text.split("\n").forEach(function (line, n2, arr) {
+        var span = document.createElement("span");
+        span.textContent = line + (n2 < arr.length - 1 ? "\n" : "");
+        if (/^\+/.test(line) && !/^\+\+\+/.test(line)) span.className = "add";
+        else if (/^-/.test(line) && !/^---/.test(line)) span.className = "del";
+        else if (/^@@/.test(line)) span.className = "hunk";
+        pre.appendChild(span);
+      });
+      box.append(head, pre);
+      box.scrollIntoView({ behavior: "smooth" });
+    })
+    .catch(function (e2) { say("Дифф не загрузился: " + e2.message, true); });
+}
+
+function openEditor() {
+  var path = state.current;
+  if (!editable(path)) return;
+  fetch(fileUrl(path), { headers: AUTH })
+    .then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.text();
+    })
+    .then(function (text) {
+      $("edit-path").textContent = path;
+      $("edit-text").value = text;
+      note("");
+      $("overlay").classList.add("open");
+      $("edit-text").focus();
+    })
+    .catch(function (e2) { say("Файл не открылся: " + e2.message, true); });
+}
+
+function saveEdit(ev) {
+  ev.preventDefault();
+  var path = state.current;
+  var sha = state.shaByPath[path];
+  if (sha === undefined) { say("Нет текущего хеша файла, перечитайте манифест", true); return; }
+  var opts = { method: "PUT", headers: Object.assign({ "If-Match": sha }, AUTH),
+               body: new Blob([$("edit-text").value]) };
+  fetch(fileUrl(path), opts)
+    .then(function (r) {
+      if (r.status === 412) {
+        note("Файл изменился с момента чтения. Перечитайте и перенесите правки.");
+        say("Файл на сервере уже другой (412)", true);
+        return null;
+      }
+      if (r.status !== 201 && r.status !== 204) throw new Error("HTTP " + r.status);
+      $("overlay").classList.remove("open");
+      say("Сохранено");
+      return refresh();
+    })
+    .catch(function (e2) { say("Правка не сохранилась: " + e2.message, true); });
+}
+
+function refresh() {
+  return fetch("manifest", { headers: AUTH })
+    .then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    })
+    .then(function (m) {
+      state.entries = (m.entries || []).slice().sort(function (a, b) { return a.path < b.path ? -1 : 1; });
+      state.shaByPath = {};
+      state.entries.forEach(function (e) { state.shaByPath[e.path] = e.sha256; });
+      renderList();
+      if (state.current && state.shaByPath[state.current] === undefined) state.current = null;
+      if (!state.current && state.entries.length) {
+        state.current = (state.entries.find(function (e) { return /\.md$/i.test(e.path); }) || state.entries[0]).path;
+      }
+      if (state.current) select(state.current, true);
+      return null;
+    });
+}
+
+function boot() {
+  state.canEdit = tokenScope().indexOf("share:write") >= 0;
+  document.body.classList.toggle("write", state.canEdit);
+  $("title").textContent = "Шара " + shareId;
+  $("mode").textContent = state.canEdit ? "правка" : "просмотр";
+  $("tab-history").onclick = function () { showTab("history"); loadHistory(); };
+  $("tab-file").onclick = function () { showTab("file"); };
+  $("btn-edit").onclick = openEditor;
+  $("btn-history").onclick = function () { showTab("history"); loadHistory(); };
+  $("edit-cancel").onclick = function () { $("overlay").classList.remove("open"); };
+  $("editor").addEventListener("submit", saveEdit);
+  $("msg-close").onclick = function () { $("msg").classList.remove("open"); };
+
+  refresh().catch(function (e) {
+    if (String(e.message).indexOf("403") >= 0 || String(e.message).indexOf("401") >= 0) {
+      say("Токен не принят: ссылка протухла или не от этой шары", true);
+    } else {
+      say("Манифест не загрузился: " + e.message, true);
+    }
+  });
+  // Проба истории отдельной правки: PUT живёт без git, история нет.
+  fetch("git/log?limit=1", { headers: AUTH }).then(function (r) {
+    state.hasHistory = r.ok;
+  }).catch(function () { state.hasHistory = false; });
+}
+
+boot();
+</script>
+</body>
+</html>
