@@ -1782,6 +1782,21 @@ fn check_delete_path(raw: String) -> Result<String, String> {
     Ok(raw)
 }
 
+/// The file whose history `git/log` asks for. Unlike a delete, an empty name
+/// is a valid query (the whole share's log), so blank turns into `None`
+/// instead of an error; a real path goes through untouched.
+fn history_path_arg(raw: String) -> Option<String> {
+    if raw.trim().is_empty() { None } else { Some(raw) }
+}
+
+/// The local file an upload sends. A missing source fails before the network
+/// with a named error, otherwise a temp-path slip would surface as a
+/// transport failure and send the user to check the connection.
+fn check_src_file(raw: String) -> Result<PathBuf, String> {
+    let p = PathBuf::from(raw);
+    if p.is_file() { Ok(p) } else { Err(format!("bad_src: файл не найден: {}", p.display())) }
+}
+
 /// The manifest row's hash for `If-Match`. An empty string (an offline row has
 /// no hash) means no condition at all, not the hash of an empty file.
 fn optional_hash(raw: &str) -> Option<String> {
@@ -1839,6 +1854,115 @@ jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_
         }
         Ok(Err(e)) | Err(e) => {
             journal_log("WARN", "files", &format!("удаление {path} из шары {share_id}: {e}"));
+            json_error(&e)
+        }
+    };
+    jstring_into_raw(&mut env, json)
+});
+
+// The share's commit history (LLD-33, the history screen): the agent's
+// `git/log` for `path` (an empty string asks for the whole share), newest
+// first, up to `limit` commits. Returns the JSON array of
+// `{sha,author,date,subject}` or `{"error":".."}`: a read-only grant fails
+// before the network with `no_write_scope`, a share without the git contour
+// answers `git_off`.
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeGitLog(
+    mut env: JNIEnv,
+    _class: JClass,
+    addr: JString,
+    port: jint,
+    token_json: JString,
+    agent_pubkey: JString,
+    relay_json: JString,
+    path: JString,
+    limit: jint,
+    timeout_ms: jlong,
+) -> jstring {
+    type LogArgs = (String, ShareToken, String, Option<RelayGrant>, Option<String>);
+    let parts = (|| -> Result<LogArgs, String> {
+        let addr = read_jstring(&mut env, &addr)?;
+        let tok = read_jstring(&mut env, &token_json).and_then(|s| parse_token(&s))?;
+        let pubkey = read_jstring(&mut env, &agent_pubkey)?;
+        let relay = read_jstring(&mut env, &relay_json).ok().and_then(|s| parse_relay(&s));
+        let path = read_jstring(&mut env, &path).ok().and_then(history_path_arg);
+        Ok((addr, tok, pubkey, relay, path))
+    })();
+    let (addr, tok, pubkey, relay, path) = match parts {
+        Ok(p) => p,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let share_id = tok.share_id.clone();
+    let grant = grant_from_parts(addr, port.max(0) as u16, tok, pubkey, relay);
+    let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+
+    let json = match with_onboarding_runtime(sync::git_log(
+        &grant,
+        path.as_deref(),
+        limit.clamp(1, 500) as u32,
+        timeout,
+    )) {
+        Ok(Ok(rows)) => serde_json::to_string(&rows)
+            .unwrap_or_else(|e| json_error(&format!("serialize: {e}"))),
+        Ok(Err(e)) | Err(e) => {
+            journal_log("WARN", "files", &format!("история шары {share_id}: {e}"));
+            json_error(&e)
+        }
+    };
+    jstring_into_raw(&mut env, json)
+});
+
+// Upload a local file into the share over the write contour (LLD-28): the
+// on-device edit (LLD-33) writes the editor's text to a temp file and sends
+// it here. `expected_sha` is the manifest row's hash the edit started from
+// and travels as `If-Match`, so a file the owner replaced meanwhile answers
+// `412` instead of being clobbered; an empty string uploads unconditionally.
+// Returns `{"ok":true}` or `{"error":".."}`.
+jni_entry!(panic_json_reply(&mut env); fn Java_com_xrproxy_app_jni_NativeBridge_nativeUploadFile(
+    mut env: JNIEnv,
+    _class: JClass,
+    addr: JString,
+    port: jint,
+    token_json: JString,
+    agent_pubkey: JString,
+    relay_json: JString,
+    path: JString,
+    src_path: JString,
+    expected_sha: JString,
+    timeout_ms: jlong,
+) -> jstring {
+    type UploadArgs =
+        (String, ShareToken, String, Option<RelayGrant>, String, PathBuf, Option<String>);
+    let parts = (|| -> Result<UploadArgs, String> {
+        let addr = read_jstring(&mut env, &addr)?;
+        let tok = read_jstring(&mut env, &token_json).and_then(|s| parse_token(&s))?;
+        let pubkey = read_jstring(&mut env, &agent_pubkey)?;
+        let relay = read_jstring(&mut env, &relay_json).ok().and_then(|s| parse_relay(&s));
+        let path = read_jstring(&mut env, &path).and_then(check_delete_path)?;
+        let src = read_jstring(&mut env, &src_path).and_then(check_src_file)?;
+        let expected = read_jstring(&mut env, &expected_sha).ok().and_then(|s| optional_hash(&s));
+        Ok((addr, tok, pubkey, relay, path, src, expected))
+    })();
+    let (addr, tok, pubkey, relay, path, src, expected) = match parts {
+        Ok(p) => p,
+        Err(e) => return jstring_into_raw(&mut env, json_error(&e)),
+    };
+    let share_id = tok.share_id.clone();
+    let grant = grant_from_parts(addr, port.max(0) as u16, tok, pubkey, relay);
+    let timeout = Duration::from_millis(timeout_ms.max(0) as u64);
+
+    let json = match with_onboarding_runtime(sync::upload_file(
+        &grant,
+        &path,
+        &src,
+        expected.as_deref(),
+        timeout,
+    )) {
+        Ok(Ok(())) => {
+            journal_log("INFO", "files", &format!("загружено в шару {share_id}: {path}"));
+            serde_json::json!({ "ok": true }).to_string()
+        }
+        Ok(Err(e)) | Err(e) => {
+            journal_log("WARN", "files", &format!("загрузка {path} в шару {share_id}: {e}"));
             json_error(&e)
         }
     };
@@ -2047,6 +2171,32 @@ mod tests {
         assert_eq!(optional_hash(""), None);
         assert_eq!(optional_hash("  "), None);
         assert_eq!(optional_hash(" abc123 "), Some("abc123".to_string()));
+    }
+
+    /// История с пустым путём это валидный запрос всего журнала шары, а не
+    /// ошибка: пустота обязана стать None, иначе экран истории файла без
+    /// имени слал бы лишний отказ.
+    #[test]
+    fn history_path_blank_is_none() {
+        assert_eq!(history_path_arg(String::new()), None);
+        assert_eq!(history_path_arg("   ".into()), None);
+        assert_eq!(history_path_arg("notes.md".into()), Some("notes.md".to_string()));
+    }
+
+    /// Источник загрузки обязан существовать до сети: временный файл правки
+    /// мог не создаться, и безымянный отказ уходил бы в сетевую диагностику.
+    #[test]
+    fn missing_src_file_is_named_error() {
+        let err = check_src_file("/нет/такого/файла.txt".into()).unwrap_err();
+        assert!(err.starts_with("bad_src: "), "{err}");
+    }
+
+    #[test]
+    fn src_file_passes_through() {
+        let p = std::env::temp_dir().join("xr190-jni-src-check.txt");
+        std::fs::write(&p, b"text").unwrap();
+        assert_eq!(check_src_file(p.to_string_lossy().into_owned()).unwrap(), p);
+        let _ = std::fs::remove_file(&p);
     }
 
     /// Пустое действие по умолчанию (так его шлёт экран правил после
