@@ -18,6 +18,8 @@ mod relay;
 mod safepath;
 mod server;
 mod setup;
+#[cfg(feature = "sync")]
+mod sync_cmd;
 mod web_page;
 
 use std::net::SocketAddr;
@@ -80,6 +82,12 @@ enum Commands {
     /// Start a URL-import job on a writable share and poll it to completion
     /// (LLD-29): the agent downloads the page's content with its plugin.
     Import(cli::ImportArgs),
+    /// Совместное редактирование текстовой шары (LLD-33): рабочая папка держится
+    /// в синке с шарой сама, локальные правки уезжают наверх, встречные
+    /// приезжают. Пересечение по строкам не сливается молча: встречная версия
+    /// кладётся рядом конфликт-копией.
+    #[cfg(feature = "sync")]
+    Sync(sync_cmd::SyncArgs),
     /// Открыть наружу локальный HTTP-сервис этой машины (LLD-38): завести
     /// публикацию, снять её, посмотреть список или проверить путь локально.
     Expose {
@@ -127,6 +135,8 @@ fn main() -> Result<()> {
         Some(Commands::Rm(args)) => return push::rm(args),
         Some(Commands::Weblink(args)) => return push::weblink(args),
         Some(Commands::Import(args)) => return cli::import(args),
+        #[cfg(feature = "sync")]
+        Some(Commands::Sync(args)) => return sync_cmd::sync(args),
         Some(Commands::Expose { command }) => return expose::run(&config_path, command),
         Some(Commands::Service { action }) => {
             return match action {

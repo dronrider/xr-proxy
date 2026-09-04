@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = []
+default = ["sync"]
 # Direct HTTPS serving via axum-server/rustls. Optional because it pulls the
 # aws-lc C crypto backend, which doesn't cross-compile to Windows. The default
 # build is HTTP-only (ring-only deps) and cross-compiles everywhere; ureq (for
@@ -23,6 +23,16 @@ relay = [
     "dep:tokio-rustls",
     "xr-proto/relay-tls",
     "ed25519-dalek/pkcs8",
+]
+# Харнесс `xr-share sync` (LLD-33 п. 2.5): libgit2 с vendored-сборкой без
+# TLS-бэкендов (прямой путь plain HTTP, авторитет у подписи HEAD; relay-путь
+# терминируется нашим rustls-мостом с пиннингом, п. 3.2). Опционально: C-сборка
+# libgit2 тяжела для кросс-компиляции агента, лёгкий бинарь собирается
+# `--no-default-features`, как и с фичей `relay`.
+sync = [
+    "dep:git2",
+    "dep:tokio-rustls",
+    "xr-proto/relay-tls",
 ]
 
 [dependencies]
@@ -73,6 +83,11 @@ anyhow = "1"
 # реверс-стримами mux. ring-бэкенд, чтобы кросс-сборка не тянула aws-lc.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"], optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+
+# Харнесс `xr-share sync` (feature `sync`, LLD-33 п. 2.5): vendored libgit2 без
+# https/ssh, транспорт только plain HTTP (прямой адрес или наш relay-мост на
+# loopback), поэтому крипто-бэкендов в C-сборке нет вовсе.
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"], optional = true }
 
 # Убить группу процессов плагина импорта (LLD-29): yt-dlp порождает ffmpeg, и
 # child.kill() оставил бы его сиротой качать дальше. Только unix, на Windows

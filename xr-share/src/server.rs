@@ -740,6 +740,22 @@ fn git_gates(
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "git repository unavailable"))
 }
 
+/// Ответ отказа гейтов git-контура (LLD-33 п. 2.5). На `401` добавляется
+/// `WWW-Authenticate: Basic`: libgit2 (харнесс `sync`) и штатный git-клиент
+/// посылают креды basic-авторизации только после такого вызова, без него
+/// первый неаутентифицированный запрос для них окончателен.
+fn git_gate_response(e: (StatusCode, &'static str)) -> Response {
+    if e.0 == StatusCode::UNAUTHORIZED {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Basic realm=\"xr-share\"")],
+            e.1,
+        )
+            .into_response();
+    }
+    e.into_response()
+}
+
 /// One value of a query parameter, if present, raw (undecoded). The git
 /// routes' own parameters are hex shas and digits, which need no decoding;
 /// the `path` parameter decodes itself, see [percent_decode].
@@ -809,7 +825,7 @@ async fn git_info_refs(
     };
     let share = match git_gates(&state, &share_id, req.headers(), &uri) {
         Ok(s) => s,
-        Err(e) => return e.into_response(),
+        Err(e) => return git_gate_response(e),
     };
     let out = tokio::process::Command::new("git")
         .arg(rpc.sub())
@@ -871,7 +887,7 @@ async fn git_rpc(state: Arc<AgentState>, share_id: String, req: Request, rpc: Gi
     let (parts, body) = req.into_parts();
     let share = match git_gates(&state, &share_id, &parts.headers, &parts.uri) {
         Ok(s) => s,
-        Err(e) => return e.into_response(),
+        Err(e) => return git_gate_response(e),
     };
     let op_guard = if rpc == GitRpc::ReceivePack {
         Some(share.op_lock.clone().lock_owned().await)
@@ -1032,7 +1048,7 @@ async fn git_head(
     let uri = req.uri().clone();
     let share = match git_gates(&state, &share_id, req.headers(), &uri) {
         Ok(s) => s,
-        Err(e) => return e.into_response(),
+        Err(e) => return git_gate_response(e),
     };
     let mut rx = share.head_tx.subscribe();
     let since = query_param(&uri, "since");
@@ -2856,13 +2872,16 @@ mod tests {
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
 
         // Нет токена -> 401; токен без write -> 403: весь контур, fetch
-        // включительно, живёт под share:write (LLD-33 п. 2.3).
+        // включительно, живёт под share:write (LLD-33 п. 2.3). На 401 зовётся
+        // basic-вызов: libgit2 харнесса посылает креды только после него
+        // (LLD-33 п. 2.5).
         let r = app
             .clone()
             .oneshot(get_with_token("/W/git/info/refs?service=git-upload-pack", None))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(r.headers().get("www-authenticate").unwrap(), "Basic realm=\"xr-share\"");
         let rtok = sign_share_token(&key, "W", SCOPE_READ, now_unix() + 1000);
         let r = app
             .clone()

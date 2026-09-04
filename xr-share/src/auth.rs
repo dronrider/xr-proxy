@@ -25,8 +25,22 @@ pub fn extract_token(headers: &HeaderMap, uri: &Uri) -> Option<ShareToken> {
 }
 
 fn bearer(headers: &HeaderMap) -> Option<String> {
-    header_value(headers, "authorization")
-        .and_then(|v| v.strip_prefix("Bearer ").map(str::to_string))
+    let value = header_value(headers, "authorization")?;
+    if let Some(blob) = value.strip_prefix("Bearer ") {
+        return Some(blob.to_string());
+    }
+    // Git-контур: libgit2 и штатный git-клиент в HTTP умеют только basic-авторизацию
+    // (токен в URL либо credentials callback), поэтому пароль basic-заголовка
+    // принимается за тот же токен-блоб. Имя пользователя игнорируется.
+    let encoded = value.strip_prefix("Basic ")?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())?;
+    decoded
+        .split_once(':')
+        .map(|(_, password)| password.trim().to_string())
+        .filter(|password| !password.is_empty())
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -85,6 +99,26 @@ mod tests {
         let t = sample();
         let uri: Uri = format!("/file/a.txt?token={}", blob(&t)).parse().unwrap();
         assert_eq!(extract_token(&HeaderMap::new(), &uri), Some(t));
+    }
+
+    #[test]
+    fn extracts_from_basic_password() {
+        // Git-контур (LLD-33 п. 2.5): libgit2 идёт basic-авторизацией, токен это
+        // пароль, имя пользователя произвольное.
+        let t = sample();
+        let b = blob(&t);
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("xr-share:{b}"));
+        let mut h = HeaderMap::new();
+        h.insert("authorization", format!("Basic {basic}").parse().unwrap());
+        assert_eq!(extract_token(&h, &Uri::from_static("/W/git/head")), Some(t));
+    }
+
+    #[test]
+    fn basic_without_password_is_ignored() {
+        let basic = base64::engine::general_purpose::STANDARD.encode("xr-share:");
+        let mut h = HeaderMap::new();
+        h.insert("authorization", format!("Basic {basic}").parse().unwrap());
+        assert_eq!(extract_token(&h, &Uri::from_static("/manifest")), None);
     }
 
     #[test]

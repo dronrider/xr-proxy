@@ -82,7 +82,7 @@ impl GitSettings {
 /// name or a full `Name <email>` string), else the hostname with a fixed
 /// domain. Co-authors should see whose machine pushed a change without anyone
 /// setting anything up.
-fn author_pair(configured: Option<&str>) -> (String, String) {
+pub(crate) fn author_pair(configured: Option<&str>) -> (String, String) {
     let host = hostname();
     let Some(given) = configured.map(str::trim).filter(|s| !s.is_empty()) else {
         return (host.clone(), format!("{host}@xr-share"));
@@ -451,23 +451,7 @@ exit 0
     /// (git's notation). The `.xr-` namespace is excluded wholesale by
     /// `info/exclude`, so it never even reaches this scan.
     fn scan_oversize(&self) -> Result<Vec<String>> {
-        let cap_bytes = self.settings.max_file_mb.saturating_mul(1024 * 1024);
-        let mut oversize = Vec::new();
-        for entry in walkdir::WalkDir::new(&self.worktree).follow_links(false) {
-            let entry = entry.with_context(|| format!("walking {}", self.worktree.display()))?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
-            if meta.len() > cap_bytes {
-                let rel = entry
-                    .path()
-                    .strip_prefix(&self.worktree)
-                    .expect("walkdir yields paths under the root");
-                oversize.push(rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"));
-            }
-        }
-        Ok(oversize)
+        scan_oversize_paths(&self.worktree, self.settings.max_file_mb)
     }
 
     /// Rewrite the managed block of `$GIT_DIR/info/exclude` from the oversize
@@ -475,36 +459,7 @@ exit 0
     /// itself is regenerated, so a file that shrank back under the cap returns
     /// to history on the next commit.
     fn write_managed_exclude(&self, oversize: &[String]) -> Result<()> {
-        let exclude = self.git_dir.join("info").join("exclude");
-        let current = std::fs::read_to_string(&exclude).context("reading info/exclude")?;
-        let mut kept: Vec<&str> = current
-            .lines()
-            .take_while(|l| l.trim() != EXCLUDE_MANAGED_MARKER)
-            .collect();
-        if !kept.iter().any(|l| l.trim() == EXCLUDE_SERVICE) {
-            kept.push(EXCLUDE_SERVICE);
-        }
-        let mut text = kept.join("\n");
-        if oversize.is_empty() {
-            // Drop a stale managed block entirely: nothing is over the cap.
-            let after_marker: Vec<&str> = current
-                .lines()
-                .skip_while(|l| l.trim() != EXCLUDE_MANAGED_MARKER)
-                .collect();
-            if !after_marker.is_empty() {
-                text.push('\n');
-            }
-        } else {
-            text.push('\n');
-            text.push('\n');
-            text.push_str(EXCLUDE_MANAGED_MARKER);
-            for path in oversize {
-                text.push('\n');
-                text.push_str(path);
-            }
-            text.push('\n');
-        }
-        std::fs::write(&exclude, text).with_context(|| format!("writing {}", exclude.display()))
+        write_managed_exclude(&self.git_dir, oversize)
     }
 
     /// A commit pass under the share lock, off the async executor. Publishing
@@ -615,9 +570,71 @@ fn is_repo(dir: &Path) -> bool {
     dir.join("HEAD").is_file() && dir.join("objects").is_dir() && dir.join("refs").is_dir()
 }
 
+/// Файлы крупнее колпака, `/`-путями от корня шары (нотация git). Общий код
+/// агентского цикла и харнесса `sync` (LLD-33 п. 2.5: колпак одинаковый с
+/// обеих сторон).
+pub(crate) fn scan_oversize_paths(worktree: &Path, max_file_mb: u64) -> Result<Vec<String>> {
+    let cap_bytes = max_file_mb.saturating_mul(1024 * 1024);
+    let mut oversize = Vec::new();
+    for entry in walkdir::WalkDir::new(worktree).follow_links(false) {
+        let entry = entry.with_context(|| format!("walking {}", worktree.display()))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
+        if meta.len() > cap_bytes {
+            let rel = entry
+                .path()
+                .strip_prefix(worktree)
+                .expect("walkdir yields paths under the root");
+            oversize.push(rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"));
+        }
+    }
+    Ok(oversize)
+}
+
+/// Перезапись ведомого блока `$GIT_DIR/info/exclude` по списку сверхколпачных
+/// файлов. Строки над маркером (рукописные и служебный `.xr-*`) не трогаются,
+/// сам список пересобирается: файл, ужавшийся под колпак, возвращается в
+/// историю следующим коммитом. `git_dir` у агента это каталог репозитория в
+/// данных, у харнесса `sync` это `<папка>/.git` его собственного клона.
+pub(crate) fn write_managed_exclude(git_dir: &Path, oversize: &[String]) -> Result<()> {
+    let exclude = git_dir.join("info").join("exclude");
+    let current = std::fs::read_to_string(&exclude).context("reading info/exclude")?;
+    let mut kept: Vec<&str> = current
+        .lines()
+        .take_while(|l| l.trim() != EXCLUDE_MANAGED_MARKER)
+        .collect();
+    if !kept.iter().any(|l| l.trim() == EXCLUDE_SERVICE) {
+        kept.push(EXCLUDE_SERVICE);
+    }
+    let mut text = kept.join("\n");
+    if oversize.is_empty() {
+        // Drop a stale managed block entirely: nothing is over the cap.
+        let after_marker: Vec<&str> = current
+            .lines()
+            .skip_while(|l| l.trim() != EXCLUDE_MANAGED_MARKER)
+            .collect();
+        if !after_marker.is_empty() {
+            text.push('\n');
+        }
+    } else {
+        text.push('\n');
+        text.push('\n');
+        text.push_str(EXCLUDE_MANAGED_MARKER);
+        for path in oversize {
+            text.push('\n');
+            text.push_str(path);
+        }
+        text.push('\n');
+    }
+    std::fs::write(&exclude, text).with_context(|| format!("writing {}", exclude.display()))
+}
+
 /// Commit subject from the staged paths: up to three named, the rest counted
 /// (LLD-33 п. 2.2). Paths are squashed to one line so the subject stays one.
-fn commit_subject(paths: &[String]) -> String {
+/// Используется и агентским циклом, и харнессом `sync` (фича `sync`).
+pub(crate) fn commit_subject(paths: &[String]) -> String {
     let clean = |p: &str| p.replace(['\n', '\r'], " ");
     let shown: Vec<String> = paths.iter().take(3).map(|p| clean(p)).collect();
     let mut subject = shown.join(", ");

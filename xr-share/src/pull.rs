@@ -53,7 +53,7 @@ pub struct PullArgs {
 
 /// One share on an invite, as the hub returns it (`GET /invite/{t}/shares`).
 /// Shared by the `pull` receiver and the `push`/`rm` harness (LLD-28).
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 pub(crate) struct InviteShareDto {
     pub(crate) share_id: String,
     pub(crate) name: String,
@@ -69,6 +69,11 @@ pub(crate) struct InviteShareDto {
     #[serde(default)]
     pub(crate) agent_pubkey: String,
     pub(crate) token: String,
+    /// Relay-лег гранта (LLD-23 п. 2.4), если шара помечена `via_relay`.
+    /// Харнесс `sync` берёт его последним кандидатом транспорта, когда ни один
+    /// прямой адрес не отвечает; `pull`/`push` живут прямым путём (XR-103).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) relay: Option<xr_proto::share::RelayGrant>,
 }
 
 impl InviteShareDto {
@@ -445,6 +450,7 @@ mod tests {
             port: 8443,
             agent_pubkey: String::new(),
             token: "t".into(),
+            relay: None,
         }
     }
 

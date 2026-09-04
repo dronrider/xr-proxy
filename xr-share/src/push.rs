@@ -198,7 +198,7 @@ pub(crate) fn select_share(hub: &str, invite: &str, want: &str) -> Result<Invite
 
 /// Refuse before touching the network if the grant's token has no write scope:
 /// this invite is read-only for the share (no write binding on the hub).
-fn ensure_writable_grant(share: &InviteShareDto) -> Result<()> {
+pub(crate) fn ensure_writable_grant(share: &InviteShareDto) -> Result<()> {
     let token = crate::auth::decode_token_blob(&share.token)
         .context("токен гранта не декодируется")?;
     if !scope_contains(&token.scope, SCOPE_WRITE) {
