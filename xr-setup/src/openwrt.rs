@@ -56,31 +56,52 @@ impl Step for ProcdService {
     }
 }
 
-/// Апстримы DNS роутера: dnsmasq переводится на Quad9 мимо резолверов
-/// провайдера, как настроен живой флот.
-pub const QUAD9: [&str; 2] = ["9.9.9.9", "149.112.112.112"];
+/// Апстрим dnsmasq это локальный DNS-форвардер xr-client (XR-285): он уносит
+/// резолв в туннель и говорит с публичным резолвером по DoT. Раньше тут стоял
+/// Quad9 обычным UDP:53, и провайдер подменял ответ от него ровно так же, как
+/// от своего: поддельный NXDOMAIN клал сайт до того, как перехвату было что
+/// перехватывать.
+pub struct DnsmasqForwarder {
+    /// Порт форвардера на петле, тот же, что в секции `[dns]` конфига клиента.
+    pub port: u16,
+}
 
-pub struct DnsmasqQuad9;
+/// Единственный апстрим, который дозволен dnsmasq.
+pub fn dnsmasq_upstream(port: u16) -> String {
+    format!("127.0.0.1#{port}")
+}
 
-impl Step for DnsmasqQuad9 {
+/// Стоит ли dnsmasq в целевом состоянии. Список апстримов обязан состоять
+/// ровно из форвардера: соседний адрес в нём dnsmasq спрашивает наравне, и
+/// часть запросов ушла бы из LAN открытым UDP, а какая именно, решал бы
+/// случай. `noresolv` отрезает апстримы, которые роутеру раздал провайдер по
+/// DHCP.
+pub fn dnsmasq_state_ok(noresolv: bool, servers: &str, port: u16) -> bool {
+    let listed: Vec<&str> = servers.split_whitespace().collect();
+    noresolv && listed == [dnsmasq_upstream(port)]
+}
+
+impl Step for DnsmasqForwarder {
     fn name(&self) -> String {
-        "dnsmasq:quad9".into()
+        "dnsmasq:tunnel".into()
     }
 
     fn check(&self) -> Result<bool> {
         let noresolv = uci_get("dhcp.@dnsmasq[0].noresolv").as_deref() == Some("1");
         let servers = uci_get("dhcp.@dnsmasq[0].server").unwrap_or_default();
-        Ok(noresolv && QUAD9.iter().all(|ip| servers.split_whitespace().any(|s| s == *ip)))
+        Ok(dnsmasq_state_ok(noresolv, &servers, self.port))
     }
 
     fn apply(&self) -> Result<()> {
         run_cmd(&["uci", "set", "dhcp.@dnsmasq[0].noresolv=1"])?;
-        // Список переписывается целиком: старые апстримы провайдера в нём
-        // и есть то, от чего уходим.
+        // Список переписывается целиком: и апстримы провайдера, и Quad9 с
+        // прежних раскладок это ровно то, от чего уходим.
         let _ = run_cmd(&["uci", "-q", "delete", "dhcp.@dnsmasq[0].server"]);
-        for ip in QUAD9 {
-            run_cmd(&["uci", "add_list", &format!("dhcp.@dnsmasq[0].server={ip}")])?;
-        }
+        run_cmd(&[
+            "uci",
+            "add_list",
+            &format!("dhcp.@dnsmasq[0].server={}", dnsmasq_upstream(self.port)),
+        ])?;
         run_cmd(&["uci", "commit", "dhcp"])?;
         run_cmd(&["/etc/init.d/dnsmasq", "restart"])
     }
@@ -195,5 +216,18 @@ wireless.wwan.ssid='UPSTREAM'
     #[test]
     fn ap_sections_empty_on_no_wifi() {
         assert!(ap_sections("").is_empty());
+    }
+
+    #[test]
+    fn dnsmasq_state_wants_only_the_forwarder() {
+        assert!(dnsmasq_state_ok(true, "127.0.0.1#5353", 5353));
+        assert!(!dnsmasq_state_ok(false, "127.0.0.1#5353", 5353), "без noresolv едут апстримы провайдера");
+        assert!(!dnsmasq_state_ok(true, "", 5353));
+        assert!(!dnsmasq_state_ok(true, "9.9.9.9 149.112.112.112", 5353), "прежняя раскладка на Quad9 это не целевое состояние");
+        assert!(
+            !dnsmasq_state_ok(true, "127.0.0.1#5353 9.9.9.9", 5353),
+            "соседний открытый апстрим dnsmasq спрашивает наравне, и часть запросов уходит голыми"
+        );
+        assert!(!dnsmasq_state_ok(true, "127.0.0.1#5300", 5353), "порт форвардера обязан совпадать с конфигом клиента");
     }
 }

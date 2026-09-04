@@ -127,6 +127,11 @@ pub struct RouterTomlParams {
     pub bypass_rules: Vec<String>,
 }
 
+/// Порт локального DNS-форвардера на петле (XR-285). Одна константа на
+/// конфиг клиента и на раскладку dnsmasq: разъедься они, dnsmasq спрашивал бы
+/// пустоту, и LAN осталась бы без резолва вовсе.
+pub const DNS_FORWARDER_PORT: u16 = 5353;
+
 pub fn render_router_toml(p: &RouterTomlParams) -> String {
     let mut out = String::from(
         "# xr-proxy client config (сгенерирован xr-setup, XR-177)\n\
@@ -160,6 +165,11 @@ pub fn render_router_toml(p: &RouterTomlParams) -> String {
     if let Some((url, preset)) = &p.hub {
         out.push_str(&format!("\n[hub]\nurl = \"{url}\"\npreset = \"{preset}\"\n"));
     }
+    // Секция пишется явно, хотя значения и совпадают с умолчанием клиента:
+    // порт тут читает человек, который полез в конфиг за раскладкой dnsmasq.
+    out.push_str(&format!(
+        "\n[dns]\nlisten = \"127.0.0.1:{DNS_FORWARDER_PORT}\"\nupstreams = [\"9.9.9.9:853\", \"149.112.112.112:853\"]\ntls_name = \"dns.quad9.net\"\n"
+    ));
     out
 }
 

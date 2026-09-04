@@ -6,7 +6,7 @@
 use crate::actions::{InstallBinary, InstallScript, Restart, Sysctl, WriteConfig};
 use crate::arch::Arch;
 use crate::fetch::BinSource;
-use crate::openwrt::{DnsmasqQuad9, ProcdService, WifiSsid};
+use crate::openwrt::{DnsmasqForwarder, ProcdService, WifiSsid};
 use crate::render::{
     render_control_section, render_router_toml, RouterTomlParams, KILLSWITCH_CLEANUP,
     KILLSWITCH_SETUP, ROUTER_INIT, ROUTER_SYSCTL_CONF, ROUTER_WATCHDOG, UDP_TPROXY_CLEANUP,
@@ -215,10 +215,12 @@ pub fn plan(r: &Resolved) -> Vec<Box<dyn Step>> {
     ];
 
     // Enroll после старта клиента (LLD-13 п. 2.1) и после dnsmasq: имя
-    // хаба резолвится уже через Quad9, а не через резолверы провайдера.
-    // SSID строго последним (п. 5.9): смена сети не должна оборвать ни
-    // один шаг после себя.
-    steps.push(Box::new(DnsmasqQuad9));
+    // хаба резолвится уже форвардером через туннель, а не резолверами
+    // провайдера. SSID строго последним (п. 5.9): смена сети не должна
+    // оборвать ни один шаг после себя.
+    steps.push(Box::new(DnsmasqForwarder {
+        port: crate::render::DNS_FORWARDER_PORT,
+    }));
     if let Some(e) = &r.enroll {
         steps.push(Box::new(EnrollStep {
             config_path: PathBuf::from(CLIENT_CONF),
@@ -415,7 +417,7 @@ mod tests {
                 "script:udp-tproxy-cleanup",
                 "sysctl",
                 "service:xr-proxy",
-                "dnsmasq:quad9",
+                "dnsmasq:tunnel",
             ]
         );
     }
@@ -425,8 +427,35 @@ mod tests {
         let names = names(&resolved(true, true));
         let pos = |n: &str| names.iter().position(|x| x == n).unwrap();
         assert!(pos("hub:enroll") > pos("service:xr-proxy"), "enroll после старта клиента");
-        assert!(pos("hub:enroll") > pos("dnsmasq:quad9"), "имя хаба резолвится уже через Quad9");
+        assert!(
+            pos("hub:enroll") > pos("dnsmasq:tunnel"),
+            "имя хаба резолвится уже форвардером через туннель"
+        );
         assert_eq!(names.last().unwrap(), "wifi:ssid", "смена SSID строго последняя");
+    }
+
+    /// Порт в секции `[dns]` конфига и порт, на который шаг переводит dnsmasq,
+    /// это одно число (XR-285). Разъедься они, dnsmasq спрашивал бы пустоту, и
+    /// LAN осталась бы вообще без резолва: молчание вместо подделки.
+    #[test]
+    fn dnsmasq_upstream_matches_client_config() {
+        let r = resolved(false, false);
+        let cfg: xr_proto::config::ClientConfig = toml::from_str(&r.config).unwrap();
+        assert!(cfg.dns.enabled);
+        assert_eq!(
+            cfg.dns.listen,
+            format!("127.0.0.1:{}", crate::render::DNS_FORWARDER_PORT)
+        );
+        assert!(
+            crate::openwrt::dnsmasq_state_ok(
+                true,
+                &crate::openwrt::dnsmasq_upstream(crate::render::DNS_FORWARDER_PORT),
+                crate::render::DNS_FORWARDER_PORT
+            ),
+            "апстрим dnsmasq не сходится с листенером форвардера"
+        );
+        // Апстримы форвардера это DoT-порт: голым UDP из туннеля никто не ходит.
+        assert!(cfg.dns.upstreams.iter().all(|u| u.ends_with(":853")), "{:?}", cfg.dns.upstreams);
     }
 
     #[test]
