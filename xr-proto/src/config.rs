@@ -27,6 +27,11 @@ pub struct ClientConfig {
     pub udp_relay: Option<UdpRelayClientConfig>,
     #[serde(default)]
     pub hub: Option<HubClientConfig>,
+    /// Локальный DNS-форвардер клиента (XR-285). Секции нет в конфиге, значит
+    /// берутся значения по умолчанию: форвардер поднимается всегда, а вот
+    /// пойдёт ли к нему dnsmasq, решает раскладка `xr-setup`.
+    #[serde(default)]
+    pub dns: DnsClientConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,6 +240,43 @@ pub struct HubClientConfig {
     pub preset: String,
     #[serde(default = "default_refresh_interval")]
     pub refresh_interval_secs: u64,
+}
+
+/// DNS-форвардер клиента (XR-285): dnsmasq спрашивает его на localhost, а он
+/// уносит запрос в туннель и говорит с публичным резолвером по DoT. Провайдеру
+/// в этой схеме нечего подменять: из LAN не уходит ни одного открытого
+/// DNS-пакета, а адрес, который видит провайдер, это адрес нашего же VPS.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DnsClientConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Куда слать запросы dnsmasq. Только петля: форвардер отвечает без
+    /// обфускации, и снаружи его слушать некому.
+    #[serde(default = "default_dns_listen")]
+    pub listen: String,
+    /// Апстримы DoT в порядке обхода. Адрес разбирается как `SocketAddr`,
+    /// доменное имя тут не работает: резолвить его было бы нечем.
+    #[serde(default = "default_dns_upstreams")]
+    pub upstreams: Vec<String>,
+    /// Имя в сертификате апстрима. Оба адреса Quad9 по умолчанию живут под
+    /// одним именем, поэтому оно одно на список.
+    #[serde(default = "default_dns_tls_name")]
+    pub tls_name: String,
+    /// Сколько ждать ответа, прежде чем отдать спрашивающему SERVFAIL.
+    #[serde(default = "default_dns_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for DnsClientConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            listen: default_dns_listen(),
+            upstreams: default_dns_upstreams(),
+            tls_name: default_dns_tls_name(),
+            timeout_ms: default_dns_timeout_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -453,6 +495,20 @@ fn default_refresh_interval() -> u64 {
 fn default_mux_pool_size() -> usize {
     4
 }
+fn default_dns_listen() -> String {
+    "127.0.0.1:5353".to_string()
+}
+/// Quad9 по DoT: те же адреса, на которые установщик раньше переводил dnsmasq
+/// открытым UDP, только теперь разговор с ними идёт из туннеля.
+fn default_dns_upstreams() -> Vec<String> {
+    vec!["9.9.9.9:853".to_string(), "149.112.112.112:853".to_string()]
+}
+fn default_dns_tls_name() -> String {
+    "dns.quad9.net".to_string()
+}
+fn default_dns_timeout_ms() -> u64 {
+    5000
+}
 
 // ── Loaders ──────────────────────────────────────────────────────────
 
@@ -504,6 +560,32 @@ pub fn validate_client_config(config: &ClientConfig) -> Result<(), String> {
         format!("{}:{}", host, udp.vps_port)
             .parse::<SocketAddr>()
             .map_err(|e| format!("udp_relay: invalid vps address '{host}': {e}"))?;
+    }
+    if config.dns.enabled {
+        dns_reject_reason(&config.dns)?;
+    }
+    Ok(())
+}
+
+/// Почему секция `[dns]` не годится, либо `Ok(())`. Адреса тут разбираются
+/// строго: имя апстрима резолвить нечем, а бесадресный форвардер оставил бы
+/// dnsmasq без ответов, и вся LAN осталась бы без DNS.
+fn dns_reject_reason(dns: &DnsClientConfig) -> Result<(), String> {
+    dns.listen
+        .parse::<SocketAddr>()
+        .map_err(|e| format!("dns: invalid listen address '{}': {}", dns.listen, e))?;
+    if dns.upstreams.is_empty() {
+        return Err("dns: upstreams is empty, forwarder would have nobody to ask".to_string());
+    }
+    for up in &dns.upstreams {
+        up.parse::<SocketAddr>()
+            .map_err(|e| format!("dns: invalid upstream '{up}': {e}"))?;
+    }
+    if dns.tls_name.trim().is_empty() {
+        return Err("dns: tls_name is empty, upstream certificate cannot be checked".to_string());
+    }
+    if dns.timeout_ms == 0 {
+        return Err("dns: timeout_ms is 0, every query would fail instantly".to_string());
     }
     Ok(())
 }
@@ -899,6 +981,71 @@ vps_port = 9999
         let err = validate_client_config(&cfg).unwrap_err();
         assert!(err.contains("servers 'primary'"), "{err}");
         assert!(err.contains("invalid address 'vps.example.com'"), "{err}");
+    }
+
+    /// Секции `[dns]` в конфиге нет, а форвардер всё равно поднимается с
+    /// Quad9 по DoT: роутеры флота живут со старыми конфигами, и молча
+    /// оставить их на открытом резолве значит не закрыть XR-285 нигде.
+    #[test]
+    fn dns_defaults_without_section() {
+        let cfg = client_with("");
+        assert!(cfg.dns.enabled);
+        assert_eq!(cfg.dns.listen, "127.0.0.1:5353");
+        assert_eq!(cfg.dns.upstreams, vec!["9.9.9.9:853", "149.112.112.112:853"]);
+        assert_eq!(cfg.dns.tls_name, "dns.quad9.net");
+        validate_client_config(&cfg).unwrap();
+    }
+
+    /// Свои значения секции читаются целиком, включая список апстримов.
+    #[test]
+    fn dns_section_overrides_defaults() {
+        let cfg = client_with(
+            "\n[dns]\nenabled = false\nlisten = \"127.0.0.1:5300\"\nupstreams = [\"1.1.1.1:853\"]\ntls_name = \"one.one.one.one\"\ntimeout_ms = 1500",
+        );
+        assert!(!cfg.dns.enabled);
+        assert_eq!(cfg.dns.listen, "127.0.0.1:5300");
+        assert_eq!(cfg.dns.upstreams, vec!["1.1.1.1:853"]);
+        assert_eq!(cfg.dns.tls_name, "one.one.one.one");
+        assert_eq!(cfg.dns.timeout_ms, 1500);
+    }
+
+    /// Битую секцию `[dns]` называет сухая проверка, а не молчащий форвардер:
+    /// без ответов от него LAN остаётся вообще без резолва.
+    #[test]
+    fn validate_rejects_broken_dns_section() {
+        let mut cfg = client_with("");
+        cfg.dns.listen = "не адрес".into();
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("dns: invalid listen address"), "{err}");
+
+        cfg.dns.listen = "127.0.0.1:5353".into();
+        cfg.dns.upstreams = vec![];
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("upstreams is empty"), "{err}");
+
+        cfg.dns.upstreams = vec!["dns.quad9.net:853".into()];
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("invalid upstream 'dns.quad9.net:853'"), "{err}");
+
+        cfg.dns.upstreams = vec!["9.9.9.9:853".into()];
+        cfg.dns.tls_name = "  ".into();
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("tls_name is empty"), "{err}");
+
+        cfg.dns.tls_name = "dns.quad9.net".into();
+        cfg.dns.timeout_ms = 0;
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("timeout_ms is 0"), "{err}");
+    }
+
+    /// Выключенная секция не судится: `enabled = false` это осознанный отказ
+    /// от форвардера, и придираться к его полям в этом случае не за что.
+    #[test]
+    fn validate_skips_disabled_dns() {
+        let mut cfg = client_with("");
+        cfg.dns.enabled = false;
+        cfg.dns.listen = "мусор".into();
+        validate_client_config(&cfg).unwrap();
     }
 
     /// Override ключа в записи пула проверяется наравне с общим: у резерва
