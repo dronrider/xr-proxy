@@ -117,16 +117,31 @@ where
     let udp = UdpSocket::bind(listen).await?;
     let tcp = TcpListener::bind(listen).await?;
 
-    let timeout = Duration::from_millis(cfg.timeout_ms);
-    let (jobs_tx, jobs_rx) = mpsc::channel(256);
-    tokio::spawn(upstream_loop(jobs_rx, connect, timeout));
-    let forwarder = Forwarder { jobs: jobs_tx, timeout };
-
     tracing::info!(
         "DNS forwarder listening on {} (DoT through the tunnel, upstreams {})",
         listen,
         cfg.upstreams.join(", ")
     );
+
+    serve_forwarder(udp, tcp, Duration::from_millis(cfg.timeout_ms), connect).await
+}
+
+/// Обслуживание уже занятых листенеров. Отдельно от [`run_forwarder`], чтобы
+/// стенд занимал порт сам и не гонялся за ним с соседними тестами.
+async fn serve_forwarder<S, F, Fut>(
+    udp: UdpSocket,
+    tcp: TcpListener,
+    timeout: Duration,
+    connect: F,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = io::Result<S>> + Send + 'static,
+{
+    let (jobs_tx, jobs_rx) = mpsc::channel(256);
+    tokio::spawn(upstream_loop(jobs_rx, connect, timeout));
+    let forwarder = Forwarder { jobs: jobs_tx, timeout };
 
     tokio::select! {
         r = serve_udp(udp, forwarder.clone()) => r,
@@ -508,27 +523,18 @@ mod tests {
         Some(Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]))
     }
 
-    /// Порт, свободный и под UDP, и под TCP: форвардер занимает оба.
-    fn free_port() -> u16 {
+    /// Пара листенеров на одном порту, занятая сразу и до конца теста. Порт
+    /// не освобождается между выбором и захватом: прежний стенд отпускал его
+    /// и на полном прогоне ловил соседа, а форвардер молча не поднимался.
+    async fn bind_local() -> (UdpSocket, TcpListener, SocketAddr) {
         for _ in 0..50 {
-            let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind udp");
-            let port = udp.local_addr().unwrap().port();
-            drop(udp);
-            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-                return port;
+            let udp = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
+            let addr = udp.local_addr().unwrap();
+            if let Ok(tcp) = TcpListener::bind(addr).await {
+                return (udp, tcp, addr);
             }
         }
-        panic!("не нашёл свободного порта под стенд");
-    }
-
-    fn config(port: u16) -> DnsClientConfig {
-        DnsClientConfig {
-            enabled: true,
-            listen: format!("127.0.0.1:{port}"),
-            upstreams: vec!["203.0.113.9:853".to_string()],
-            tls_name: "dns.example".to_string(),
-            timeout_ms: 1500,
-        }
+        panic!("не нашёл свободной пары листенеров под стенд");
     }
 
     /// Честный резолвер за туннелем: говорит DNS-over-TCP и на всё отвечает
@@ -588,24 +594,27 @@ mod tests {
         addr
     }
 
-    /// Поднять форвардер поверх голого TCP до заглушки апстрима.
-    fn spawn_forwarder(cfg: DnsClientConfig, upstream: SocketAddr) {
+    /// Поднять форвардер поверх голого TCP до заглушки апстрима и вернуть его
+    /// адрес.
+    async fn spawn_forwarder(upstream: SocketAddr, timeout: Duration) -> SocketAddr {
+        let (udp, tcp, addr) = bind_local().await;
         tokio::spawn(async move {
             let connect = move || async move { TcpStream::connect(upstream).await };
-            let _ = run_forwarder(&cfg, connect).await;
+            let _ = serve_forwarder(udp, tcp, timeout, connect).await;
         });
+        addr
     }
 
-    /// Спросить форвардер по UDP и дождаться ответа.
+    /// Спросить форвардер по UDP и дождаться ответа. Датаграмма, пришедшая до
+    /// первого `recv_from`, лежит в буфере сокета, так что гонки со стартом
+    /// таска тут нет, а повтор страхует от потери на петле.
     async fn ask_udp(forwarder: SocketAddr, q: &[u8]) -> Vec<u8> {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        for _ in 0..40 {
+        for _ in 0..20 {
             sock.send_to(q, forwarder).await.unwrap();
             let mut buf = vec![0u8; MAX_MSG];
-            match tokio::time::timeout(Duration::from_millis(200), sock.recv_from(&mut buf)).await {
+            match tokio::time::timeout(Duration::from_millis(500), sock.recv_from(&mut buf)).await {
                 Ok(Ok((n, _))) => return buf[..n].to_vec(),
-                // Листенер поднимается в своём таске, первые датаграммы могут
-                // прийти в ещё не открытый сокет.
                 _ => continue,
             }
         }
@@ -634,10 +643,9 @@ mod tests {
         assert!(authoritative(&buf[..n]), "стенд обязан ставить флаг aa");
 
         let (upstream, _) = spawn_upstream(real, 8).await;
-        let port = free_port();
-        spawn_forwarder(config(port), upstream);
+        let forwarder = spawn_forwarder(upstream, Duration::from_millis(1500)).await;
 
-        let answer = ask_udp(SocketAddr::from(([127, 0, 0, 1], port)), &q).await;
+        let answer = ask_udp(forwarder, &q).await;
         assert_eq!(rcode(&answer), 0, "форвардер отдал не NOERROR");
         assert_eq!(&answer[0..2], &q[0..2], "идентификатор запроса не сохранён");
         assert_eq!(first_a(&answer), Some(real));
@@ -649,9 +657,7 @@ mod tests {
     async fn answers_return_to_their_own_asker() {
         let real = Ipv4Addr::new(93, 184, 216, 34);
         let (upstream, conns) = spawn_upstream(real, 16).await;
-        let port = free_port();
-        spawn_forwarder(config(port), upstream);
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let addr = spawn_forwarder(upstream, Duration::from_millis(1500)).await;
 
         let first = ask_udp(addr, &query(0x0001, "one.example", None)).await;
         let second = ask_udp(addr, &query(0xBEEF, "two.example", None)).await;
@@ -668,9 +674,7 @@ mod tests {
         let real = Ipv4Addr::new(1, 2, 3, 4);
         // Заглушка отвечает по одному разу на соединение и закрывает его.
         let (upstream, conns) = spawn_upstream(real, 1).await;
-        let port = free_port();
-        spawn_forwarder(config(port), upstream);
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let addr = spawn_forwarder(upstream, Duration::from_millis(1500)).await;
 
         assert_eq!(rcode(&ask_udp(addr, &query(1, "a.example", None)).await), 0);
         let second = ask_udp(addr, &query(2, "b.example", None)).await;
@@ -689,11 +693,10 @@ mod tests {
             drop(l);
             a
         };
-        let port = free_port();
-        spawn_forwarder(config(port), dead);
+        let addr = spawn_forwarder(dead, Duration::from_millis(1500)).await;
 
         let q = query(0x7777, "rutracker.org", None);
-        let answer = ask_udp(SocketAddr::from(([127, 0, 0, 1], port)), &q).await;
+        let answer = ask_udp(addr, &q).await;
         assert_eq!(rcode(&answer), 2, "ожидался SERVFAIL");
         assert_eq!(&answer[0..2], &q[0..2]);
         assert_eq!(&answer[6..12], &[0u8; 6], "в отказе не должно быть записей");
@@ -705,21 +708,10 @@ mod tests {
     async fn tcp_listener_answers_too() {
         let real = Ipv4Addr::new(8, 8, 4, 4);
         let (upstream, _) = spawn_upstream(real, 4).await;
-        let port = free_port();
-        spawn_forwarder(config(port), upstream);
+        let addr = spawn_forwarder(upstream, Duration::from_millis(1500)).await;
 
         let q = query(0x0042, "tcp.example", None);
-        let mut sock = None;
-        for _ in 0..40 {
-            match TcpStream::connect(("127.0.0.1", port)).await {
-                Ok(s) => {
-                    sock = Some(s);
-                    break;
-                }
-                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-            }
-        }
-        let mut sock = sock.expect("форвардер не слушает TCP");
+        let mut sock = TcpStream::connect(addr).await.expect("форвардер не слушает TCP");
         sock.write_all(&(q.len() as u16).to_be_bytes()).await.unwrap();
         sock.write_all(&q).await.unwrap();
         let mut len = [0u8; 2];
@@ -736,9 +728,7 @@ mod tests {
     /// пока очередь форвардера не забьётся (замечание ревью 1).
     #[tokio::test]
     async fn silent_upstream_still_answers_every_asker() {
-        let port = free_port();
-        let mut cfg = config(port);
-        cfg.timeout_ms = 300;
+        let (udp, tcp, addr) = bind_local().await;
         tokio::spawn(async move {
             // Заглушка апстрима не отказывает и не отвечает: ровно так
             // выглядит лежащий туннель, где open_stream ждёт свой таймаут.
@@ -746,10 +736,8 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 Err::<TcpStream, _>(io::Error::new(io::ErrorKind::TimedOut, "молчит"))
             };
-            let _ = run_forwarder(&cfg, connect).await;
+            let _ = serve_forwarder(udp, tcp, Duration::from_millis(300), connect).await;
         });
-
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
         // Запросов заведомо больше, чем помещается в очередь форвардера.
         for i in 0..300u16 {
             let q = query(i, "rutracker.org", None);
@@ -794,19 +782,8 @@ mod tests {
             }
         });
 
-        let port = free_port();
-        spawn_forwarder(config(port), upstream);
-        let mut sock = None;
-        for _ in 0..40 {
-            match TcpStream::connect(("127.0.0.1", port)).await {
-                Ok(s) => {
-                    sock = Some(s);
-                    break;
-                }
-                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-            }
-        }
-        let mut sock = sock.expect("форвардер не слушает TCP");
+        let addr = spawn_forwarder(upstream, Duration::from_millis(1500)).await;
+        let mut sock = TcpStream::connect(addr).await.expect("форвардер не слушает TCP");
 
         for id in [0x0001u16, 0x0002] {
             let q = query(id, "big.example", None);
