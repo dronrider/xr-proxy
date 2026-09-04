@@ -166,6 +166,21 @@ echo ""
 
 # 7. DNS
 echo "── 7. DNS ──"
+DNS_PORT=$(sed -n 's/^listen *= *"127\.0\.0\.1:\([0-9]*\)".*/\1/p' "$CONFIG" 2>/dev/null | head -1)
+DNS_PORT=${DNS_PORT:-5353}
+if netstat -lnp 2>/dev/null | grep -q "127.0.0.1:${DNS_PORT} "; then
+    ok "DNS-форвардер слушает 127.0.0.1:${DNS_PORT}"
+else
+    fail "DNS-форвардер НЕ слушает 127.0.0.1:${DNS_PORT}"
+    info "Резолв роутера уйдёт из LAN открытым UDP, и провайдер подменит ответ"
+fi
+DNSMASQ_UP=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null)
+if [ "$DNSMASQ_UP" = "127.0.0.1#${DNS_PORT}" ] && [ "$(uci -q get dhcp.@dnsmasq[0].noresolv)" = "1" ]; then
+    ok "dnsmasq спрашивает только форвардер"
+else
+    warn "Апстримы dnsmasq: ${DNSMASQ_UP:-<пусто>} (ожидался только 127.0.0.1#${DNS_PORT})"
+    info "Поправит 'xr-setup router', шаг dnsmasq:tunnel"
+fi
 if nslookup google.com >/dev/null 2>&1; then
     ok "DNS работает (google.com резолвится)"
 elif ping -c1 -W2 8.8.8.8 >/dev/null 2>&1; then
