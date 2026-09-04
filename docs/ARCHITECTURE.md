@@ -323,10 +323,19 @@ Cargo-workspace + Android-модуль:
 
 - [main.rs](../xr-client/src/main.rs) — точка входа, загрузка конфига, запуск
   TCP-прокси и UDP-relay, обработка сигналов.
-- [proxy.rs](../xr-client/src/proxy.rs) — прозрачный TCP-прокси: `accept →
-  SO_ORIGINAL_DST → SNI extraction → route → relay/tunnel`.
-  Извлечение SNI и маршрутизация берутся напрямую из `xr_proto` (`sni`,
-  `routing`), своих обёрток у клиента нет.
+- [proxy.rs](../xr-client/src/proxy.rs) это прозрачный TCP-прокси: `accept ->
+  SO_ORIGINAL_DST -> SNI extraction -> route -> relay/tunnel`. Извлечение SNI
+  и маршрутизация берутся напрямую из `xr_proto` (`sni`, `routing`), своих
+  обёрток у клиента нет. До маршрута клиент подсматривает первые байты
+  соединения, ожидание зависит от порта (XR-292). На 80/443 маршрут решает
+  SNI, peek держит 10 секунд. Вне web-портов байты нужны ровно на первый байт
+  0x16, там хватает короткого окна в `300 мс`. Молчащий клиент по таймауту
+  уходит в Direct с пустым буфером, соединение живёт. Это случай server-first
+  протоколов (VNC, SMTP, MySQL, IRC), раньше такое соединение висело 10 секунд
+  и рвалось. TLS-клиент на нестандартном порту успевает в короткое окно,
+  обфускация под TLS шлёт ClientHello сразу после connect. Решение о маршруте
+  вынесено в `decide_route`, её и гоняют тесты. `handle_connection` требует
+  настоящего `SO_ORIGINAL_DST`, которого вне Linux NAT-перехвата нет.
 - [redirect.rs](../xr-client/src/redirect.rs) — управление nftables/iptables
   (auto-setup, cleanup). Использует семейство `ip` (не `inet`, см. CLAUDE.md).
   Каждый VPS пула выводится из перехвата не целиком, а двумя правилами: всё,
