@@ -1,3 +1,4 @@
+mod dns;
 mod proxy;
 mod redirect;
 mod udp_relay;
@@ -10,7 +11,7 @@ use xr_proto::config::{
     decode_key, load_client_config, validate_client_config, ObfuscationConfig, ServerEntry,
 };
 use xr_proto::obfuscation::{ModifierStrategy, Obfuscator};
-use xr_proto::protocol::Codec;
+use xr_proto::protocol::{Codec, TargetAddr};
 use xr_proto::routing;
 use xr_proto::server_pool::{PoolProfile, PoolServer, ServerPool};
 
@@ -236,6 +237,41 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Run TCP proxy
     let proxy_handle = tokio::spawn(proxy::run_proxy(config.client.listen_port, state.clone()));
 
+    // Локальный DNS-форвардер (XR-285): dnsmasq спрашивает его на петле, а он
+    // уносит запрос в туннель и говорит с публичным резолвером по DoT. Отказ
+    // тут не роняет прокси, но и не откатывает резолв на провайдерский: он
+    // ложится строкой в журнал, иначе снаружи молчание не отличить от работы.
+    if config.dns.enabled {
+        let dns_config = config.dns.clone();
+        let pool = state.server_pool.clone();
+        match dns_upstreams(&dns_config) {
+            Ok((upstreams, tls_connector, server_name)) => {
+                tokio::spawn(async move {
+                    let connect = move || {
+                        let pool = pool.clone();
+                        let upstreams = upstreams.clone();
+                        let tls_connector = tls_connector.clone();
+                        let server_name = server_name.clone();
+                        async move { open_dot(pool, tls_connector, upstreams, server_name).await }
+                    };
+                    if let Err(e) = dns::run_forwarder(&dns_config, connect).await {
+                        tracing::error!(
+                            "DNS forwarder is down ({e}); dnsmasq keeps asking it and gets nothing, \
+                             LAN resolution will not fall back to the provider"
+                        );
+                        log_to_file(&format!("dns forwarder failed: {e}"));
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::error!("DNS forwarder not started: {e}");
+                log_to_file(&format!("dns forwarder not started: {e}"));
+            }
+        }
+    } else {
+        tracing::warn!("DNS forwarder disabled by config: router resolution goes out in the clear");
+    }
+
     // Background preset watch: hot-swaps the active Router when the hub
     // publishes a new preset version. Без этого таска изменения в xr-hub
     // применялись бы только при рестарте xr-client, а обойти десяток
@@ -365,6 +401,73 @@ fn codec_for_entry(
     let salt = entry.salt.unwrap_or(obfuscation.salt);
     let obfuscator = Obfuscator::new(key, salt as u32, strategy);
     Ok(Codec::new(obfuscator, obfuscation.padding_min, obfuscation.padding_max))
+}
+
+/// Разобранная секция `[dns]`: адреса апстримов, TLS-коннектор с корнями
+/// webpki и имя, которое обязано стоять в сертификате. Ошибка тут значит, что
+/// форвардер поднимать не из чего.
+#[allow(clippy::type_complexity)]
+fn dns_upstreams(
+    cfg: &xr_proto::config::DnsClientConfig,
+) -> Result<
+    (
+        Vec<SocketAddr>,
+        tokio_rustls::TlsConnector,
+        rustls::pki_types::ServerName<'static>,
+    ),
+    String,
+> {
+    let mut upstreams = Vec::with_capacity(cfg.upstreams.len());
+    for up in &cfg.upstreams {
+        upstreams.push(
+            up.parse::<SocketAddr>()
+                .map_err(|e| format!("dns upstream '{up}': {e}"))?,
+        );
+    }
+    if upstreams.is_empty() {
+        return Err("dns upstreams is empty".to_string());
+    }
+    let server_name = rustls::pki_types::ServerName::try_from(cfg.tls_name.clone())
+        .map_err(|e| format!("dns tls_name '{}': {e}", cfg.tls_name))?;
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| format!("rustls versions: {e}"))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok((upstreams, tokio_rustls::TlsConnector::from(Arc::new(tls)), server_name))
+}
+
+/// Соединение до DoT-резолвера поверх туннельного стрима. Апстримы обходятся
+/// по порядку: первый ответивший и берётся, а падение всех это причина, с
+/// которой форвардер жалуется в журнал.
+async fn open_dot(
+    pool: Arc<ServerPool>,
+    tls: tokio_rustls::TlsConnector,
+    upstreams: Vec<SocketAddr>,
+    server_name: rustls::pki_types::ServerName<'static>,
+) -> std::io::Result<tokio_rustls::client::TlsStream<xr_proto::mux::MuxStreamIo>> {
+    let mut last: Option<std::io::Error> = None;
+    for addr in upstreams {
+        let stream = match pool.open_stream(&TargetAddr::Ip(addr)).await {
+            Ok(s) => s,
+            Err(e) => {
+                last = Some(e);
+                continue;
+            }
+        };
+        match tls.connect(server_name.clone(), stream.into_io()).await {
+            Ok(tls_stream) => return Ok(tls_stream),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no dns upstreams configured")
+    }))
 }
 
 async fn shutdown_signal() {
