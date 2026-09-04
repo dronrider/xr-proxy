@@ -23,8 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use xr_proto::config::DnsClientConfig;
 
-/// Потолок разбираемого сообщения: больше EDNS0 не просит, а всё, что длиннее,
-/// это повод закрыть соединение, а не растить буфер.
+/// Потолок принимаемой датаграммы: больше EDNS0 не просит.
 const MAX_MSG: usize = 4096;
 
 /// Классический потолок UDP-ответа без EDNS0 (RFC 1035).
@@ -34,6 +33,11 @@ const MIN_UDP_PAYLOAD: usize = 512;
 /// пишется сразу, дальше редко: dnsmasq переспрашивает, и без этого порога
 /// лежащий туннель залил бы logread роутера.
 const UPSTREAM_ERROR_QUIET: Duration = Duration::from_secs(60);
+
+/// Пауза между попытками поднять апстрим. Без неё каждый запрос из очереди
+/// ждёт свой полный таймаут подключения, очередь копится, и спрашивающий
+/// перестаёт получать даже отказ.
+const UPSTREAM_RETRY_PAUSE: Duration = Duration::from_secs(1);
 
 struct Job {
     query: Vec<u8>,
@@ -83,7 +87,9 @@ impl Forwarder {
     pub async fn resolve(&self, query: &[u8]) -> Vec<u8> {
         let (tx, rx) = oneshot::channel();
         let job = Job { query: query.to_vec(), reply: tx };
-        if self.jobs.send(job).await.is_err() {
+        // Очередь забита значит апстрим не отвечает, и ждать в ней места это
+        // то самое молчание, вместо которого спрашивающему нужен отказ.
+        if self.jobs.try_send(job).is_err() {
             return servfail(query);
         }
         match tokio::time::timeout(self.timeout, rx).await {
@@ -158,6 +164,7 @@ where
     let mut conn: Option<Conn<tokio::io::WriteHalf<S>>> = None;
     let mut answers: Option<mpsc::Receiver<Vec<u8>>> = None;
     let mut last_complaint: Option<Instant> = None;
+    let mut next_attempt: Option<Instant> = None;
     let mut sweep = tokio::time::interval(Duration::from_secs(1));
 
     loop {
@@ -205,7 +212,15 @@ where
                 if job.query.len() < 12 {
                     continue;
                 }
+                // Спрашивающий уже ушёл по своему таймауту: тратить на него
+                // попытку подключения значит задерживать тех, кто ещё ждёт.
+                if job.reply.is_closed() {
+                    continue;
+                }
                 if conn.is_none() {
+                    if next_attempt.is_some_and(|t| Instant::now() < t) {
+                        continue;
+                    }
                     match tokio::time::timeout(timeout, connect()).await {
                         Ok(Ok(stream)) => {
                             let (reader, writer) = tokio::io::split(stream);
@@ -213,16 +228,19 @@ where
                             tokio::spawn(read_answers(reader, atx));
                             answers = Some(arx);
                             conn = Some(Conn { writer, pending: HashMap::new(), next_id: 0 });
+                            next_attempt = None;
                             if last_complaint.take().is_some() {
                                 tracing::info!("dns: upstream is reachable again");
                             }
                         }
                         Ok(Err(e)) => {
                             complain(&mut last_complaint, format!("{e}"));
+                            next_attempt = Some(Instant::now() + UPSTREAM_RETRY_PAUSE);
                             continue;
                         }
                         Err(_) => {
                             complain(&mut last_complaint, "connect timed out".to_string());
+                            next_attempt = Some(Instant::now() + UPSTREAM_RETRY_PAUSE);
                             continue;
                         }
                     }
@@ -270,8 +288,11 @@ async fn read_answers<R: AsyncRead + Unpin>(mut reader: R, tx: mpsc::Sender<Vec<
         if reader.read_exact(&mut len).await.is_err() {
             break;
         }
+        // Длинный ответ дочитывается целиком, а не рвёт разговор: обрыв снёс
+        // бы таблицу ожидающих, и SERVFAIL получили бы все, кто спрашивал
+        // параллельно про другие имена, а само имя не резолвилось бы никогда.
         let n = u16::from_be_bytes(len) as usize;
-        if n == 0 || n > MAX_MSG {
+        if n == 0 {
             break;
         }
         let mut msg = vec![0u8; n];
@@ -323,8 +344,12 @@ async fn serve_tcp_conn(mut stream: TcpStream, forwarder: Forwarder) -> io::Resu
         if stream.read_exact(&mut len).await.is_err() {
             return Ok(());
         }
+        // Своего потолка тут нет: длина на проводе лежит в двух байтах, и
+        // сужать её нельзя. Апстрим отвечает по TLS, где размер приёмного
+        // буфера спрашивающего его не связывает, а DNSKEY и длинный TXT
+        // законно не влезают в датаграмму.
         let n = u16::from_be_bytes(len) as usize;
-        if n == 0 || n > MAX_MSG {
+        if n == 0 {
             return Ok(());
         }
         let mut query = vec![0u8; n];
@@ -704,6 +729,102 @@ mod tests {
 
         assert_eq!(rcode(&answer), 0);
         assert_eq!(first_a(&answer), Some(real));
+    }
+
+    /// Туннель не отказывает, а молчит: подключение висит. Спрашивающий всё
+    /// равно получает SERVFAIL, и получает его каждый раз, а не до тех пор,
+    /// пока очередь форвардера не забьётся (замечание ревью 1).
+    #[tokio::test]
+    async fn silent_upstream_still_answers_every_asker() {
+        let port = free_port();
+        let mut cfg = config(port);
+        cfg.timeout_ms = 300;
+        tokio::spawn(async move {
+            // Заглушка апстрима не отказывает и не отвечает: ровно так
+            // выглядит лежащий туннель, где open_stream ждёт свой таймаут.
+            let connect = move || async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Err::<TcpStream, _>(io::Error::new(io::ErrorKind::TimedOut, "молчит"))
+            };
+            let _ = run_forwarder(&cfg, connect).await;
+        });
+
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        // Запросов заведомо больше, чем помещается в очередь форвардера.
+        for i in 0..300u16 {
+            let q = query(i, "rutracker.org", None);
+            let answer = ask_udp(addr, &q).await;
+            assert_eq!(rcode(&answer), 2, "запрос {i} остался без отказа");
+            assert_eq!(&answer[0..2], &q[0..2]);
+        }
+    }
+
+    /// Ответ длиннее датаграммы не рвёт разговор с апстримом: он доезжает по
+    /// TCP целиком, и соседний запрос по тому же соединению доходит следом
+    /// (замечание ревью 2).
+    #[tokio::test]
+    async fn long_answer_survives_and_keeps_the_connection() {
+        // Заглушка отвечает записью, которая заведомо не влезает в 4096.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = listener.local_addr().unwrap();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let counter = conns.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 2];
+                        if sock.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut msg = vec![0u8; u16::from_be_bytes(len) as usize];
+                        if sock.read_exact(&mut msg).await.is_err() {
+                            return;
+                        }
+                        let mut a = answer_a(&msg, Ipv4Addr::new(5, 6, 7, 8));
+                        a.resize(5000, 0);
+                        let _ = sock.write_all(&(a.len() as u16).to_be_bytes()).await;
+                        let _ = sock.write_all(&a).await;
+                    }
+                });
+            }
+        });
+
+        let port = free_port();
+        spawn_forwarder(config(port), upstream);
+        let mut sock = None;
+        for _ in 0..40 {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(s) => {
+                    sock = Some(s);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        let mut sock = sock.expect("форвардер не слушает TCP");
+
+        for id in [0x0001u16, 0x0002] {
+            let q = query(id, "big.example", None);
+            sock.write_all(&(q.len() as u16).to_be_bytes()).await.unwrap();
+            sock.write_all(&q).await.unwrap();
+            let mut len = [0u8; 2];
+            sock.read_exact(&mut len).await.unwrap();
+            let mut answer = vec![0u8; u16::from_be_bytes(len) as usize];
+            sock.read_exact(&mut answer).await.unwrap();
+            assert_eq!(answer.len(), 5000, "длинный ответ доехал не целиком");
+            assert_eq!(&answer[0..2], &q[0..2]);
+            assert_eq!(first_a(&answer), Some(Ipv4Addr::new(5, 6, 7, 8)));
+        }
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            1,
+            "длинный ответ порвал разговор, соединение поднялось заново"
+        );
     }
 
     #[test]
