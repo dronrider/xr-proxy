@@ -325,9 +325,13 @@ and the same five-minute safety scan commits local edits. A long-poll on
 someone's push. Then comes fetch, merge and push. A push can be rejected
 because somebody was faster, or because the owner's folder is dirty right now.
 That is not an error. The loop repeats fetch-merge-push, and the race
-converges. The size cap and the `.xr-*` namespace are the same as on the agent.
-A big file lives in the folder and travels by the manifest, never through
-history.
+converges. The `.xr-*` namespace stays out of history here as well. So does
+anything over the size cap: a big file lives in the folder and travels by the
+manifest, never through history. The cap the harness applies is the shared
+default from `xr-proto`, 10 MiB. The agent's own `git_max_file_mb` stays
+invisible to it. Nothing in the grant carries that setting, and the git contour
+deliberately adds no fields to it. An owner who moves the cap should say so to
+the co-authors, or leave it at the default.
 
 **Conflicts never produce markers in a file.** Non-overlapping edits merge
 themselves. When both sides edited the same lines, the file keeps the local
