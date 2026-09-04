@@ -301,9 +301,9 @@ per minute instead of a poll storm. An unborn `main` reports an empty string.
 ### Co-editing a share: `xr-share sync` (LLD-33 phase 2)
 
 The co-author's side of the same contour. One command keeps a local folder in
-sync with the share: local edits travel up on their own, other people's edits
-arrive on their own, and everyone keeps their own editor. Git is **not** needed
-on this machine: libgit2 is built into the binary.
+sync with the share. Local edits travel up on their own. Other people's edits
+arrive on their own. Everyone keeps their own editor. Git is **not** needed on
+this machine, because libgit2 is built into the binary.
 
 ```sh
 # First run: clones the share into an empty (or not yet existing) folder.
@@ -313,20 +313,21 @@ xr-share sync --invite <invite> --share notes ~/notes
 xr-share sync --invite <invite> --share notes ~/notes --once
 ```
 
-The folder is an ordinary clone with its own `.git`, so `git log` and any git
-GUI work in it. A non-empty folder that is not a clone of this share is
-refused: mixing local files into someone's history silently is not something
-the harness will do. The commits it makes are authored by the machine's
-hostname, or by `--name`.
+The folder is an ordinary clone with its own `.git`. `git log` and any git GUI
+work in it. A non-empty folder that is not a clone of this share is refused.
+Mixing local files into someone's history silently is not something the harness
+will do. The commits it makes are authored by the machine's hostname, or by
+`--name`.
 
 Everything else runs by itself. A watcher with the same two-second debounce
-(and the same five-minute safety scan) commits local edits; a long-poll on
+and the same five-minute safety scan commits local edits. A long-poll on
 `GET /{id}/git/head` wakes the loop the moment the agent commits or accepts
-someone's push; then comes fetch, merge and push. A push rejected because
-somebody was faster, or because the owner's folder is dirty right now, is not
-an error: the loop repeats fetch-merge-push, and the race converges. The size
-cap and the `.xr-*` namespace are the same as on the agent, so a big file lives
-in the folder and travels by the manifest, never through history.
+someone's push. Then comes fetch, merge and push. A push can be rejected
+because somebody was faster, or because the owner's folder is dirty right now.
+That is not an error. The loop repeats fetch-merge-push, and the race
+converges. The size cap and the `.xr-*` namespace are the same as on the agent.
+A big file lives in the folder and travels by the manifest, never through
+history.
 
 **Conflicts never produce markers in a file.** Non-overlapping edits merge
 themselves. When both sides edited the same lines, the file keeps the local
@@ -337,21 +338,21 @@ notes.md
 notes (конфликт macbook 4f21ab9).md
 ```
 
-Both versions enter the same merge commit, so both reach everyone: nobody
-loses an edit, and no half-merged text is ever committed as if it were content.
-The copy's name carries the author and the short SHA of the incoming commit, so
-re-merging the same fork yields the same name instead of piling up duplicates.
+Both versions enter the same merge commit, so both reach everyone. Nobody
+loses an edit. No half-merged text is ever committed as if it were content.
+The copy's name carries the author and the short SHA of the incoming commit.
+Re-merging the same fork yields the same name instead of piling up duplicates.
 Sorting it out is manual, and it is meant to be.
 
-A share behind NAT is reached the same way as everything else in this project:
-direct addresses first (LAN before the public one), the relay last. On the
-relay path the harness runs a loopback bridge and carries the bytes inside
-identity-TLS pinned to the agent's key, so libgit2 talks plain HTTP to
-`127.0.0.1` and knows nothing about the relay. On the direct path the plain
-HTTP has the signed head as its authority: an address whose signature does not
+A share behind NAT is reached the same way as everything else in this project.
+Direct addresses come first, LAN before the public one, and the relay comes
+last. On the relay path the harness runs a loopback bridge and carries the
+bytes inside identity-TLS pinned to the agent's key. libgit2 talks plain HTTP
+to `127.0.0.1` and knows nothing about the relay. On the direct path the plain
+HTTP has the signed head as its authority. An address whose signature does not
 match `agent_pubkey` from the grant is not used at all.
 
-The harness lives behind the `sync` cargo feature (on by default). A build with
+The harness lives behind the `sync` cargo feature, on by default. A build with
 `--no-default-features` has no libgit2 in it and serves as an agent only.
 
 ### Web page (LLD-33)
