@@ -159,6 +159,92 @@ async fn peek_client_hello(
     Ok(n)
 }
 
+/// Порты, которым маршрутизация доверяет подсмотренному SNI.
+fn is_web_port(port: u16) -> bool {
+    matches!(port, 80 | 443)
+}
+
+/// Сколько peek ждёт первые байты клиента. На web-портах SNI решает маршрут,
+/// и ClientHello с постквантовым key_share приезжает медленно и кусками,
+/// поэтому ожидание длинное. Вне web-портов подсмотренные байты нужны ровно
+/// на первый байт 0x16: обфускация под TLS шлёт ClientHello сразу после
+/// connect и укладывается в короткое окно, а молчащему клиенту (server-first
+/// протокол: VNC, SMTP, MySQL, IRC) дальше нужен баннер сервера, а не наше
+/// ожидание.
+const PEEK_WAIT_WEB: Duration = Duration::from_secs(10);
+const PEEK_WAIT_OTHER: Duration = Duration::from_millis(300);
+
+/// Решение по первым байтам клиента: маршрут или разрыв соединения.
+#[derive(Debug, PartialEq, Eq)]
+enum PeekVerdict {
+    /// Клиент на web-порту так и не заговорил: соединение мёртвое.
+    Dead,
+    /// Действие маршрутизации и подсмотренное SNI-имя для туннеля.
+    Route(Action, Option<String>),
+}
+
+/// Подсмотреть первые байты клиента и решить маршрут. Молчание вне web-портов
+/// это штатный случай server-first протокола: баннер обещает сервер, поэтому
+/// по таймауту короткого ожидания подсмотренные байты остаются пустыми и
+/// соединение уходит в Direct, а не рвётся после долгого висения (XR-292).
+/// На web-порту клиент обязан говорить первым, тишина означает мёртвое
+/// соединение.
+async fn decide_route<F>(
+    client: &TcpStream,
+    orig_dst: SocketAddr,
+    resolve: F,
+) -> io::Result<PeekVerdict>
+where
+    F: FnOnce(Option<&str>) -> Action,
+{
+    let mut peek_buf = vec![0u8; 4096];
+    let wait = if is_web_port(orig_dst.port()) {
+        PEEK_WAIT_WEB
+    } else {
+        PEEK_WAIT_OTHER
+    };
+    let n = match tokio::time::timeout(wait, client.peek(&mut peek_buf)).await {
+        Ok(result) => result?,
+        Err(_) if !is_web_port(orig_dst.port()) => {
+            tracing::debug!("Peek timeout -> {}: server-first, routing direct", orig_dst);
+            0
+        }
+        Err(_) => {
+            tracing::debug!("Peek timeout -> {}: dropping", orig_dst);
+            return Ok(PeekVerdict::Dead);
+        }
+    };
+    let n = peek_client_hello(client, &mut peek_buf, n).await?;
+    let sni_name = sni::extract_sni(&peek_buf[..n]);
+    let resolved = resolve(sni_name.as_deref());
+
+    // SNI-роутинг доверяем только на стандартных web-портах (80/443). На любом
+    // нестандартном порту SNI скорее всего fake (Telegram MTProto маскирует
+    // обфусцированный поток под TLS-handshake с self.events.data.microsoft.com,
+    // ssl.gstatic.com и подобными доменами для обхода DPI). Решение по такому
+    // SNI = заведомо неправильный routing -> direct -> провайдерский RST.
+    //
+    // Для non-80/443 портов смотрим на сам первый байт: 0x16 = TLS handshake
+    // ContentType. Если это TLS, почти наверняка обфусцированный/маскированный
+    // протокол (Telegram MTProto на 5277/5993, DoT на 853 и т.п.) -> Proxy.
+    // Если нет, это сырой TCP-протокол (BitTorrent peer handshake начинается
+    // с 0x13 + "BitTorrent protocol", IRC и т.д.). Проксировать его бессмысленно
+    // (IP клиента всё равно засветится в peer-listing), а вред огромный:
+    // BitTorrent открывает десятки одновременных Connect'ов к мёртвым/firewalled
+    // пирам, забивает mux writer-канал и target-семафор xr-server'а
+    // (max_connections=256), из-за чего ConnectAck для легитимного TLS-трафика
+    // (YouTube, шортсы) timeout'ит и видео фризит.
+    let looks_like_tls = n > 0 && peek_buf[0] == 0x16;
+    let action = if is_web_port(orig_dst.port()) {
+        resolved
+    } else if looks_like_tls {
+        Action::Proxy
+    } else {
+        Action::Direct
+    };
+    Ok(PeekVerdict::Route(action, sni_name))
+}
+
 async fn handle_connection(
     mut client: TcpStream,
     client_addr: SocketAddr,
@@ -179,49 +265,23 @@ async fn handle_connection(
     // Enable TCP keepalive to detect dead connections
     set_keepalive(&client);
 
-    // Peek at first bytes for SNI extraction (with timeout — don't hang on dead connections)
-    let mut peek_buf = vec![0u8; 4096];
-    let n = match tokio::time::timeout(Duration::from_secs(10), client.peek(&mut peek_buf)).await {
-        Ok(result) => result?,
-        Err(_) => {
-            tracing::debug!("Peek timeout from {}, dropping", client_addr);
-            return Ok(());
-        }
-    };
-    let n = peek_client_hello(&client, &mut peek_buf, n).await?;
-    let sni_name = sni::extract_sni(&peek_buf[..n]);
-
-    let sni_display = sni_name.as_deref().unwrap_or("-");
-    // Один short-lived read-lock: resolve() возвращает Action по value,
-    // поэтому guard живёт ровно длину этого statement.
-    let resolved_action = state.router.read().unwrap().resolve(sni_name.as_deref(), dest_ip);
-
-    // SNI-роутинг доверяем только на стандартных web-портах (80/443). На любом
-    // нестандартном порту SNI скорее всего fake (Telegram MTProto маскирует
-    // обфусцированный поток под TLS-handshake с self.events.data.microsoft.com,
-    // ssl.gstatic.com и подобными доменами для обхода DPI). Решение по такому
-    // SNI = заведомо неправильный routing → direct → провайдерский RST.
-    //
-    // Для non-80/443 портов смотрим на сам первый байт: 0x16 = TLS handshake
-    // ContentType. Если это TLS — почти наверняка обфусцированный/маскированный
-    // протокол (Telegram MTProto на 5277/5993, DoT на 853 и т.п.) → Proxy.
-    // Если нет — это сырой TCP-протокол (BitTorrent peer handshake начинается с
-    // 0x13 + "BitTorrent protocol", IRC и т.д.). Проксировать его бессмысленно
-    // (IP клиента всё равно засветится в peer-listing), а вред огромный:
-    // BitTorrent открывает десятки одновременных Connect'ов к мёртвым/firewalled
-    // пирам, забивает mux writer-канал и target-семафор xr-server'а
-    // (max_connections=256), из-за чего ConnectAck для легитимного TLS-трафика
-    // (YouTube, шортсы) timeout'ит и видео фризит.
-    let looks_like_tls = peek_buf.get(0) == Some(&0x16);
-    let action = match orig_dst.port() {
-        80 | 443 => resolved_action,
-        _ if looks_like_tls => Action::Proxy,
-        _ => Action::Direct,
+    // Read-lock роутера живёт ровно длину вызова resolve(): guard не Send,
+    // и держать его через await-точки decide_route не выйдет.
+    let verdict = decide_route(&client, orig_dst, |sni| {
+        state.router.read().unwrap().resolve(sni, dest_ip)
+    })
+    .await?;
+    let (action, sni_name) = match verdict {
+        PeekVerdict::Dead => return Ok(()),
+        PeekVerdict::Route(action, sni_name) => (action, sni_name),
     };
 
     tracing::info!(
         "{} -> {} [SNI: {}] => {:?}",
-        client_addr, orig_dst, sni_display, action
+        client_addr,
+        orig_dst,
+        sni_name.as_deref().unwrap_or("-"),
+        action
     );
 
     let idle_timeout = Duration::from_secs(300);
@@ -563,6 +623,111 @@ mod tests {
         assert_eq!(n, 1400);
         assert!(sni::extract_sni(&buf[..n]).is_none());
         assert!(started.elapsed() < SNI_FRAGMENT_WAIT * 3, "ждали {:?}", started.elapsed());
+    }
+
+    /// Держит сокет открытым и молчит: peek упирается в таймаут, а не в EOF.
+    /// Возвращённая задача доживает до конца теста на своей паузе.
+    fn hold_silent(writer: TcpStream) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let _silent = writer;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        })
+    }
+
+    /// Server-first протокол (VNC, SMTP, MySQL, IRC): клиент молчит и ждёт
+    /// баннер сервера. На порту вне 80/443 маршрут обязан стать Direct за
+    /// короткое время, а не висеть до дропа. Внешний потолок меньше
+    /// web-портового ожидания: десяти секунд прежнего поведения тест не
+    /// переживает.
+    #[tokio::test]
+    async fn silent_client_off_web_port_routes_direct() {
+        let (client, writer) = socket_pair().await;
+        let _hold = hold_silent(writer);
+
+        let orig_dst: SocketAddr = "203.0.113.7:5900".parse().unwrap();
+        let router = router_proxying(&["youtube.com"]);
+        let ip = orig_dst.ip();
+        let verdict = tokio::time::timeout(
+            Duration::from_secs(2),
+            decide_route(&client, orig_dst, |sni| router.resolve(sni, ip)),
+        )
+        .await
+        .expect("короткий peek не уложился в две секунды")
+        .unwrap();
+
+        assert_eq!(verdict, PeekVerdict::Route(Action::Direct, None));
+    }
+
+    /// Первый байт 0x16 на нестандартном порту уезжает в Proxy: обфускация
+    /// под TLS (MTProto, DoT) обязана попадать в короткое окно ожидания.
+    /// Решение роутера при этом не спрашивается: SNI вне web-портов фейковый.
+    #[tokio::test]
+    async fn tls_first_byte_off_web_port_routes_proxy() {
+        let (client, writer) = socket_pair().await;
+        let hello = client_hello("tube.example.org", 100);
+        tokio::spawn(async move {
+            let mut writer = writer;
+            writer.write_all(&hello).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let orig_dst: SocketAddr = "203.0.113.7:5277".parse().unwrap();
+        let router = router_proxying(&["youtube.com"]);
+        let ip = orig_dst.ip();
+        let verdict = decide_route(&client, orig_dst, |sni| router.resolve(sni, ip))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            verdict,
+            PeekVerdict::Route(Action::Proxy, Some("tube.example.org".into()))
+        );
+    }
+
+    /// На web-портах маршрут по-прежнему решает SNI из ClientHello.
+    #[tokio::test]
+    async fn web_port_routes_by_sni() {
+        let (client, writer) = socket_pair().await;
+        let hello = client_hello("youtube.com", 100);
+        tokio::spawn(async move {
+            let mut writer = writer;
+            writer.write_all(&hello).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let orig_dst: SocketAddr = "203.0.113.7:443".parse().unwrap();
+        let router = router_proxying(&["youtube.com"]);
+        let ip = orig_dst.ip();
+        let verdict = decide_route(&client, orig_dst, |sni| router.resolve(sni, ip))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            verdict,
+            PeekVerdict::Route(Action::Proxy, Some("youtube.com".into()))
+        );
+    }
+
+    /// Молчащий клиент на web-порту рвётся: HTTP обязан говорить первым, и
+    /// тихое соединение там мёртвое. Время паущено, десятисекундное ожидание
+    /// срабатывает мгновенно; писатель держится дольше него, чтобы peek
+    /// упёрся в таймаут, а не в EOF.
+    #[tokio::test(start_paused = true)]
+    async fn silent_client_on_web_port_is_dropped() {
+        let (client, writer) = socket_pair().await;
+        tokio::spawn(async move {
+            let _silent = writer;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let orig_dst: SocketAddr = "203.0.113.7:443".parse().unwrap();
+        let router = router_proxying(&[]);
+        let ip = orig_dst.ip();
+        let verdict = decide_route(&client, orig_dst, |sni| router.resolve(sni, ip))
+            .await
+            .unwrap();
+
+        assert_eq!(verdict, PeekVerdict::Dead);
     }
 
     fn router_proxying(domains: &[&str]) -> Router {
