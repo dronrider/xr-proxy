@@ -571,9 +571,18 @@ pub fn validate_client_config(config: &ClientConfig) -> Result<(), String> {
 /// строго: имя апстрима резолвить нечем, а бесадресный форвардер оставил бы
 /// dnsmasq без ответов, и вся LAN осталась бы без DNS.
 fn dns_reject_reason(dns: &DnsClientConfig) -> Result<(), String> {
-    dns.listen
-        .parse::<SocketAddr>()
+    let listen: SocketAddr = dns
+        .listen
+        .parse()
         .map_err(|e| format!("dns: invalid listen address '{}': {}", dns.listen, e))?;
+    // Только петля: форвардер отвечает без обфускации и рекурсивно, и адрес
+    // пошире делает из роутера открытый резолвер, то есть чужой усилитель.
+    if !listen.ip().is_loopback() {
+        return Err(format!(
+            "dns: listen '{}' is not a loopback address, that would expose an open resolver",
+            dns.listen
+        ));
+    }
     if dns.upstreams.is_empty() {
         return Err("dns: upstreams is empty, forwarder would have nobody to ask".to_string());
     }
@@ -1036,6 +1045,22 @@ vps_port = 9999
         cfg.dns.timeout_ms = 0;
         let err = validate_client_config(&cfg).unwrap_err();
         assert!(err.contains("timeout_ms is 0"), "{err}");
+    }
+
+    /// Слушать шире петли форвардеру нельзя: он резолвит рекурсивно и без
+    /// обфускации, и адрес пошире делает из роутера чужой усилитель.
+    #[test]
+    fn validate_rejects_dns_listen_beyond_loopback() {
+        let mut cfg = client_with("");
+        for addr in ["0.0.0.0:5353", "192.168.1.1:5353", "[::]:5353"] {
+            cfg.dns.listen = addr.into();
+            let err = validate_client_config(&cfg).unwrap_err();
+            assert!(err.contains("not a loopback address"), "{addr}: {err}");
+        }
+        for addr in ["127.0.0.1:5353", "[::1]:5353"] {
+            cfg.dns.listen = addr.into();
+            validate_client_config(&cfg).unwrap();
+        }
     }
 
     /// Выключенная секция не судится: `enabled = false` это осознанный отказ
