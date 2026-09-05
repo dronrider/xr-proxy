@@ -399,16 +399,19 @@ setup to the most.
 1. **Relay through the hub.** Nothing to configure on the router. A token
    install picks the relay descriptor up from the hub. `share` sees it and
    turns the relay leg on by itself, and consumers fall back to the relay when
-   the direct addresses fail. `share` prints a `relay: включён` line when the
-   leg is on. The agent's log says `relay reverse tunnel enabled` once the
-   uplink to the hub is up:
+   the direct addresses fail. `share` prints a `relay: включён` line when it
+   advertises the share through the relay. The agent's log says
+   `relay reverse tunnel enabled` once the uplink to the hub is up:
 
    ```sh
    journalctl -u xr-share | grep relay
    ```
 
    The binary has to be built with `--features relay` (release binaries from
-   the hub are). A hand-rolled config needs a `[relay]` block, see LLD-23.
+   the hub are). A build without the feature never advertises the relay, even
+   with a descriptor in its config. `share` says so with a `relay в этот
+   бинарь не собран` line and the private-address warning stays. A hand-rolled
+   config needs a `[relay]` block, see LLD-23.
 
 2. **Forward port 8443 to the agent's machine.** Open the router's admin page
    and find the port forwarding (also called virtual server or NAT) section.
@@ -442,8 +445,9 @@ setup to the most.
 `share` prints a warning when the address it just registered is private:
 RFC 1918 (`192.168.x`, `10.x`, `172.16-31.x`), loopback, link-local, carrier
 NAT `100.64.0.0/10`, IPv6 ULA `fc00::/7` and `fe80::`. The warning names the
-port to forward. It does not fire when the share goes through the relay.
-That share is reachable from outside already.
+port to forward. It does not fire when the share is advertised through the
+relay, that is a relay build with a descriptor. Such a share is reachable
+from outside already.
 
 Carrier-grade NAT is the case where a port forward does not help. Look at the
 router's WAN address. If it is in `100.64.0.0/10` (or in `10.x`, `192.168.x`),
