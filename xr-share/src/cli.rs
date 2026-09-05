@@ -1258,11 +1258,9 @@ mod tests {
     // A default build holds a [relay] block after `install --token` but cannot
     // bring the uplink up, so the share must not be advertised as relayed and
     // the private-address warning must stay (XR-034 review).
+    #[cfg(not(feature = "relay"))]
     #[test]
     fn via_relay_off_without_relay_feature() {
-        if cfg!(feature = "relay") {
-            return;
-        }
         assert!(!resolve_via_relay(false, false, true));
         assert!(!resolve_via_relay(true, false, true));
         let via = resolve_via_relay(false, false, true);
