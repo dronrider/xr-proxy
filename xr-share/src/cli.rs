@@ -452,16 +452,17 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     for a in &extra_addrs {
         println!("  LAN:      {a}:{port} (потребитель в этой же сети пробует его первым)");
     }
+    if via_relay {
+        println!("  relay:    включён (снаружи шара достижима через хаб)");
+    }
     if args.writable {
         println!("  запись:   разрешена (держатели инвайта могут заливать и удалять файлы)");
     }
     if args.import {
         println!("  импорт:   разрешён (держатели write-инвайта запускают скачивание по URL)");
     }
-    if addr_is_private(&addr) {
-        eprintln!("\n  ВНИМАНИЕ: адрес {addr} приватный, шара видна только в локальной сети.");
-        eprintln!("  Снаружи она недоступна. Регистрируй с хоста агента (хаб подставит белый IP сам),");
-        eprintln!("  либо передай --addr <публичный IP или DDNS> и пробрось порт {port} на эту машину.");
+    if let Some(warning) = private_addr_warning(&addr, port, via_relay) {
+        eprintln!("\n{warning}");
     }
     if invites.is_empty() {
         // No invite: hand out a self-contained link (receiver pulls directly).
@@ -556,15 +557,47 @@ fn local_lan_addrs() -> Vec<String> {
     out
 }
 
-/// True if a resolved address is a private/loopback/link-local IP, so a share at
-/// it is reachable only inside the LAN. A hostname (DDNS) is treated as public.
+/// True if a resolved address is an IP nobody outside the local network can
+/// route to, so a share at it is reachable only inside the LAN: RFC 1918
+/// private, loopback, link-local, CGNAT 100.64/10 (the address a carrier hands
+/// out behind its own NAT), IPv6 ULA fc00::/7 and link-local fe80::/10. A
+/// hostname (DDNS) is treated as public.
 fn addr_is_private(addr: &str) -> bool {
     use std::net::IpAddr;
     match addr.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
-        Ok(IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Ok(IpAddr::V4(ip)) => {
+            let o = ip.octets();
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || (o[0] == 100 && (64..128).contains(&o[1]))
+        }
+        Ok(IpAddr::V6(ip)) => {
+            let s = ip.segments();
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+        }
         Err(_) => false,
     }
+}
+
+/// Warning `xr-share share` prints when the advertised address is reachable
+/// only from inside the LAN. None for a public address, and none when the share
+/// goes through the hub relay: the relay reaches the agent from outside no
+/// matter what address it advertises, so the warning would be false there.
+fn private_addr_warning(addr: &str, port: u16, via_relay: bool) -> Option<String> {
+    if via_relay || !addr_is_private(addr) {
+        return None;
+    }
+    Some(format!(
+        "  ВНИМАНИЕ: адрес {addr} приватный, шара видна только в локальной сети.\n\
+         \x20 Снаружи она недоступна. Регистрируй с хоста агента (хаб подставит белый IP сам),\n\
+         \x20 либо передай --addr <публичный IP или DDNS> и пробрось порт {port} на эту машину,\n\
+         \x20 либо пусти шару через relay хаба (README, раздел Reaching a share from outside)."
+    ))
 }
 
 fn short(s: &str) -> String {
@@ -1117,6 +1150,74 @@ mod tests {
         // Empty invite half.
         let empty = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"reg.");
         assert!(unpack_setup_token(&empty).is_err());
+    }
+
+    // A share at one of these addresses is reachable only from inside its own
+    // network: RFC 1918, loopback, link-local, CGNAT 100.64/10 (XR-034), IPv6
+    // ULA and link-local. The warning must fire for every one of them.
+    #[test]
+    fn addr_is_private_catches_unroutable_ranges() {
+        for addr in [
+            "192.168.1.10",
+            "10.0.0.5",
+            "172.16.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "0.0.0.0",
+            "100.64.0.1",
+            "100.127.255.254",
+            "::1",
+            "::",
+            "fc00::1",
+            "fd12:3456::1",
+            "fe80::1",
+        ] {
+            assert!(addr_is_private(addr), "{addr} должен считаться приватным");
+        }
+    }
+
+    // Globally routable addresses and DDNS hostnames are what the warning is
+    // meant to steer the user towards, so none of them may trigger it. The
+    // neighbours of the CGNAT block guard the range arithmetic.
+    #[test]
+    fn addr_is_private_passes_public_addresses() {
+        for addr in [
+            "198.51.100.7",
+            "8.8.8.8",
+            "100.63.255.255",
+            "100.128.0.1",
+            "172.32.0.1",
+            "2001:db8::1",
+            "2a00:1450::1",
+            "home.example.org",
+            "",
+        ] {
+            assert!(!addr_is_private(addr), "{addr} должен считаться публичным");
+        }
+    }
+
+    // Through the hub relay the share is reachable from outside whatever address
+    // it advertises, so the warning must stay silent (XR-034).
+    #[test]
+    fn private_addr_warning_silent_via_relay() {
+        assert_eq!(private_addr_warning("192.168.1.10", 8443, true), None);
+    }
+
+    #[test]
+    fn private_addr_warning_silent_for_public_addr() {
+        assert_eq!(private_addr_warning("198.51.100.7", 8443, false), None);
+        assert_eq!(private_addr_warning("home.example.org", 8443, false), None);
+    }
+
+    // Without the relay a LAN-only address earns the warning, and the text names
+    // the address, the port to forward and every way out.
+    #[test]
+    fn private_addr_warning_names_addr_port_and_ways_out() {
+        let text = private_addr_warning("100.64.0.1", 9443, false).expect("warning expected");
+        assert!(text.starts_with("  ВНИМАНИЕ: адрес 100.64.0.1 приватный"), "{text}");
+        assert!(text.contains("пробрось порт 9443"), "{text}");
+        assert!(text.contains("--addr"), "{text}");
+        assert!(text.contains("relay"), "{text}");
     }
 
     #[test]
