@@ -365,7 +365,7 @@ mod tests {
         let mut shares = SharesMap::new();
         shares.insert(
             "S".into(),
-            ShareRoot { path: dir.path().canonicalize().unwrap(), is_file: false, writable: false, import: false },
+            ShareRoot { path: dir.path().canonicalize().unwrap(), is_file: false, writable: false, import: false, git: false },
         );
         let cache = Arc::new(HashCache::new());
         let state = Arc::new(AgentState {
@@ -376,6 +376,7 @@ mod tests {
             max_file_mb: None,
             import: crate::import::ImportManager::new(None, cache),
             expose: RwLock::new(Arc::new(Vec::new())),
+            git: Arc::new(crate::gitrepo::GitManager::new(&tempfile::tempdir().unwrap().keep())),
         });
         let cred = sign_agent_credential(&hub, &agent_pk, now() + 3600);
         let cred_blob =
@@ -500,7 +501,7 @@ mod tests {
         let mut shares = SharesMap::new();
         shares.insert(
             "S".into(),
-            ShareRoot { path: dir.path().canonicalize().unwrap(), is_file: false, writable: false, import: false },
+            ShareRoot { path: dir.path().canonicalize().unwrap(), is_file: false, writable: false, import: false, git: false },
         );
         let cache = Arc::new(HashCache::new());
         let state = Arc::new(AgentState {
@@ -514,6 +515,7 @@ mod tests {
                 name: "dash".into(),
                 upstream: upstream_addr.to_string(),
             }])),
+            git: Arc::new(crate::gitrepo::GitManager::new(&tempfile::tempdir().unwrap().keep())),
         });
         let cred = sign_agent_credential(&hub, &agent_pk, now() + 3600);
         let cred_blob =
@@ -663,7 +665,7 @@ mod tests {
         let mut shares = SharesMap::new();
         shares.insert(
             "S".into(),
-            ShareRoot { path: dir.path().canonicalize().unwrap(), is_file: false, writable: false, import: false },
+            ShareRoot { path: dir.path().canonicalize().unwrap(), is_file: false, writable: false, import: false, git: false },
         );
         let cache = Arc::new(HashCache::new());
         let state = Arc::new(AgentState {
@@ -677,6 +679,7 @@ mod tests {
                 name: "live".into(),
                 upstream: upstream_addr.to_string(),
             }])),
+            git: Arc::new(crate::gitrepo::GitManager::new(&tempfile::tempdir().unwrap().keep())),
         });
         let cred = sign_agent_credential(&hub, &agent_pk, now() + 3600);
         let cred_blob =

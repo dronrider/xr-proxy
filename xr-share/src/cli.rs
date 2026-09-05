@@ -44,10 +44,19 @@ fn resolve_invites(explicit: &[String], default_invite: Option<&str>) -> Vec<Str
     }
 }
 
+/// Whether this binary can bring the relay uplink up at all. `install --token`
+/// stores a `[relay]` block whenever the hub hands one out, but only a build
+/// with the `relay` feature honours it (main.rs logs a warning otherwise), so a
+/// share advertised through the relay from a default build would be dead.
+fn relay_built() -> bool {
+    cfg!(feature = "relay")
+}
+
 /// Whether to advertise a share through the hub relay. On by default once the
 /// agent holds a relay descriptor; `--relay` forces it, `--no-relay` opts out.
+/// Always off in a build without the `relay` feature (XR-034).
 fn resolve_via_relay(force_relay: bool, no_relay: bool, has_descriptor: bool) -> bool {
-    if no_relay {
+    if no_relay || !relay_built() {
         false
     } else if force_relay {
         true
@@ -288,6 +297,9 @@ pub fn share(config_path: &Path, args: ShareArgs) -> Result<()> {
     // mandate carried one). --relay forces it on even before the descriptor
     // arrives; --no-relay opts a public-IP host out of the uplink (XR-127).
     let via_relay = resolve_via_relay(args.relay, args.no_relay, cfg.relay.is_some());
+    if !via_relay && !args.no_relay && (args.relay || cfg.relay.is_some()) {
+        eprintln!("  ! relay в этот бинарь не собран (--features relay), шара идёт только напрямую");
+    }
 
     let canon = Path::new(&args.path)
         .canonicalize()
@@ -563,23 +575,28 @@ fn local_lan_addrs() -> Vec<String> {
 /// out behind its own NAT), IPv6 ULA fc00::/7 and link-local fe80::/10. A
 /// hostname (DDNS) is treated as public.
 fn addr_is_private(addr: &str) -> bool {
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr};
+    fn v4_is_private(ip: Ipv4Addr) -> bool {
+        let o = ip.octets();
+        ip.is_private()
+            || ip.is_loopback()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            || (o[0] == 100 && (64..128).contains(&o[1]))
+    }
     match addr.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => {
-            let o = ip.octets();
-            ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_unspecified()
-                || (o[0] == 100 && (64..128).contains(&o[1]))
-        }
-        Ok(IpAddr::V6(ip)) => {
-            let s = ip.segments();
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || (s[0] & 0xfe00) == 0xfc00
-                || (s[0] & 0xffc0) == 0xfe80
-        }
+        Ok(IpAddr::V4(ip)) => v4_is_private(ip),
+        // An IPv4-mapped address (::ffff:a.b.c.d) is judged by its v4 half.
+        Ok(IpAddr::V6(ip)) => match ip.to_ipv4_mapped() {
+            Some(v4) => v4_is_private(v4),
+            None => {
+                let s = ip.segments();
+                ip.is_loopback()
+                    || ip.is_unspecified()
+                    || (s[0] & 0xfe00) == 0xfc00
+                    || (s[0] & 0xffc0) == 0xfe80
+            }
+        },
         Err(_) => false,
     }
 }
@@ -1171,6 +1188,8 @@ mod tests {
             "fc00::1",
             "fd12:3456::1",
             "fe80::1",
+            "::ffff:192.168.1.10",
+            "::ffff:100.64.0.1",
         ] {
             assert!(addr_is_private(addr), "{addr} должен считаться приватным");
         }
@@ -1189,6 +1208,7 @@ mod tests {
             "172.32.0.1",
             "2001:db8::1",
             "2a00:1450::1",
+            "::ffff:198.51.100.7",
             "home.example.org",
             "",
         ] {
@@ -1222,14 +1242,31 @@ mod tests {
 
     #[test]
     fn via_relay_defaults_to_having_a_descriptor() {
-        // Default: follows whether the agent holds a relay descriptor.
-        assert!(resolve_via_relay(false, false, true));
+        // Default: follows whether the agent holds a relay descriptor, in a
+        // build that can actually run the uplink (XR-034). The default test run
+        // has no `relay` feature, `--features relay` flips the expectation.
+        let built = cfg!(feature = "relay");
+        assert_eq!(resolve_via_relay(false, false, true), built);
         assert!(!resolve_via_relay(false, false, false));
         // --relay forces on even without a descriptor yet.
-        assert!(resolve_via_relay(true, false, false));
+        assert_eq!(resolve_via_relay(true, false, false), built);
         // --no-relay wins over everything, including --relay.
         assert!(!resolve_via_relay(false, true, true));
         assert!(!resolve_via_relay(true, true, true));
+    }
+
+    // A default build holds a [relay] block after `install --token` but cannot
+    // bring the uplink up, so the share must not be advertised as relayed and
+    // the private-address warning must stay (XR-034 review).
+    #[test]
+    fn via_relay_off_without_relay_feature() {
+        if cfg!(feature = "relay") {
+            return;
+        }
+        assert!(!resolve_via_relay(false, false, true));
+        assert!(!resolve_via_relay(true, false, true));
+        let via = resolve_via_relay(false, false, true);
+        assert!(private_addr_warning("192.168.1.10", 8443, via).is_some());
     }
 
     fn minimal_cfg() -> AgentConfig {
