@@ -386,6 +386,71 @@ write scope appears. The printed URL carries that token in full. Treat it like
 the token itself, and remember the browser history keeps it (the command says
 so too). Add `--https` when the agent serves TLS.
 
+## Reaching a share from outside
+
+The agent listens on `0.0.0.0:8443` and registers the share with the address
+the hub sees the request coming from. Run `xr-share share` on the agent's own
+machine behind a router and the hub records your public IP, but nothing routes
+port 8443 to that machine yet. Consumers on your Wi-Fi reach the share by its
+LAN address; everyone else gets a connection timeout. This section is how to
+open it up. Pick one of the three ways below. They are listed from the least
+setup to the most.
+
+1. **Relay through the hub.** Nothing to configure on the router. A token
+   install picks the relay descriptor up from the hub. `share` sees it and
+   turns the relay leg on by itself, and consumers fall back to the relay when
+   the direct addresses fail. `share` prints a `relay: включён` line when the
+   leg is on. The agent's log says `relay reverse tunnel enabled` once the
+   uplink to the hub is up:
+
+   ```sh
+   journalctl -u xr-share | grep relay
+   ```
+
+   The binary has to be built with `--features relay` (release binaries from
+   the hub are). A hand-rolled config needs a `[relay]` block, see LLD-23.
+
+2. **Forward port 8443 to the agent's machine.** Open the router's admin page
+   and find the port forwarding (also called virtual server or NAT) section.
+   Add a TCP rule from WAN port 8443 to the machine's LAN IP, port 8443. Give
+   that machine a static DHCP lease first. Without it the rule goes stale.
+   Then register the share from that machine:
+
+   ```sh
+   sudo xr-share share /srv/photos
+   ```
+
+   The hub fills in your public IP. From a network other than your own:
+
+   ```sh
+   curl -sk https://<your public IP>:8443/ -o /dev/null -w '%{http_code}\n'
+   # 401 means the agent answered; a timeout means the forward is not there
+   ```
+
+3. **Public IP or DDNS name by hand.** When `share` runs on a machine other
+   than the agent (the hub then sees that machine's address), name the
+   address yourself. The same applies when the provider changes your IP now
+   and then:
+
+   ```sh
+   sudo xr-share share /srv/photos --addr home.example.org
+   ```
+
+   A DDNS name (No-IP, DuckDNS, the router's own DDNS client) keeps the share
+   reachable across IP changes. The port forward from step 2 is still needed.
+
+`share` prints a warning when the address it just registered is private:
+RFC 1918 (`192.168.x`, `10.x`, `172.16-31.x`), loopback, link-local, carrier
+NAT `100.64.0.0/10`, IPv6 ULA `fc00::/7` and `fe80::`. The warning names the
+port to forward. It does not fire when the share goes through the relay.
+That share is reachable from outside already.
+
+Carrier-grade NAT is the case where a port forward does not help. Look at the
+router's WAN address. If it is in `100.64.0.0/10` (or in `10.x`, `192.168.x`),
+your provider sits between you and the internet. The port you open on the
+router then opens on nobody's public address. Some providers sell a public IP
+as an option; otherwise the relay (XR-035, LLD-23) carries the share instead.
+
 ## Manual setup (no installer)
 
 ```sh
@@ -402,9 +467,9 @@ xr-share keygen
 xr-share -c /etc/xr-share/config.toml
 ```
 
-Direct access needs a public IP or a forwarded port. Behind NAT the relay leg
-(LLD-23) carries the share instead: token installs pick the relay descriptor up
-from the hub automatically, hand-rolled setups add a `[relay]` block.
+Direct access needs a public IP or a forwarded port; behind NAT, the relay
+leg (LLD-23) carries the share instead. The choice between them is laid out
+in [Reaching a share from outside](#reaching-a-share-from-outside).
 
 ## Build
 
