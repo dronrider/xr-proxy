@@ -1284,8 +1284,13 @@ async fn share_web(
     if let Err(e) = check_token(&state, &share_id, SCOPE_READ, &req) {
         return e.into_response();
     }
+    // Адрес страницы несёт `?token=`, и без Referrer-Policy переход по ссылке
+    // из отрендеренного markdown унёс бы его чужому сайту в Referer (XR-198).
     (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
         crate::web_page::SHARE_WEB_HTML,
     )
         .into_response()
@@ -3208,6 +3213,11 @@ mod tests {
         assert_eq!(
             r.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/html; charset=utf-8"
+        );
+        // Адрес страницы несёт ?token=, в Referer он уезжать не должен (XR-198).
+        assert_eq!(
+            r.headers().get(header::REFERRER_POLICY).unwrap(),
+            "no-referrer"
         );
         let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
         let page = String::from_utf8_lossy(&body).into_owned();
