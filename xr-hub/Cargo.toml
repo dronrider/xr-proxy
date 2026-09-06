@@ -37,3 +37,7 @@ rpassword = "7"
 tar = "0.4"
 flate2 = "1"
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+
+[dev-dependencies]
+# Тест deploy/nginx-token-mask.conf гоняет регулярки map по образцам (XR-198).
+regex = "1"

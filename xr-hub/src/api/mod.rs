@@ -3,6 +3,7 @@ pub mod auth;
 pub mod dist;
 pub mod health;
 pub mod invites;
+pub mod log_mask;
 pub mod presets;
 pub mod register;
 pub mod share_v2;
@@ -147,7 +148,19 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/invite/{token}/view", get(invites::redirect_to_view))
         .with_state(state)
         .layer(cors)
-        .layer(TraceLayer::new_for_http());
+        // Request-спан пишет URI без секретов (XR-198): инвайт-токен стоит в
+        // пути, share-токен в query, и спан по умолчанию клал бы их в journal
+        // на RUST_LOG=debug. Поля те же, что у DefaultMakeSpan.
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |req: &axum::http::Request<axum::body::Body>| {
+                tracing::debug_span!(
+                    "request",
+                    method = %req.method(),
+                    uri = %log_mask::mask_uri(&req.uri().to_string()),
+                    version = ?req.version(),
+                )
+            },
+        ));
 
     // SPA fallback for admin UI.
     api.fallback_service(spa_service())
@@ -209,11 +222,16 @@ pub(crate) mod testlog {
     /// Гвард держать до конца теста: подписчик ставится на текущий поток, а
     /// тесты гоняются на однопоточном рантайме, поэтому его хватает и на await.
     pub(crate) fn capture() -> (Buffer, tracing::subscriber::DefaultGuard) {
+        capture_at(tracing::Level::ERROR)
+    }
+
+    /// То же с порогом уровня: request-спан tower-http виден только с debug.
+    pub(crate) fn capture_at(level: tracing::Level) -> (Buffer, tracing::subscriber::DefaultGuard) {
         let buf = Buffer::default();
         let sub = tracing_subscriber::fmt()
             .with_writer(buf.clone())
             .with_ansi(false)
-            .with_max_level(tracing::Level::ERROR)
+            .with_max_level(level)
             .finish();
         (buf.clone(), tracing::subscriber::set_default(sub))
     }
@@ -285,6 +303,34 @@ mod tests {
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap()
+    }
+
+    /// Request-спан не пишет секретов из URI (XR-198): инвайт-токен в пути и
+    /// share-токен в query уходят в лог отметкой <masked>. Проверяется по
+    /// настоящему выводу tracing на уровне debug, где спан tower-http виден.
+    #[tokio::test]
+    async fn test_request_span_masks_tokens_in_uri() {
+        const TOKEN: &str = "XR198InviteToken000001";
+        let (log, _guard) = testlog::capture_at(tracing::Level::DEBUG);
+        // Callsite'ы tower-http регистрируются лениво первым заходом, и при
+        // параллельном прогоне их интерес в общем кеше tracing считается по
+        // чужому подписчику с порогом ERROR: debug-события спана молча
+        // выпадают. Прогрев одним заходом и пересборка кеша от своего
+        // подписчика делают прогон детерминированным.
+        let _ = get("/healthz").await;
+        tracing::callsite::rebuild_interest_cache();
+        let _ = get(&format!("/api/v1/invite/{TOKEN}")).await;
+        let _ = get(&format!("/invite/{TOKEN}/view")).await;
+        let _ = get(&format!("/api/v1/shares?token={TOKEN}&x=1")).await;
+        let text = log.text();
+        assert!(
+            text.contains("started processing request"),
+            "спан tower-http в лог не попал, проверять нечего: {text}"
+        );
+        assert!(!text.contains(TOKEN), "токен уехал в лог: {text}");
+        assert!(text.contains("uri=/api/v1/invite/<masked> "), "нет маскированного пути инвайта: {text}");
+        assert!(text.contains("uri=/invite/<masked>/view"), "{text}");
+        assert!(text.contains("uri=/api/v1/shares?token=<masked>&x=1"), "{text}");
     }
 
     async fn body_text(resp: axum::response::Response) -> String {
