@@ -3,7 +3,8 @@
 //! `regex` по образцам URL. Захваты в файле записаны в форме `(?P<имя>...)`,
 //! общей для PCRE и `regex`. Эмулируется порядок nginx: срабатывает первая
 //! совпавшая регулярка, в значение подставляются захваты, без совпадения
-//! берётся `default`.
+//! берётся `default`. Маскировка идёт двумя ступенями `map` (путь, потом
+//! query), поэтому и стенд гонит значение через обе.
 
 use std::path::PathBuf;
 
@@ -37,8 +38,13 @@ fn map_rules(source: &str, target: &str) -> Vec<Rule> {
     // Первая же `}` стоит внутри `${pre}`, конец блока это скобка в начале строки.
     let end = body.find("\n}").expect("блок map закрыт");
     let mut rules = Vec::new();
+    let mut default = None;
     for line in body[..end].lines() {
         let line = line.trim();
+        if let Some(rest) = line.strip_prefix("default") {
+            default = Some(rest.trim().trim_end_matches(';').to_string());
+            continue;
+        }
         if !line.starts_with("\"~") {
             continue;
         }
@@ -49,6 +55,13 @@ fn map_rules(source: &str, target: &str) -> Vec<Rule> {
         rules.push(Rule { re, value });
     }
     assert!(!rules.is_empty(), "в блоке `{header}` нет ни одной регулярки");
+    // `apply` без совпадения отдаёт вход как есть; это честно, только пока
+    // default возвращает сам источник, а не переменную ступенью раньше.
+    assert_eq!(
+        default.as_deref(),
+        Some(source),
+        "default блока `{header}` обязан быть его источником"
+    );
     rules
 }
 
@@ -67,9 +80,22 @@ fn apply(rules: &[Rule], input: &str) -> String {
     input.to_string()
 }
 
+/// Две ступени `map` от источника до итоговой переменной, как их читает nginx.
+fn masked(source: &str, stage1: &str, target: &str, input: &str) -> String {
+    let no_invite = apply(&map_rules(source, stage1), input);
+    apply(&map_rules(stage1, target), &no_invite)
+}
+
+fn masked_uri(input: &str) -> String {
+    masked("$request_uri", "$xr_uri_no_invite", "$xr_masked_uri", input)
+}
+
+fn masked_referer(input: &str) -> String {
+    masked("$http_referer", "$xr_referer_no_invite", "$xr_masked_referer", input)
+}
+
 #[test]
 fn request_uri_masks_invite_in_path_and_token_in_query() {
-    let rules = map_rules("$request_uri", "$xr_masked_uri");
     let cases = [
         (format!("/invite/{TOKEN}"), "/invite/<masked>".to_string()),
         (format!("/api/v1/invite/{TOKEN}/claim"), "/api/v1/invite/<masked>/claim".to_string()),
@@ -80,9 +106,14 @@ fn request_uri_masks_invite_in_path_and_token_in_query() {
             format!("/W/file/a/b.md?x=1&token={TOKEN}&y=2"),
             "/W/file/a/b.md?x=1&token=<masked>&y=2".to_string(),
         ),
+        // Оба секрета разом: путь шары с сегментом invite и токен в query.
+        (
+            format!("/W/file/invite/notes.md?token={TOKEN}"),
+            "/W/file/invite/<masked>?token=<masked>".to_string(),
+        ),
     ];
     for (input, want) in cases {
-        let got = apply(&rules, &input);
+        let got = masked_uri(&input);
         assert_eq!(got, want, "маскировка {input}");
         assert!(!got.contains(TOKEN));
     }
@@ -90,7 +121,6 @@ fn request_uri_masks_invite_in_path_and_token_in_query() {
 
 #[test]
 fn request_uri_leaves_unrelated_paths_alone() {
-    let rules = map_rules("$request_uri", "$xr_masked_uri");
     for uri in [
         "/healthz",
         "/api/v1/shares",
@@ -99,19 +129,23 @@ fn request_uri_leaves_unrelated_paths_alone() {
         "/W/web?tokens=1&t=token",
         "/W/manifest?if_none_match=abc",
     ] {
-        assert_eq!(apply(&rules, uri), uri, "безобидный URI тронут");
+        assert_eq!(masked_uri(uri), uri, "безобидный URI тронут");
     }
 }
 
 #[test]
 fn referer_with_token_is_masked_too() {
-    let rules = map_rules("$http_referer", "$xr_masked_referer");
     let page = format!("http://agent.lan:8543/W/web?token={TOKEN}");
-    assert_eq!(apply(&rules, &page), "http://agent.lan:8543/W/web?token=<masked>");
+    assert_eq!(masked_referer(&page), "http://agent.lan:8543/W/web?token=<masked>");
     let invite = format!("https://hub.example.com/invite/{TOKEN}");
-    assert_eq!(apply(&rules, &invite), "https://hub.example.com/invite/<masked>");
-    assert_eq!(apply(&rules, "-"), "-");
-    assert_eq!(apply(&rules, "https://hub.example.com/"), "https://hub.example.com/");
+    assert_eq!(masked_referer(&invite), "https://hub.example.com/invite/<masked>");
+    let both = format!("http://agent.lan:8543/W/file/invite/a.md?token={TOKEN}");
+    assert_eq!(
+        masked_referer(&both),
+        "http://agent.lan:8543/W/file/invite/<masked>?token=<masked>"
+    );
+    assert_eq!(masked_referer("-"), "-");
+    assert_eq!(masked_referer("https://hub.example.com/"), "https://hub.example.com/");
 }
 
 /// Сам формат обязан брать маскированные переменные: `$request` и
@@ -128,5 +162,6 @@ fn log_format_uses_masked_variables_only() {
     assert!(!fmt.contains("$request\""), "сырой $request в формате: {fmt}");
     assert!(!fmt.contains("$request_uri"), "сырой $request_uri в формате: {fmt}");
     assert!(!fmt.contains("$http_referer"), "сырой $http_referer в формате: {fmt}");
+    assert!(!fmt.contains("_no_invite"), "промежуточная ступень в формате: {fmt}");
     assert!(text.contains(MASK));
 }
