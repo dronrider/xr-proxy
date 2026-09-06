@@ -151,7 +151,10 @@ Token is presented as a URL-safe base64 blob of the hub's `ShareToken` JSON, via
 (best-effort for browsers). Verified offline against the pinned hub key (bound
 `share_id`, not expired, valid signature, and carrying the route's scope);
 otherwise `401` (no/garbled token) or `403` (wrong share, expired, bad signature,
-or missing scope). Tokens are never logged.
+or missing scope). Tokens are never logged: the agent keeps no request log,
+the share page is served with `Referrer-Policy: no-referrer`, and a front
+proxy in front of a public path masks `token=` in its access log
+(`deploy/nginx-token-mask.conf`).
 
 ### Scope model (LLD-28, LLD-29)
 

@@ -238,6 +238,7 @@ server {
     server_name *.web.example.com;
     ssl_certificate     /etc/nginx/ssl/web-example-com.pem;      # wildcard
     ssl_certificate_key /etc/nginx/ssl/web-example-com.key;
+    access_log /var/log/nginx/access.log xr_masked;  # формат из nginx-token-mask.conf
     location / {
         proxy_pass http://127.0.0.1:8090;
         proxy_set_header Host $host;                 # имя публикации едет в Host
@@ -259,6 +260,40 @@ server {
 работает как одна страница. Соседний блок хаба на том же адресе http2 держать
 может: настройка привязана к сокету, но ALPN согласуется на соединение, поэтому
 хаб останется на h2, а публикации сами уедут на HTTP/1.1.
+
+### Лог фронта маскирует токены (XR-198)
+
+Инвайт-токен стоит в пути ссылки (`/invite/<токен>`, её кодирует QR), а
+share-токен едет в query (`?token=<блоб>`). Обе ссылки открывает браузер.
+Дефолтный формат `combined` пишет `$request` и `$http_referer` целиком, и
+инвариант «токены не логируем» на фронте ломается. Поэтому в обоих
+server-блоках, у хаба и у публикаций, строка `access_log` обязательна, а
+формат для неё лежит в репозитории:
+
+```sh
+cp deploy/nginx-token-mask.conf /etc/nginx/conf.d/
+# в каждом server-блоке хаба и xr-web:
+#   access_log /var/log/nginx/access.log xr_masked;
+nginx -t && systemctl reload nginx
+```
+
+Проверка по логу: заход по несуществующему инвайту ложится в `access.log`
+без токена.
+
+```sh
+curl -s -o /dev/null https://xr-hub.example.com/invite/XR198CHECK0000000000AA
+tail -1 /var/log/nginx/access.log
+# ... "GET /invite/<masked> HTTP/1.1" 404 ...
+grep -c XR198CHECK0000000000AA /var/log/nginx/access.log
+# 0
+```
+
+Собственный лог хаба маскирует те же места сам (`journalctl -u xr-hub` под
+`RUST_LOG=debug` показывает `uri=/api/v1/invite/<masked>`), `xr-web` query не
+пишет вовсе. Остаётся `error_log`. Переменных он не знает и при `502` от
+упавшего апстрима пишет строку запроса как есть. Уровень `crit` в этих
+server-блоках закрывает и это, но прячет причины отказов апстрима. Выбор за
+оператором.
 
 Wildcard-сертификат берётся DNS-01, и это единственный способ покрыть все
 публикации разом: HTTP-01 wildcard не выдаёт. Пока токена DNS-провайдера нет,
