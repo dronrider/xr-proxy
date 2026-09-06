@@ -91,6 +91,8 @@ RTOK=$(curl -s -H 'content-type: application/json' \
 # Шаг 1: страница отдаётся по токену в query, без токена отказ, наружу ничего
 test "$(curl -s -o "$S/page.html" -w '%{http_code}' "http://127.0.0.1:18543/$SID/web?token=$RTOK")" = 200
 grep -q '<title>Шара</title>' "$S/page.html"
+# адрес страницы несёт токен, в Referer он уезжать не должен (XR-198)
+curl -s -D - -o /dev/null "http://127.0.0.1:18543/$SID/web?token=$RTOK" | grep -qi '^referrer-policy: no-referrer'
 if grep -qE 'https?://' "$S/page.html"; then echo 'страница тянет внешние адреса' >&2; exit 1; fi
 test "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18543/$SID/web")" = 401
 
