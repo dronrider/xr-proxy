@@ -837,44 +837,40 @@ async fn run_event_loop(
 
             // Transfer data.
             if let Some(ref mut relay) = session.relay {
-                // Detect dead relay: if receiver dropped, relay task died.
-                // Abort socket so the app gets RST and retries with fresh DNS.
-                if relay.to_relay.is_closed() {
-                    socket.abort();
-                    stale_keys.push(*key);
-                    continue;
-                }
-
-                // smoltcp → relay (upload).
-                // Никогда не делаем recv_slice, если канал к relay полон:
-                // consume'нутые из smoltcp байты тогда было бы некуда деть и
-                // их пришлось бы выбросить (потеря данных при больших upload'ах).
-                while socket.can_recv() {
-                    if relay.to_relay.capacity() == 0 { break; }
-                    let mut buf = vec![0u8; 32768];
-                    match socket.recv_slice(&mut buf) {
-                        Ok(n) if n > 0 => {
-                            buf.truncate(n);
-                            ctx.stats.add_smol_recv(n as u64);
-                            if relay.to_relay.try_send(buf).is_err() { break; }
+                // smoltcp -> relay (upload). Пропускаем, когда релей уже
+                // кончился (его приёмник закрыт): заливать вверх больше некому,
+                // но хвост скачивания ниже надо ещё доставить.
+                if !relay.to_relay.is_closed() {
+                    // Никогда не делаем recv_slice, если канал к relay полон:
+                    // consume'нутые из smoltcp байты тогда было бы некуда деть и
+                    // их пришлось бы выбросить (потеря данных при больших upload'ах).
+                    while socket.can_recv() {
+                        if relay.to_relay.capacity() == 0 { break; }
+                        let mut buf = vec![0u8; 32768];
+                        match socket.recv_slice(&mut buf) {
+                            Ok(n) if n > 0 => {
+                                buf.truncate(n);
+                                ctx.stats.add_smol_recv(n as u64);
+                                if relay.to_relay.try_send(buf).is_err() { break; }
+                            }
+                            _ => break,
                         }
-                        _ => break,
                     }
                 }
 
-                // relay → smoltcp (download).
-                match drain_download_to_tx(
+                // relay -> smoltcp (download). На завершении релея хвост
+                // доливается и сокет закрывается через FIN, а не обрывается
+                // RST-ом: иначе последние байты ответа теряются (обрыв картинок).
+                if finish_or_pump_download(
                     &mut *socket,
                     &mut relay.from_relay,
                     &mut relay.pending_download,
                     &ctx.stats,
                 ) {
-                    DownloadDrain::Idle => {}
-                    DownloadDrain::Disconnected => {
-                        // Relay sender dropped — relay task finished.
-                        socket.abort();
-                        stale_keys.push(*key);
-                    }
+                    // Сокет закрывается штатно: перестаём его обслуживать, а
+                    // саму запись снимет проверка Closed/TimeWait ниже, когда
+                    // smoltcp дольёт буфер и завершит закрытие.
+                    session.relay = None;
                 }
             }
 
@@ -978,6 +974,10 @@ trait TxSink {
     /// Enqueue as many leading bytes as fit. Returns the count accepted
     /// (`0..=data.len()`). A short return means the TX buffer is (nearly) full.
     fn enqueue(&mut self, data: &[u8]) -> usize;
+    /// Half-close the send side: no more bytes will be written, and the FIN
+    /// follows whatever is still buffered. Unlike an abort, the already
+    /// enqueued tail is delivered, not discarded.
+    fn close(&mut self);
 }
 
 impl TxSink for smoltcp::socket::tcp::Socket<'_> {
@@ -986,8 +986,37 @@ impl TxSink for smoltcp::socket::tcp::Socket<'_> {
     }
     fn enqueue(&mut self, data: &[u8]) -> usize {
         // send_slice errors only if the socket can't send at all; treat that
-        // as "0 accepted" — `can_send()` gates the call anyway.
+        // as "0 accepted" since `can_send()` gates the call anyway.
         self.send_slice(data).unwrap_or(0)
+    }
+    fn close(&mut self) {
+        smoltcp::socket::tcp::Socket::close(self);
+    }
+}
+
+/// Обслужить сторону скачивания (таргет -> приложение) одной сессии. Пока релей
+/// жив, просто перекладывает байты в буфер smoltcp. Когда релей кончился и весь
+/// произведённый им хвост уже лёг в буфер, закрывает сокет через FIN и
+/// возвращает `true`: сессия дальше не обслуживается, а сокет доливает буфер и
+/// шлёт FIN сам.
+///
+/// **Почему FIN, а не abort.** Раньше на завершении релея сокет обрывался
+/// `abort()`-ом (RST). Байты, уже принятые из релея в буфер smoltcp, но ещё не
+/// ушедшие приложению, RST выбрасывал, и ответ обрывался на хвосте. Это било по
+/// картинкам: CDN закрывает соединение сразу за последними байтами, и мы RST-ом
+/// сносили их раньше доставки. `close()` доливает буфер и шлёт FIN.
+fn finish_or_pump_download<S: TxSink>(
+    sink: &mut S,
+    from_relay: &mut mpsc::Receiver<Vec<u8>>,
+    pending: &mut Vec<u8>,
+    stats: &Stats,
+) -> bool {
+    match drain_download_to_tx(sink, from_relay, pending, stats) {
+        DownloadDrain::Idle => false,
+        DownloadDrain::Disconnected => {
+            sink.close();
+            true
+        }
     }
 }
 
@@ -1429,6 +1458,13 @@ mod tests {
         buf: Vec<u8>,
         capacity: usize,
         max_accept: usize,
+        closed: bool,
+    }
+
+    impl MockSink {
+        fn new(capacity: usize, max_accept: usize) -> Self {
+            Self { buf: Vec::new(), capacity, max_accept, closed: false }
+        }
     }
 
     impl TxSink for MockSink {
@@ -1440,6 +1476,9 @@ mod tests {
             let n = room.min(self.max_accept).min(data.len());
             self.buf.extend_from_slice(&data[..n]);
             n
+        }
+        fn close(&mut self) {
+            self.closed = true;
         }
     }
 
@@ -1471,7 +1510,7 @@ mod tests {
             // tx dropped here → eventual Disconnected.
         });
 
-        let mut sink = MockSink { buf: Vec::new(), capacity: 2048, max_accept: 700 };
+        let mut sink = MockSink::new(2048, 700);
         let mut pending = Vec::new();
         let mut received = Vec::with_capacity(total);
 
@@ -1498,7 +1537,7 @@ mod tests {
         let stats = Stats::new();
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
         drop(tx);
-        let mut sink = MockSink { buf: Vec::new(), capacity: 4096, max_accept: 4096 };
+        let mut sink = MockSink::new(4096, 4096);
         let mut pending = Vec::new();
         assert!(matches!(
             drain_download_to_tx(&mut sink, &mut rx, &mut pending, &stats),
@@ -1513,7 +1552,7 @@ mod tests {
         let stats = Stats::new();
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
         tx.send(vec![7u8; 1000]).await.unwrap();
-        let mut sink = MockSink { buf: Vec::new(), capacity: 400, max_accept: 400 };
+        let mut sink = MockSink::new(400, 400);
         let mut pending = Vec::new();
 
         assert!(matches!(
@@ -1523,10 +1562,59 @@ mod tests {
         assert_eq!(sink.buf.len(), 400, "should fill exactly the available room");
         assert_eq!(pending.len(), 600, "remainder must be preserved, not dropped");
 
-        // Drain the sink (app reads) and run again — the rest must flush.
+        // Drain the sink (app reads) and run again, the rest must flush.
         sink.buf.clear();
         let _ = drain_download_to_tx(&mut sink, &mut rx, &mut pending, &stats);
         assert_eq!(sink.buf.len(), 400);
         assert_eq!(pending.len(), 200);
+    }
+
+    /// Баг обрыва хвоста: сервер отдаёт ответ и закрывает соединение. Все байты
+    /// обязаны доехать до приложения, а сокет обязан закрыться штатно (FIN), а
+    /// не оборваться. Раньше на завершении релея сокет обрывался `abort()`-ом
+    /// (RST) сразу, и хвост, ещё лежавший в буфере smoltcp, пропадал: картинки
+    /// не догружались. `finish_or_pump_download` доливает буфер и зовёт
+    /// `close()`.
+    #[tokio::test]
+    async fn download_tail_is_delivered_and_socket_closes_gracefully() {
+        let stats = Stats::new();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+
+        let total = 120_000usize;
+        let chunk = 1000usize;
+        let mut expected = Vec::with_capacity(total);
+        for i in 0..total {
+            expected.push((i % 251) as u8);
+        }
+        let producer = expected.clone();
+        tokio::spawn(async move {
+            let mut off = 0;
+            while off < producer.len() {
+                let end = (off + chunk).min(producer.len());
+                tx.send(producer[off..end].to_vec()).await.unwrap();
+                off = end;
+            }
+            // tx dropped: сервер закрыл соединение сразу за последним байтом.
+        });
+
+        let mut sink = MockSink::new(2048, 700);
+        let mut pending = Vec::new();
+        let mut received = Vec::with_capacity(total);
+        let mut finished = false;
+
+        for _ in 0..1_000_000 {
+            let done = finish_or_pump_download(&mut sink, &mut rx, &mut pending, &stats);
+            received.extend(sink.buf.drain(..));
+            if done {
+                finished = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert!(finished, "сессия так и не закрылась");
+        assert!(sink.closed, "сокет закрыт через FIN, а не оборван");
+        assert_eq!(received.len(), expected.len(), "хвост ответа потерян");
+        assert_eq!(received, expected, "поток побит или переставлен");
     }
 }
