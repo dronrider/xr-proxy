@@ -185,6 +185,13 @@ class XrVpnService : VpnService() {
     // колбэков ConnectivityManager; единственное исключение это clear() на
     // тир-дауне, и он идёт уже после unregister, когда колбэки не приходят.
     private val underlyingNetworks = HashSet<Network>()
+    // Транспорт каждого живого аплинка (wifi, cellular, ethernet, other) на
+    // момент его появления. По нему выход из «сети нет» различает возврат того
+    // же аплинка и приход другого (XR-296): у пропавшей сети возможностей уже
+    // не спросить. Пишется и читается там же, где underlyingNetworks.
+    private val uplinkTransports = HashMap<Network, String>()
+    // Транспорт последнего аплинка, с уходом которого наступило «сети нет».
+    @Volatile private var lostUplinkTransport: String? = null
 
     // Separate callback that watches only the DEFAULT (active) uplink so we
     // can (a) re-bind the tunnel when it switches (LTE↔Wi-Fi, task 3b-1) and
@@ -1244,6 +1251,7 @@ class XrVpnService : VpnService() {
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 underlyingNetworks.add(network)
+                uplinkTransportOf(cm, network)?.let { uplinkTransports[network] = it }
                 NativeBridge.underlyingNetwork = network
                 // Inform the framework that traffic is metered/unmetered
                 // through this uplink, it's also what SystemUI uses to
@@ -1251,10 +1259,11 @@ class XrVpnService : VpnService() {
                 setUnderlyingNetworks(arrayOf(network))
                 // Физика вернулась: снять «сети нет» (при живом туннеле только
                 // этот колбэк её и увидит, XR-183).
-                exitNoNetwork()
+                exitNoNetwork(network)
             }
             override fun onLost(network: Network) {
                 underlyingNetworks.remove(network)
+                val transport = uplinkTransports.remove(network)
                 // Only clear if the lost one is what we were pointing at;
                 // another network may already be Available.
                 if (NativeBridge.underlyingNetwork == network) {
@@ -1262,7 +1271,10 @@ class XrVpnService : VpnService() {
                 }
                 // Ушёл последний физический аплинк это и есть «сети нет»,
                 // независимо от того, поднят туннель или нет.
-                if (underlyingNetworks.isEmpty()) enterNoNetwork()
+                if (underlyingNetworks.isEmpty()) {
+                    lostUplinkTransport = transport
+                    enterNoNetwork()
+                }
             }
         }
         try {
@@ -1335,7 +1347,7 @@ class XrVpnService : VpnService() {
         // registerUnderlyingNetworkCallback): там «сети нет» некому снять по
         // физике, берём на себя дефолтный колбэк, как было до XR-183. В паузе
         // дефолт видит физику, так что кейс XR-095 не регрессирует.
-        if (networkCallback == null) exitNoNetwork()
+        if (networkCallback == null) exitNoNetwork(network)
     }
 
     private fun onDefaultCaps(network: Network, caps: NetworkCapabilities) {
@@ -1379,17 +1391,52 @@ class XrVpnService : VpnService() {
         // а pollLoop параллельно копирует состояние с Dispatchers.Default, и
         // проигранная гонка теряла бы один из апдейтов.
         _stateFlow.update { it.copy(noNetwork = true, restrictedNetwork = false) }
+        // Пул серверов движка замирает на прежнем активном (XR-296): без сети
+        // молчат все серверы разом, перебор резервов только рвал бы сессии.
+        NativeBridge.nativeOnUplinkLost()
         updateNotification()
     }
 
-    /** Физический аплинк вернулся. Снимаем «сети нет» и ставим долг на re-bind
-     *  туннеля к новому аплинку (иначе Connected оживал бы только медленным
-     *  нативным детектором). Окно ожидания Wi-Fi уже взведено на входе. */
-    private fun exitNoNetwork() {
+    /** Физический аплинк вернулся. Снимаем «сети нет» и перепривязываем
+     *  туннель сразу, а не долгом через pendingSwitch (иначе Connected оживал
+     *  бы только медленным нативным детектором, а застрявший долг держал бы пул
+     *  замороженным). Тот же транспорт, что пропал, это возврат того же
+     *  аплинка: движок пересобирает mux и продолжает с прежнего сервера, не
+     *  стирая здоровья и штрафов за мигание (XR-296). Другой транспорт это
+     *  настоящая смена сети, она идёт прежним путём с обнулением. Окно
+     *  ожидания Wi-Fi уже взведено на входе. */
+    private fun exitNoNetwork(network: Network) {
         if (!_stateFlow.value.noNetwork) return
         _stateFlow.update { it.copy(noNetwork = false) }
-        pendingSwitch = true
+        val lost = lostUplinkTransport
+        lostUplinkTransport = null
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val returned = cm?.let { uplinkTransportOf(it, network) }
+        if (lost != null && returned != null && lost != returned) {
+            NativeBridge.nativeJournalLog(
+                "INFO", "net", "сеть вернулась другим аплинком ($lost -> $returned): перепривязка туннеля",
+            )
+            NativeBridge.nativeOnNetworkChanged()
+        } else {
+            NativeBridge.nativeOnUplinkRestored()
+        }
         updateNotification()
+    }
+
+    /** Транспорт аплинка одним словом для журнала и сравнения; null, когда
+     *  система уже не отдаёт возможностей сети. */
+    private fun uplinkTransportOf(cm: ConnectivityManager, network: Network): String? {
+        val caps = try {
+            cm.getNetworkCapabilities(network)
+        } catch (_: SecurityException) {
+            null
+        } ?: return null
+        return when {
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+            else -> "other"
+        }
     }
 
     private fun registerScreenOnReceiver() {
@@ -1490,6 +1537,7 @@ class XrVpnService : VpnService() {
         NativeBridge.underlyingNetwork = null
         if (cm == null) {
             underlyingNetworks.clear()
+            uplinkTransports.clear()
             return
         }
         try {
@@ -1500,6 +1548,7 @@ class XrVpnService : VpnService() {
         // Чистим сет после unregister: новые onAvailable/onLost уже не придут,
         // гонки с потоком колбэков нет.
         underlyingNetworks.clear()
+        uplinkTransports.clear()
     }
 
     // ── State publishing helpers ──────────────────────────────────────

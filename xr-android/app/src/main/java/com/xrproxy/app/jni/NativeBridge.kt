@@ -91,6 +91,23 @@ object NativeBridge {
     external fun nativeOnNetworkChanged()
 
     /**
+     * Физического аплинка не осталось (XR-296). Пул серверов движка замирает
+     * на прежнем активном: без сети молчат все серверы разом, и перебор
+     * резервов только рвёт сессии. Признак переживает движок, туннель,
+     * поднятый без сети, получает его на старте. Безопасно без движка.
+     */
+    external fun nativeOnUplinkLost()
+
+    /**
+     * Тот же аплинк вернулся после пропажи (XR-296). Движок пересобирает
+     * mux и продолжает с прежнего сервера, не трогая накопленное здоровье и
+     * штрафы за мигание; живые сессии сбрасываются на новый интерфейс.
+     * Настоящая смена сети идёт через [nativeOnNetworkChanged]. Безопасно
+     * без движка.
+     */
+    external fun nativeOnUplinkRestored()
+
+    /**
      * True if the raw current SSID (as returned by `WifiInfo.getSSID()`,
      * quotes and all) matches any entry in `trusted`. Pure string logic in
      * Rust (`xr_core::trusted`) — case-insensitive, quote/whitespace-tolerant,
