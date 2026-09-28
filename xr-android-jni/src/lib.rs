@@ -362,11 +362,18 @@ jni_entry!(jstring_into_raw(&mut env, JNI_PANIC_START.to_string()); fn Java_com_
     let _guard = runtime.enter();
     match engine.start(queue.clone(), protect) {
         Ok(()) => {
-            if UPLINK_DOWN.load(Ordering::Relaxed) {
-                engine.on_uplink_lost();
-            }
             let mut lock = lock_surviving_poison(get_engine(), "engine");
             *lock = Some(EngineHandle { engine, queue, runtime });
+            // Признак читается под тем же локом, что берут uplink_lost и
+            // uplink_restored, и уже с лежащим handle: пришедший раньше возврат
+            // сети снял признак до нас, пришедший позже найдёт движок и снимет
+            // заморозку сам. До установки handle окно между проверкой и
+            // записью оставляло пул замороженным без снимающего.
+            if UPLINK_DOWN.load(Ordering::Relaxed) {
+                if let Some(ref handle) = *lock {
+                    handle.engine.on_uplink_lost();
+                }
+            }
             tracing::info!("VPN engine started");
             std::ptr::null_mut() // null = success
         }
@@ -384,11 +391,7 @@ jni_entry!(jstring_into_raw(&mut env, JNI_PANIC_START.to_string()); fn Java_com_
 jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativeStop(
     _env: JNIEnv, _class: JClass,
 ) {
-    let mut lock = lock_surviving_poison(get_engine(), "engine");
-    if let Some(mut handle) = lock.take() {
-        handle.engine.stop();
-        tracing::info!("VPN engine stopped");
-    }
+    engine_stop();
 });
 
 // Notify the engine that the underlying network switched (LTE<->Wi-Fi).
@@ -397,12 +400,7 @@ jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativeStop(
 jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativeOnNetworkChanged(
     _env: JNIEnv, _class: JClass,
 ) {
-    let lock = lock_surviving_poison(get_engine(), "engine");
-    if let Some(ref handle) = *lock {
-        // Enter the engine's runtime: on_network_changed spawns a recycle task.
-        let _guard = handle.runtime.enter();
-        handle.engine.on_network_changed();
-    }
+    network_changed();
 });
 
 // Физического аплинка не осталось (XR-296): пул серверов замирает на прежнем
@@ -410,11 +408,7 @@ jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativeOnNetworkChanged(
 jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativeOnUplinkLost(
     _env: JNIEnv, _class: JClass,
 ) {
-    UPLINK_DOWN.store(true, Ordering::Relaxed);
-    let lock = lock_surviving_poison(get_engine(), "engine");
-    if let Some(ref handle) = *lock {
-        handle.engine.on_uplink_lost();
-    }
+    uplink_lost();
 });
 
 // Тот же аплинк вернулся (XR-296): пул пересобирает mux и продолжает с прежнего
@@ -422,6 +416,44 @@ jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativeOnUplinkLost(
 jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativeOnUplinkRestored(
     _env: JNIEnv, _class: JClass,
 ) {
+    uplink_restored();
+});
+
+// Тела четырёх входов выше живут отдельными функциями, чтобы юниты гоняли
+// признак UPLINK_DOWN без JNIEnv. Признак снимается везде, где пул теряет
+// заморозку: возврат того же аплинка, настоящая смена сети (recycle движка
+// снимает её сам) и остановка движка. Иначе признак, взведённый в пропавшей
+// сети и не снятый этим путём, замораживал бы следующий свежий пул при живой
+// сети: без failover и с ложным «сети нет» в журнале.
+
+fn engine_stop() {
+    UPLINK_DOWN.store(false, Ordering::Relaxed);
+    let mut lock = lock_surviving_poison(get_engine(), "engine");
+    if let Some(mut handle) = lock.take() {
+        handle.engine.stop();
+        tracing::info!("VPN engine stopped");
+    }
+}
+
+fn network_changed() {
+    UPLINK_DOWN.store(false, Ordering::Relaxed);
+    let lock = lock_surviving_poison(get_engine(), "engine");
+    if let Some(ref handle) = *lock {
+        // Enter the engine's runtime: on_network_changed spawns a recycle task.
+        let _guard = handle.runtime.enter();
+        handle.engine.on_network_changed();
+    }
+}
+
+fn uplink_lost() {
+    UPLINK_DOWN.store(true, Ordering::Relaxed);
+    let lock = lock_surviving_poison(get_engine(), "engine");
+    if let Some(ref handle) = *lock {
+        handle.engine.on_uplink_lost();
+    }
+}
+
+fn uplink_restored() {
     UPLINK_DOWN.store(false, Ordering::Relaxed);
     let lock = lock_surviving_poison(get_engine(), "engine");
     if let Some(ref handle) = *lock {
@@ -429,7 +461,7 @@ jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativeOnUplinkRestored(
         let _guard = handle.runtime.enter();
         handle.engine.on_uplink_restored();
     }
-});
+}
 
 /// Разобрать массив `user_rules` (тот же, что уезжает в конфиг движка).
 /// Битые записи выбрасываются молча, они и в конфиге не выживают.
@@ -2084,6 +2116,31 @@ jni_entry!(jni::sys::JNI_FALSE; fn Java_com_xrproxy_app_jni_NativeBridge_nativeC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// XR-296, ревью: признак «аплинка нет» снимается каждым путём, которым
+    /// пул теряет заморозку. Один тест на все три пути, статика общая, и
+    /// параллельные тесты толкались бы на ней.
+    #[test]
+    fn uplink_flag_clears_on_every_unfreeze_path() {
+        uplink_lost();
+        assert!(UPLINK_DOWN.load(Ordering::Relaxed));
+        network_changed();
+        assert!(
+            !UPLINK_DOWN.load(Ordering::Relaxed),
+            "a real network change must clear the flag, or the next start freezes a fresh pool"
+        );
+
+        uplink_lost();
+        engine_stop();
+        assert!(
+            !UPLINK_DOWN.load(Ordering::Relaxed),
+            "stopping the engine must clear the flag, the next service instance starts afresh"
+        );
+
+        uplink_lost();
+        uplink_restored();
+        assert!(!UPLINK_DOWN.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn selection_absent_is_whole_share() {
