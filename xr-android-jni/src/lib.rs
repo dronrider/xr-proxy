@@ -6,6 +6,7 @@ use jni::{JNIEnv, JavaVM};
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -29,6 +30,12 @@ mod guard;
 
 /// Global engine instance.
 static ENGINE: OnceLock<Mutex<Option<EngineHandle>>> = OnceLock::new();
+
+/// Признак «аплинка нет» от ОС (XR-296). Живёт вне движка: Kotlin взводит его
+/// и до старта туннеля, и между сессиями, а движок рождается на `nativeStart`
+/// и признак получает вдогонку. Иначе туннель, поднятый в авиарежиме, шёл бы
+/// перебирать резервы, пока ОС молчит про возврат сети.
+static UPLINK_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// Единый персистентный журнал приложения (XR-042). Живёт на уровне процесса,
 /// а не движка: перезапуск движка (смена сети, пауза) ленту не обнуляет.
@@ -355,6 +362,9 @@ jni_entry!(jstring_into_raw(&mut env, JNI_PANIC_START.to_string()); fn Java_com_
     let _guard = runtime.enter();
     match engine.start(queue.clone(), protect) {
         Ok(()) => {
+            if UPLINK_DOWN.load(Ordering::Relaxed) {
+                engine.on_uplink_lost();
+            }
             let mut lock = lock_surviving_poison(get_engine(), "engine");
             *lock = Some(EngineHandle { engine, queue, runtime });
             tracing::info!("VPN engine started");
@@ -392,6 +402,32 @@ jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativeOnNetworkChanged(
         // Enter the engine's runtime: on_network_changed spawns a recycle task.
         let _guard = handle.runtime.enter();
         handle.engine.on_network_changed();
+    }
+});
+
+// Физического аплинка не осталось (XR-296): пул серверов замирает на прежнем
+// активном вместо перебора резервов. Признак переживает движок, см. UPLINK_DOWN.
+jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativeOnUplinkLost(
+    _env: JNIEnv, _class: JClass,
+) {
+    UPLINK_DOWN.store(true, Ordering::Relaxed);
+    let lock = lock_surviving_poison(get_engine(), "engine");
+    if let Some(ref handle) = *lock {
+        handle.engine.on_uplink_lost();
+    }
+});
+
+// Тот же аплинк вернулся (XR-296): пул пересобирает mux и продолжает с прежнего
+// сервера, живые сессии сбрасываются на новый интерфейс. No-op без движка.
+jni_entry!(fn Java_com_xrproxy_app_jni_NativeBridge_nativeOnUplinkRestored(
+    _env: JNIEnv, _class: JClass,
+) {
+    UPLINK_DOWN.store(false, Ordering::Relaxed);
+    let lock = lock_surviving_poison(get_engine(), "engine");
+    if let Some(ref handle) = *lock {
+        // Внутри runtime движка: on_uplink_restored поднимает задачу пересборки.
+        let _guard = handle.runtime.enter();
+        handle.engine.on_uplink_restored();
     }
 });
 

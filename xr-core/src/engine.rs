@@ -564,6 +564,40 @@ impl VpnEngine {
             });
         }
     }
+
+    /// Хост сообщил, что физического аплинка не осталось (XR-296). Пул
+    /// серверов замирает на прежнем активном: без сети молчат все серверы
+    /// разом, и перебор резервов в это окно только рвёт сессии. Живые сессии
+    /// не трогаются, они и так упираются в мёртвый интерфейс и переживут
+    /// окно либо умрут своими таймаутами. No-op, пока движок не запущен;
+    /// признак до старта держит JNI-слой и досылает его после `start`.
+    pub fn on_uplink_lost(&self) {
+        if let Some(pool) = &self.server_pool {
+            pool.uplink_lost();
+        }
+    }
+
+    /// Тот же аплинк вернулся после пропажи (XR-296). Живые сессии сидят на
+    /// мёртвом интерфейсе и сбрасываются поколением сети, как при смене
+    /// сети, а пул пересобирает mux без сброса здоровья и без возврата на
+    /// primary, после чего греется через прежний активный. Настоящая смена
+    /// сети идёт через `on_network_changed`. Без взведённой заморозки это
+    /// no-op: рвать сессии нечем, окна не было. Вызывать изнутри runtime
+    /// движка, метод поднимает задачу пересборки.
+    pub fn on_uplink_restored(&self) {
+        let Some(pool) = &self.server_pool else { return };
+        if !pool.is_uplink_down() {
+            return;
+        }
+        if let Some(tx) = &self.netgen_tx {
+            tx.send_modify(|g| *g = g.wrapping_add(1));
+        }
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            pool.uplink_restored().await;
+            let _ = pool.warmup().await;
+        });
+    }
 }
 
 // ── Session ─────────────────────────────────────────────────────────
@@ -1239,6 +1273,46 @@ mod tests {
             .active_router()
             .expect("running engine must have a router")
             .resolve(Some(sni), IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)))
+    }
+
+    /// XR-296: признак «аплинка нет» доезжает до пула, а его снятие рвёт
+    /// живые сессии поколением сети и отпускает пул уже после пересборки mux.
+    /// Возврат без пропажи ничего не трогает: окна не было, рвать нечего.
+    #[test]
+    fn uplink_flag_reaches_the_pool_and_lifts_after_rebuild() {
+        let (rt, mut engine) = started_engine(test_config(routing_with(vec![])));
+        let pool = engine.server_pool.clone().expect("running engine has a pool");
+        let netgen = engine.netgen_tx.clone().expect("running engine has a netgen");
+        assert!(!pool.is_uplink_down());
+
+        {
+            let _guard = rt.enter();
+            engine.on_uplink_restored();
+        }
+        assert_eq!(*netgen.borrow(), 0, "restore without a loss must not drop sessions");
+
+        engine.on_uplink_lost();
+        assert!(pool.is_uplink_down(), "the flag must reach the pool");
+        {
+            let _guard = rt.enter();
+            engine.on_uplink_restored();
+        }
+        assert_eq!(*netgen.borrow(), 1, "restore after a loss re-binds sessions");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pool.is_uplink_down() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!pool.is_uplink_down(), "the freeze must lift once the mux is rebuilt");
+        engine.stop();
+    }
+
+    /// XR-296: до старта движка признак никуда не идёт и ничего не ломает.
+    #[test]
+    fn uplink_flag_before_start_is_a_no_op() {
+        let engine = VpnEngine::new(test_config(routing_with(vec![])));
+        engine.on_uplink_lost();
+        engine.on_uplink_restored();
+        assert!(engine.server_pool.is_none());
     }
 
     /// Добавленное правило действует на живом туннеле, без переподключения.
