@@ -1403,8 +1403,10 @@ class XrVpnService : VpnService() {
      *  замороженным). Тот же транспорт, что пропал, это возврат того же
      *  аплинка: движок пересобирает mux и продолжает с прежнего сервера, не
      *  стирая здоровья и штрафов за мигание (XR-296). Другой транспорт это
-     *  настоящая смена сети, она идёт прежним путём с обнулением. Окно
-     *  ожидания Wi-Fi уже взведено на входе. */
+     *  настоящая смена сети, она идёт прежним путём с обнулением. Неизвестный
+     *  транспорт с любой стороны считается сменой сети: без сброса прежнее
+     *  знание о серверах пережило бы сеть, которой уже нет. Окно ожидания
+     *  Wi-Fi уже взведено на входе. */
     private fun exitNoNetwork(network: Network) {
         if (!_stateFlow.value.noNetwork) return
         _stateFlow.update { it.copy(noNetwork = false) }
@@ -1412,9 +1414,10 @@ class XrVpnService : VpnService() {
         lostUplinkTransport = null
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
         val returned = cm?.let { uplinkTransportOf(it, network) }
-        if (lost != null && returned != null && lost != returned) {
+        if (lost == null || returned == null || lost != returned) {
             NativeBridge.nativeJournalLog(
-                "INFO", "net", "сеть вернулась другим аплинком ($lost -> $returned): перепривязка туннеля",
+                "INFO", "net",
+                "сеть вернулась другим аплинком (${lost ?: "неизвестно"} -> ${returned ?: "неизвестно"}): перепривязка туннеля",
             )
             NativeBridge.nativeOnNetworkChanged()
         } else {
