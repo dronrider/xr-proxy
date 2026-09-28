@@ -17,7 +17,7 @@
 //! сводится к выбору индекса активного `MuxPool`.
 
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -322,6 +322,11 @@ pub struct ServerPool {
     /// Момент снятия заморозки (XR-296). Первые `MIN_ACTIVE_DWELL` после него
     /// отказ активного не двигает слот, стрим уходит соседу по обходу.
     resumed_at: Mutex<Option<Instant>>,
+    /// Подмена в окне выдержки уже названа в журнале. Одна строка на окно:
+    /// каждый стрим под breaker'ом активного заходит сюда за миллисекунды, и
+    /// строка на каждый залила бы журнал. Сбрасывается сменой активного и
+    /// снятием заморозки, то есть началом нового окна.
+    substitute_noted: AtomicBool,
 }
 
 impl ServerPool {
@@ -359,6 +364,7 @@ impl ServerPool {
             on_event,
             uplink_down_since: Mutex::new(None),
             resumed_at: Mutex::new(None),
+            substitute_noted: AtomicBool::new(false),
         })
     }
 
@@ -458,6 +464,7 @@ impl ServerPool {
             return false;
         };
         *self.resumed_at.lock().unwrap() = Some(Instant::now());
+        self.substitute_noted.store(false, Ordering::Relaxed);
         let label = self.slots[self.active_index()].label();
         let secs = since.elapsed().as_secs();
         self.emit(
@@ -489,6 +496,7 @@ impl ServerPool {
             .is_ok();
         if switched {
             self.slots[to].note_became_active(reason);
+            self.substitute_noted.store(false, Ordering::Relaxed);
             let from_label = self.slots[from].label();
             let to_label = self.slots[to].label();
             self.emit(
@@ -569,12 +577,28 @@ impl ServerPool {
                         // соседу, а активный остаётся: иначе на частично живой
                         // связи каждый стрим катал бы активный между серверами
                         // (XR-296). Следующие стримы упрутся в breaker `start`
-                        // и дойдут сюда за миллисекунды.
-                        tracing::debug!(
-                            "server {} failed within the dwell, serving via {} without switching",
-                            self.slots[start].label(),
-                            self.slots[idx].label()
-                        );
+                        // и дойдут сюда за миллисекунды. Статусная строка в
+                        // эти секунды показывает активный, а не сосед, поэтому
+                        // подмена названа в журнале, один раз на окно.
+                        let start_label = self.slots[start].label();
+                        let via_label = self.slots[idx].label();
+                        if !self.substitute_noted.swap(true, Ordering::Relaxed) {
+                            self.emit(
+                                &format!(
+                                    "server {} failed within the dwell, streams go via {} until it ends",
+                                    start_label, via_label
+                                ),
+                                &format!(
+                                    "сервер {} не ответил, стримы идут через {}, активный не меняю до конца выдержки",
+                                    start_label, via_label
+                                ),
+                            );
+                        } else {
+                            tracing::debug!(
+                                "server {} failed within the dwell, serving via {} without switching",
+                                start_label, via_label
+                            );
+                        }
                     } else if idx != start {
                         // Ушли с активного `start` на другой сервер. Если `start`
                         // только что стал активным (недавний failback) и тут же
@@ -1848,5 +1872,60 @@ mod tests {
         *pool.resumed_at.lock().unwrap() = Some(Instant::now() - MIN_ACTIVE_DWELL);
         let _ = pool.open_stream(&target()).await.expect("backup serves");
         assert_eq!(pool.active_index(), 1, "after the grace the failure moves the active slot");
+    }
+
+    /// XR-296, ревью: в окне выдержки статус показывает активный, а стримы
+    /// идут через соседа. Подмена названа в журнале ровно один раз на окно,
+    /// второй стрим под breaker'ом активного строку не повторяет.
+    #[tokio::test]
+    async fn test_dwell_substitution_is_journaled_once_per_window() {
+        let addr = spawn_test_server().await;
+        let primary_dead = Arc::new(AtomicBool::new(true));
+        let backup_dead = Arc::new(AtomicBool::new(false));
+        let (cb, events) = collecting_events();
+        let pool = ServerPool::new(
+            vec![
+                slot("primary", switchable_connect(addr, primary_dead.clone())),
+                slot("backup", switchable_connect(addr, backup_dead.clone())),
+            ],
+            PoolProfile::mobile(),
+            Some(cb),
+        );
+        let _ = pool.open_stream(&target()).await.expect("backup serves");
+        assert_eq!(pool.active_index(), 1);
+
+        primary_dead.store(false, Ordering::Relaxed);
+        backup_dead.store(true, Ordering::Relaxed);
+        pool.slots[1].pool.recycle().await;
+        pool.slots[0].pool.probe_fresh().await.expect("primary is reachable again");
+        for _ in 0..3 {
+            let _ = pool.open_stream(&target()).await.expect("primary serves the stream");
+        }
+        assert_eq!(pool.active_index(), 1, "the dwell keeps the active slot");
+        let noted = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.contains("стримы идут через primary") && e.contains("сервер backup"))
+            .count();
+        assert_eq!(noted, 1, "the substitution must be journaled exactly once per dwell");
+
+        // Новое окно после смены активного: строка приходит снова.
+        pool.slots[1].state.lock().unwrap().became_active_at =
+            Some(Instant::now() - MIN_ACTIVE_DWELL);
+        let _ = pool.open_stream(&target()).await.expect("primary serves");
+        assert_eq!(pool.active_index(), 0);
+        primary_dead.store(true, Ordering::Relaxed);
+        backup_dead.store(false, Ordering::Relaxed);
+        pool.slots[0].pool.recycle().await;
+        pool.slots[1].pool.probe_fresh().await.expect("backup is reachable again");
+        let _ = pool.open_stream(&target()).await.expect("backup serves the stream");
+        let noted_backup = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.contains("стримы идут через backup"))
+            .count();
+        assert_eq!(noted_backup, 1, "a new dwell window journals its own substitution");
     }
 }
