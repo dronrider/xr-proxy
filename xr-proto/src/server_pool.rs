@@ -58,6 +58,16 @@ const FAILBACK_FLAP_CAP: u32 = 6;
 /// Максимальная задержка перед повторным failback на мигающий слот.
 const FAILBACK_BACKOFF_MAX: Duration = Duration::from_secs(1800);
 
+/// Минимальное время на сервере после failover (XR-296). Пока свежий
+/// резерв активен меньше этого срока, его отказ не двигает активный слот:
+/// стрим всё равно уходит следующему живому по обходу, но статус и точка
+/// отсчёта failback остаются на месте. Иначе на частично живой связи каждый
+/// стрим катал активный между двумя серверами. Первый уход в резерв задержки
+/// не получает: у сервера, выбранного при старте, срок не отсчитывается.
+/// Меньше `FAILBACK_FLAP_WINDOW`, поэтому штраф за мигание по-прежнему
+/// успевает лечь на слот, отказавший вскоре после смены.
+const MIN_ACTIVE_DWELL: Duration = Duration::from_secs(30);
+
 /// Энергетический профиль пула (LLD-10 §2.7). Роутер может позволить себе
 /// тёплые резервы и частые пробы; телефону каждое лишнее пробуждение радио
 /// стоит батареи, поэтому там пробер живёт только в деградированном состоянии.
@@ -128,6 +138,11 @@ struct SlotState {
     /// По нему ловим «мигание»: failback тут же откатывается реальным
     /// failover'ом (XR-082).
     became_active_at: Option<Instant>,
+    /// Чем слот стал активным в последний раз. Минимальное время на сервере
+    /// (`MIN_ACTIVE_DWELL`) отсчитывается только после failover: у failback
+    /// своя защита, штраф за мигание XR-082, и она требует немедленного
+    /// отката, а не выдержки.
+    became_active_by: Option<SwitchReason>,
     /// Сколько раз подряд failback на этот слот оказался преждевременным
     /// (тут же откат). Растит экспоненциальную задержку до следующего
     /// failback, сбрасывается устойчивой работой.
@@ -177,8 +192,20 @@ impl ServerSlot {
     }
 
     /// Отметить, что слот стал активным (вызывается из switch_active).
-    fn note_became_active(&self) {
-        self.state.lock().unwrap().became_active_at = Some(Instant::now());
+    fn note_became_active(&self, reason: SwitchReason) {
+        let mut st = self.state.lock().unwrap();
+        st.became_active_at = Some(Instant::now());
+        st.became_active_by = Some(reason);
+    }
+
+    /// Слот стал активным по failover меньше `MIN_ACTIVE_DWELL` назад, и его
+    /// отказ ещё не двигает активный (XR-296).
+    fn in_failover_dwell(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        matches!(
+            st.became_active_by,
+            Some(SwitchReason::Failover | SwitchReason::RelayDegraded)
+        ) && st.became_active_at.is_some_and(|t| t.elapsed() < MIN_ACTIVE_DWELL)
     }
 
     /// Сколько слот пробыл активным с последнего переключения.
@@ -218,6 +245,7 @@ impl ServerSlot {
         st.health = HealthState::Up;
         st.up_since = None;
         st.became_active_at = None;
+        st.became_active_by = None;
         st.flap_count = 0;
         st.failback_suppressed_until = None;
     }
@@ -226,7 +254,7 @@ impl ServerSlot {
 /// Почему сменился активный сервер. Причина едет в две ленты сразу, поэтому
 /// хранится типом, а не строкой: в tracing уходит привычное разработчику
 /// `failover`, в журнал приложения русская формулировка.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum SwitchReason {
     /// Активный не отдал стрим (или не ответил в срок), ушли на резерв.
     Failover,
@@ -278,6 +306,13 @@ pub struct ServerPool {
     active: AtomicUsize,
     profile: PoolProfile,
     on_event: Option<PoolEventFn>,
+    /// Момент, с которого ОС хоста считает аплинк пропавшим (XR-296). Пока
+    /// `Some`, пул заморожен: `open_stream` не обходит список и не двигает
+    /// активный, `health_tick` молчит. Снимает признак хост же (`uplink_restored`)
+    /// либо настоящая смена сети (`recycle`). Потолка у заморозки нет: без
+    /// аплинка недостижимы все серверы разом, и перебор в это окно даёт только
+    /// потраченные секунды и порванные сессии.
+    uplink_down_since: Mutex<Option<Instant>>,
 }
 
 impl ServerPool {
@@ -302,6 +337,7 @@ impl ServerPool {
                     health: HealthState::Up,
                     up_since: None,
                     became_active_at: None,
+                    became_active_by: None,
                     flap_count: 0,
                     failback_suppressed_until: None,
                 }),
@@ -312,6 +348,7 @@ impl ServerPool {
             active: AtomicUsize::new(0),
             profile,
             on_event,
+            uplink_down_since: Mutex::new(None),
         })
     }
 
@@ -349,6 +386,61 @@ impl ServerPool {
         self.slots.get(idx).map(|s| s.state.lock().unwrap().health)
     }
 
+    /// Пул заморожен признаком «аплинка нет» от ОС хоста (XR-296).
+    pub fn is_uplink_down(&self) -> bool {
+        self.uplink_down_since.lock().unwrap().is_some()
+    }
+
+    /// ОС хоста сообщила, что физического аплинка не осталось (XR-296).
+    /// Пул замирает на прежнем активном: без сети молчат все серверы разом, и
+    /// их отказы ничего не говорят о здоровье. Повторный вызов без снятия
+    /// признака ничего не меняет. Вход в заморозку виден строкой журнала.
+    pub fn uplink_lost(&self) {
+        let mut since = self.uplink_down_since.lock().unwrap();
+        if since.is_some() {
+            return;
+        }
+        *since = Some(Instant::now());
+        drop(since);
+        let label = self.slots[self.active_index()].label();
+        self.emit(
+            &format!("uplink lost, server pool frozen on {}", label),
+            &format!("сети нет, жду её возврата на сервере {}, резервы не перебираю", label),
+        );
+    }
+
+    /// Пропал и вернулся тот же аплинк (XR-296). Mux-соединения сидят на
+    /// мёртвом интерфейсе и пересобираются, а знание о серверах остаётся:
+    /// сеть та же самая, и устареть оно не успело. Здоровье, штраф за мигание
+    /// и активный слот не трогаются, на primary никто не возвращается, для
+    /// настоящей смены сети есть `recycle`. Заморозка снимается после
+    /// пересборки, а не до: иначе первый же стрим в щели между ними упёрся бы
+    /// во взведённый за окно breaker активного и уехал бы на резерв.
+    /// Возвращает `false`, когда заморозки не было, тогда и пересборки нет.
+    /// Выход виден строкой журнала с длительностью окна.
+    pub async fn uplink_restored(&self) -> bool {
+        if !self.is_uplink_down() {
+            return false;
+        }
+        for slot in &self.slots {
+            slot.pool.recycle().await;
+        }
+        self.unfreeze()
+    }
+
+    fn unfreeze(&self) -> bool {
+        let Some(since) = self.uplink_down_since.lock().unwrap().take() else {
+            return false;
+        };
+        let label = self.slots[self.active_index()].label();
+        let secs = since.elapsed().as_secs();
+        self.emit(
+            &format!("uplink restored after {}s, server pool resumes via {}", secs, label),
+            &format!("сеть вернулась через {} с, продолжаю через {}", secs, label),
+        );
+        true
+    }
+
     /// Событие пула уходит в два адреса, и текст у них разный: в tracing по-английски,
     /// его читает разработчик в логах роутера и сервера, а `on_event` ведёт в журнал
     /// приложения, где запись видит пользователь и стиль там русский (XR-089).
@@ -370,7 +462,7 @@ impl ServerPool {
             .compare_exchange(from, to, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok();
         if switched {
-            self.slots[to].note_became_active();
+            self.slots[to].note_became_active(reason);
             let from_label = self.slots[from].label();
             let to_label = self.slots[to].label();
             self.emit(
@@ -428,6 +520,9 @@ impl ServerPool {
     /// в Direct.
     pub async fn open_stream(&self, target: &TargetAddr) -> io::Result<MuxStream> {
         let start = self.active_index();
+        if self.is_uplink_down() {
+            return self.open_stream_frozen(start, target).await;
+        }
         let mut failures: Vec<(usize, io::Error)> = Vec::new();
 
         for idx in self.walk_order(start) {
@@ -442,7 +537,18 @@ impl ServerPool {
             match outcome {
                 Ok(Ok(stream)) => {
                     self.slots[idx].mark_up();
-                    if idx != start {
+                    if idx != start && self.slots[start].in_failover_dwell() {
+                        // Активный сам стал таким по failover только что. Стрим
+                        // уходит живому соседу, а активный остаётся: иначе на
+                        // частично живой связи каждый стрим катал бы активный
+                        // между серверами (XR-296). Следующие стримы упрутся в
+                        // breaker `start` и дойдут сюда за миллисекунды.
+                        tracing::debug!(
+                            "server {} failed within the dwell after failover, serving via {} without switching",
+                            self.slots[start].label(),
+                            self.slots[idx].label()
+                        );
+                    } else if idx != start {
                         // Ушли с активного `start` на другой сервер. Если `start`
                         // только что стал активным (недавний failback) и тут же
                         // не смог отдать стрим, это преждевременный failback:
@@ -502,11 +608,39 @@ impl ServerPool {
         Err(self.pool_exhausted(failures))
     }
 
+    /// `open_stream` под заморозкой (XR-296): одна попытка через прежний
+    /// активный, без обхода списка, без смены активного и без отметок
+    /// здоровья. Попытка остаётся, а не отказ на месте: признак от ОС может
+    /// отстать от вернувшейся связи на мгновение, и тогда стрим всё же
+    /// уходит, а устаревший признак вырождается в «без failover», а не в
+    /// «без сети». Отказ уходит вызывающему как есть, breaker mux-пула на
+    /// время окна взводится и снимается пересборкой при возврате аплинка.
+    async fn open_stream_frozen(&self, idx: usize, target: &TargetAddr) -> io::Result<MuxStream> {
+        let slot = &self.slots[idx];
+        match tokio::time::timeout(PER_SERVER_OPEN_TIMEOUT, slot.pool.open_stream(target)).await {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(e)) => {
+                tracing::debug!("uplink is down, {} refused a stream ({}), no failover", slot.label(), e);
+                Err(e)
+            }
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("open timed out за {:?} (аплинка нет)", PER_SERVER_OPEN_TIMEOUT),
+            )),
+        }
+    }
+
     /// Прогрев при старте / после смены сети. Тёплый профиль поднимает mux ко
     /// всем серверам параллельно, холодный только к активному (при его отказе
     /// к следующему по приоритету). `Ok` значит, что хотя бы один сервер
     /// отвечает.
     pub async fn warmup(&self) -> io::Result<()> {
+        if self.is_uplink_down() {
+            // Без аплинка прогрев это та же попытка через прежний активный:
+            // обход списка под заморозкой ничего не проверяет (XR-296).
+            let slot = &self.slots[self.active_index()];
+            return slot.pool.warmup().await;
+        }
         if self.profile.warm_backups {
             let mut handles = Vec::with_capacity(self.slots.len());
             for (idx, slot) in self.slots.iter().enumerate() {
@@ -545,7 +679,9 @@ impl ServerPool {
                 match self.slots[idx].pool.warmup().await {
                     Ok(()) => {
                         self.slots[idx].mark_up();
-                        if idx != start {
+                        // Свежий после failover активный остаётся на месте, как
+                        // в open_stream (XR-296).
+                        if idx != start && !self.slots[start].in_failover_dwell() {
                             self.switch_active(start, idx, SwitchReason::Failover);
                         }
                         return Ok(());
@@ -562,8 +698,12 @@ impl ServerPool {
 
     /// Сетевой re-bind (C4, Android LTE<->Wi-Fi): пересоздать все mux-пулы и
     /// вернуть активного на primary. Знание о здоровье, накопленное на
-    /// прежней сети, устарело вместе с ней.
+    /// прежней сети, устарело вместе с ней. Это путь настоящей смены сети;
+    /// возврат того же аплинка после пропажи идёт через `uplink_restored`
+    /// (XR-296). Заморозку по аплинку смена сети снимает сама: новая сеть это
+    /// и есть аплинк, и застрявший признак ей не указ.
     pub async fn recycle(&self) {
+        self.unfreeze();
         for slot in &self.slots {
             slot.pool.recycle().await;
             slot.reset();
@@ -592,6 +732,11 @@ impl ServerPool {
     }
 
     async fn health_tick(&self) {
+        if self.is_uplink_down() {
+            // Без аплинка проба ложится на любой сервер, а relay-счётчики
+            // говорят о сети, не о сервере: тик молчит целиком (XR-296).
+            return;
+        }
         self.relay_degradation_tick();
 
         let active = self.active_index();
@@ -1329,7 +1474,7 @@ mod tests {
             None,
         );
         // Свежий failback: primary только что стал активным.
-        pool.slots[0].note_became_active();
+        pool.slots[0].note_became_active(SwitchReason::Failback);
         // Relay-сбои по live-трафику (так их записал бы mux из Close с причиной).
         for _ in 0..10 {
             pool.slots[0].pool.relay_health().record_resolve_fail();
@@ -1400,7 +1545,7 @@ mod tests {
             None,
         );
         // Симулируем свежий failback: primary только что стал активным.
-        pool.slots[0].note_became_active();
+        pool.slots[0].note_became_active(SwitchReason::Failback);
         assert!(!pool.slots[0].failback_suppressed());
 
         // Реальный open с active=primary: primary падает, уходим на backup.
@@ -1457,5 +1602,187 @@ mod tests {
             0,
             "after the penalty clears, failback resumes"
         );
+    }
+
+    fn collecting_events() -> (PoolEventFn, Arc<Mutex<Vec<String>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let cb: PoolEventFn = Arc::new(move |s: &str| sink.lock().unwrap().push(s.to_string()));
+        (cb, events)
+    }
+
+    /// XR-296: признак «аплинка нет» от ОС замораживает пул. Отказ активного
+    /// под заморозкой не двигает активный, не трогает здоровье и не обходит
+    /// резерв, а после возврата аплинка работа продолжается с прежнего сервера.
+    /// Вход и выход видны строками журнала.
+    #[tokio::test]
+    async fn test_uplink_down_freezes_pool_and_resumes_on_same_server() {
+        let addr = spawn_test_server().await;
+        let primary_dead = Arc::new(AtomicBool::new(false));
+        let backup_calls = Arc::new(AtomicU32::new(0));
+        let (cb, events) = collecting_events();
+        let pool = ServerPool::new(
+            vec![
+                slot("primary", switchable_connect(addr, primary_dead.clone())),
+                slot("backup", connect_to(addr, backup_calls.clone())),
+            ],
+            PoolProfile::mobile(),
+            Some(cb),
+        );
+        let _ = pool.open_stream(&target()).await.expect("primary serves");
+        assert_eq!(pool.active_index(), 0);
+
+        // Радио пропало: ОС сообщила раньше, чем упал первый стрим, а сокеты
+        // живого mux на мёртвом интерфейсе рвутся вместе с ним.
+        pool.uplink_lost();
+        pool.uplink_lost();
+        primary_dead.store(true, Ordering::Relaxed);
+        pool.slots[0].pool.recycle().await;
+        for _ in 0..3 {
+            let err = pool.open_stream(&target()).await.err();
+            assert!(err.is_some(), "frozen pool must not serve via the backup");
+        }
+        assert_eq!(pool.active_index(), 0, "frozen pool must not move the active slot");
+        assert_eq!(backup_calls.load(Ordering::Relaxed), 0, "frozen pool must not walk the list");
+        assert_eq!(
+            pool.server_health(0),
+            Some(HealthState::Up),
+            "a failure without uplink says nothing about the server"
+        );
+        // Пробер тоже молчит: живой резерв не забирает активность.
+        pool.health_tick().await;
+        assert_eq!(pool.active_index(), 0);
+
+        // Радио вернулось: тот же сервер, без обхода и без смены активного.
+        primary_dead.store(false, Ordering::Relaxed);
+        assert!(pool.uplink_restored().await);
+        assert!(!pool.uplink_restored().await, "second restore is a no-op");
+        let stream = pool.open_stream(&target()).await.expect("primary serves again");
+        assert!(stream.is_alive());
+        assert_eq!(pool.active_index(), 0);
+        assert_eq!(backup_calls.load(Ordering::Relaxed), 0);
+
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| e.contains("сети нет") && e.contains("primary")),
+            "freeze entry must be logged: {:?}",
+            events
+        );
+        assert_eq!(
+            events.iter().filter(|e| e.contains("сети нет")).count(),
+            1,
+            "repeated uplink_lost must not spam the journal"
+        );
+        assert!(
+            events.iter().any(|e| e.contains("сеть вернулась") && e.contains("primary")),
+            "freeze exit must be logged: {:?}",
+            events
+        );
+    }
+
+    /// XR-296: под заморозкой прогрев тоже не переводит активный на резерв.
+    #[tokio::test]
+    async fn test_uplink_down_warmup_keeps_active() {
+        let addr = spawn_test_server().await;
+        let pool = ServerPool::new(
+            vec![
+                slot("primary", failing_connect_msg("no route")),
+                slot("backup", connect_to(addr, Arc::new(AtomicU32::new(0)))),
+            ],
+            PoolProfile::mobile(),
+            None,
+        );
+        pool.uplink_lost();
+        assert!(pool.warmup().await.is_err(), "frozen warmup tries only the active");
+        assert_eq!(pool.active_index(), 0);
+    }
+
+    /// XR-296: после failover резерв держит активность минимальное время.
+    /// Его отказ в этот срок отдаёт стрим соседу, но активный не двигает;
+    /// по истечении срока отказ снова переключает как раньше.
+    #[tokio::test]
+    async fn test_failover_dwell_keeps_active_on_fresh_backup() {
+        let addr = spawn_test_server().await;
+        let primary_dead = Arc::new(AtomicBool::new(true));
+        let backup_dead = Arc::new(AtomicBool::new(false));
+        let pool = ServerPool::new(
+            vec![
+                slot("primary", switchable_connect(addr, primary_dead.clone())),
+                slot("backup", switchable_connect(addr, backup_dead.clone())),
+            ],
+            PoolProfile::mobile(),
+            None,
+        );
+        // Первый уход в резерв без задержки.
+        let _ = pool.open_stream(&target()).await.expect("backup serves");
+        assert_eq!(pool.active_index(), 1);
+
+        // Роли поменялись сразу после failover: primary ожил, backup лёг
+        // вместе со своим mux.
+        primary_dead.store(false, Ordering::Relaxed);
+        backup_dead.store(true, Ordering::Relaxed);
+        pool.slots[1].pool.recycle().await;
+        pool.slots[0].pool.probe_fresh().await.expect("primary is reachable again");
+        let stream = pool.open_stream(&target()).await.expect("primary serves the stream");
+        assert!(stream.is_alive());
+        assert!(
+            matches!(pool.server_health(1), Some(HealthState::Down { .. })),
+            "the backup was really tried and failed"
+        );
+        assert_eq!(pool.active_index(), 1, "the fresh backup must keep the active slot");
+        assert!(pool.is_backup_active());
+
+        // Минимальное время прошло: тот же отказ переключает.
+        pool.slots[1].state.lock().unwrap().became_active_at =
+            Some(Instant::now() - MIN_ACTIVE_DWELL);
+        let _ = pool.open_stream(&target()).await.expect("primary serves");
+        assert_eq!(pool.active_index(), 0, "after the dwell the failure moves the active slot");
+    }
+
+    /// XR-296: возврат того же аплинка пересобирает mux, но оставляет
+    /// `flap_count`, `failback_suppressed_until` и активный слот на месте.
+    /// Настоящая смена сети (`recycle`) по-прежнему обнуляет всё и возвращает
+    /// активного на primary.
+    #[tokio::test]
+    async fn test_same_uplink_return_keeps_flap_penalty_and_active() {
+        let addr = spawn_test_server().await;
+        let pool = ServerPool::new(
+            vec![
+                slot("primary", failing_connect(Arc::new(AtomicU32::new(0)))),
+                slot("backup", connect_to(addr, Arc::new(AtomicU32::new(0)))),
+            ],
+            PoolProfile::mobile(),
+            None,
+        );
+        let _ = pool.open_stream(&target()).await.expect("backup serves");
+        assert_eq!(pool.active_index(), 1);
+        pool.slots[0].penalize_flap(Duration::from_secs(3600));
+        assert!(pool.slots[0].failback_suppressed());
+
+        pool.uplink_lost();
+        assert!(pool.uplink_restored().await);
+        assert_eq!(pool.active_index(), 1, "same uplink must not move the active slot");
+        {
+            let st = pool.slots[0].state.lock().unwrap();
+            assert_eq!(st.flap_count, 1, "same uplink must keep the flap counter");
+            assert!(st.failback_suppressed_until.is_some(), "same uplink must keep the penalty");
+            assert!(
+                matches!(st.health, HealthState::Down { .. }),
+                "same uplink must keep the health knowledge"
+            );
+        }
+        let stream = pool.open_stream(&target()).await.expect("backup still serves");
+        assert!(stream.is_alive());
+        assert_eq!(pool.active_index(), 1);
+
+        // Настоящая смена сети ведёт себя как раньше и заодно снимает заморозку.
+        pool.uplink_lost();
+        pool.recycle().await;
+        assert!(!pool.is_uplink_down(), "a real network change lifts the freeze");
+        assert_eq!(pool.active_index(), 0, "a real network change resets to primary");
+        let st = pool.slots[0].state.lock().unwrap();
+        assert_eq!(st.flap_count, 0);
+        assert!(st.failback_suppressed_until.is_none());
+        assert_eq!(st.health, HealthState::Up);
     }
 }
