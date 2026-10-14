@@ -1,14 +1,16 @@
-//! VPN Engine — main entry point for mobile/desktop clients.
+//! VPN Engine - main entry point for mobile/desktop clients.
 //!
 //! Architecture:
-//! 1. DNS queries (UDP:53) → intercepted via Fake DNS
-//! 2. TCP SYN → smoltcp socket (listen on unique ephemeral port)
-//! 3. TCP Established → spawn relay task to xr-server or direct
-//! 4. TCP data: smoltcp ↔ channels ↔ relay task
+//! 1. DNS queries (UDP:53) -> intercepted via Fake DNS
+//! 2. Other IPv4 UDP -> UdpRelay (flow table + tunnel socket to VPS)
+//! 3. TCP SYN -> smoltcp socket (listen on unique ephemeral port)
+//! 4. TCP Established -> spawn relay task to xr-server or direct
+//! 5. TCP data: smoltcp <-> channels <-> relay task
 
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 
@@ -215,6 +217,8 @@ impl VpnEngine {
         let strategy = ModifierStrategy::from_str(&self.config.modifier)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "unknown modifier"))?;
         let obfuscator = Obfuscator::new(key, self.config.salt, strategy);
+        // Копия уезжает в UDP-реле: провод общий с туннелем, мутаторы те же.
+        let udp_obfuscator = obfuscator.clone();
         let codec = Codec::new(obfuscator, self.config.padding_min, self.config.padding_max);
 
         // Build router, optionally merging with hub preset.
@@ -334,6 +338,7 @@ impl VpnEngine {
         let live_overrides = Arc::new(std::sync::Mutex::new(self.config.routing.clone()));
         self.live_overrides = Some(live_overrides.clone());
 
+        let protect_for_udp = protect_socket.clone();
         let ctx = Arc::new(SessionContext {
             router: std::sync::RwLock::new(Arc::new(router)),
             codec,
@@ -354,6 +359,49 @@ impl VpnEngine {
         self.netgen_tx = Some(netgen_tx);
         let state = self.state.clone();
         let stats = self.stats.clone();
+
+        // UDP relay (XR-301): собственный сокет к relay-порту VPS, мимо mux.
+        // Адрес хоста тот же, что у пула, порт зашит (`DEFAULT_RELAY_PORT`).
+        // Без реле TCP продолжает работать, UDP тогда уходит в smoltcp и
+        // тонет там; старт из-за UDP не блокируем.
+        let udp_relay_handle = {
+            let relay_host = entries
+                .first()
+                .map(|e| e.address.clone())
+                .unwrap_or_default();
+            let vps_addr: Option<SocketAddr> = match format!(
+                "{}:{}",
+                relay_host,
+                crate::udp_relay::DEFAULT_RELAY_PORT
+            )
+            .parse()
+            {
+                Ok(addr) => Some(addr),
+                Err(e) => {
+                    tracing::warn!("UDP relay disabled: bad VPS address: {}", e);
+                    None
+                }
+            };
+            match (vps_addr, bind_relay_socket(&protect_for_udp)) {
+                (Some(vps_addr), Ok(socket)) => {
+                    tracing::info!("UDP relay tunnel to {}", vps_addr);
+                    Some(UdpRelayHandle {
+                        relay: Arc::new(std::sync::Mutex::new(crate::udp_relay::UdpRelay::new(
+                            udp_obfuscator,
+                            crate::udp_relay::DEFAULT_MAX_FLOWS,
+                            crate::udp_relay::DEFAULT_FLOW_TIMEOUT,
+                        ))),
+                        socket: Arc::new(socket),
+                        vps_addr,
+                    })
+                }
+                (_, Err(e)) => {
+                    tracing::warn!("UDP relay disabled: {}", e);
+                    None
+                }
+                (None, Ok(_)) => None,
+            }
+        };
 
         // Health-пробер пула (LLD-10 §2.7, экономный профиль): в здоровом
         // состоянии молчит и не будит радио; при активном резерве пробит
@@ -416,6 +464,10 @@ impl VpnEngine {
             });
         }
 
+        if let Some(udp_handle) = udp_relay_handle.clone() {
+            spawn_udp_companions(udp_handle, queue.clone(), shutdown_rx.clone());
+        }
+
         tokio::spawn(async move {
             stats.mark_started();
 
@@ -446,7 +498,14 @@ impl VpnEngine {
             }
 
             state.set(VpnState::Connected);
-            if let Err(e) = run_event_loop(queue, ctx, fake_dns, shutdown_rx, netgen_rx).await {
+            if let Err(e) = run_event_loop(
+                queue,
+                ctx,
+                fake_dns,
+                shutdown_rx,
+                netgen_rx,
+                udp_relay_handle,
+            ).await {
                 state.set(VpnState::Error(e.to_string()));
             } else {
                 state.set(VpnState::Disconnected);
@@ -625,6 +684,99 @@ struct RelayChannels {
     pending_download: Vec<u8>,
 }
 
+/// UDP relay (XR-301): свой сокет к relay-порту VPS, не mux. Таблица флоу
+/// общая для event loop (upstream из TUN) и таска приёма (downstream в TUN).
+#[derive(Clone)]
+struct UdpRelayHandle {
+    relay: Arc<std::sync::Mutex<crate::udp_relay::UdpRelay>>,
+    socket: Arc<tokio::net::UdpSocket>,
+    vps_addr: SocketAddr,
+}
+
+/// UDP-сокет к VPS: bind на любой порт, `protect` от петли через VPN, nonblocking.
+fn bind_relay_socket(protect_socket: &ProtectSocketFn) -> io::Result<tokio::net::UdpSocket> {
+    let sock = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
+    sock.set_nonblocking(true)?;
+    if !protect_socket(sock.as_raw_fd()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "protect_socket failed for UDP relay",
+        ));
+    }
+    tokio::net::UdpSocket::from_std(sock)
+}
+
+/// Задачи-компаньоны UDP-реле: приём ответов, keepalive и чистка протухших.
+/// Без них upstream уезжает, а downstream не возвращается.
+fn spawn_udp_companions(
+    handle: UdpRelayHandle,
+    queue: PacketQueue,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    // Downstream: ответ из туннеля собирается в IP-пакет и уходит в TUN.
+    {
+        let handle = handle.clone();
+        let queue = queue.clone();
+        let mut shutdown_down = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let n = tokio::select! {
+                    r = handle.socket.recv(&mut buf) => match r {
+                        Ok(n) => n,
+                        Err(e) => {
+                            tracing::debug!("UDP relay recv error: {}", e);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    },
+                    _ = shutdown_down.changed() => return,
+                };
+                let now = std::time::Instant::now();
+                let packet = {
+                    let mut relay = handle.relay.lock().unwrap();
+                    relay.wire_to_tun(&buf[..n], now)
+                };
+                if let Some(pkt) = packet {
+                    queue.push_outbound_public(pkt);
+                }
+            }
+        });
+    }
+
+    // Keepalive + чистка. Keepalive держит NAT-дыру, пока есть хоть один флоу;
+    // простой флоу уезжает по таймауту и возвращает порт в пул.
+    {
+        let handle = handle.clone();
+        let mut shutdown_ka = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut keepalive = tokio::time::interval(crate::udp_relay::DEFAULT_KEEPALIVE);
+            let mut cleanup = tokio::time::interval(Duration::from_secs(30));
+            // Первый тик interval срабатывает сразу, это дешёвый пустой проход.
+            keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = keepalive.tick() => {
+                        let (wire, empty) = {
+                            let relay = handle.relay.lock().unwrap();
+                            (relay.keepalive(), relay.is_empty())
+                        };
+                        if !empty {
+                            let _ = handle.socket.send_to(&wire, handle.vps_addr).await;
+                        }
+                    }
+                    _ = cleanup.tick() => {
+                        let mut relay = handle.relay.lock().unwrap();
+                        relay.retire_expired(std::time::Instant::now());
+                    }
+                    _ = shutdown_ka.changed() => return,
+                }
+            }
+        });
+    }
+}
+
 // ── Event loop ──────────────────────────────────────────────────────
 
 async fn run_event_loop(
@@ -633,6 +785,7 @@ async fn run_event_loop(
     fake_dns: Arc<FakeDns>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mut netgen_rx: tokio::sync::watch::Receiver<u64>,
+    udp_relay: Option<UdpRelayHandle>,
 ) -> io::Result<()> {
     let mut stack = IpStack::new(queue.clone());
     let waker = queue.notifier();
@@ -665,6 +818,10 @@ async fn run_event_loop(
             let cur_netgen = *netgen_rx.borrow_and_update();
             if cur_netgen != last_netgen {
                 last_netgen = cur_netgen;
+                // UDP-флоу старого аплинка не живут: порты возвращаются в пул.
+                if let Some(udp) = &udp_relay {
+                    udp.relay.lock().unwrap().clear();
+                }
                 if !sessions.is_empty() {
                     tracing::info!(
                         "underlying network changed (gen {}), dropping {} active session(s)",
@@ -688,15 +845,37 @@ async fn run_event_loop(
             }
         }
 
-        // ── 1. Intercept DNS ────────────────────────────────────────
+        // -- 1. Intercept DNS, then UDP relay --
+        // DNS отвечает FakeDns, остальной IPv4 UDP уезжает своим relay-портом
+        // мимо smoltcp. TCP и прочее уходят в smoltcp как раньше.
         let mut tcp_packets = Vec::new();
         while let Some(packet) = queue.pop_inbound_public() {
             if let Some(dns_response) = try_handle_dns(&packet, &fake_dns) {
                 ctx.stats.add_dns_query();
                 queue.push_outbound_public(dns_response);
-            } else {
-                tcp_packets.push(packet);
+                continue;
             }
+            if let Some(udp) = &udp_relay {
+                if is_ipv4_udp(&packet) {
+                    let wire = {
+                        let mut relay = udp.relay.lock().unwrap();
+                        relay.tun_to_wire(&packet, std::time::Instant::now())
+                    };
+                    if let Some(wire) = wire {
+                        // try_send: очередь сокета полная, пакет теряем как UDP
+                        // и теряет его на проводе; event loop не ждёт сеть.
+                        if let Err(e) = udp.socket.try_send_to(&wire, udp.vps_addr) {
+                            if e.kind() != io::ErrorKind::WouldBlock {
+                                tracing::debug!("UDP relay send failed: {}", e);
+                            }
+                        }
+                    }
+                    // Не-UDP, исключённый порт и переполненный пул не возвращаются
+                    // в smoltcp: там UDP не обслуживается.
+                    continue;
+                }
+            }
+            tcp_packets.push(packet);
         }
 
         // ── 2. Process TCP packets: rewrite dst port for SYNs ───────
@@ -1120,6 +1299,14 @@ fn try_handle_dns(packet: &[u8], fake_dns: &FakeDns) -> Option<Vec<u8>> {
     if dst_port != 53 { return None; }
     let (dns_response, _) = fake_dns.handle_query(&udp[data_offset..])?;
     Some(build_udp_response(dst_ip, src_ip, dst_port, src_port, &dns_response))
+}
+
+/// IPv4 UDP, кроме DNS (его берёт FakeDns). Такой пакет уходит в UDP-реле.
+fn is_ipv4_udp(packet: &[u8]) -> bool {
+    let Some((_, _, protocol, _)) = parse_ipv4_header(packet) else {
+        return false;
+    };
+    protocol == 17
 }
 
 pub fn parse_ipv4_header(p: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, u8, usize)> {
