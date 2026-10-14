@@ -43,8 +43,12 @@ pub type ProtectSocketFn = Arc<dyn Fn(i32) -> bool + Send + Sync>;
 /// get dropped on networks that whitelist traffic by destination port.
 ///
 /// Returning `None` means "I can't resolve this, try the UDP fallback."
-/// Implementations are called from async context but may block — wrap the
+/// Implementations are called from async context but may block, so wrap the
 /// call site in `spawn_blocking` to avoid stalling the tokio worker.
+///
+/// Системный резолвер отдаёт только IPv4: таков контракт JNI Android.
+/// IPv6 (AAAA) закрывает UDP-фолбэк в `resolve_via_protected_dns`, для сайта
+/// только на IPv6 системный путь даст `None` и уйдёт туда же.
 pub type SystemResolverFn = Arc<dyn Fn(&str) -> Option<Ipv4Addr> + Send + Sync>;
 
 /// Shared context for session management.
@@ -634,7 +638,7 @@ pub(crate) async fn resolve_domain_with_fallback(
     resolve_via_protected_dns(domain, resolvers, protect).await
 }
 
-/// Resolve a domain to an IPv4 address via protected UDP sockets.
+/// Resolve a domain to an IP address via protected UDP sockets.
 ///
 /// On Android, the system DNS resolver routes through the VPN's FakeDNS,
 /// returning fake IPs and creating a loop. This function sends raw DNS
@@ -694,7 +698,10 @@ async fn resolve_via_protected_dns(
     )))
 }
 
-/// Один резолвер отвечает на A и AAAA; первый успевший запис берётся целиком.
+/// Один резолвер отвечает на A и AAAA. Запросы ждутся вместе, а из двух
+/// успешных ответов берётся A: он совместимее для dual-stack, AAAA остаётся
+/// запасом, когда A нет. SystemResolverFn пока умеет только IPv4 (JNI Android),
+/// поэтому системный путь всегда отдаёт V4, а оба семейства закрывает UDP-фолбэк.
 async fn query_single_resolver(
     domain: &str,
     resolver: SocketAddr,

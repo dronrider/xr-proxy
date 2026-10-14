@@ -1109,32 +1109,7 @@ async fn run_event_loop(
         // We need to rewrite them to src=original_dst_ip:original_dst_port
         // so the TUN client sees the response from the expected address.
         while let Some(mut pkt) = queue.pop_smol_outbound() {
-            if pkt.len() >= 40 {
-                if let Some((_, dst_ip, protocol, transport_off)) = parse_ip_header(&pkt) {
-                    if protocol == 6 && pkt.len() >= transport_off + 4 {
-                        let src_port =
-                            u16::from_be_bytes([pkt[transport_off], pkt[transport_off + 1]]);
-                        if let Some(orig_key) = port_to_key.get(&src_port) {
-                            let orig_ip = orig_key.dst_addr.ip();
-                            let orig_port = orig_key.dst_addr.port();
-                            if pkt[0] >> 4 == 4 {
-                                if let IpAddr::V4(v4) = orig_ip {
-                                    pkt[12..16].copy_from_slice(&v4.octets());
-                                    pkt[10] = 0;
-                                    pkt[11] = 0;
-                                    let ip_cksum = ipv4_checksum(&pkt[..transport_off]);
-                                    pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
-                                }
-                            } else if let IpAddr::V6(v6) = orig_ip {
-                                pkt[8..24].copy_from_slice(&v6.octets());
-                            }
-                            pkt[transport_off] = (orig_port >> 8) as u8;
-                            pkt[transport_off + 1] = orig_port as u8;
-                            tcp_checksum_update_ip(&mut pkt, transport_off, &orig_ip, &dst_ip);
-                        }
-                    }
-                }
-            }
+            restore_outbound_src(&mut pkt, &port_to_key);
             queue.push_outbound_public(pkt);
         }
 
@@ -1380,9 +1355,14 @@ fn parse_ipv6_header(p: &[u8]) -> Option<(IpAddr, IpAddr, u8, usize)> {
                 next = p[off];
                 off += ext_len;
             }
-            // Fragment: первый фрагмент несёт транспорт, дальше усечение.
+            // Fragment: транспорт несёт только первый (offset == 0).
+            // Не-первый фрагмент уходит в стек как есть, без сессии и NAT.
             44 => {
                 if off + 8 > p.len() {
+                    return None;
+                }
+                let frag_off = u16::from_be_bytes([p[off + 2], p[off + 3]]) >> 3;
+                if frag_off != 0 {
                     return None;
                 }
                 next = p[off];
@@ -1447,6 +1427,41 @@ fn tcp_checksum_update_ip(pkt: &mut [u8], transport_off: usize, src: &IpAddr, ds
         }
         _ => {}
     }
+}
+
+/// Возврат исходящего TCP smoltcp к источнику из TUN: src:port становится
+/// парой оригинального назначения, checksum пересчитывается под новые адреса.
+/// Такой пакет уходит наверх, в TUN.
+fn restore_outbound_src(pkt: &mut [u8], port_to_key: &HashMap<u16, TcpSessionKey>) {
+    if pkt.len() < 40 {
+        return;
+    }
+    let Some((_, dst_ip, protocol, transport_off)) = parse_ip_header(pkt) else {
+        return;
+    };
+    if protocol != 6 || pkt.len() < transport_off + 4 {
+        return;
+    }
+    let src_port = u16::from_be_bytes([pkt[transport_off], pkt[transport_off + 1]]);
+    let Some(orig_key) = port_to_key.get(&src_port) else {
+        return;
+    };
+    let orig_ip = orig_key.dst_addr.ip();
+    let orig_port = orig_key.dst_addr.port();
+    if pkt[0] >> 4 == 4 {
+        if let IpAddr::V4(v4) = orig_ip {
+            pkt[12..16].copy_from_slice(&v4.octets());
+            pkt[10] = 0;
+            pkt[11] = 0;
+            let ip_cksum = ipv4_checksum(&pkt[..transport_off]);
+            pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+        }
+    } else if let IpAddr::V6(v6) = orig_ip {
+        pkt[8..24].copy_from_slice(&v6.octets());
+    }
+    pkt[transport_off] = (orig_port >> 8) as u8;
+    pkt[transport_off + 1] = orig_port as u8;
+    tcp_checksum_update_ip(pkt, transport_off, &orig_ip, &dst_ip);
 }
 
 /// Подмена адреса назначения на адрес стека и порта на ephemeral (входящий SYN
@@ -2254,6 +2269,126 @@ mod tests {
         assert_eq!(dst, IpAddr::V6(v6_target()));
         assert_eq!(proto, 6);
         assert_eq!(off, 48);
+    }
+
+    /// Пакет с заголовком фрагмента IPv6: next, reserved, offset|res|M, id.
+    fn ipv6_with_fragment(src: Ipv6Addr, dst: Ipv6Addr, frag_off: u16, more: bool, payload: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; 40 + 8 + payload.len()];
+        p[0] = 0x60;
+        p[4..6].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        p[6] = 44; // next = Fragment
+        p[7] = 64;
+        p[8..24].copy_from_slice(&src.octets());
+        p[24..40].copy_from_slice(&dst.octets());
+        p[40] = 6; // fragment next = TCP (или мусор)
+        p[41] = 0;
+        let off_flags = (frag_off << 3) | if more { 1 } else { 0 };
+        p[42..44].copy_from_slice(&off_flags.to_be_bytes());
+        p[44..48].copy_from_slice(&0x11223344u32.to_be_bytes());
+        p[48..].copy_from_slice(payload);
+        p
+    }
+
+    /// Не-первый фрагмент не разбирается в транспорт: NAT и сессии его не трогают.
+    #[test]
+    fn parse_ipv6_header_rejects_non_first_fragment() {
+        let junk = [0u8; 20];
+        let pkt = ipv6_with_fragment(v6_client(), v6_target(), 136, true, &junk);
+        assert!(
+            parse_ip_header(&pkt).is_none(),
+            "фрагмент с offset=136 обязан уйти в стек как есть, без транспорта"
+        );
+    }
+
+    /// Первый фрагмент несёт транспорт и разбирается дальше.
+    #[test]
+    fn parse_ipv6_header_accepts_first_fragment() {
+        let tcp = tcp_v6(v6_client(), v6_target(), 1, 2, 0, 0, TCP_SYN, &[]);
+        let pkt = ipv6_with_fragment(v6_client(), v6_target(), 0, true, &tcp[40..]);
+        let (_, _, proto, off) = parse_ip_header(&pkt).expect("первый фрагмент обязан разбираться");
+        assert_eq!(proto, 6);
+        assert_eq!(off, 48);
+    }
+
+    /// Контрольная сумма транспорта поверх псевдозаголовка IPv6 (RFC 8200).
+    fn ipv6_pseudo_checksum(src: &Ipv6Addr, dst: &Ipv6Addr, next: u8, segment: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        for part in [src.octets(), dst.octets()] {
+            for pair in part.chunks(2) {
+                sum += u16::from_be_bytes([pair[0], pair[1]]) as u32;
+            }
+        }
+        let len = segment.len() as u32;
+        sum += (len >> 16) as u32;
+        sum += (len & 0xFFFF) as u32;
+        sum += next as u32;
+        for i in (0..segment.len()).step_by(2) {
+            let word = if i + 1 < segment.len() {
+                u16::from_be_bytes([segment[i], segment[i + 1]])
+            } else {
+                u16::from_be_bytes([segment[i], 0])
+            };
+            sum += word as u32;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// Возврат src:port из smoltcp к назначению TUN и валидная TCP-сумма IPv6.
+    #[test]
+    fn restore_outbound_src_v6_keeps_tcp_checksum_valid() {
+        let client = v6_client();
+        let target = v6_target();
+        let smol = Ipv6Addr::from(crate::ip_stack::SMOL_IPV6.octets());
+        let eph = 55555u16;
+
+        // Пакет, каким его отдаёт smoltcp: src=стек:eph, dst=клиент.
+        let mut pkt = tcp_v6(smol, client, eph, 40000, 2000, 1001, TCP_ACK, b"pong");
+        let mut map = HashMap::new();
+        map.insert(
+            eph,
+            TcpSessionKey {
+                src_addr: SocketAddr::new(IpAddr::V6(client), 40000),
+                dst_addr: SocketAddr::new(IpAddr::V6(target), 443),
+            },
+        );
+        restore_outbound_src(&mut pkt, &map);
+
+        let (src, dst, proto, off) = parse_ip_header(&pkt).unwrap();
+        assert_eq!(src, IpAddr::V6(target), "источником ответа обязано стать назначение TUN");
+        assert_eq!(dst, IpAddr::V6(client));
+        assert_eq!(proto, 6);
+        assert_eq!(u16::from_be_bytes([pkt[off], pkt[off + 1]]), 443);
+        assert_eq!(u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]), 40000);
+
+        let cksum = u16::from_be_bytes([pkt[off + 16], pkt[off + 17]]);
+        let mut seg = pkt[off..].to_vec();
+        seg[16] = 0;
+        seg[17] = 0;
+        let expect = ipv6_pseudo_checksum(&target, &client, 6, &seg);
+        assert_eq!(cksum, expect, "TCP-сумма после NAT обязана сходиться с RFC 8200");
+    }
+
+    /// Контрольная сумма UDP из build_udp_response_v6 сходится с эталоном.
+    #[test]
+    fn build_udp_response_v6_checksum_matches_rfc() {
+        let src: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let dst: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        let pkt = build_udp_response_v6(src, dst, 53, 53000, b"ping");
+        let (s, d, proto, off) = parse_ip_header(&pkt).unwrap();
+        assert_eq!(s, IpAddr::V6(src));
+        assert_eq!(d, IpAddr::V6(dst));
+        assert_eq!(proto, 17);
+
+        let cksum = u16::from_be_bytes([pkt[off + 6], pkt[off + 7]]);
+        let mut seg = pkt[off..].to_vec();
+        seg[6] = 0;
+        seg[7] = 0;
+        let expect = ipv6_pseudo_checksum(&src, &dst, 17, &seg);
+        let expect = if expect == 0 { 0xFFFF } else { expect };
+        assert_eq!(cksum, expect, "UDP-сумма IPv6 обязана сходиться с RFC 8200");
     }
 
     /// AAAA через FakeDns отвечает в туннель пакетом того же семейства.
