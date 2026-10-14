@@ -3757,6 +3757,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "xr-ios-ffi"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "xr-core",
+ "xr-proto",
+]
+
+[[package]]
 name = "xr-proto"
 version = "0.1.0"
 dependencies = [

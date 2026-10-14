@@ -49,19 +49,29 @@ pub struct PacketQueue {
 
 struct PacketQueueInner {
     inbound: VecDeque<Vec<u8>>,
-    /// Packets from smoltcp device → engine (for NAT rewrite).
+    /// Packets from smoltcp device -> engine (for NAT rewrite).
     smol_outbound: VecDeque<Vec<u8>>,
-    /// Packets after NAT rewrite → TUN fd.
+    /// Packets after NAT rewrite -> TUN fd.
     tun_outbound: VecDeque<Vec<u8>>,
+    /// Потолок каждой очереди. NE-профиль (LLD-39, п. 4) ужимает его до 512:
+    /// глубокий бэклог бесполезен, NE читает пакеты пачками.
+    capacity: usize,
 }
 
 impl PacketQueue {
     pub fn new() -> Self {
+        Self::with_capacity(crate::tuning::DEFAULT_QUEUE_CAPACITY)
+    }
+
+    /// Очередь со своим потолком (tuning::TuningProfile::queue_capacity).
+    pub fn with_capacity(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
             inner: Arc::new(Mutex::new(PacketQueueInner {
                 inbound: VecDeque::with_capacity(256),
                 smol_outbound: VecDeque::with_capacity(256),
                 tun_outbound: VecDeque::with_capacity(256),
+                capacity,
             })),
             notify: Arc::new(Notify::new()),
         }
@@ -77,7 +87,7 @@ impl PacketQueue {
         {
             let mut inner = self.inner.lock().unwrap();
             // Drop oldest if queue is too large (backpressure).
-            if inner.inbound.len() >= 4096 {
+            if inner.inbound.len() >= inner.capacity {
                 inner.inbound.pop_front();
             }
             inner.inbound.push_back(packet);
@@ -105,7 +115,7 @@ impl PacketQueue {
     /// Push a packet to the TUN outbound queue (for DNS responses and NAT-rewritten packets).
     pub fn push_outbound_public(&self, packet: Vec<u8>) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.tun_outbound.len() >= 4096 {
+        if inner.tun_outbound.len() >= inner.capacity {
             inner.tun_outbound.pop_front();
         }
         inner.tun_outbound.push_back(packet);
@@ -117,7 +127,7 @@ impl PacketQueue {
 
     fn push_outbound(&self, packet: Vec<u8>) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.smol_outbound.len() >= 4096 {
+        if inner.smol_outbound.len() >= inner.capacity {
             inner.smol_outbound.pop_front();
         }
         inner.smol_outbound.push_back(packet);

@@ -29,6 +29,8 @@ struct StatsInner {
     /// Cumulative ERROR-level event count (real I/O failures: mux open fail, timeouts).
     /// Grows monotonically, not affected by clearing the journal.
     relay_errors: AtomicU64,
+    /// Сколько UDP/443 (QUIC) срезано на входе (mac-путь, XR-300).
+    quic_dropped: AtomicU64,
     debug_msg: std::sync::Mutex<String>,
     /// Куда уходят записи `add_log`/`add_warn`/`add_error`. По умолчанию
     /// memory-only журнал; Android-обвязка подменяет его на общий
@@ -52,6 +54,8 @@ pub struct StatsSnapshot {
     pub relay_warns: u64,
     /// Cumulative ERROR count (real failures).
     pub relay_errors: u64,
+    /// Сколько QUIC (UDP/443) срезано на входе.
+    pub quic_dropped: u64,
     pub debug_msg: String,
 }
 
@@ -70,6 +74,7 @@ impl Stats {
                 smol_send: AtomicU64::new(0),
                 relay_warns: AtomicU64::new(0),
                 relay_errors: AtomicU64::new(0),
+                quic_dropped: AtomicU64::new(0),
                 debug_msg: std::sync::Mutex::new(String::new()),
                 journal: std::sync::Mutex::new(Journal::memory()),
             }),
@@ -121,6 +126,13 @@ impl Stats {
 
     pub fn add_smol_send(&self, n: u64) {
         self.inner.smol_send.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Срез QUIC (UDP/443) на входе. Это политика mac-пути, а не ошибка:
+    /// в журнал ничего не пишем, чтобы лента DNS-запросов не шумела, но
+    /// счётчик виден в статистике (проверка кейса 6).
+    pub fn add_quic_drop(&self) {
+        self.inner.quic_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Информационное событие (успешное действие), не увеличивает counters.
@@ -176,6 +188,7 @@ impl Stats {
             smol_send: self.inner.smol_send.load(Ordering::Relaxed),
             relay_warns: self.inner.relay_warns.load(Ordering::Relaxed),
             relay_errors: self.inner.relay_errors.load(Ordering::Relaxed),
+            quic_dropped: self.inner.quic_dropped.load(Ordering::Relaxed),
             debug_msg: self.inner.debug_msg.lock().unwrap().clone(),
         }
     }

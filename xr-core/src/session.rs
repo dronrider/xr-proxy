@@ -75,6 +75,11 @@ pub struct SessionContext {
     /// Optional host-level resolver (Android `Network.getAllByName`) tried
     /// BEFORE the UDP:53 fallback. See `SystemResolverFn` docs.
     pub system_resolver: Option<SystemResolverFn>,
+    /// Рычаги тюнинга памяти (LLD-39): буферы сессий, кап, каналы, окно.
+    pub tuning: crate::tuning::TuningProfile,
+    /// Резать QUIC (UDP/443) на входе. Нужен mac-пути: без среза H3 уходит
+    /// с IP сервера мимо резидента.
+    pub block_quic: bool,
 }
 
 /// Create a TCP connection that bypasses the VPN tunnel.

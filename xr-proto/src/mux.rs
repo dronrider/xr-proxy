@@ -966,6 +966,11 @@ pub struct Multiplexer {
     shutdown_notify: Arc<Notify>,
     /// Возможности, согласованные хендшейком (LLD-27).
     caps: MuxCaps,
+    /// Начальное окно отправки нового стрима. По умолчанию константа
+    /// `STREAM_RECV_WINDOW`; NE-профиль (LLD-39) поднимает мельче, сервер
+    /// своё окно не перенастраивает и слать больше не станет: окно раздаёт
+    /// получатель через WindowUpdate.
+    send_window_init: i64,
 }
 
 impl Multiplexer {
@@ -976,7 +981,26 @@ impl Multiplexer {
     where
         S: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
     {
-        Self::new_inner(stream, codec, 1, None, caps) // client uses odd stream IDs
+        Self::new_client_windowed(stream, codec, caps, 0)
+    }
+
+    /// Клиентский мультиплексор со своим начальным окном отправки.
+    /// `recv_window == 0` берёт константу `STREAM_RECV_WINDOW`.
+    pub fn new_client_windowed<S>(
+        stream: S,
+        codec: Codec,
+        caps: MuxCaps,
+        recv_window: u32,
+    ) -> Arc<Self>
+    where
+        S: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
+    {
+        let w = if recv_window == 0 {
+            STREAM_RECV_WINDOW
+        } else {
+            recv_window
+        };
+        Self::new_inner(stream, codec, 1, None, caps, w) // client uses odd stream IDs
     }
 
     /// Клиентский мультиплексор с учётом исходов relay в общем здоровье пула
@@ -991,7 +1015,27 @@ impl Multiplexer {
     where
         S: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
     {
-        Self::new_inner(stream, codec, 1, Some(health), caps)
+        Self::new_inner(stream, codec, 1, Some(health), caps, STREAM_RECV_WINDOW)
+    }
+
+    /// Клиентский мультиплексор с учётом здоровья пула и своим окном отправки.
+    /// `recv_window == 0` берёт константу `STREAM_RECV_WINDOW`.
+    pub fn new_client_tracked_windowed<S>(
+        stream: S,
+        codec: Codec,
+        health: Arc<RelayHealth>,
+        caps: MuxCaps,
+        recv_window: u32,
+    ) -> Arc<Self>
+    where
+        S: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
+    {
+        let w = if recv_window == 0 {
+            STREAM_RECV_WINDOW
+        } else {
+            recv_window
+        };
+        Self::new_inner(stream, codec, 1, Some(health), caps, w)
     }
 
     /// Create a server-side multiplexer over an established TCP connection.
@@ -999,7 +1043,7 @@ impl Multiplexer {
     where
         S: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
     {
-        Self::new_inner(stream, codec, 2, None, caps) // server uses even stream IDs
+        Self::new_inner(stream, codec, 2, None, caps, STREAM_RECV_WINDOW) // server uses even stream IDs
     }
 
     fn new_inner<S>(
@@ -1008,6 +1052,7 @@ impl Multiplexer {
         first_stream_id: u32,
         relay_health: Option<Arc<RelayHealth>>,
         caps: MuxCaps,
+        send_window_init: u32,
     ) -> Arc<Self>
     where
         S: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
@@ -1068,14 +1113,16 @@ impl Multiplexer {
             new_stream_rx: Mutex::new(Some(new_stream_rx)),
             shutdown_notify,
             caps,
+            send_window_init: send_window_init as i64,
         })
     }
 
     /// Окно отправки нового стрима: при выключенном flow control кредит
-    /// бесконечен, путь отправки не ветвится (LLD-27).
+    /// бесконечен, путь отправки не ветвится (LLD-27). При выключенном окно
+    /// берётся из профиля (`send_window_init`), а не из константы протокола.
     fn new_send_window(&self) -> Arc<SendWindow> {
         let initial = if self.caps.window {
-            STREAM_RECV_WINDOW as i64
+            self.send_window_init
         } else {
             i64::MAX
         };

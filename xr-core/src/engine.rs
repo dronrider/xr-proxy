@@ -31,13 +31,14 @@ use crate::session::{relay_session_with_domain, ProtectSocketFn, SessionContext,
 use crate::state::{StateHandle, VpnState};
 use crate::stats::Stats;
 
-/// Буферы smoltcp на одну TCP-сессию: заводятся на каждый SYN и живут, пока
-/// живёт сессия. Вынесены в константы, потому что на них держится бюджет
-/// памяти движка под iOS (LLD-39): расширение NEPacketTunnelProvider не
-/// переживает 50 МБ на процесс, а 128 КиБ на сессию это главная статья
-/// расхода. Меняя размер, смотри `tests/ios_memory_budget.rs`.
-pub const SESSION_RX_BUF: usize = 65535;
-pub const SESSION_TX_BUF: usize = 65535;
+/// Буферы smoltcp на одну TCP-сессию по умолчанию: заводятся на каждый SYN и
+/// живут, пока живёт сессия. На них держится бюджет памяти движка под NE
+/// (LLD-39): расширение NEPacketTunnelProvider не переживает 50 МБ на процесс,
+/// а 128 КиБ на сессию это главная статья расхода. Конкретные значения живут
+/// в `tuning::TuningProfile`, NE-профиль ужимает их до 16 КБ. Меняя размер,
+/// смотри `tests/ios_memory_budget.rs`.
+pub const SESSION_RX_BUF: usize = crate::tuning::DEFAULT_SESSION_RX_BUF;
+pub const SESSION_TX_BUF: usize = crate::tuning::DEFAULT_SESSION_TX_BUF;
 
 /// Ephemeral port counter for unique listen endpoints.
 /// Each smoltcp socket listens on a unique port so multiple SYNs
@@ -107,6 +108,13 @@ pub struct VpnConfig {
     /// Порт UDP relay на VPS. По умолчанию 9999 (`DEFAULT_RELAY_PORT`),
     /// нестандартный задаётся конфигом: без этого UDP молчал бы при живом TCP.
     pub udp_relay_port: u16,
+    /// Рычаги тюнинга памяти (LLD-39). `Default` повторяет прежние литералы,
+    /// профиль `ne` ужимает буферы и очереди под Network Extension.
+    pub tuning: crate::tuning::TuningProfile,
+    /// Резать QUIC (UDP/443) на входе в туннель. На mac-пути это срез H3:
+    /// браузер откатывается на TCP, а чувствительные веб-интерфейсы не уходят
+    /// с IP сервера мимо резидента. Android по умолчанию не режет.
+    pub block_quic: bool,
 }
 
 pub struct VpnEngine {
@@ -285,7 +293,7 @@ impl VpnEngine {
                 .parse()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{}", e)))?;
             let protect = protect_socket.clone();
-            let mux_pool = xr_proto::mux_pool::MuxPool::new(
+            let mux_pool = xr_proto::mux_pool::MuxPool::new_windowed(
                 Arc::new(move || {
                     let protect = protect.clone();
                     let addr = addr;
@@ -300,6 +308,7 @@ impl VpnEngine {
                 }),
                 codec.clone(),
                 self.config.mux_pool_size,
+                self.config.tuning.recv_window,
             );
             pool_servers.push(PoolServer {
                 name: entry.display_name().to_string(),
@@ -351,6 +360,8 @@ impl VpnEngine {
             server_pool: server_pool.clone(),
             dns_resolvers,
             system_resolver: self.config.system_resolver.clone(),
+            tuning: self.config.tuning.clone(),
+            block_quic: self.config.block_quic,
         });
         self.ctx = Some(ctx.clone());
 
@@ -392,8 +403,8 @@ impl VpnEngine {
                     Some(UdpRelayHandle {
                         relay: Arc::new(std::sync::Mutex::new(crate::udp_relay::UdpRelay::new(
                             udp_obfuscator,
-                            crate::udp_relay::DEFAULT_MAX_FLOWS,
-                            crate::udp_relay::DEFAULT_FLOW_TIMEOUT,
+                            self.config.tuning.relay_max_flows,
+                            self.config.tuning.relay_flow_timeout,
                         ))),
                         socket: Arc::new(socket),
                         server_pool: server_pool.clone(),
@@ -873,6 +884,13 @@ async fn run_event_loop(
         // relay-портом мимо smoltcp. TCP и прочее уходят в smoltcp как раньше.
         let mut tcp_packets = Vec::new();
         while let Some(packet) = queue.pop_inbound_public() {
+            // Срез QUIC (mac-путь, XR-300): UDP/443 не уезжает в туннель, иначе
+            // H3 к веб-интерфейсам уходит с IP сервера мимо резидента. Браузер
+            // по таймауту откатывается на TCP, тот идёт через туннель как обычно.
+            if ctx.block_quic && is_udp_dst_port(&packet, 443) {
+                ctx.stats.add_quic_drop();
+                continue;
+            }
             if let Some(dns_response) = try_handle_dns(&packet, &fake_dns) {
                 ctx.stats.add_dns_query();
                 queue.push_outbound_public(dns_response);
@@ -923,9 +941,23 @@ async fn run_event_loop(
                 };
 
                 if is_syn && !sessions.contains_key(&orig_key) {
+                    // Кап одновременных сессий (LLD-39, п. 2): новый SYN выше
+                    // потолка роняется, клиент повторит сам, всплеск не съедает
+                    // память. 0 на дефолтном профиле означает без капа, как было.
+                    let max_sessions = ctx.tuning.max_sessions;
+                    if max_sessions > 0 && sessions.len() >= max_sessions {
+                        ctx.stats.add_warn(&format!(
+                            "session cap {} reached, dropping {}",
+                            max_sessions, orig_key.dst_addr
+                        ));
+                        continue;
+                    }
                     // New connection: assign ephemeral port, create listen socket.
                     let eph_port = next_ephemeral_port();
-                    let handle = stack.add_tcp_socket(SESSION_RX_BUF, SESSION_TX_BUF);
+                    let handle = stack.add_tcp_socket(
+                        ctx.tuning.session_rx_buf,
+                        ctx.tuning.session_tx_buf,
+                    );
                     let socket = stack.tcp_socket_mut(handle);
 
                     if socket.listen(eph_port).is_ok() {
@@ -973,8 +1005,8 @@ async fn run_event_loop(
 
             // Spawn relay when handshake completes.
             if tcp_state == TcpState::Established && session.relay.is_none() {
-                let (to_relay_tx, to_relay_rx) = mpsc::channel(512);
-                let (from_relay_tx, from_relay_rx) = mpsc::channel(512);
+                let (to_relay_tx, to_relay_rx) = mpsc::channel(ctx.tuning.session_channel);
+                let (from_relay_tx, from_relay_rx) = mpsc::channel(ctx.tuning.session_channel);
                 session.relay = Some(RelayChannels {
                     to_relay: to_relay_tx,
                     from_relay: from_relay_rx,
@@ -1290,6 +1322,21 @@ fn is_ip_udp(packet: &[u8]) -> bool {
         return false;
     };
     protocol == 17
+}
+
+/// UDP-пакет с портом назначения `port`. Семейство любое, расширения IPv6
+/// разбирает `parse_ip_header`.
+fn is_udp_dst_port(packet: &[u8], port: u16) -> bool {
+    let Some((_, _, protocol, transport_off)) = parse_ip_header(packet) else {
+        return false;
+    };
+    if protocol != 17 {
+        return false;
+    }
+    let Some((_, dst_port, _)) = parse_udp_header(&packet[transport_off..]) else {
+        return false;
+    };
+    dst_port == port
 }
 
 /// Ответ DNS или UDP-реле обратно в TUN: сборка семейства по адресам.
@@ -1621,6 +1668,7 @@ fn ipv4_checksum(h: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client_config::parse_config;
 
     // Правила пользователя на живом туннеле (XR-180).
 
@@ -1668,6 +1716,8 @@ mod tests {
             system_resolver: None,
             mux_pool_size: 1,
             udp_relay_port: crate::udp_relay::DEFAULT_RELAY_PORT,
+            tuning: crate::tuning::TuningProfile::default(),
+            block_quic: false,
         }
     }
 
@@ -2611,5 +2661,67 @@ mod tests {
         assert!(saw_v4, "SYN-ACK по IPv4 потерян");
         assert_eq!(stack.tcp_socket(h6).state(), St::SynReceived);
         assert_eq!(stack.tcp_socket(h4).state(), St::SynReceived);
+    }
+
+    /// UDP/443 (QUIC) узнаётся на обоих семействах, соседние порты нет.
+    #[test]
+    fn is_udp_dst_port_flags_quic_on_both_families() {
+        let q4 = build_udp_response(
+            Ipv4Addr::new(192, 0, 2, 10),
+            Ipv4Addr::new(203, 0, 113, 5),
+            50000,
+            443,
+            b"quic",
+        );
+        assert!(is_udp_dst_port(&q4, 443), "IPv4 UDP/443 обязан считаться QUIC");
+        assert!(!is_udp_dst_port(&q4, 853), "чужой порт не QUIC");
+
+        let q6 = build_udp_response_v6(
+            Ipv6Addr::new(0xfd00, 0x78, 0, 0, 0, 0, 0, 2),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            50001,
+            443,
+            b"quic",
+        );
+        assert!(is_udp_dst_port(&q6, 443), "IPv6 UDP/443 обязан считаться QUIC");
+
+        // TCP на 443 не путаем с QUIC.
+        let syn = tcp_v4(
+            Ipv4Addr::new(192, 0, 2, 10),
+            Ipv4Addr::new(203, 0, 113, 5),
+            50002,
+            443,
+            1,
+            0,
+            TCP_SYN,
+            &[],
+        );
+        assert!(!is_udp_dst_port(&syn, 443), "TCP/443 не UDP");
+    }
+
+    /// Профиль из JSON: ne_profile берёт набор LLD-39, отдельные ключи уточняют.
+    #[test]
+    fn parse_config_applies_ne_tuning_profile() {
+        let cfg = parse_config(
+            r#"{"server_address":"vps.example","server_port":8443,"obfuscation_key":"a2V5",
+                "ne_profile":true,"block_quic":true,"max_sessions":64}"#,
+        )
+        .unwrap();
+        assert!(cfg.block_quic);
+        assert_eq!(cfg.tuning.session_rx_buf, 16 * 1024);
+        assert_eq!(cfg.tuning.max_sessions, 64, "отдельный ключ перекрывает профиль");
+        assert_eq!(cfg.tuning.recv_window, 256 * 1024);
+    }
+
+    /// Без ключей профиль остаётся прежним: дефолтные литералы.
+    #[test]
+    fn parse_config_without_tuning_keeps_defaults() {
+        let cfg = parse_config(
+            r#"{"server_address":"vps.example","server_port":8443,"obfuscation_key":"a2V5"}"#,
+        )
+        .unwrap();
+        assert!(!cfg.block_quic);
+        assert_eq!(cfg.tuning.session_rx_buf, SESSION_RX_BUF);
+        assert_eq!(cfg.tuning.max_sessions, 0);
     }
 }

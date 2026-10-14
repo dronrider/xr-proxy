@@ -372,6 +372,8 @@ pub fn parse_config(json: &str) -> Result<VpnConfig, String> {
 
     let dns_resolvers = parse_dns_resolvers(json);
     let servers = parse_servers(json);
+    let tuning = parse_tuning(json);
+    let block_quic = json_flag(json, "block_quic");
 
     Ok(VpnConfig {
         server_address,
@@ -396,7 +398,62 @@ pub fn parse_config(json: &str) -> Result<VpnConfig, String> {
         system_resolver: None,
         mux_pool_size,
         udp_relay_port,
+        tuning,
+        block_quic,
     })
+}
+
+/// `true`, когда ключ стоит голым `true` (или `ne_profile` включает набор).
+fn json_flag(json: &str, key: &str) -> bool {
+    let pattern = format!("\"{}\"", key);
+    let Some(pos) = json.find(&pattern) else {
+        return false;
+    };
+    let after = &json[pos + pattern.len()..];
+    let Some(colon) = after.find(':') else {
+        return false;
+    };
+    after[colon + 1..].trim_start().starts_with("true")
+}
+
+/// Профиль тюнинга из JSON (XR-300). `"ne_profile": true` берёт набор LLD-39,
+/// отдельные ключи поверх него уточняют значения. Ключей нет: дефолт, то есть
+/// прежние литералы.
+fn parse_tuning(json: &str) -> crate::tuning::TuningProfile {
+    let mut tuning = if json_flag(json, "ne_profile") {
+        crate::tuning::TuningProfile::ne()
+    } else {
+        crate::tuning::TuningProfile::default()
+    };
+    if let Some(n) = json_num(json, "session_rx_buf") {
+        tuning.session_rx_buf = n as usize;
+    }
+    if let Some(n) = json_num(json, "session_tx_buf") {
+        tuning.session_tx_buf = n as usize;
+    }
+    if let Some(n) = json_num(json, "max_sessions") {
+        tuning.max_sessions = n as usize;
+    }
+    if let Some(n) = json_num(json, "session_channel") {
+        tuning.session_channel = n as usize;
+    }
+    if let Some(n) = json_num(json, "queue_capacity") {
+        tuning.queue_capacity = n as usize;
+    }
+    if let Some(n) = json_num(json, "recv_window") {
+        tuning.recv_window = n as u32;
+    }
+    tuning
+}
+
+fn json_num(json: &str, key: &str) -> Option<u64> {
+    let pattern = format!("\"{}\"", key);
+    let pos = json.find(&pattern)?;
+    let after = &json[pos + pattern.len()..];
+    let colon = after.find(':')? + 1;
+    let rest = after[colon..].trim_start();
+    let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    num_str.parse().ok()
 }
 
 /// Массив `servers` (LLD-10): `[{"name":"aeza","address":"1.2.3.4",

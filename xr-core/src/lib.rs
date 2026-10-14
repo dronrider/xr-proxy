@@ -20,5 +20,6 @@ pub mod state;
 pub mod stats;
 pub mod sync;
 pub mod trusted;
+pub mod tuning;
 pub mod udp_relay;
 pub mod update;

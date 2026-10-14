@@ -96,6 +96,8 @@ pub struct MuxPool {
     /// `ServerPool` ловит сервер с мёртвым DNS/egress, у которого туннель и
     /// keepalive живы, а сама работа падает.
     relay_health: Arc<RelayHealth>,
+    /// Начальное окно отправки стримов; 0 означает константу протокола.
+    recv_window: u32,
 }
 
 impl MuxPool {
@@ -103,6 +105,17 @@ impl MuxPool {
     /// `DEFAULT_POOL_SIZE` so callers can pass through config defaults
     /// without panicking on a misconfigured zero.
     pub fn new(connect_fn: ConnectFn, codec: Codec, size: usize) -> Arc<Self> {
+        Self::new_windowed(connect_fn, codec, size, 0)
+    }
+
+    /// Пул со своим начальным окном отправки (NE-профиль, LLD-39).
+    /// `recv_window == 0` означает константу протокола `STREAM_RECV_WINDOW`.
+    pub fn new_windowed(
+        connect_fn: ConnectFn,
+        codec: Codec,
+        size: usize,
+        recv_window: u32,
+    ) -> Arc<Self> {
         let size = if size == 0 { DEFAULT_POOL_SIZE } else { size };
         let mut slots = Vec::with_capacity(size);
         let mut timeout_counters = Vec::with_capacity(size);
@@ -119,6 +132,7 @@ impl MuxPool {
             down_until_ms: AtomicU64::new(0),
             created: Instant::now(),
             relay_health: Arc::new(RelayHealth::new()),
+            recv_window,
         })
     }
 
@@ -413,11 +427,12 @@ impl MuxPool {
         let mut stream = (self.connect_fn)().await?;
         match mux_handshake_client(&mut stream, &self.codec).await {
             Ok(Some(caps)) => {
-                let mux = Multiplexer::new_client_tracked(
+                let mux = Multiplexer::new_client_tracked_windowed(
                     stream,
                     self.codec.clone(),
                     self.relay_health.clone(),
                     caps,
+                    self.recv_window,
                 );
                 *guard = Some(mux.clone());
                 tracing::info!("mux slot {} connection established", idx);
