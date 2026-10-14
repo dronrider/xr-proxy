@@ -870,7 +870,7 @@ async fn run_event_loop(
                             }
                         }
                     }
-                    // Не-UDP, исключённый порт и переполненный пул не возвращаются
+                    // Исключённый порт и переполненный пул не возвращаются
                     // в smoltcp: там UDP не обслуживается.
                     continue;
                 }
@@ -1301,7 +1301,7 @@ fn try_handle_dns(packet: &[u8], fake_dns: &FakeDns) -> Option<Vec<u8>> {
     Some(build_udp_response(dst_ip, src_ip, dst_port, src_port, &dns_response))
 }
 
-/// IPv4 UDP, кроме DNS (его берёт FakeDns). Такой пакет уходит в UDP-реле.
+/// IPv4 UDP. DNS отсекается раньше, его берёт FakeDns; такой пакет уходит в UDP-реле.
 fn is_ipv4_udp(packet: &[u8]) -> bool {
     let Some((_, _, protocol, _)) = parse_ipv4_header(packet) else {
         return false;
