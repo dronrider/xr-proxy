@@ -1,0 +1,139 @@
+//! Управление NE-туннелем из приложения.
+
+import Foundation
+import NetworkExtension
+import Combine
+import os.log
+
+/// Управляет профилем туннеля и его состоянием. Провайдер туннеля живёт
+/// в отдельном процессе, связь через `NETunnelProviderManager` и App Group.
+@MainActor
+final class TunnelController: ObservableObject {
+    @Published var state: String = "Проверка..."
+    @Published var isRunning = false
+    @Published var lastError: String?
+    @Published var stats: TunnelStats?
+
+    private let log = Logger(subsystem: "xr.macos.app", category: "controller")
+    private var manager: NETunnelProviderManager?
+
+    /// Конфиг кладётся в App Group, его читает процесс расширения.
+    /// Здесь пример: прод-конфиг собирается из настроек пользователя.
+    func refresh() {
+        NETunnelProviderManager.loadAllFromPreferences { [weak self] managers, error in
+            DispatchQueue.main.async {
+                if let error {
+                    self?.lastError = error.localizedDescription
+                    self?.state = "Ошибка"
+                    return
+                }
+                self?.manager = managers?.first
+                self?.updateState()
+            }
+        }
+    }
+
+    func toggle() {
+        if isRunning {
+            stop()
+        } else {
+            start()
+        }
+    }
+
+    private func start() {
+        guard let manager else {
+            lastError = "Профиль туннеля не установлен. Откройте Настройки -> Сеть -> VPN."
+            return
+        }
+        do {
+            try manager.connection.startVPNTunnel()
+            state = "Подключение..."
+            isRunning = true
+            schedulePoll()
+        } catch {
+            lastError = error.localizedDescription
+            state = "Ошибка"
+        }
+    }
+
+    private func stop() {
+        manager?.connection.stopVPNTunnel()
+        state = "Отключение..."
+        isRunning = false
+    }
+
+    private func updateState() {
+        guard let manager else {
+            state = "Не настроен"
+            isRunning = false
+            return
+        }
+        switch manager.connection.status {
+        case .connected:
+            state = "Подключено"
+            isRunning = true
+        case .connecting:
+            state = "Подключение..."
+            isRunning = true
+        case .disconnecting:
+            state = "Отключение..."
+            isRunning = false
+        case .disconnected:
+            state = "Отключено"
+            isRunning = false
+        case .reasserting:
+            state = "Переподключение..."
+            isRunning = true
+        case .invalid:
+            state = "Недоступен"
+            isRunning = false
+        @unknown default:
+            state = "Неизвестно"
+        }
+    }
+
+    /// Опрос статистики у процесса расширения раз в секунду.
+    private func schedulePoll() {
+        Task {
+            while isRunning {
+                pollStats()
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                updateState()
+            }
+        }
+    }
+
+    private func pollStats() {
+        guard let session = manager?.connection as? NETunnelProviderSession else { return }
+        let message = "stats".data(using: .utf8)
+        do {
+            try session.sendProviderMessage(message ?? Data()) { [weak self] response in
+                DispatchQueue.main.async {
+                    guard let response,
+                          let object = try? JSONSerialization.jsonObject(with: response) as? [String: Any]
+                    else { return }
+                    self?.stats = TunnelStats(
+                        bytesUp: object["bytes_up"] as? UInt64 ?? 0,
+                        bytesDown: object["bytes_down"] as? UInt64 ?? 0,
+                        active: object["active"] as? UInt32 ?? 0,
+                        quicDropped: object["quic_dropped"] as? UInt64 ?? 0,
+                        uptime: object["uptime"] as? UInt64 ?? 0,
+                        activeServer: object["active_server"] as? String ?? ""
+                    )
+                }
+            }
+        } catch {
+            log.debug("статистика недоступна: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+}
+
+struct TunnelStats: Equatable {
+    var bytesUp: UInt64
+    var bytesDown: UInt64
+    var active: UInt32
+    var quicDropped: UInt64
+    var uptime: UInt64
+    var activeServer: String
+}

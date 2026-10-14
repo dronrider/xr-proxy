@@ -1,0 +1,4 @@
+module CXrFfi {
+    header "xr_ios_ffi.h"
+    export *
+}
