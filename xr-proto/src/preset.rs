@@ -284,6 +284,7 @@ mod tests {
                     domains: vec!["youtube.com".into()],
                     ip_ranges: vec![],
                     geoip: vec![],
+                    outbound: None,
                 }],
             },
             signature: None,

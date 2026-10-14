@@ -739,6 +739,7 @@ mod tests {
                 domains: domains.iter().map(|s| s.to_string()).collect(),
                 ip_ranges: vec![],
                 geoip: vec![],
+                outbound: None,
             }],
         };
         Router::new(&cfg, None)

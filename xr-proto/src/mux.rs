@@ -31,8 +31,8 @@ use tokio::time::Duration;
 
 use crate::protocol::{
     decode_mux_payload, encode_mux_payload, Codec, Command, Frame, TargetAddr,
-    CLOSE_REASON_CONNECT_FAIL, CLOSE_REASON_RESOLVE_FAIL, HEADER_LEN, MAX_PADDING_LEN,
-    MAX_PAYLOAD_LEN, NONCE_LEN,
+    CLOSE_REASON_CONNECT_FAIL, CLOSE_REASON_OUTBOUND_FAIL, CLOSE_REASON_RESOLVE_FAIL, HEADER_LEN,
+    MAX_PADDING_LEN, MAX_PAYLOAD_LEN, NONCE_LEN,
 };
 
 // ── Constants ───────────────────────────────────────────────────────
@@ -1373,6 +1373,9 @@ async fn dispatch_frame(
                             match code {
                                 CLOSE_REASON_RESOLVE_FAIL => h.record_resolve_fail(),
                                 CLOSE_REASON_CONNECT_FAIL => h.record_connect_fail(),
+                                // Сбой исходящего выхода (XR-299) тоже
+                                // отбивает установку соединения.
+                                CLOSE_REASON_OUTBOUND_FAIL => h.record_connect_fail(),
                                 _ => {}
                             }
                         }
@@ -2103,6 +2106,51 @@ mod tests {
         let (domain_ok, total_ok, resolve_fail, connect_fail) = health.snapshot();
         assert_eq!(resolve_fail, 1, "resolve-сбой считается один раз, дубль Close не удваивает");
         assert_eq!((domain_ok, total_ok, connect_fail), (0, 0, 0));
+    }
+
+    /// XR-299: сбой исходящего выхода чувствительного правила уходит причиной
+    /// `CLOSE_REASON_OUTBOUND_FAIL` и считается в здоровье сбоем установки,
+    /// как connect: резидент лежит, полезной работы по этим целям нет.
+    #[tokio::test]
+    async fn test_outbound_fail_reason_counts_as_connect_fail() {
+        let (client_io, server_io) = duplex(65536);
+        let codec = test_codec();
+        let health = Arc::new(RelayHealth::new());
+        let client_mux =
+            Multiplexer::new_client_tracked(client_io, codec.clone(), health.clone(), MuxCaps::LOCAL);
+        let server_mux = Multiplexer::new_server(server_io, codec.clone(), MuxCaps::LOCAL);
+
+        let server_task = tokio::spawn(async move {
+            let mut rx = server_mux.take_new_stream_rx().await.unwrap();
+            let ns = rx.recv().await.unwrap();
+            server_mux
+                .send_frame(ns.stream_id, Command::ConnectAck, vec![0])
+                .await
+                .unwrap();
+            server_mux
+                .send_frame(
+                    ns.stream_id,
+                    Command::Close,
+                    vec![crate::protocol::CLOSE_REASON_OUTBOUND_FAIL],
+                )
+                .await
+                .unwrap();
+        });
+
+        let target = TargetAddr::Domain("sensitive.example".to_string(), 443);
+        let mut stream = mux_open_stream(&client_mux, &target).await.unwrap();
+        assert!(stream.recv().await.is_none());
+        server_task.await.unwrap();
+
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if health.snapshot().3 >= 1 {
+                break;
+            }
+        }
+        let (domain_ok, total_ok, resolve_fail, connect_fail) = health.snapshot();
+        assert_eq!(connect_fail, 1, "сбой выхода считается сбоем установки");
+        assert_eq!((domain_ok, total_ok, resolve_fail), (0, 0, 0));
     }
 
     /// XR-094: первый Data-кадр стрима засчитывает relay-успех ровно один раз

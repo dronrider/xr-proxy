@@ -1,6 +1,7 @@
 mod fallback;
 mod handler;
 mod mux_handler;
+mod outbound;
 mod udp_relay;
 
 use clap::{Parser, Subcommand};
@@ -102,6 +103,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.limits.max_streams_per_mux
     );
 
+    // Политика исходящих соединений (XR-299): правило с полем outbound обязано
+    // уходить через свой выход. Без таких правил политики нет, и наличие
+    // гарантии названо в журнале: молчание неотличимо от незаконченной настройки.
+    let outbound = outbound::OutboundPolicy::from_config(&config);
+    if outbound.is_some() {
+        let sensitive = config
+            .routing
+            .rules
+            .iter()
+            .filter(|r| r.outbound.is_some())
+            .count();
+        tracing::info!(
+            "Outbound guarantee: {} sensitive rule(s), direct exit for them is disabled",
+            sensitive
+        );
+    }
+
     // Start UDP relay if configured
     if let Some(udp_config) = config.udp_relay {
         if udp_config.enabled {
@@ -139,10 +157,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fallback = fallback_response.clone();
             let sem = semaphore.clone();
             let limits = stream_limits.clone();
+            let outbound = outbound.clone();
 
             tokio::spawn(async move {
-                handler::serve_connection(stream, addr, codec, timeout, fallback, limits, &sem)
-                    .await;
+                handler::serve_connection(
+                    stream,
+                    addr,
+                    codec,
+                    timeout,
+                    fallback,
+                    limits,
+                    &sem,
+                    outbound,
+                )
+                .await;
             });
             std::future::ready(())
         },

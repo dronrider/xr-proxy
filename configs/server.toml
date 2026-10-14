@@ -33,6 +33,27 @@ enabled = true
 level = "info"                        # error, warn, info, debug
 # file = "/var/log/xr-proxy.log"     # Optional log file
 
+# --- Routing и исходящие выходы (XR-299) -------------------------------
+# Сервер применяет из правил только поле outbound: цель с ним обязана уходить
+# через именованный SOCKS5-выход, прямой connect к ней запрещён. Ниже заком-
+# ментировано: без секции routing все соединения идут напрямую, как раньше.
+# [routing]
+# default_action = "direct"
+#
+# [[routing.rules]]
+# action = "proxy"
+# domains = ["sensitive.example.com"]
+# ip_ranges = ["192.0.2.0/24"]
+# outbound = "resident"               # имя из секции [outbound.*]
+#
+# # Именованные выходы, пока поддерживается только socks5
+# [outbound.resident]
+# type = "socks5"
+# address = "proxy.example.net"
+# port = 1080
+# # username = "login"                # опционально, аутентификация RFC 1929
+# # pass = "..."                      # опционально, аутентификация RFC 1929
+
 # ─── UDP Relay ────────────────────────────────────────────────────────
 # Relay UDP traffic for game consoles. Must be enabled on both client and server.
 # [udp_relay]

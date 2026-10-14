@@ -14,9 +14,11 @@ use tokio::time::Duration;
 
 use xr_proto::mux::{mux_handshake_server, Multiplexer};
 use xr_proto::protocol::{
-    Codec, Command, Frame, TargetAddr, CLOSE_REASON_CONNECT_FAIL, CLOSE_REASON_RESOLVE_FAIL,
-    CLOSE_REASON_STREAM_LIMIT,
+    Codec, Command, Frame, TargetAddr, CLOSE_REASON_CONNECT_FAIL, CLOSE_REASON_OUTBOUND_FAIL,
+    CLOSE_REASON_RESOLVE_FAIL, CLOSE_REASON_STREAM_LIMIT,
 };
+
+use crate::outbound::{connect_target, OutboundPolicy, TargetError};
 
 const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -49,13 +51,23 @@ pub async fn handle_mux_client(
     codec: Codec,
     init_frame: &Frame,
     limits: StreamLimits,
+    outbound: Option<Arc<OutboundPolicy>>,
 ) -> io::Result<()> {
     // Стагерим лайфтайм по эфемерному порту клиента (0..15 мин поверх базы), чтобы
     // 4 слота пула, поднятые почти одновременно, не упирались в кап и не
     // переподключались лок-степом (иначе разом закрылись бы и дали секундный
     // провал открытий раз в цикл).
     let lifetime = MAX_LIFETIME + Duration::from_secs((client_addr.port() as u64) % 900);
-    handle_mux_client_lt(client, client_addr, codec, init_frame, lifetime, limits).await
+    handle_mux_client_lt(
+        client,
+        client_addr,
+        codec,
+        init_frame,
+        lifetime,
+        limits,
+        outbound,
+    )
+    .await
 }
 
 /// Тело с явным лайфтаймом accept-петли, чтобы тест мог задать короткий кап.
@@ -66,6 +78,7 @@ async fn handle_mux_client_lt(
     init_frame: &Frame,
     lifetime: Duration,
     limits: StreamLimits,
+    outbound: Option<Arc<OutboundPolicy>>,
 ) -> io::Result<()> {
     let Some(caps) = mux_handshake_server(&mut client, &codec, init_frame).await? else {
         tracing::warn!("{} mux handshake rejected", client_addr);
@@ -147,8 +160,9 @@ async fn handle_mux_client_lt(
             // FIFO с Data и не обогнал их (XR-241).
             let addr_str = addr_display(&target_addr);
             let client_addr_clone = client_addr;
+            let outbound = outbound.clone();
             tokio::spawn(async move {
-                if let Err(e) = relay_stream(mux_stream, target_addr).await {
+                if let Err(e) = relay_stream(mux_stream, target_addr, outbound).await {
                     tracing::debug!("{} sid={} {} relay error: {}", client_addr_clone, stream_id, addr_str, e);
                 }
                 drop(session_permit);
@@ -189,6 +203,10 @@ async fn handle_mux_client_lt(
 enum RelayError {
     Resolve(io::Error),
     Connect(io::Error),
+    /// Исходящий выход чувствительного правила не открылся (XR-299): свой
+    /// класс, своя причина в Close, чтобы клиент считал отказ резидента
+    /// отдельно от мёртвого DNS и connect'а к цели.
+    Outbound(io::Error),
     Io(io::Error),
 }
 
@@ -197,6 +215,7 @@ impl RelayError {
         match self {
             RelayError::Resolve(_) => Some(CLOSE_REASON_RESOLVE_FAIL),
             RelayError::Connect(_) => Some(CLOSE_REASON_CONNECT_FAIL),
+            RelayError::Outbound(_) => Some(CLOSE_REASON_OUTBOUND_FAIL),
             RelayError::Io(_) => None,
         }
     }
@@ -207,6 +226,7 @@ impl std::fmt::Display for RelayError {
         match self {
             RelayError::Resolve(e) => write!(f, "resolve: {}", e),
             RelayError::Connect(e) => write!(f, "connect: {}", e),
+            RelayError::Outbound(e) => write!(f, "outbound: {}", e),
             RelayError::Io(e) => e.fmt(f),
         }
     }
@@ -221,9 +241,10 @@ impl std::fmt::Display for RelayError {
 async fn relay_stream(
     mux_stream: xr_proto::mux::MuxStream,
     target_addr: TargetAddr,
+    outbound: Option<Arc<OutboundPolicy>>,
 ) -> Result<(), RelayError> {
     let (mut mux_r, mut mux_w) = mux_stream.split();
-    let result = relay_pump(&mut mux_r, &mut mux_w, target_addr).await;
+    let result = relay_pump(&mut mux_r, &mut mux_w, target_addr, outbound.as_deref()).await;
     // Close клиенту шлём сами и той же половиной записи, что и Data: иначе кадр
     // обгонит недописанный хвост ответа апстрима (XR-241). Сбой установки relay
     // (resolve или connect до апстрима) уезжает причиной в payload, по ней
@@ -238,26 +259,17 @@ async fn relay_pump(
     mux_r: &mut xr_proto::mux::MuxReadHalf,
     mux_w: &mut xr_proto::mux::MuxWriteHalf,
     target_addr: TargetAddr,
+    outbound: Option<&OutboundPolicy>,
 ) -> Result<(), RelayError> {
-    // Resolve and connect to target.
-    let target_sockaddr = resolve_target(&target_addr)
+    // Цель уходит через исходящей выход правила либо напрямую, одной
+    // функцией с одиночным соединением (XR-299).
+    let mut target = connect_target(outbound, &target_addr, TARGET_CONNECT_TIMEOUT)
         .await
-        .map_err(RelayError::Resolve)?;
-    let mut target = match tokio::time::timeout(
-        TARGET_CONNECT_TIMEOUT,
-        TcpStream::connect(target_sockaddr),
-    )
-    .await
-    {
-        Ok(Ok(t)) => t,
-        Ok(Err(e)) => return Err(RelayError::Connect(e)),
-        Err(_) => {
-            return Err(RelayError::Connect(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "target connect timeout",
-            )))
-        }
-    };
+        .map_err(|e| match e {
+            TargetError::Resolve(e) => RelayError::Resolve(e),
+            TargetError::Connect(e) => RelayError::Connect(e),
+            TargetError::Outbound(e) => RelayError::Outbound(e),
+        })?;
 
     configure_target(&target);
 
@@ -306,22 +318,6 @@ fn addr_display(addr: &TargetAddr) -> String {
     }
 }
 
-async fn resolve_target(addr: &TargetAddr) -> io::Result<SocketAddr> {
-    match addr {
-        TargetAddr::Ip(sockaddr) => Ok(*sockaddr),
-        TargetAddr::Domain(domain, port) => {
-            let addrs: Vec<SocketAddr> =
-                tokio::net::lookup_host(format!("{}:{}", domain, port))
-                    .await?
-                    .collect();
-            addrs
-                .into_iter()
-                .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "DNS resolution failed"))
-        }
-    }
-}
-
 fn configure_target(stream: &TcpStream) {
     let _ = stream.set_nodelay(true);
     let ka = socket2::TcpKeepalive::new()
@@ -358,6 +354,15 @@ mod tests {
     }
 
     async fn start_mux_server_limited(codec: Codec, limits: StreamLimits) -> TcpStream {
+        start_mux_server_policy(codec, limits, None).await
+    }
+
+    /// То же с заданной политикой исходящих соединений (XR-299).
+    async fn start_mux_server_policy(
+        codec: Codec,
+        limits: StreamLimits,
+        outbound: Option<Arc<OutboundPolicy>>,
+    ) -> TcpStream {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let scodec = codec.clone();
@@ -380,6 +385,7 @@ mod tests {
                 &init,
                 Duration::from_secs(60),
                 limits,
+                outbound,
             )
             .await;
         });
@@ -777,6 +783,7 @@ mod tests {
                 &init,
                 Duration::from_millis(300),
                 wide_limits(),
+                None,
             )
             .await
         });
@@ -795,5 +802,75 @@ mod tests {
         assert_eq!(n, 0, "после капа клиент должен получить EOF (mux закрыт), а не данные");
 
         let _ = server.await;
+    }
+
+    /// XR-299, кейс 2: резидент лежит - стрим рвётся Close'ом с причиной
+    /// OUTBOUND_FAIL, и цель не получает прямого соединения в обход выхода.
+    #[tokio::test]
+    async fn outbound_failure_close_carries_reason() {
+        use crate::outbound::testutil::{dead_addr, policy, rule, DirectCanary};
+
+        let codec = test_codec();
+        let dead = dead_addr().await;
+        let canary = DirectCanary::start().await;
+        let cidr = format!("{}/32", canary.addr.ip());
+        let policy = policy(vec![rule(&[], &[&cidr])], dead, None);
+        let mut client = start_mux_server_policy(codec.clone(), wide_limits(), Some(policy)).await;
+
+        let wire = codec
+            .encode_frame(
+                Command::Connect,
+                &encode_mux_payload(1, &TargetAddr::Ip(canary.addr).encode().unwrap()),
+            )
+            .unwrap();
+        client.write_all(&wire).await.unwrap();
+
+        let close = read_until_close(&mut client, &codec).await;
+        let (sid, reason) = decode_mux_payload(&close.payload).unwrap();
+        assert_eq!(sid, 1);
+        assert_eq!(
+            reason,
+            [CLOSE_REASON_OUTBOUND_FAIL],
+            "отказ резидента должен прийти причиной {} в Close",
+            CLOSE_REASON_OUTBOUND_FAIL
+        );
+        assert_eq!(canary.take(), 0, "прямого соединения с целью быть не должно");
+    }
+
+    /// XR-299, кейсы 1 и 5: стрим к цели чувствительного правила релеится
+    /// через резидента - ответные байты приходят эхом резидента, а
+    /// канарейка прямого пути за окно молчит.
+    #[tokio::test]
+    async fn relay_goes_through_resident_not_directly() {
+        use crate::outbound::testutil::{policy, rule, DirectCanary, FakeSocks5};
+
+        let codec = test_codec();
+        let socks = FakeSocks5::start().await;
+        let canary = DirectCanary::start().await;
+        let cidr = format!("{}/32", canary.addr.ip());
+        let policy = policy(vec![rule(&[], &[&cidr])], socks.addr, None);
+        let mut client =
+            start_mux_server_policy(codec.clone(), wide_limits(), Some(policy)).await;
+
+        client.write_all(&connect_wire(&codec, 1, canary.addr)).await.unwrap();
+
+        let mut reader = FrameReader::new();
+        let ack = reader.answer_for(&mut client, &codec, 1).await;
+        assert_eq!(ack.command, Command::ConnectAck);
+
+        let ping = codec
+            .encode_frame(Command::Data, &encode_mux_payload(1, b"ping"))
+            .unwrap();
+        client.write_all(&ping).await.unwrap();
+
+        let echo = reader.answer_for(&mut client, &codec, 1).await;
+        assert_eq!(echo.command, Command::Data, "эхо через резидента идёт кадром Data");
+        let (sid, data) = decode_mux_payload(&echo.payload).unwrap();
+        assert_eq!(sid, 1);
+        assert_eq!(data, b"ping", "ответные байты обязаны прийти через резидента");
+
+        let requests = socks.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "резидент обязан получить запрос на цель");
+        assert_eq!(canary.take(), 0, "прямого соединения с целью быть не должно");
     }
 }

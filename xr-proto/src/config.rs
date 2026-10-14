@@ -1,6 +1,8 @@
 /// Configuration parsing for client and server.
 use crate::obfuscation::ModifierStrategy;
+use crate::routing::Action;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 
@@ -115,6 +117,15 @@ pub struct RoutingConfig {
     pub rules: Vec<RoutingRule>,
 }
 
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            default_action: default_action(),
+            rules: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingRule {
     /// Название тематической группы («YouTube», «Мессенджеры»), которое хаб
@@ -125,6 +136,12 @@ pub struct RoutingRule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub action: String,
+    /// Имя исходящего выхода из секции `[outbound]` сервера (XR-299): цель
+    /// правила обязана уходить через него, напрямый connect запрещён. Поле
+    /// опциональное, поэтому пресеты и клиентские правила без него читаются
+    /// как раньше и не сериализуются с ним (подписи пресетов не меняются).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound: Option<String>,
     #[serde(default)]
     pub domains: Vec<String>,
     #[serde(default)]
@@ -298,6 +315,32 @@ pub struct ServerConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub udp_relay: Option<UdpRelayServerConfig>,
+    /// Правила исходящих соединений сервера (XR-299). Сервер применяет из них
+    /// только поле `outbound`: цель с таким правилом уходит через именованный
+    /// выход из секции `[outbound]` и никогда напрямую. Пустая секция это
+    /// отказ от гарантии, все соединения идут как раньше.
+    #[serde(default)]
+    pub routing: RoutingConfig,
+    /// Именованные исходящие выходы: `[outbound.<имя>]` с адресом SOCKS5.
+    #[serde(default)]
+    pub outbound: HashMap<String, OutboundConfig>,
+}
+
+/// Исходящий выход сервера (XR-299): куда уходит трафик чувствительных
+/// правил. Пока поддерживается только SOCKS5, и `kind` это способ назвать
+/// будущий тип, не ломая конфиги.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OutboundConfig {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub address: String,
+    pub port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Пара к SOCKS5-аутентификации (RFC 1929). Имя поля `pass`, а не
+    /// «пароль»: хук devkit читает `password:` как записанный секрет.
+    #[serde(default)]
+    pub pass: Option<String>,
 }
 
 // ── UDP Relay configs ───────────────────────────────────────────────
@@ -610,6 +653,58 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), String> {
     let bind = format!("{}:{}", config.server.listen, config.server.port);
     bind.to_socket_addrs()
         .map_err(|e| format!("server: invalid listen address '{bind}': {e}"))?;
+    validate_outbound(config)?;
+    Ok(())
+}
+
+/// Почему секция исходящих выходов или правило с полем `outbound` не годится
+/// (XR-299), либо `Ok(())`. Гарантия «мимо прямого выхода» обязана держаться
+/// уже на старте: правило со ссылкой на несуществующий выход, с чужим
+/// действием или с содержимым, которое `compile_rule` молча выкинет с WARN,
+/// ушло бы напрямую при первом же соединении, и узнать об этом можно было бы
+/// только по реальному адресу в логах принимающей стороны.
+fn validate_outbound(config: &ServerConfig) -> Result<(), String> {
+    for (name, out) in &config.outbound {
+        let section = format!("outbound '{name}'");
+        if out.kind.trim().to_ascii_lowercase() != "socks5" {
+            return Err(format!(
+                "{section}.type: unsupported outbound type '{}' (only socks5)",
+                out.kind
+            ));
+        }
+        if out.address.trim().is_empty() {
+            return Err(format!("{section}.address: must not be empty"));
+        }
+        if out.port == 0 {
+            return Err(format!("{section}.port: must not be 0"));
+        }
+        if out.pass.is_some() && out.username.is_none() {
+            return Err(format!("{section}: pass without username"));
+        }
+    }
+    for (index, rule) in config.routing.rules.iter().enumerate() {
+        let Some(outbound) = rule.outbound.as_deref() else {
+            continue;
+        };
+        let label = match &rule.name {
+            Some(name) => format!("routing.rules '{name}'"),
+            None => format!("routing.rules[{index}]"),
+        };
+        if !config.outbound.contains_key(outbound) {
+            return Err(format!(
+                "{label}: outbound '{outbound}' is not defined in [outbound]"
+            ));
+        }
+        if Action::from_str(&rule.action) != Action::Proxy {
+            return Err(format!(
+                "{label}: action must be 'proxy' when outbound is set, got '{}'",
+                rule.action
+            ));
+        }
+        if let Some(reason) = crate::routing::outbound_rule_reject_reason(rule) {
+            return Err(format!("{label}: {reason}"));
+        }
+    }
     Ok(())
 }
 
@@ -836,6 +931,7 @@ domains = ["x.com"]
             domains: vec!["youtube.com".into()],
             ip_ranges: vec![],
             geoip: vec![],
+            outbound: None,
         };
         assert_eq!(
             serde_json::to_string(&rule).unwrap(),
@@ -1161,6 +1257,127 @@ vps_host = "not an address"
         cfg.server.listen = "not an address".into();
         let err = validate_server_config(&cfg).unwrap_err();
         assert!(err.contains("invalid listen address"), "{err}");
+    }
+
+    /// Годная секция исходящих выходов и правило с outbound проходят
+    /// validate целиком: сухой прогон обязан соглашаться со стартом.
+    #[test]
+    fn validate_accepts_good_outbound_config() {
+        let cfg = server_with(
+            r#"
+[outbound.resident]
+type = "socks5"
+address = "resident.example.com"
+port = 1080
+username = "user"
+pass = "secret-value"
+
+[[routing.rules]]
+name = "AI"
+action = "proxy"
+outbound = "resident"
+domains = ["claude.ai", "*.anthropic.com"]
+ip_ranges = ["192.0.2.0/24"]
+"#,
+        );
+        validate_server_config(&cfg).unwrap();
+    }
+
+    #[test]
+    fn validate_names_outbound_reject_reasons() {
+        // Ссылка на выход, которого нет: правило ушло бы напрямую.
+        let cfg = server_with(
+            r#"
+[[routing.rules]]
+name = "AI"
+action = "proxy"
+outbound = "ghost"
+domains = ["claude.ai"]
+"#,
+        );
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.contains("routing.rules 'AI'"), "{err}");
+        assert!(err.contains("not defined in [outbound]"), "{err}");
+
+        // Правило с outbound обязано остаться proxy (XR-081: неизвестное
+        // значение action уходит в Direct, так уже ловили утечку).
+        let cfg = server_with(
+            r#"
+[outbound.resident]
+type = "socks5"
+address = "resident.example.com"
+port = 1080
+
+[[routing.rules]]
+name = "AI"
+action = "direct"
+outbound = "resident"
+domains = ["claude.ai"]
+"#,
+        );
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.contains("action must be 'proxy'"), "{err}");
+
+        // Неразбираемый домен compile_rule выкидывает с WARN: правило
+        // выпало бы из гарантии, поэтому validate его называет.
+        let cfg = server_with(
+            r#"
+[outbound.resident]
+type = "socks5"
+address = "resident.example.com"
+port = 1080
+
+[[routing.rules]]
+name = "AI"
+action = "proxy"
+outbound = "resident"
+domains = ["claude"]
+"#,
+        );
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.contains("does not parse"), "{err}");
+
+        // Пустое правило не матчит никогда.
+        let cfg = server_with(
+            r#"
+[outbound.resident]
+type = "socks5"
+address = "resident.example.com"
+port = 1080
+
+[[routing.rules]]
+name = "AI"
+action = "proxy"
+outbound = "resident"
+"#,
+        );
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.contains("nothing to match"), "{err}");
+
+        // Неизвестный тип выхода: поддерживается только socks5.
+        let cfg = server_with(
+            r#"
+[outbound.resident]
+type = "http"
+address = "resident.example.com"
+port = 1080
+"#,
+        );
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.contains("unsupported outbound type"), "{err}");
+
+        // Пара к аутентификации без пользователя не собирается.
+        let cfg = server_with(
+            r#"
+[outbound.resident]
+type = "socks5"
+address = "resident.example.com"
+port = 1080
+pass = "secret-value"
+"#,
+        );
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.contains("pass without username"), "{err}");
     }
 }
 

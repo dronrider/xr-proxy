@@ -98,6 +98,9 @@ struct CompiledRule {
     ip_ranges: Vec<CidrRange>,
     /// GeoIP country codes (uppercase).
     geoip_codes: Vec<String>,
+    /// Имя исходящего выхода сервера (XR-299): у цели, попавшей в правило,
+    /// соединение обязано уходить через него. У клиентских правил None.
+    outbound: Option<String>,
 }
 
 /// The routing engine. Created once from config, used for every connection.
@@ -191,34 +194,70 @@ impl Router {
         self.default_action
     }
 
-    fn matches_rule(&self, rule: &CompiledRule, sni: Option<&str>, dest_ip: IpAddr) -> bool {
-        // Check domain rules
-        if let Some(hostname) = sni {
-            let hostname_lower = hostname.to_lowercase();
-
-            for exact in &rule.exact_domains {
-                if hostname_lower == *exact {
-                    return true;
-                }
+    /// Имя исходящего выхода для цели (XR-299): первое правило с полем
+    /// `outbound`, которое матчит домен `sni` либо адрес `dest_ip`.
+    ///
+    /// Правила без поля пропускаются, даже если они матчат раньше: широкий
+    /// прокси-пресет соседней группы не должен снимать с чувствительного
+    /// домена требование уходить через резидента. Доменьная цель проверяется
+    /// только доменами правила, IP-цель только его диапазонами: чтобы сверить
+    /// домен с `ip_ranges`, его пришлось бы резолвить на стороне вызывающего,
+    /// а серверу это утекает DNS с адресом хостинга.
+    pub fn resolve_outbound(&self, sni: Option<&str>, dest_ip: Option<IpAddr>) -> Option<&str> {
+        for rule in &self.rules {
+            let Some(outbound) = rule.outbound.as_deref() else {
+                continue;
+            };
+            let domain_hit = sni.is_some_and(|host| self.matches_domain(rule, host));
+            let ip_hit = dest_ip.is_some_and(|ip| self.matches_ip(rule, ip));
+            if domain_hit || ip_hit {
+                return Some(outbound);
             }
+        }
+        None
+    }
 
-            for suffix in &rule.wildcard_suffixes {
-                // "*.google.com" хранится как ".google.com" и матчит как
-                // "mail.google.com", так и сам "google.com"; одиночная "*" это
-                // пустой суффикс, он матчит любой SNI. Срез по байтам здесь
-                // недопустим: домен приходит из чужого конфига, и на
-                // многобайтовом символе он роняет процесс.
-                if hostname_lower.ends_with(suffix.as_str()) {
+    fn matches_rule(&self, rule: &CompiledRule, sni: Option<&str>, dest_ip: IpAddr) -> bool {
+        self.matches_domain(rule, sni.unwrap_or(""))
+            || self.matches_ip(rule, dest_ip)
+    }
+
+    /// Матч по домену. Пустая строка (`sni = None`) ничего не совпадает:
+    /// точный список и суффиксы привязаны к реальному хостнейму, а пустой
+    /// домен не бывает.
+    fn matches_domain(&self, rule: &CompiledRule, hostname: &str) -> bool {
+        if hostname.is_empty() {
+            return false;
+        }
+        let hostname_lower = hostname.to_lowercase();
+
+        for exact in &rule.exact_domains {
+            if hostname_lower == *exact {
+                return true;
+            }
+        }
+
+        for suffix in &rule.wildcard_suffixes {
+            // "*.google.com" хранится как ".google.com" и матчит как
+            // "mail.google.com", так и сам "google.com"; одиночная "*" это
+            // пустой суффикс, он матчит любой SNI. Срез по байтам здесь
+            // недопустим: домен приходит из чужого конфига, и на
+            // многобайтовом символе он роняет процесс.
+            if hostname_lower.ends_with(suffix.as_str()) {
+                return true;
+            }
+            if let Some(base) = suffix.strip_prefix('.') {
+                if hostname_lower == base {
                     return true;
-                }
-                if let Some(base) = suffix.strip_prefix('.') {
-                    if hostname_lower == base {
-                        return true;
-                    }
                 }
             }
         }
 
+        false
+    }
+
+    /// Матч по адресу назначения: CIDR-диапазоны и GeoIP.
+    fn matches_ip(&self, rule: &CompiledRule, dest_ip: IpAddr) -> bool {
         // Check IP range rules (CIDR)
         for cidr in &rule.ip_ranges {
             if cidr.contains(dest_ip) {
@@ -308,7 +347,36 @@ fn compile_rule(rule: &RoutingRule) -> CompiledRule {
         wildcard_suffixes,
         ip_ranges,
         geoip_codes,
+        outbound: rule.outbound.clone(),
     }
+}
+
+/// Почему правило с полем `outbound` не годится для сервера, либо `None`
+/// (XR-299). Гарантия обхода прямого выхода держится на том, что правило
+/// реально матчит, а `compile_rule` битые записи выкидывает с WARN и
+/// продолжает: опечатка в домене молча выпадала бы из гарантии, и об этом
+/// узнали бы только по адресу хостинга в ответе. Поэтому здесь fail-closed
+/// вместо fail-soft, в отличие от общих пресетов.
+pub fn outbound_rule_reject_reason(rule: &RoutingRule) -> Option<String> {
+    if rule.domains.is_empty() && rule.ip_ranges.is_empty() {
+        return Some("no domains or ip_ranges: nothing to match".into());
+    }
+    for domain in &rule.domains {
+        let d = normalize_pattern(domain);
+        match classify_pattern(&d) {
+            Ok(RuleKind::Domain) | Ok(RuleKind::Wildcard) => {}
+            Ok(RuleKind::CidrV4) | Ok(RuleKind::CidrV6) => {
+                return Some(format!("IP range in domains, use ip_ranges: {domain}"));
+            }
+            Err(_) => return Some(format!("domain does not parse: {domain}")),
+        }
+    }
+    for cidr in &rule.ip_ranges {
+        if CidrRange::parse(cidr).is_none() {
+            return Some(format!("broken CIDR range: {cidr}"));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -330,6 +398,7 @@ mod tests {
                     ],
                     ip_ranges: vec![],
                     geoip: vec![],
+                    outbound: None,
                 },
                 RoutingRule {
                     name: None,
@@ -337,6 +406,7 @@ mod tests {
                     domains: vec!["*.corp.local".into()],
                     ip_ranges: vec![],
                     geoip: vec![],
+                    outbound: None,
                 },
             ],
         }
@@ -404,6 +474,7 @@ mod tests {
             wildcard_suffixes: vec!["яндекс.рф".into()],
             ip_ranges: vec![],
             geoip_codes: vec![],
+            outbound: None,
         };
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         assert!(router.matches_rule(&rule, Some("почта.яндекс.рф"), ip));
@@ -425,6 +496,7 @@ mod tests {
             wildcard_suffixes: vec!["".into()],
             ip_ranges: vec![],
             geoip_codes: vec![],
+            outbound: None,
         };
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         assert!(router.matches_rule(&rule, Some("example.com"), ip));
@@ -443,6 +515,7 @@ mod tests {
                 domains: vec!["*".into()],
                 ip_ranges: vec![],
                 geoip: vec![],
+                outbound: None,
             }],
         };
         let router = Router::new(&config, None);
@@ -469,6 +542,7 @@ mod tests {
                 ],
                 ip_ranges: vec![],
                 geoip: vec![],
+                outbound: None,
             }],
         };
         let router = Router::new(&config, None);
@@ -490,6 +564,7 @@ mod tests {
                 domains: vec!["10.0.0.0/8".into(), "1.2.3.4".into(), "youtube.com".into()],
                 ip_ranges: vec![],
                 geoip: vec![],
+                outbound: None,
             }],
         };
         let router = Router::new(&config, None);
@@ -508,6 +583,7 @@ mod tests {
                 domains: vec![" *.GitHub.com ".into(), "  YouTube.com".into()],
                 ip_ranges: vec![],
                 geoip: vec![],
+                outbound: None,
             }],
         };
         let router = Router::new(&config, None);
@@ -544,6 +620,7 @@ mod tests {
                     "149.154.160.0/20".into(),
                 ],
                 geoip: vec![],
+                outbound: None,
             }],
         };
         let router = Router::new(&config, None);
@@ -565,6 +642,7 @@ mod tests {
                 domains: vec![],
                 ip_ranges: vec!["2001:b28:f23d::/48".into()],
                 geoip: vec![],
+                outbound: None,
             }],
         };
         let router = Router::new(&config, None);
@@ -588,6 +666,7 @@ mod tests {
                 domains: vec!["*.telegram.org".into()],
                 ip_ranges: vec!["91.108.56.0/22".into()],
                 geoip: vec![],
+                outbound: None,
             }],
         };
         let router = Router::new(&config, None);
@@ -609,6 +688,7 @@ mod tests {
                 domains: vec!["github.corp.internal".into()],
                 ip_ranges: vec![],
                 geoip: vec![],
+                outbound: None,
             }],
         };
         let preset = RoutingConfig {
@@ -619,6 +699,7 @@ mod tests {
                 domains: vec!["*.github.com".into()],
                 ip_ranges: vec![],
                 geoip: vec![],
+                outbound: None,
             }],
         };
         let router = Router::from_merged(&overrides, &preset, None);
@@ -646,6 +727,7 @@ mod tests {
                 domains: vec!["youtube.com".into()],
                 ip_ranges: vec![],
                 geoip: vec![],
+                outbound: None,
             }],
         };
         let router = Router::from_merged(&overrides, &preset, None);
@@ -655,5 +737,149 @@ mod tests {
         assert_eq!(router.resolve(Some("youtube.com"), ip), Action::Proxy);
         // default_action from overrides
         assert_eq!(router.resolve(Some("example.com"), ip), Action::Direct);
+    }
+
+    /// Правило XR-299 с полем outbound: домен уезжает именем, цель в
+    /// ip_ranges (в боевом конфиге так лежит подсеть инференса Claude)
+    /// уезжает адресом, чужая цель выхода не касается. В тесте подсеть
+    /// документационная: сами диапазоны это данные конфига, а не кода.
+    #[test]
+    fn test_resolve_outbound_matches_domain_and_ip_targets() {
+        let config = RoutingConfig {
+            default_action: "direct".into(),
+            rules: vec![RoutingRule {
+                name: Some("Claude".into()),
+                action: "proxy".into(),
+                outbound: Some("resident".into()),
+                domains: vec!["claude.ai".into(), "*.anthropic.com".into()],
+                ip_ranges: vec!["192.0.2.0/24".into()],
+                geoip: vec![],
+            }],
+        };
+        let router = Router::new(&config, None);
+
+        assert_eq!(router.resolve_outbound(Some("claude.ai"), None), Some("resident"));
+        assert_eq!(router.resolve_outbound(Some("api.anthropic.com"), None), Some("resident"));
+        assert_eq!(router.resolve_outbound(Some("CLAUDE.AI"), None), Some("resident"));
+        let infer: IpAddr = "192.0.2.5".parse().unwrap();
+        assert_eq!(router.resolve_outbound(None, Some(infer)), Some("resident"));
+
+        let foreign: IpAddr = "198.51.100.7".parse().unwrap();
+        assert_eq!(router.resolve_outbound(None, Some(foreign)), None);
+        assert_eq!(router.resolve_outbound(Some("example.com"), None), None);
+        assert_eq!(router.resolve_outbound(None, None), None);
+    }
+
+    /// Широкое правило соседней группы матчит раньше, но outbound-правила
+    /// пропускаются только по полю: чувствительный домен обязан остаться под
+    /// резидентом, какой бы прокси-пресет ни стоял впереди.
+    #[test]
+    fn test_resolve_outbound_ignores_rules_without_outbound() {
+        let config = RoutingConfig {
+            default_action: "direct".into(),
+            rules: vec![
+                RoutingRule {
+                    name: Some("Общий прокси".into()),
+                    action: "proxy".into(),
+                    outbound: None,
+                    domains: vec!["*.ai".into()],
+                    ip_ranges: vec![],
+                    geoip: vec![],
+                },
+                RoutingRule {
+                    name: Some("AI".into()),
+                    action: "proxy".into(),
+                    outbound: Some("resident".into()),
+                    domains: vec!["chat.example.ai".into()],
+                    ip_ranges: vec![],
+                    geoip: vec![],
+                },
+            ],
+        };
+        let router = Router::new(&config, None);
+
+        assert_eq!(
+            router.resolve_outbound(Some("chat.example.ai"), None),
+            Some("resident"),
+            "правило без outbound раньше по порядку не снимает требование резидента"
+        );
+        assert_eq!(router.resolve_outbound(Some("other.ai"), None), None);
+    }
+
+    /// Доменьная цель сверяется только с доменами правила: ip_ranges для неё
+    /// неприменимы, иначе серверу пришлось бы резолвить домен у себя.
+    #[test]
+    fn test_resolve_outbound_domain_target_skips_ip_ranges() {
+        let config = RoutingConfig {
+            default_action: "direct".into(),
+            rules: vec![RoutingRule {
+                name: None,
+                action: "proxy".into(),
+                outbound: Some("resident".into()),
+                domains: vec![],
+                ip_ranges: vec!["192.0.2.0/24".into()],
+                geoip: vec![],
+            }],
+        };
+        let router = Router::new(&config, None);
+
+        assert_eq!(router.resolve_outbound(Some("claude.ai"), None), None);
+        let infer: IpAddr = "192.0.2.5".parse().unwrap();
+        assert_eq!(router.resolve_outbound(None, Some(infer)), Some("resident"));
+    }
+
+    #[test]
+    fn test_outbound_rule_reject_reason() {
+        let good = RoutingRule {
+            name: Some("AI".into()),
+            action: "proxy".into(),
+            outbound: Some("resident".into()),
+            domains: vec!["claude.ai".into(), "*.anthropic.com".into()],
+            ip_ranges: vec!["192.0.2.0/24".into()],
+            geoip: vec![],
+        };
+        assert_eq!(outbound_rule_reject_reason(&good), None);
+
+        let empty = RoutingRule {
+            domains: vec![],
+            ip_ranges: vec![],
+            ..good.clone()
+        };
+        assert!(
+            outbound_rule_reject_reason(&empty).unwrap().contains("nothing to match"),
+            "правило без содержимого не матчит никогда"
+        );
+
+        let broken_domain = RoutingRule {
+            domains: vec!["claude".into()],
+            ip_ranges: vec![],
+            ..good.clone()
+        };
+        assert!(
+            outbound_rule_reject_reason(&broken_domain)
+                .unwrap()
+                .contains("does not parse"),
+            "одна метка выпала бы из compile_rule с WARN"
+        );
+
+        let cidr_in_domains = RoutingRule {
+            domains: vec!["192.0.2.0/24".into()],
+            ip_ranges: vec![],
+            ..good.clone()
+        };
+        assert!(
+            outbound_rule_reject_reason(&cidr_in_domains)
+                .unwrap()
+                .contains("use ip_ranges")
+        );
+
+        let broken_cidr = RoutingRule {
+            domains: vec![],
+            ip_ranges: vec!["192.0.2.0/99".into()],
+            ..good.clone()
+        };
+        assert!(
+            outbound_rule_reject_reason(&broken_cidr).unwrap().contains("broken CIDR")
+        );
     }
 }

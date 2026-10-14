@@ -174,6 +174,7 @@ pub fn to_routing_config(rules: &[UserRule], default_action: &str) -> RoutingCon
                     domains: vec![pattern],
                     ip_ranges: vec![],
                     geoip: vec![],
+                    outbound: None,
                 }),
                 Ok(RuleKind::CidrV4) | Ok(RuleKind::CidrV6) => Some(RoutingRule {
                     name: None,
@@ -181,6 +182,7 @@ pub fn to_routing_config(rules: &[UserRule], default_action: &str) -> RoutingCon
                     domains: vec![],
                     ip_ranges: vec![pattern],
                     geoip: vec![],
+                    outbound: None,
                 }),
                 Err(e) => {
                     tracing::warn!("skipping invalid user rule '{}': {}", r.pattern, e);
@@ -292,6 +294,7 @@ mod tests {
                 domains: vec!["youtube.com".into(), "*.youtube.com".into()],
                 ip_ranges: vec![],
                 geoip: vec![],
+                outbound: None,
             }],
         };
         let router = Router::from_merged(&overrides, &preset, None);

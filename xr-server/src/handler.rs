@@ -2,14 +2,20 @@
 /// decode Connect command, connect to target, relay data.
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::time::Duration;
-use xr_proto::protocol::{Codec, Command, Frame, TargetAddr};
+use xr_proto::protocol::{Codec, Command, Frame, TargetAddr, CLOSE_REASON_OUTBOUND_FAIL};
+
+use crate::outbound::{connect_target, OutboundPolicy, TargetError};
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);   // 5 min idle
 const MAX_LIFETIME: Duration = Duration::from_secs(3600);  // 1 hour max
+/// Сколько ждать установки соединения с целевой стороной, включая диалог с
+/// исходящим выходом правила (XR-299).
+const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Configure TCP socket: keepalive + nodelay.
 fn configure_socket(stream: &TcpStream) {
@@ -33,6 +39,7 @@ pub async fn serve_connection(
     fallback_response: Option<Vec<u8>>,
     limits: crate::mux_handler::StreamLimits,
     connections: &Semaphore,
+    outbound: Option<Arc<OutboundPolicy>>,
 ) {
     let _permit = match connections.try_acquire() {
         Ok(p) => p,
@@ -42,8 +49,16 @@ pub async fn serve_connection(
         }
     };
 
-    if let Err(e) =
-        handle_client(client, client_addr, codec, handshake_timeout, fallback_response, limits).await
+    if let Err(e) = handle_client(
+        client,
+        client_addr,
+        codec,
+        handshake_timeout,
+        fallback_response,
+        limits,
+        outbound,
+    )
+    .await
     {
         tracing::warn!("Client {} error: {}", client_addr, e);
     }
@@ -57,6 +72,7 @@ pub async fn handle_client(
     handshake_timeout: Duration,
     fallback_response: Option<Vec<u8>>,
     limits: crate::mux_handler::StreamLimits,
+    outbound: Option<Arc<OutboundPolicy>>,
 ) -> io::Result<()> {
     configure_socket(&client);
 
@@ -70,7 +86,14 @@ pub async fn handle_client(
     // путь до релея: первый кадр, DNS и connect к цели.
     let outcome = tokio::time::timeout(
         handshake_timeout,
-        handshake(&mut client, client_addr, &codec, &mut buf, fallback_response),
+        handshake(
+            &mut client,
+            client_addr,
+            &codec,
+            &mut buf,
+            fallback_response,
+            outbound.as_deref(),
+        ),
     )
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake deadline"))??;
@@ -79,7 +102,7 @@ pub async fn handle_client(
         HandshakeOutcome::Done => Ok(()),
         HandshakeOutcome::Mux(connect_frame) => {
             crate::mux_handler::handle_mux_client(
-                client, client_addr, codec, &connect_frame, limits,
+                client, client_addr, codec, &connect_frame, limits, outbound,
             )
             .await
         }
@@ -106,6 +129,7 @@ async fn handshake(
     codec: &Codec,
     buf: &mut Vec<u8>,
     fallback_response: Option<Vec<u8>>,
+    outbound: Option<&OutboundPolicy>,
 ) -> io::Result<HandshakeOutcome> {
     let (connect_frame, filled) = match read_first_frame(client, buf, codec).await? {
         FirstFrameOutcome::Ready(frame, leftover) => (frame, leftover),
@@ -135,15 +159,30 @@ async fn handshake(
     client.write_all(&ack).await?;
     tracing::info!("{} ack sent for {}", client_addr, addr_display(&target_addr));
 
-    let target_sockaddr = resolve_target(&target_addr).await?;
-    tracing::info!("{} -> {} ({})", client_addr, target_sockaddr, addr_display(&target_addr));
-
-    let target = tokio::time::timeout(
-        Duration::from_secs(5),
-        TcpStream::connect(target_sockaddr),
-    )
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "target connect timeout"))??;
+    let target = match connect_target(outbound, &target_addr, TARGET_CONNECT_TIMEOUT).await {
+        Ok(target) => target,
+        Err(TargetError::Outbound(e)) => {
+            // XR-299: резидент лежит либо выход неизвестен. Close с причиной
+            // уходит после ConnectAck: клиент отличает отказ исходящего
+            // выхода от прочих сбоев, а запасного напрямого пути нет.
+            tracing::warn!(
+                "{} outbound fail for {}: {}",
+                client_addr,
+                addr_display(&target_addr),
+                e
+            );
+            let close = codec.encode_frame(Command::Close, &[CLOSE_REASON_OUTBOUND_FAIL])?;
+            client.write_all(&close).await?;
+            return Err(io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()));
+        }
+        Err(e) => return Err(e.into_io()),
+    };
+    tracing::info!(
+        "{} -> {} ({})",
+        client_addr,
+        target.peer_addr().map(|a| a.to_string()).unwrap_or_default(),
+        addr_display(&target_addr)
+    );
 
     configure_socket(&target);
 
@@ -154,22 +193,6 @@ fn addr_display(addr: &TargetAddr) -> String {
     match addr {
         TargetAddr::Domain(d, p) => format!("{}:{}", d, p),
         TargetAddr::Ip(s) => s.to_string(),
-    }
-}
-
-async fn resolve_target(addr: &TargetAddr) -> io::Result<SocketAddr> {
-    match addr {
-        TargetAddr::Ip(sockaddr) => Ok(*sockaddr),
-        TargetAddr::Domain(domain, port) => {
-            // Use tokio's async DNS resolution
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host(format!("{}:{}", domain, port))
-                .await?
-                .collect();
-            addrs
-                .into_iter()
-                .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "DNS resolution failed"))
-        }
     }
 }
 
@@ -411,6 +434,7 @@ mod tests {
                 Duration::from_secs(2),
                 Some(server_fallback),
                 crate::mux_handler::StreamLimits::new(1024, 1024),
+                None,
             )
             .await
         });
@@ -468,6 +492,7 @@ mod tests {
                 Duration::from_secs(2),
                 None,
                 crate::mux_handler::StreamLimits::new(1024, 1024),
+                None,
             )
             .await;
         });
@@ -509,6 +534,7 @@ mod tests {
                 Duration::from_secs(1),
                 None,
                 crate::mux_handler::StreamLimits::new(1024, 1024),
+                None,
             )
             .await
         });
@@ -590,6 +616,7 @@ mod tests {
                 None,
                 limits,
                 &slow_sem,
+                None,
             )
             .await;
         });
@@ -636,6 +663,7 @@ mod tests {
                 None,
                 crate::mux_handler::StreamLimits::new(1024, 1024),
                 &honest_sem,
+                None,
             )
             .await;
         });
@@ -731,5 +759,189 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// XR-299, кейсы 1 и 7: Connect приходит от старого клиента, который
+    /// ничего не знает про outbound, а цель чувствительного правила всё
+    /// равно уходит через резидента. Данные возвращает эхо резидента - это
+    /// единственный возможный их источник, - а канарейка прямого пути за
+    /// окно молчит.
+    #[tokio::test]
+    async fn sensitive_connect_relays_through_resident() {
+        use crate::outbound::testutil::{policy, rule, DirectCanary, FakeSocks5};
+
+        let codec = make_codec();
+        let socks = FakeSocks5::start().await;
+        let canary = DirectCanary::start().await;
+        let cidr = format!("{}/32", canary.addr.ip());
+        let policy = policy(vec![rule(&[], &[&cidr])], socks.addr, None);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_codec = codec.clone();
+        tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let _ = handle_client(
+                stream,
+                peer,
+                server_codec,
+                Duration::from_secs(2),
+                None,
+                crate::mux_handler::StreamLimits::new(1024, 1024),
+                Some(policy),
+            )
+            .await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let payload = TargetAddr::Ip(canary.addr).encode().unwrap();
+        client
+            .write_all(&codec.encode_frame(Command::Connect, &payload).unwrap())
+            .await
+            .unwrap();
+
+        let ack = read_one_frame(&mut client, &codec).await;
+        assert_eq!(ack.command, Command::ConnectAck);
+
+        client
+            .write_all(&codec.encode_frame(Command::Data, b"ping").unwrap())
+            .await
+            .unwrap();
+        let echo = tokio::time::timeout(
+            Duration::from_secs(3),
+            read_one_frame(&mut client, &codec),
+        )
+        .await
+        .expect("ответ обязан вернуться через резидента");
+        assert_eq!(echo.command, Command::Data, "эхо данных идёт кадром Data");
+        assert_eq!(echo.payload, b"ping");
+
+        let requests = socks.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "резидент обязан получить запрос на цель");
+        assert_eq!(canary.take(), 0, "прямого соединения с целью быть не должно");
+    }
+
+    /// XR-299, кейс 2: резидент лежит, соединение рвётся после ConnectAck
+    /// Close'ом с причиной OutboundFail и не уходит мимо выхода на канарейку.
+    #[tokio::test]
+    async fn resident_down_closes_without_direct_leak() {
+        use crate::outbound::testutil::{dead_addr, policy, rule, DirectCanary};
+
+        let codec = make_codec();
+        let dead = dead_addr().await;
+        let canary = DirectCanary::start().await;
+        let cidr = format!("{}/32", canary.addr.ip());
+        let policy = policy(vec![rule(&[], &[&cidr])], dead, None);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_codec = codec.clone();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_client(
+                stream,
+                peer,
+                server_codec,
+                Duration::from_secs(2),
+                None,
+                crate::mux_handler::StreamLimits::new(1024, 1024),
+                Some(policy),
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let payload = TargetAddr::Ip(canary.addr).encode().unwrap();
+        client
+            .write_all(&codec.encode_frame(Command::Connect, &payload).unwrap())
+            .await
+            .unwrap();
+
+        let ack = read_one_frame(&mut client, &codec).await;
+        assert_eq!(
+            ack.command,
+            Command::ConnectAck,
+            "ConnectAck уходит до установления, как и раньше"
+        );
+
+        let close = tokio::time::timeout(
+            Duration::from_secs(3),
+            read_one_frame(&mut client, &codec),
+        )
+        .await
+        .expect("клиент обязан получить отказ от сервера, а не повиснуть");
+        assert_eq!(close.command, Command::Close, "падение резидента рвёт соединение");
+        assert_eq!(
+            close.payload,
+            vec![CLOSE_REASON_OUTBOUND_FAIL],
+            "причина Close обязана называть отказ исходящего выхода"
+        );
+
+        let err = server
+            .await
+            .unwrap()
+            .expect_err("отказ резидента это ошибка обработки соединения");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(canary.take(), 0, "прямого соединения с целью быть не должно");
+    }
+
+    /// XR-299, кейс 4: политика на сервере есть, но цель не подпадает ни
+    /// под одно outbound-правило - трафик идёт напрямую, как раньше, и
+    /// резидент его не видит.
+    #[tokio::test]
+    async fn unmatched_target_keeps_direct_path() {
+        use crate::outbound::testutil::{echo_upstream, policy, rule, FakeSocks5};
+
+        let codec = make_codec();
+        let socks = FakeSocks5::start().await;
+        let upstream = echo_upstream().await;
+        let policy = policy(vec![rule(&["other.internal.test"], &[])], socks.addr, None);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_codec = codec.clone();
+        tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let _ = handle_client(
+                stream,
+                peer,
+                server_codec,
+                Duration::from_secs(2),
+                None,
+                crate::mux_handler::StreamLimits::new(1024, 1024),
+                Some(policy),
+            )
+            .await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let payload = TargetAddr::Ip(upstream).encode().unwrap();
+        client
+            .write_all(&codec.encode_frame(Command::Connect, &payload).unwrap())
+            .await
+            .unwrap();
+
+        let ack = read_one_frame(&mut client, &codec).await;
+        assert_eq!(ack.command, Command::ConnectAck);
+
+        client
+            .write_all(&codec.encode_frame(Command::Data, b"ping").unwrap())
+            .await
+            .unwrap();
+        let echo = tokio::time::timeout(
+            Duration::from_secs(3),
+            read_one_frame(&mut client, &codec),
+        )
+        .await
+        .expect("обычный трафик обязан работать напрямую");
+        assert_eq!(echo.payload, b"ping");
+
+        assert!(
+            socks.requests.lock().unwrap().is_empty(),
+            "резидент не должен видеть трафик без совпадения правила"
+        );
     }
 }

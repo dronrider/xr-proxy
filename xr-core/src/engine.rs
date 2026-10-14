@@ -1215,6 +1215,7 @@ mod tests {
                     domains: vec![domain.into()],
                     ip_ranges: vec![],
                     geoip: vec![],
+                    outbound: None,
                 })
                 .collect(),
         }
@@ -1473,6 +1474,7 @@ mod tests {
                     domains: vec![domain],
                     ip_ranges: vec![],
                     geoip: vec![],
+                    outbound: None,
                 })
                 .collect(),
         };
