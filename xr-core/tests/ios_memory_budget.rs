@@ -145,6 +145,7 @@ fn config(server_port: u16) -> VpnConfig {
         system_resolver: None,
         // Столько же тоннелей, сколько поднимает приложение по умолчанию.
         mux_pool_size: 4,
+        udp_relay_port: xr_core::udp_relay::DEFAULT_RELAY_PORT,
     }
 }
 

@@ -95,6 +95,9 @@ pub struct ClientProfile {
     /// выпускать проксируемый трафик напрямую.
     #[serde(default)]
     pub fail_closed: Option<bool>,
+    /// Порт UDP relay на VPS. Ноль и отсутствие поля дают 9999.
+    #[serde(default)]
+    pub udp_relay_port: Option<u16>,
 }
 
 fn de_salt<'de, D>(de: D) -> Result<Option<u64>, D::Error>
@@ -167,6 +170,15 @@ pub fn build_config_json(profile: &ClientProfile) -> Result<String, String> {
         "on_server_down": on_server_down,
         "dns_resolvers": usable_resolvers(&profile.dns_resolvers),
     });
+
+    // Нестандартный порт relay уезжает в конфиг; ноль и пустое поле
+    // оставляют дефолт движка.
+    if let Some(port) = profile.udp_relay_port.filter(|p| *p != 0) {
+        config
+            .as_object_mut()
+            .expect("config is an object")
+            .insert("udp_relay_port".into(), port.into());
+    }
 
     // Пресет хаба доклеивается только целиком: без имени пресета качать нечего,
     // без адреса хаба неоткуда.
@@ -352,6 +364,11 @@ pub fn parse_config(json: &str) -> Result<VpnConfig, String> {
     let hub_refresh_interval_secs = get_num("hub_refresh_interval_secs").ok();
     let hub_trusted_public_key = get_str("hub_trusted_public_key").ok();
     let mux_pool_size = get_num("mux_pool_size").map(|v| v as usize).unwrap_or(0);
+    let udp_relay_port = get_num("udp_relay_port")
+        .ok()
+        .map(|v| v as u16)
+        .filter(|p| *p != 0)
+        .unwrap_or(crate::udp_relay::DEFAULT_RELAY_PORT);
 
     let dns_resolvers = parse_dns_resolvers(json);
     let servers = parse_servers(json);
@@ -378,6 +395,7 @@ pub fn parse_config(json: &str) -> Result<VpnConfig, String> {
         // платформы, а не значение конфига.
         system_resolver: None,
         mux_pool_size,
+        udp_relay_port,
     })
 }
 
@@ -525,6 +543,20 @@ mod tests {
         assert_eq!(cfg.routing.rules.len(), 1);
         assert_eq!(cfg.dns_resolvers, vec!["77.88.8.8"]);
         assert!(cfg.hub_url.is_none());
+    }
+
+    /// Порт UDP relay едет через профиль и конфиг. Без поля остаётся 9999.
+    #[test]
+    fn udp_relay_port_travels_with_config() {
+        let profile = parse_client_profile(&profile_json(r#","udp_relay_port":10000"#)).unwrap();
+        let json = build_config_json(&profile).unwrap();
+        let cfg = parse_config(&json).unwrap();
+        assert_eq!(cfg.udp_relay_port, 10000);
+
+        let profile = parse_client_profile(&profile_json("")).unwrap();
+        let json = build_config_json(&profile).unwrap();
+        let cfg = parse_config(&json).unwrap();
+        assert_eq!(cfg.udp_relay_port, crate::udp_relay::DEFAULT_RELAY_PORT);
     }
 
     /// Primary берётся из головы пула, а не из легаси-полей: они могли

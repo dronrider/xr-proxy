@@ -40,6 +40,10 @@ pub const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(25);
 /// Порт UDP relay на VPS (по умолчанию как у `xr-server`).
 pub const DEFAULT_RELAY_PORT: u16 = 9999;
 
+/// Буфер приёма downstream. Как у `xr-client` и `xr-server`: ответ крупнее
+/// буфера обрезается и не декодируется.
+pub const UDP_RECV_BUF: usize = 65536;
+
 /// Порты, которые не уходят в реле: DNS перехватывает FakeDns, DHCP живёт
 /// локальной сетью.
 const EXCLUDE_DST_PORTS: [u16; 3] = [53, 67, 68];

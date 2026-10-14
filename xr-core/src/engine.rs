@@ -102,8 +102,11 @@ pub struct VpnConfig {
     /// On Android it should call `Network.getAllByName()` on the underlying
     /// non-VPN network. When set, it's tried before the UDP:53 fallback.
     pub system_resolver: Option<SystemResolverFn>,
-    /// Number of parallel mux tunnels (0 → pool default).
+    /// Number of parallel mux tunnels (0 -> pool default).
     pub mux_pool_size: usize,
+    /// Порт UDP relay на VPS. По умолчанию 9999 (`DEFAULT_RELAY_PORT`),
+    /// нестандартный задаётся конфигом: без этого UDP молчал бы при живом TCP.
+    pub udp_relay_port: u16,
 }
 
 pub struct VpnEngine {
@@ -361,30 +364,31 @@ impl VpnEngine {
         let stats = self.stats.clone();
 
         // UDP relay (XR-301): собственный сокет к relay-порту VPS, мимо mux.
-        // Адрес хоста тот же, что у пула, порт зашит (`DEFAULT_RELAY_PORT`).
+        // Хост берётся у активного сервера пула и по его failover уезжает
+        // вместе с TCP. Порт один на профиль, по умолчанию `DEFAULT_RELAY_PORT`.
         // Без реле TCP продолжает работать, UDP тогда уходит в smoltcp и
         // тонет там; старт из-за UDP не блокируем.
         let udp_relay_handle = {
-            let relay_host = entries
-                .first()
-                .map(|e| e.address.clone())
-                .unwrap_or_default();
-            let vps_addr: Option<SocketAddr> = match format!(
-                "{}:{}",
-                relay_host,
-                crate::udp_relay::DEFAULT_RELAY_PORT
-            )
-            .parse()
-            {
-                Ok(addr) => Some(addr),
-                Err(e) => {
-                    tracing::warn!("UDP relay disabled: bad VPS address: {}", e);
-                    None
-                }
-            };
-            match (vps_addr, bind_relay_socket(&protect_for_udp)) {
-                (Some(vps_addr), Ok(socket)) => {
-                    tracing::info!("UDP relay tunnel to {}", vps_addr);
+            let relay_endpoints: Vec<Option<SocketAddr>> = entries
+                .iter()
+                .map(|e| {
+                    let parsed = format!("{}:{}", e.address, self.config.udp_relay_port).parse();
+                    if let Err(err) = &parsed {
+                        tracing::warn!(
+                            "UDP relay endpoint for {} unusable: {}",
+                            e.display_name(),
+                            err
+                        );
+                    }
+                    parsed.ok()
+                })
+                .collect();
+            match bind_relay_socket(&protect_for_udp) {
+                Ok(socket) => {
+                    tracing::info!(
+                        "UDP relay tunnel on port {}",
+                        self.config.udp_relay_port
+                    );
                     Some(UdpRelayHandle {
                         relay: Arc::new(std::sync::Mutex::new(crate::udp_relay::UdpRelay::new(
                             udp_obfuscator,
@@ -392,14 +396,14 @@ impl VpnEngine {
                             crate::udp_relay::DEFAULT_FLOW_TIMEOUT,
                         ))),
                         socket: Arc::new(socket),
-                        vps_addr,
+                        server_pool: server_pool.clone(),
+                        relay_endpoints,
                     })
                 }
-                (_, Err(e)) => {
+                Err(e) => {
                     tracing::warn!("UDP relay disabled: {}", e);
                     None
                 }
-                (None, Ok(_)) => None,
             }
         };
 
@@ -686,11 +690,28 @@ struct RelayChannels {
 
 /// UDP relay (XR-301): свой сокет к relay-порту VPS, не mux. Таблица флоу
 /// общая для event loop (upstream из TUN) и таска приёма (downstream в TUN).
+/// `relay_endpoints` идёт вровень со слотами пула: индекс активного сервера
+/// выбирает хост, на который уезжает UDP.
 #[derive(Clone)]
 struct UdpRelayHandle {
     relay: Arc<std::sync::Mutex<crate::udp_relay::UdpRelay>>,
     socket: Arc<tokio::net::UdpSocket>,
-    vps_addr: SocketAddr,
+    server_pool: Arc<ServerPool>,
+    relay_endpoints: Vec<Option<SocketAddr>>,
+}
+
+impl UdpRelayHandle {
+    /// Relay-порт активного сервера. Порт у всех серверов один, хост берётся
+    /// у активного, чтобы UDP не остался на мёртвом primary после failover.
+    fn vps_addr(&self) -> Option<SocketAddr> {
+        pick_relay_endpoint(&self.relay_endpoints, self.server_pool.active_index())
+    }
+}
+
+/// Адрес relay-порта слота `active`. `None` у слота значит, что хост не
+/// разобрался в IP при старте, и UDP для него молчит.
+fn pick_relay_endpoint(endpoints: &[Option<SocketAddr>], active: usize) -> Option<SocketAddr> {
+    endpoints.get(active).copied().flatten()
 }
 
 /// UDP-сокет к VPS: bind на любой порт, `protect` от петли через VPN, nonblocking.
@@ -719,7 +740,7 @@ fn spawn_udp_companions(
         let queue = queue.clone();
         let mut shutdown_down = shutdown_rx.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 2048];
+            let mut buf = vec![0u8; crate::udp_relay::UDP_RECV_BUF];
             loop {
                 let n = tokio::select! {
                     r = handle.socket.recv(&mut buf) => match r {
@@ -763,7 +784,9 @@ fn spawn_udp_companions(
                             (relay.keepalive(), relay.is_empty())
                         };
                         if !empty {
-                            let _ = handle.socket.send_to(&wire, handle.vps_addr).await;
+                            if let Some(vps_addr) = handle.vps_addr() {
+                                let _ = handle.socket.send_to(&wire, vps_addr).await;
+                            }
                         }
                     }
                     _ = cleanup.tick() => {
@@ -864,9 +887,11 @@ async fn run_event_loop(
                     if let Some(wire) = wire {
                         // try_send: очередь сокета полная, пакет теряем как UDP
                         // и теряет его на проводе; event loop не ждёт сеть.
-                        if let Err(e) = udp.socket.try_send_to(&wire, udp.vps_addr) {
-                            if e.kind() != io::ErrorKind::WouldBlock {
-                                tracing::debug!("UDP relay send failed: {}", e);
+                        if let Some(vps_addr) = udp.vps_addr() {
+                            if let Err(e) = udp.socket.try_send_to(&wire, vps_addr) {
+                                if e.kind() != io::ErrorKind::WouldBlock {
+                                    tracing::debug!("UDP relay send failed: {}", e);
+                                }
                             }
                         }
                     }
@@ -1434,6 +1459,7 @@ mod tests {
             hub_trusted_public_key: None,
             system_resolver: None,
             mux_pool_size: 1,
+            udp_relay_port: crate::udp_relay::DEFAULT_RELAY_PORT,
         }
     }
 
@@ -1879,5 +1905,19 @@ mod tests {
         assert!(sink.closed, "сокет закрыт через FIN, а не оборван");
         assert_eq!(received.len(), expected.len(), "хвост ответа потерян");
         assert_eq!(received, expected, "поток побит или переставлен");
+    }
+
+    /// UDP уезжает на хост активного сервера пула. Слот без разобранного
+    /// адреса не даёт endpoint, соседний продолжает работать.
+    #[test]
+    fn pick_relay_endpoint_follows_active_slot() {
+        let primary = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 9999);
+        let backup = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), 9999);
+        let endpoints = vec![Some(primary), Some(backup), None];
+
+        assert_eq!(pick_relay_endpoint(&endpoints, 0), Some(primary));
+        assert_eq!(pick_relay_endpoint(&endpoints, 1), Some(backup));
+        assert_eq!(pick_relay_endpoint(&endpoints, 2), None);
+        assert_eq!(pick_relay_endpoint(&endpoints, 3), None);
     }
 }
