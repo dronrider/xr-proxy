@@ -2,6 +2,7 @@
 
 import Foundation
 import NetworkExtension
+import XrCore
 import Combine
 import os.log
 
@@ -13,12 +14,17 @@ final class TunnelController: ObservableObject {
     @Published var isRunning = false
     @Published var lastError: String?
     @Published var stats: TunnelStats?
+    @Published var isConfigured = false
+
+    // Поля первого запуска. Уходят в SetupProfile и App Group.
+    @Published var serverAddress = ""
+    @Published var serverPort = "443"
+    @Published var obfuscationKey = ""
 
     private let log = Logger(subsystem: "xr.macos.app", category: "controller")
     private var manager: NETunnelProviderManager?
 
-    /// Конфиг кладётся в App Group, его читает процесс расширения.
-    /// Здесь пример: прод-конфиг собирается из настроек пользователя.
+    /// Читает установленный профиль и обновляет состояние экрана.
     func refresh() {
         NETunnelProviderManager.loadAllFromPreferences { [weak self] managers, error in
             DispatchQueue.main.async {
@@ -28,7 +34,59 @@ final class TunnelController: ObservableObject {
                     return
                 }
                 self?.manager = managers?.first
+                self?.isConfigured = managers?.isEmpty == false
                 self?.updateState()
+            }
+        }
+    }
+
+    /// Первый запуск: профиль в App Group, профиль NE с on-demand, старт.
+    /// Без saveToPreferences системный диалог добавления VPN не появится.
+    func installAndStart() {
+        let port = UInt16(serverPort) ?? 443
+        let profile = SetupProfile(
+            serverAddress: serverAddress.trimmingCharacters(in: .whitespacesAndNewlines),
+            serverPort: port,
+            obfuscationKey: obfuscationKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        guard !profile.serverAddress.isEmpty, !profile.obfuscationKey.isEmpty else {
+            lastError = "Заполни адрес сервера и ключ."
+            state = "Не настроен"
+            return
+        }
+        guard let json = try? profile.json() else {
+            lastError = "Профиль не собрался в JSON."
+            state = "Ошибка"
+            return
+        }
+        guard let defaults = UserDefaults(suiteName: appGroupSuiteName) else {
+            lastError = "App Group недоступна."
+            state = "Ошибка"
+            return
+        }
+        defaults.set(json, forKey: configDefaultsKey)
+
+        let manager = NETunnelProviderManager()
+        let proto = NETunnelProviderProtocol()
+        proto.providerBundleIdentifier = tunnelProviderBundleId
+        proto.serverAddress = profile.serverAddress
+        manager.protocolConfiguration = proto
+        manager.localizedDescription = "XR Proxy"
+        manager.isOnDemandEnabled = alwaysOnDemandEnabled
+        if alwaysOnDemandEnabled {
+            manager.onDemandRules = [NEOnDemandRuleConnect()]
+        }
+
+        manager.saveToPreferences { [weak self] error in
+            DispatchQueue.main.async {
+                if let error {
+                    self?.lastError = error.localizedDescription
+                    self?.state = "Ошибка"
+                    return
+                }
+                self?.manager = manager
+                self?.isConfigured = true
+                self?.start()
             }
         }
     }
@@ -43,7 +101,8 @@ final class TunnelController: ObservableObject {
 
     private func start() {
         guard let manager else {
-            lastError = "Профиль туннеля не установлен. Откройте Настройки -> Сеть -> VPN."
+            lastError = "Профиль туннеля не установлен. Заполни подключение."
+            state = "Не настроен"
             return
         }
         do {

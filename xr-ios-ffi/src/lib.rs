@@ -223,7 +223,7 @@ ffi_entry!(cstring_into_raw(json_error(FFI_PANIC_TEXT)); fn xr_get_stats() -> *m
                 s.relay_warns, s.relay_errors, s.quic_dropped, debug_escaped, srv_escaped, srv_backup,
             )
         }
-        None => "{\"bytes_up\":0,\"bytes_down\":0,\"active\":0,\"total\":0,\"uptime\":0,\"dns\":0,\"syns\":0,\"smol_recv\":0,\"smol_send\":0,\"relay_warn\":0,\"relay_err\":0,\"quic_dropped\":0,\"debug\":\"\"}".into(),
+        None => "{\"bytes_up\":0,\"bytes_down\":0,\"active\":0,\"total\":0,\"uptime\":0,\"dns\":0,\"syns\":0,\"smol_recv\":0,\"smol_send\":0,\"relay_warn\":0,\"relay_err\":0,\"quic_dropped\":0,\"debug\":\"\",\"active_server\":\"\",\"backup_active\":false}".into(),
     };
     cstring_into_raw(json)
 });
@@ -358,6 +358,31 @@ mod tests {
         let ptr = xr_get_state();
         let state = unsafe { take(ptr) };
         assert_eq!(state, "Disconnected");
+    }
+
+    #[test]
+    fn stats_without_engine_carry_server_keys() {
+        // Запасной JSON обязан нести те же ключи, что и ответ при живом
+        // движке, иначе разбор статистики у хоста двоится.
+        let ptr = xr_get_stats();
+        let json = unsafe { take(ptr) };
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["active_server"], "");
+        assert_eq!(value["backup_active"], false);
+    }
+
+    #[test]
+    fn headers_of_bridge_are_identical() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crate_header = std::fs::read_to_string(root.join("include/xr_ios_ffi.h")).unwrap();
+        let swift_header = std::fs::read_to_string(
+            root.join("../macos/XrCore/Sources/CXrFfi/include/xr_ios_ffi.h"),
+        )
+        .unwrap();
+        assert_eq!(
+            crate_header, swift_header,
+            "копии xr_ios_ffi.h разошлись, синхронизируй include/ и CXrFfi/include"
+        );
     }
 
     #[test]

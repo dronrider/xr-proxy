@@ -28,6 +28,8 @@ targets:
     platform: macOS
     sources:
       - path: XrMac
+      - path: ../XrCore/Sources/XrCore
+        group: XrCore
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.xr.macos

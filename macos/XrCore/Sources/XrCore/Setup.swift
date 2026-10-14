@@ -165,3 +165,44 @@ public func ipFamily(of packet: Data) -> IPFamily {
     default: return .unknown
     }
 }
+
+// MARK: - Раскладка NE
+
+/// App Group, через которую приложение кладёт конфиг расширению.
+public let appGroupSuiteName = "group.dev.xr.macos"
+
+/// Ключ конфига в App Group.
+public let configDefaultsKey = "config_json"
+
+/// Bundle identifier расширения Packet Tunnel.
+public let tunnelProviderBundleId = "dev.xr.macos.tunnel"
+
+/// Always-on и fail-closed: туннель возвращается сам после перезагрузки
+/// и обрыва сети. Разрыв с Android (доверенные сети) осознанный, XR-300.
+public let alwaysOnDemandEnabled = true
+
+/// Адрес сервера как IPv4-литерал. `nil` для имени хоста и мусора:
+/// исключение из перехвата строится только по адресу, имя резолвится
+/// отдельно до установки сетевых настроек.
+public func ipv4Literal(_ raw: String) -> String? {
+    let parts = raw.split(separator: ".", omittingEmptySubsequences: false)
+    guard parts.count == 4 else { return nil }
+    var octets: [String] = []
+    for part in parts {
+        guard !part.isEmpty, part.allSatisfy(\.isNumber), let value = UInt8(part) else {
+            return nil
+        }
+        octets.append(String(value))
+    }
+    return octets.joined(separator: ".")
+}
+
+/// Адрес сервера из JSON профиля (`SetupProfile.json()`). Пустая строка,
+/// если ключа нет или JSON не разобрался.
+public func serverAddress(fromProfileJSON json: String) -> String {
+    guard let data = json.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let address = object["server_address"] as? String
+    else { return "" }
+    return address
+}

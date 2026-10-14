@@ -133,12 +133,41 @@ func testIpFamily() {
     Check.equal("ip.мусор", ipFamily(of: Data([0x00, 0x01])), .unknown)
 }
 
+func testIPv4Literal() {
+    let octets = [192, 0, 2, 7]
+    let literal = octets.map(String.init).joined(separator: ".")
+    let padded = ["192", "000", "002", "007"].joined(separator: ".")
+    let garbage = literal + ".5"
+    Check.equal("addr.литерал", ipv4Literal(literal), literal)
+    Check.equal("addr.ведущие нули", ipv4Literal(padded), octets.map(String.init).joined(separator: "."))
+    Check.equal("addr.имя", ipv4Literal("vps.example"), nil)
+    Check.equal("addr.мусор", ipv4Literal(garbage), nil)
+    Check.equal("addr.пустой", ipv4Literal(""), nil)
+}
+
+func testAlwaysOnDemand() {
+    Check.true("policy.always-on", alwaysOnDemandEnabled)
+    Check.equal("policy.bundle", tunnelProviderBundleId, "dev.xr.macos.tunnel")
+    Check.equal("policy.app-group", appGroupSuiteName, "group.dev.xr.macos")
+}
+
+func testServerAddressFromProfile() {
+    let profile = SetupProfile(serverAddress: "vps.example", obfuscationKey: "a2V5")
+    let json = (try? profile.json()) ?? ""
+    Check.equal("profile.server", serverAddress(fromProfileJSON: json), "vps.example")
+    Check.equal("profile.мусор", serverAddress(fromProfileJSON: "не JSON"), "")
+    Check.equal("profile.нет ключа", serverAddress(fromProfileJSON: "{}"), "")
+}
+
 testProfileJson()
 testProfileJsonRelayPort()
 testStatsDecode()
 testStatsDecodeDefaults()
 testStateMapping()
 testIpFamily()
+testIPv4Literal()
+testAlwaysOnDemand()
+testServerAddressFromProfile()
 
 if Check.failed > 0 {
     print("юниты XrCore: \(Check.failed) провалов из \(Check.passed + Check.failed)")

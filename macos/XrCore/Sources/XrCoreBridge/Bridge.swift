@@ -25,6 +25,12 @@ public enum XrBridge {
         return setup.withCString { take(xr_build_config($0)) }
     }
 
+    /// Собрать JSON конфига из готового профиля-строки (формат
+    /// `SetupProfile.json()`). `nil` на ошибке.
+    public static func buildConfig(json setup: String) -> String? {
+        setup.withCString { take(xr_build_config($0)) }
+    }
+
     /// Проверить конфиг. `"ok"` или JSON `{"error":...}`.
     public static func validateConfig(_ config: String) -> String {
         config.withCString { take(xr_validate_config($0)) } ?? #""{"error":"нет ответа"}"#

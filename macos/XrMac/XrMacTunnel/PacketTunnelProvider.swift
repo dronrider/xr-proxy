@@ -27,8 +27,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         log.info("старт туннеля")
 
-        guard let config = Self.loadConfig() else {
-            log.error("конфиг не найден или не разобран")
+        guard let profileJSON = Self.loadProfile() else {
+            log.error("профиль не найден")
+            completionHandler(TunnelError.noConfig)
+            return
+        }
+        guard let config = XrBridge.buildConfig(json: profileJSON) else {
+            log.error("конфиг из профиля не собрался")
             completionHandler(TunnelError.noConfig)
             return
         }
@@ -39,7 +44,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
-        let settings = Self.makeNetworkSettings()
+        let serverAddress = XrCore.serverAddress(fromProfileJSON: profileJSON)
+        let settings = Self.makeNetworkSettings(serverAddress: serverAddress)
         setTunnelNetworkSettings(settings) { [weak self] error in
             if let error {
                 self?.log.error("настройки сети не встали: \(error.localizedDescription, privacy: .public)")
@@ -80,7 +86,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func sleep(completionHandler: @escaping () -> Void) {
         // Mac спит: туннель не останавливаем, движок переживёт сон своим
-        // таймаутом. On-demand вернёт его на пробуждении.
+        // таймаутом. Вернёт его on-demand (`isOnDemandEnabled`), настроенный
+        // приложением при установке профиля.
         log.info("система засыпает")
         completionHandler()
     }
@@ -143,18 +150,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// Сетевые настройки туннеля. `includeAllNetworks` держит kill-switch:
     /// приложение без настроек не утекает мимо туннеля, и падение туннеля
-    /// не открывает прямой выход. Соседние VPN не трогаются: свойства
+    /// не открывает прямой выход. Адрес сервера исключается из перехвата:
+    /// без исключения includeAllNetworks заворачивает и соединение к серверу,
+    /// и переподключение остаётся без пути. Имя хоста резолвится здесь же,
+    /// до установки настроек. Соседние VPN не трогаются: свойства
     /// `excludeLocalNetworks` и маршруты по умолчанию оставляем системе.
-    private static func makeNetworkSettings() -> NEPacketTunnelNetworkSettings {
-        let loopback = [127, 0, 0, 1].map(String.init).joined(separator: ".")
-        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: loopback)
+    static func makeNetworkSettings(serverAddress: String) -> NEPacketTunnelNetworkSettings {
+        let remote = serverAddress.isEmpty
+            ? [127, 0, 0, 1].map(String.init).joined(separator: ".")
+            : serverAddress
+        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: remote)
 
         let ipv4 = NEIPv4Settings(addresses: [tunnelAddress], subnetMasks: ["255.255.255.255"])
         // Дефолтный маршрут весь, выбор приложений не входит (XR-016).
         ipv4.includedRoutes = [NEIPv4Route.default()]
-        // Туннельный адрес сервера выведен из перехвата: его стек живёт
-        // поверх сети, а не внутри туннеля.
-        ipv4.excludedRoutes = []
+        ipv4.excludedRoutes = Self.excludedServerRoutes(serverAddress: serverAddress)
         settings.ipv4Settings = ipv4
 
         // Уникальный локальный адрес (ULA), хост 2: как v4-адрес выше.
@@ -178,16 +188,50 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return settings
     }
 
-    // MARK: - Конфиг
+    /// Маршруты, которые не уходят в туннель: адрес сервера как /32.
+    /// Имя хоста резолвится системным резолвером до подъёма интерфейса.
+    static func excludedServerRoutes(serverAddress: String) -> [NEIPv4Route] {
+        var addresses: [String] = []
+        if let literal = ipv4Literal(serverAddress) {
+            addresses.append(literal)
+        } else if !serverAddress.isEmpty {
+            addresses.append(contentsOf: resolveIPv4(host: serverAddress))
+        }
+        return addresses.map {
+            NEIPv4Route(destinationAddress: $0, subnetMasks: ["255.255.255.255"])
+        }
+    }
 
-    /// Конфиг достаётся из App Group, куда его кладёт приложение. Без
-    /// конфига туннель не стартует: лучше честный отказ, чем туннель
-    /// в никуда.
-    private static func loadConfig() -> String? {
-        guard let defaults = UserDefaults(suiteName: "group.dev.xr.macos") else {
+    private static func resolveIPv4(host: String) -> [String] {
+        let name = host as CFString
+        guard let lookup = CFHostCreateWithName(nil, name)?.takeRetainedValue(),
+              CFHostStartInfoResolution(lookup, .addresses, nil)
+        else { return [] }
+        guard let data = CFHostGetAddressing(lookup, nil)?.takeUnretainedValue() as? [Data] else {
+            return []
+        }
+        var result: [String] = []
+        for raw in data {
+            let sa = raw.withUnsafeBytes { $0.baseAddress?.assumingMemoryBound(to: sockaddr.self) }
+            guard let sa, sa.pointee.sa_family == UInt8(AF_INET) else { continue }
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            if getnameinfo(sa, socklen_t(raw.count), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST) == 0 {
+                result.append(String(cString: hostname))
+            }
+        }
+        return result
+    }
+
+    // MARK: - Профиль
+
+    /// Профиль достаётся из App Group, куда его кладёт приложение. Без
+    /// профиля туннель не стартует: лучше честный отказ, чем туннель
+    /// в никуда. Ключ совпадает с `configDefaultsKey`.
+    private static func loadProfile() -> String? {
+        guard let defaults = UserDefaults(suiteName: appGroupSuiteName) else {
             return nil
         }
-        return defaults.string(forKey: "config_json")
+        return defaults.string(forKey: configDefaultsKey)
     }
 }
 
