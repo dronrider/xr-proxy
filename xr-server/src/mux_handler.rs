@@ -261,7 +261,7 @@ async fn relay_pump(
     target_addr: TargetAddr,
     outbound: Option<&OutboundPolicy>,
 ) -> Result<(), RelayError> {
-    // Цель уходит через исходящей выход правила либо напрямую, одной
+    // Цель уходит через исходящий выход правила либо напрямую, одной
     // функцией с одиночным соединением (XR-299).
     let mut target = connect_target(outbound, &target_addr, TARGET_CONNECT_TIMEOUT)
         .await
