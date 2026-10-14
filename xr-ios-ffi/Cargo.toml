@@ -1,0 +1,17 @@
+[package]
+name = "xr-ios-ffi"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+name = "xr_ios_ffi"
+
+[dependencies]
+xr-core = { path = "../xr-core" }
+xr-proto = { path = "../xr-proto" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1"
+base64 = "0.22"
