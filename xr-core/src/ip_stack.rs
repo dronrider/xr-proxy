@@ -11,7 +11,7 @@
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -19,11 +19,20 @@ use tokio::sync::Notify;
 /// MTU for the virtual TUN device.
 pub const TUN_MTU: usize = 1500;
 
-/// smoltcp interface IP — intentionally DIFFERENT from TUN IP (10.0.0.2).
+/// Адрес интерфейса smoltcp. Нарочно отличается от адреса TUN: с одним и тем
+/// же адресом smoltcp считает SYN-ACK петлёй и не отправляет его в устройство,
+/// рукопожатие TCP не завершается. Конкретный адрес TUN задаёт платформа.
 pub const SMOL_IP: Ipv4Address = Ipv4Address::new(172, 16, 0, 1);
 /// Gateway IP. MUST be smoltcp's own IP for any_ip routing check:
 /// smoltcp requires routes.lookup(dst).gateway == one of ip_addrs.
 pub const SMOL_GATEWAY: Ipv4Address = Ipv4Address::new(172, 16, 0, 1);
+
+/// IPv6-адрес того же интерфейса: ULA, публичный адрес устройству не нужен
+/// (развилка «адрес-в6» XR-302). Глобальные маршруты уходят в туннель как есть,
+/// стеку нужен только свой источник для ответов.
+pub const SMOL_IPV6: Ipv6Address = Ipv6Address::new(0xfd00, 0x78, 0, 0, 0, 0, 0, 1);
+/// Префикс IPv6-адреса интерфейса. Один /64 как у типичного LAN-сегмента.
+pub const SMOL_IPV6_PREFIX: u8 = 64;
 
 // ── Packet queue (TUN ↔ smoltcp bridge) ─────────────────────────────
 
@@ -222,21 +231,22 @@ impl IpStack {
         let config = Config::new(HardwareAddress::Ip);
         let mut iface = Interface::new(config, &mut device, SmolInstant::now());
 
-        // Configure interface with a DIFFERENT IP than the TUN (10.0.0.2).
-        // With any_ip=true, smoltcp considers ALL IPs as local.
-        // If the smoltcp IP == TUN IP, smoltcp treats SYN-ACK as loopback
-        // and never sends it through the device → TCP handshake never completes.
+        // Адрес интерфейса нарочно не совпадает с адресом TUN: см. SMOL_IP.
+        // any_ip=true принимает пакеты на любой адрес назначения.
         iface.update_ip_addrs(|addrs| {
+            addrs.push(IpCidr::new(SMOL_IP.into(), 16)).ok();
             addrs
-                .push(IpCidr::new(SMOL_IP.into(), 16))
+                .push(IpCidr::new(SMOL_IPV6.into(), SMOL_IPV6_PREFIX))
                 .ok();
         });
 
         // Accept packets for ANY destination IP.
         iface.set_any_ip(true);
 
-        // Default route.
+        // Default route. У IPv6 шлюзом выступает свой же адрес, как у IPv4:
+        // smoltcp требует, чтобы gateway входил в ip_addrs.
         iface.routes_mut().add_default_ipv4_route(SMOL_GATEWAY).ok();
+        iface.routes_mut().add_default_ipv6_route(SMOL_IPV6).ok();
 
         let sockets = SocketSet::new(Vec::new());
 

@@ -7,7 +7,7 @@
 //! This is the standard approach used by Clash, Sing-box, Leaf, etc.
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -15,10 +15,19 @@ use xr_proto::protocol::MAX_DOMAIN_LEN;
 
 use crate::stats::Stats;
 
-/// Reserved CIDR for fake IPs: 198.18.0.0/15 (198.18.0.0 - 198.19.255.255).
-/// This range is designated for benchmarking (RFC 2544) and safe for local use.
-const FAKE_IP_BASE: u32 = 0xC6120000; // 198.18.0.0
+/// Reserved CIDR for fake IPs, a /15 from the RFC 2544 benchmarking range.
+/// This range is safe for local use and never routes on the internet.
+const FAKE_IP_BASE: u32 = 0xC6120000;
 const FAKE_IP_MASK: u32 = 0xFFFE0000; // /15 -> 131072 addresses
+
+/// Первые 96 бит fake-адресов IPv6. Домен получает пару из одного пула:
+/// IPv4-адрес и тот же номер, вложенный в этот префикс. Отдельного пула не
+/// нужно, вытеснение и TTL одни на оба семейства. Префикс ULA не пересекается
+/// с адресом интерфейса `SMOL_IPV6`.
+const FAKE_IPV6_BASE: u128 = 0xfd00_0078_0001_0000_0000_0000_0000_0000;
+const FAKE_IPV6_PREFIX_LEN: u8 = 96;
+/// Маска тех же 96 бит.
+const FAKE_IPV6_MASK: u128 = u128::MAX << (128 - FAKE_IPV6_PREFIX_LEN);
 
 /// Сколько адресов раздаём: смещения от 1 до предпоследнего в /15. Нулевой это
 /// адрес сети, последний широковещательный, оба остаются за бортом.
@@ -241,10 +250,42 @@ impl FakeDns {
         (ip_u32 & FAKE_IP_MASK) == FAKE_IP_BASE
     }
 
+    /// Fake-адрес IPv6 для того же домена: младшие 32 бита несут его IPv4-номер.
+    pub fn to_fake_v6(fake_v4: Ipv4Addr) -> Ipv6Addr {
+        Ipv6Addr::from(FAKE_IPV6_BASE | u32::from(fake_v4) as u128)
+    }
+
+    /// Адрес из fake-диапазона IPv6.
+    pub fn is_fake_v6(ip: Ipv6Addr) -> bool {
+        (u128::from(ip) & FAKE_IPV6_MASK) == FAKE_IPV6_BASE
+    }
+
+    /// Обратная проекция fake-адреса IPv6 на его IPv4-номер.
+    fn fake_v6_to_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+        if !Self::is_fake_v6(ip) {
+            return None;
+        }
+        Some(Ipv4Addr::from((u128::from(ip) & 0xFFFF_FFFF) as u32))
+    }
+
+    /// Домен по адресу любого семейства.
+    pub fn lookup_ip(&self, ip: IpAddr) -> Option<String> {
+        match ip {
+            IpAddr::V4(v4) => self.lookup(v4),
+            IpAddr::V6(v6) => self.lookup_v6(v6),
+        }
+    }
+
+    /// Домен по fake-адресу IPv6.
+    pub fn lookup_v6(&self, ip: Ipv6Addr) -> Option<String> {
+        self.lookup(Self::fake_v6_to_v4(ip)?)
+    }
+
     /// Process a raw DNS query packet. Returns a DNS response with fake IP, or None.
     ///
-    /// Supports only A record queries (type 1, class 1).
-    pub fn handle_query(&self, query: &[u8]) -> Option<(Vec<u8>, Ipv4Addr)> {
+    /// Поддерживаются A (type 1) и AAAA (type 28), class IN. Оба ответа
+    /// несут fake-адрес своего семейства из одного пула.
+    pub fn handle_query(&self, query: &[u8]) -> Option<(Vec<u8>, IpAddr)> {
         // Minimal DNS header: 12 bytes.
         if query.len() < 12 {
             return None;
@@ -266,16 +307,22 @@ impl FakeDns {
         // Parse the first question.
         let (domain, qtype, qclass, qend) = parse_dns_question(&query[12..])?;
 
-        // Only handle A records (type=1, class=IN=1).
-        if qtype != 1 || qclass != 1 {
+        // Only handle A (type=1) and AAAA (type=28) records, class=IN=1.
+        if qclass != 1 || (qtype != 1 && qtype != 28) {
             return None;
         }
 
-        let fake_ip = self.allocate(&domain);
+        let fake_v4 = self.allocate(&domain);
+        let question = &query[12..qend + 12];
 
         // Build DNS response.
-        let response = build_dns_response(id, &query[12..qend + 12], fake_ip);
-        Some((response, fake_ip))
+        let (response, answer_ip) = if qtype == 28 {
+            let fake_v6 = Self::to_fake_v6(fake_v4);
+            (build_dns_response_aaaa(id, question, fake_v6), IpAddr::V6(fake_v6))
+        } else {
+            (build_dns_response(id, question, fake_v4), IpAddr::V4(fake_v4))
+        };
+        Some((response, answer_ip))
     }
 
     fn evict_expired_inner(inner: &mut FakeDnsInner) {
@@ -376,6 +423,32 @@ fn build_dns_response(id: u16, question_section: &[u8], ip: Ipv4Addr) -> Vec<u8>
     resp
 }
 
+/// Build a minimal DNS response with a single AAAA record.
+fn build_dns_response_aaaa(id: u16, question_section: &[u8], ip: Ipv6Addr) -> Vec<u8> {
+    let mut resp = Vec::with_capacity(12 + question_section.len() + 28);
+
+    // Header.
+    resp.extend_from_slice(&id.to_be_bytes());
+    resp.extend_from_slice(&0x8180u16.to_be_bytes()); // QR=1, RD=1, RA=1
+    resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+    resp.extend_from_slice(&1u16.to_be_bytes()); // ANCOUNT=1
+    resp.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT=0
+    resp.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT=0
+
+    // Question section (copy from query).
+    resp.extend_from_slice(question_section);
+
+    // Answer: pointer to domain in question (0xC00C = offset 12).
+    resp.extend_from_slice(&0xC00Cu16.to_be_bytes()); // NAME pointer
+    resp.extend_from_slice(&28u16.to_be_bytes()); // TYPE AAAA
+    resp.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+    resp.extend_from_slice(&60u32.to_be_bytes()); // TTL 60s
+    resp.extend_from_slice(&16u16.to_be_bytes()); // RDLENGTH
+    resp.extend_from_slice(&ip.octets()); // RDATA
+
+    resp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +489,24 @@ mod tests {
         assert!(!FakeDns::is_fake_ip(Ipv4Addr::new(8, 8, 8, 8)));
     }
 
+    /// Fake-адреса IPv6 выводятся из IPv4-номера домена и обратно
+    /// восстанавливаются без потерь.
+    #[test]
+    fn test_fake_v6_round_trip() {
+        let fake_v4 = Ipv4Addr::new(198, 18, 0, 1);
+        let fake_v6 = FakeDns::to_fake_v6(fake_v4);
+
+        assert!(FakeDns::is_fake_v6(fake_v6));
+        assert_eq!(FakeDns::fake_v6_to_v4(fake_v6), Some(fake_v4));
+
+        // Глобальный адрес и адрес интерфейса в fake-диапазон не входят.
+        let global = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        assert!(!FakeDns::is_fake_v6(global));
+        let iface = Ipv6Addr::new(0xfd00, 0x78, 0, 0, 0, 0, 0, 1);
+        assert!(!FakeDns::is_fake_v6(iface));
+        assert_eq!(FakeDns::fake_v6_to_v4(global), None);
+    }
+
     #[test]
     fn test_expired_entry() {
         let dns = FakeDns::with_ttl(Duration::from_millis(1));
@@ -440,8 +531,11 @@ mod tests {
         let query = build_test_dns_query("example.com");
         let (response, fake_ip) = dns.handle_query(&query).unwrap();
 
-        assert!(FakeDns::is_fake_ip(fake_ip));
-        assert_eq!(dns.lookup(fake_ip), Some("example.com".to_string()));
+        let IpAddr::V4(fake_v4) = fake_ip else {
+            panic!("A-запрос обязан отдать IPv4, отдал {:?}", fake_ip);
+        };
+        assert!(FakeDns::is_fake_ip(fake_v4));
+        assert_eq!(dns.lookup(fake_v4), Some("example.com".to_string()));
 
         // Verify response structure.
         assert!(response.len() >= 12);
@@ -451,17 +545,40 @@ mod tests {
         assert_eq!(u16::from_be_bytes([response[6], response[7]]), 1);
     }
 
+    /// AAAA отвечает fake-адресом того же домена, что и A: клиент получает
+    /// dual-stack и сам выбирает семейство (развилка «резолв-в6» XR-302).
+    #[test]
+    fn test_handle_aaaa_query() {
+        let dns = FakeDns::new();
+
+        let query = build_test_dns_query_typed("example.com", 28);
+        let (response, fake_ip) = dns.handle_query(&query).unwrap();
+
+        let IpAddr::V6(fake_v6) = fake_ip else {
+            panic!("AAAA-запрос обязан отдать IPv6, отдал {:?}", fake_ip);
+        };
+        assert!(FakeDns::is_fake_v6(fake_v6));
+        assert_eq!(dns.lookup_v6(fake_v6), Some("example.com".to_string()));
+
+        // Тот же домен по A получает парный адрес из того же пула.
+        let (_, a_ip) = dns.handle_query(&build_test_dns_query("example.com")).unwrap();
+        let IpAddr::V4(fake_v4) = a_ip else { panic!("A обязан отдать IPv4") };
+        assert_eq!(FakeDns::to_fake_v6(fake_v4), fake_v6);
+
+        // TYPE AAAA в ответе, ANCOUNT=1.
+        assert_eq!(u16::from_be_bytes([response[6], response[7]]), 1);
+        let name_end = 12 + query.len() - 12; // вопрос скопирован целиком
+        // Ответ: указатель имени (2) + TYPE (2) + CLASS (2) + TTL (4) + RDLENGTH (2) + RDATA (16).
+        assert_eq!(name_end + 28, response.len());
+        assert_eq!(u16::from_be_bytes([response[name_end + 2], response[name_end + 3]]), 28);
+    }
+
     #[test]
     fn test_non_a_query_ignored() {
         let dns = FakeDns::new();
 
-        // AAAA query (type 28) should be ignored.
-        let mut query = build_test_dns_query("example.com");
-        // Patch qtype to 28 (AAAA) — it's the 2 bytes after the question name.
-        let name_end = 12 + "example".len() + 1 + "com".len() + 1 + 1; // header + labels + null
-        query[name_end] = 0;
-        query[name_end + 1] = 28;
-
+        // MX (type 15) fake DNS не берёт.
+        let query = build_test_dns_query_typed("example.com", 15);
         assert!(dns.handle_query(&query).is_none());
     }
 
@@ -482,7 +599,7 @@ mod tests {
         let edge = vec!["abc"; 64].join(".");
         assert_eq!(edge.len(), MAX_DOMAIN_LEN);
         let (_, fake_ip) = dns.handle_query(&build_test_dns_query(&edge)).unwrap();
-        assert_eq!(dns.lookup(fake_ip), Some(edge));
+        assert_eq!(dns.lookup_ip(fake_ip), Some(edge));
     }
 
     /// Пул на четыре адреса, занятый живыми записями. Раньше подбор кандидата
@@ -605,6 +722,11 @@ mod tests {
 
     /// Build a DNS query packet for testing.
     fn build_test_dns_query(domain: &str) -> Vec<u8> {
+        build_test_dns_query_typed(domain, 1)
+    }
+
+    /// DNS-запрос с явным типом вопроса.
+    fn build_test_dns_query_typed(domain: &str, qtype: u16) -> Vec<u8> {
         let mut pkt = Vec::new();
 
         // Header.
@@ -622,7 +744,7 @@ mod tests {
         }
         pkt.push(0); // null terminator
 
-        pkt.extend_from_slice(&1u16.to_be_bytes()); // QTYPE = A
+        pkt.extend_from_slice(&qtype.to_be_bytes());
         pkt.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
 
         pkt

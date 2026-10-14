@@ -7,7 +7,7 @@
 //! 4. Relay data between smoltcp socket and outbound connection
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
@@ -155,7 +155,16 @@ fn is_private_ip(ip: IpAddr) -> bool {
             || v4.is_loopback()      // 127.x
             || v4.is_link_local()    // 169.254.x
         }
-        IpAddr::V6(v6) => v6.is_loopback(),
+        IpAddr::V6(v6) => {
+            // Fake-адреса живут в ULA, но они служебные и уходят в туннель
+            // с восстановленным доменом: их нельзя ронять как приватные.
+            if FakeDns::is_fake_v6(v6) {
+                return false;
+            }
+            v6.is_loopback()
+                || v6.is_unicast_link_local()
+                || (v6.segments()[0] & 0xFE00) == 0xFC00 // ULA
+        }
     }
 }
 
@@ -276,19 +285,22 @@ pub async fn relay_session_with_domain(
         ));
     }
 
-    // Never proxy fake IPs without a domain — server can't connect to 198.18.x.x.
+    // Never proxy fake IPs without a domain: server can't connect to them.
     if domain.is_none() {
-        if let IpAddr::V4(v4) = key.dst_addr.ip() {
-            if FakeDns::is_fake_ip(v4) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("fake IP {} without domain, dropping", v4),
-                ));
-            }
+        let dst_ip = key.dst_addr.ip();
+        let is_fake = match dst_ip {
+            IpAddr::V4(v4) => FakeDns::is_fake_ip(v4),
+            IpAddr::V6(v6) => FakeDns::is_fake_v6(v6),
+        };
+        if is_fake {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("fake IP {} without domain, dropping", dst_ip),
+            ));
         }
     }
 
-    // Never proxy private/local IPs — they're not reachable from server.
+    // Never proxy private/local IPs: they are not reachable from server.
     if is_private_ip(key.dst_addr.ip()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -396,28 +408,30 @@ async fn relay_direct(
 ) -> io::Result<()> {
     // Resolve real destination for fake IPs.
     // On Android, tokio::net::lookup_host goes through the system resolver
-    // which uses the VPN's DNS (FakeDNS) — returning another fake IP and
+    // which uses the VPN's DNS (FakeDNS), returning another fake IP and
     // creating an infinite loop. We resolve via a protected UDP socket to
     // an external DNS server, bypassing the VPN tunnel entirely.
-    let real_dst = if let IpAddr::V4(v4) = dst.ip() {
-        if FakeDns::is_fake_ip(v4) {
-            if let Some(domain) = domain {
-                // Prefer the host resolver: on Android it uses the underlying
-                // non-VPN Network and whatever DNS channel (plain / DoT / DoH)
-                // the carrier actually allows. Our own UDP:53 probes die on
-                // whitelist networks that only permit port-443 traffic.
-                let ip = resolve_domain_with_fallback(
-                    domain,
-                    ctx.system_resolver.as_ref(),
-                    &ctx.dns_resolvers,
-                    &ctx.protect_socket,
-                ).await?;
-                SocketAddr::new(IpAddr::V4(ip), dst.port())
-            } else {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "fake IP without domain"));
-            }
+    let dst_ip = dst.ip();
+    let is_fake = match dst_ip {
+        IpAddr::V4(v4) => FakeDns::is_fake_ip(v4),
+        IpAddr::V6(v6) => FakeDns::is_fake_v6(v6),
+    };
+    let real_dst = if is_fake {
+        if let Some(domain) = domain {
+            // Prefer the host resolver: on Android it uses the underlying
+            // non-VPN Network and whatever DNS channel (plain / DoT / DoH)
+            // the carrier actually allows. Our own UDP:53 probes die on
+            // whitelist networks that only permit port-443 traffic.
+            let ip = resolve_domain_with_fallback(
+                domain,
+                ctx.system_resolver.as_ref(),
+                &ctx.dns_resolvers,
+                &ctx.protect_socket,
+            )
+            .await?;
+            SocketAddr::new(ip, dst.port())
         } else {
-            dst
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "fake IP without domain"));
         }
     } else {
         dst
@@ -585,29 +599,29 @@ pub const FALLBACK_DNS_RESOLVERS: &[SocketAddr] = &[
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(77, 88, 8, 8)), 53),
 ];
 
-/// Resolve a domain to an IPv4 via the host OS first, falling back to our
-/// own UDP:53 client on protected sockets.
+/// Resolve a domain to an address of either family via the host OS first,
+/// falling back to our own UDP:53 client on protected sockets.
 ///
 /// The host-level path matters on whitelist-style carrier networks where
 /// plain UDP DNS to public resolvers is dropped but the OS resolver (via
 /// DoT/DoH set up by the carrier) still works. Without it, a dead xr-server
 /// combined with a blocked UDP:53 means even "direct" traffic can't resolve
-/// fake IPs — so the user loses whitelist sites too, not just proxied ones.
+/// fake IPs: the user loses whitelist sites too, not just proxied ones.
 pub(crate) async fn resolve_domain_with_fallback(
     domain: &str,
     system_resolver: Option<&SystemResolverFn>,
     resolvers: &[SocketAddr],
     protect: &ProtectSocketFn,
-) -> io::Result<Ipv4Addr> {
+) -> io::Result<IpAddr> {
     if let Some(resolver) = system_resolver {
         let resolver = resolver.clone();
         let domain_owned = domain.to_string();
-        // System resolvers are synchronous JNI/syscall chains — run on a
+        // System resolvers are synchronous JNI/syscall chains. Run on a
         // blocking pool so we don't stall the tokio worker.
         match tokio::task::spawn_blocking(move || resolver(&domain_owned)).await {
             Ok(Some(ip)) => {
                 tracing::debug!("system resolver returned {} for {}", ip, domain);
-                return Ok(ip);
+                return Ok(IpAddr::V4(ip));
             }
             Ok(None) => {
                 tracing::debug!("system resolver has no answer for {}, using UDP fallback", domain);
@@ -633,8 +647,8 @@ async fn resolve_via_protected_dns(
     domain: &str,
     resolvers: &[SocketAddr],
     protect: &ProtectSocketFn,
-) -> io::Result<Ipv4Addr> {
-    // Always query at least the fallback resolvers — if the caller passed an
+) -> io::Result<IpAddr> {
+    // Always query at least the fallback resolvers. If the caller passed an
     // empty list we'd otherwise silently return "no DNS" here.
     let effective: Vec<SocketAddr> = if resolvers.is_empty() {
         FALLBACK_DNS_RESOLVERS.to_vec()
@@ -654,7 +668,7 @@ async fn resolve_via_protected_dns(
     // Race all resolvers concurrently. First success wins; collect errors
     // until the last task to finish.
     let n = effective.len();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<io::Result<Ipv4Addr>>(n);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<io::Result<IpAddr>>(n);
     for &resolver in &effective {
         let tx = tx.clone();
         let domain = domain.to_string();
@@ -680,11 +694,29 @@ async fn resolve_via_protected_dns(
     )))
 }
 
+/// Один резолвер отвечает на A и AAAA; первый успевший запис берётся целиком.
 async fn query_single_resolver(
     domain: &str,
     resolver: SocketAddr,
     protect: &ProtectSocketFn,
-) -> io::Result<Ipv4Addr> {
+) -> io::Result<IpAddr> {
+    let (a_res, aaaa_res) = tokio::join!(
+        query_single_qtype(domain, resolver, protect, 1),
+        query_single_qtype(domain, resolver, protect, 28),
+    );
+    match (a_res, aaaa_res) {
+        (Ok(ip), _) => Ok(ip),
+        (_, Ok(ip)) => Ok(ip),
+        (Err(e), _) => Err(e),
+    }
+}
+
+async fn query_single_qtype(
+    domain: &str,
+    resolver: SocketAddr,
+    protect: &ProtectSocketFn,
+    qtype: u16,
+) -> io::Result<IpAddr> {
     let std_sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
     std_sock.set_nonblocking(true)?;
     if !protect(std_sock.as_raw_fd()) {
@@ -692,7 +724,7 @@ async fn query_single_resolver(
     }
     let sock = tokio::net::UdpSocket::from_std(std_sock)?;
 
-    let query = build_dns_query(domain);
+    let query = build_dns_query(domain, qtype);
     sock.send_to(&query, resolver).await?;
 
     let mut buf = [0u8; 512];
@@ -703,11 +735,11 @@ async fn query_single_resolver(
             format!("DNS resolve timeout for {} via {}", domain, resolver),
         ))??;
 
-    parse_dns_a_record(&buf[..n], domain)
+    parse_dns_addr_record(&buf[..n], domain)
 }
 
-/// Build a minimal DNS A-record query for the given domain.
-fn build_dns_query(domain: &str) -> Vec<u8> {
+/// Build a minimal DNS query for the given domain and record type.
+fn build_dns_query(domain: &str, qtype: u16) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     // Header: ID=0xABCD, Flags=0x0100 (RD=1), QDCOUNT=1.
     buf.extend_from_slice(&[0xAB, 0xCD, 0x01, 0x00]);
@@ -718,13 +750,13 @@ fn build_dns_query(domain: &str) -> Vec<u8> {
         buf.extend_from_slice(label.as_bytes());
     }
     buf.push(0); // Root terminator.
-    buf.extend_from_slice(&[0x00, 0x01]); // QTYPE = A
+    buf.extend_from_slice(&qtype.to_be_bytes());
     buf.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
     buf
 }
 
-/// Parse the first A record (IPv4) from a DNS response.
-fn parse_dns_a_record(data: &[u8], domain: &str) -> io::Result<Ipv4Addr> {
+/// Parse the first A or AAAA record from a DNS response.
+fn parse_dns_addr_record(data: &[u8], domain: &str) -> io::Result<IpAddr> {
     if data.len() < 12 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "DNS response too short"));
     }
@@ -741,7 +773,7 @@ fn parse_dns_a_record(data: &[u8], domain: &str) -> io::Result<Ipv4Addr> {
     pos = skip_dns_name(data, pos);
     pos += 4; // QTYPE + QCLASS
 
-    // Scan answer records for the first A record.
+    // Scan answer records for the first address record.
     for _ in 0..ancount {
         if pos >= data.len() { break; }
         pos = skip_dns_name(data, pos);
@@ -750,7 +782,17 @@ fn parse_dns_a_record(data: &[u8], domain: &str) -> io::Result<Ipv4Addr> {
         let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
         pos += 10;
         if rtype == 1 && rdlength == 4 && pos + 4 <= data.len() {
-            return Ok(Ipv4Addr::new(data[pos], data[pos + 1], data[pos + 2], data[pos + 3]));
+            return Ok(IpAddr::V4(Ipv4Addr::new(
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+            )));
+        }
+        if rtype == 28 && rdlength == 16 && pos + 16 <= data.len() {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&data[pos..pos + 16]);
+            return Ok(IpAddr::V6(Ipv6Addr::from(octets)));
         }
         pos += rdlength;
     }
@@ -933,7 +975,7 @@ mod tests {
 
     #[test]
     fn dns_query_format() {
-        let q = build_dns_query("example.com");
+        let q = build_dns_query("example.com", 1);
         // Header: 12 bytes.
         assert_eq!(&q[..2], &[0xAB, 0xCD]); // ID
         assert_eq!(&q[2..4], &[0x01, 0x00]); // Flags: RD=1
@@ -946,34 +988,56 @@ mod tests {
         assert_eq!(q[24], 0); // Root
         assert_eq!(&q[25..27], &[0x00, 0x01]); // QTYPE=A
         assert_eq!(&q[27..29], &[0x00, 0x01]); // QCLASS=IN
+
+        let q6 = build_dns_query("example.com", 28);
+        assert_eq!(&q6[25..27], &[0x00, 28]); // QTYPE=AAAA
     }
 
     #[test]
     fn dns_response_parse_a_record() {
         // Minimal DNS response: header + question + 1 A record answer.
-        let mut resp = build_dns_query("t.co");
+        let mut resp = build_dns_query("t.co", 1);
         // Patch header: QR=1, AA=1, ANCOUNT=1.
         resp[2] = 0x85; resp[3] = 0x00;
         resp[6] = 0x00; resp[7] = 0x01;
         // Answer: compression pointer to name at offset 12, TYPE=A,
-        // CLASS=IN, TTL=300, RDLENGTH=4, RDATA=93.184.216.34.
+        // CLASS=IN, TTL=300, RDLENGTH=4, RDATA is four payload bytes.
         resp.extend_from_slice(&[0xC0, 12]); // Name pointer
         resp.extend_from_slice(&[0x00, 0x01]); // TYPE=A
         resp.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
         resp.extend_from_slice(&[0x00, 0x00, 0x01, 0x2C]); // TTL=300
         resp.extend_from_slice(&[0x00, 0x04]); // RDLENGTH=4
-        resp.extend_from_slice(&[93, 184, 216, 34]); // IP
+        let v4 = Ipv4Addr::new(93, 184, 216, 34);
+        resp.extend_from_slice(&v4.octets());
 
-        let ip = parse_dns_a_record(&resp, "t.co").unwrap();
-        assert_eq!(ip, Ipv4Addr::new(93, 184, 216, 34));
+        let ip = parse_dns_addr_record(&resp, "t.co").unwrap();
+        assert_eq!(ip, IpAddr::V4(v4));
+    }
+
+    #[test]
+    fn dns_response_parse_aaaa_record() {
+        // Minimal DNS response: header + question + 1 AAAA record answer.
+        let mut resp = build_dns_query("t.co", 28);
+        resp[2] = 0x85; resp[3] = 0x00;
+        resp[6] = 0x00; resp[7] = 0x01;
+        resp.extend_from_slice(&[0xC0, 12]); // Name pointer
+        resp.extend_from_slice(&[0x00, 28]); // TYPE=AAAA
+        resp.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
+        resp.extend_from_slice(&[0x00, 0x00, 0x01, 0x2C]); // TTL=300
+        resp.extend_from_slice(&[0x00, 16]); // RDLENGTH=16
+        let v6 = Ipv6Addr::new(0x2606, 0x2800, 0x220, 0x1, 0x248, 0x1893, 0x25c8, 0x1946);
+        resp.extend_from_slice(&v6.octets());
+
+        let ip = parse_dns_addr_record(&resp, "t.co").unwrap();
+        assert_eq!(ip, IpAddr::V6(v6));
     }
 
     #[test]
     fn dns_response_no_answers() {
-        let mut resp = build_dns_query("nxdomain.test");
+        let mut resp = build_dns_query("nxdomain.test", 1);
         resp[2] = 0x81; resp[3] = 0x03; // QR=1, RCODE=NXDOMAIN
         // ANCOUNT stays 0.
-        let err = parse_dns_a_record(&resp, "nxdomain.test").unwrap_err();
+        let err = parse_dns_addr_record(&resp, "nxdomain.test").unwrap_err();
         assert!(err.to_string().contains("no answers"));
     }
 
@@ -1012,7 +1076,7 @@ mod tests {
             &[SocketAddr::new(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1)), 53)],
             &protect,
         ).await.expect("system resolver should succeed");
-        assert_eq!(ip, Ipv4Addr::new(93, 184, 216, 34));
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
         assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 

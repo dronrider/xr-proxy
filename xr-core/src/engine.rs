@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -869,8 +869,8 @@ async fn run_event_loop(
         }
 
         // -- 1. Intercept DNS, then UDP relay --
-        // DNS отвечает FakeDns, остальной IPv4 UDP уезжает своим relay-портом
-        // мимо smoltcp. TCP и прочее уходят в smoltcp как раньше.
+        // DNS отвечает FakeDns, остальной UDP любого семейства уезжает своим
+        // relay-портом мимо smoltcp. TCP и прочее уходят в smoltcp как раньше.
         let mut tcp_packets = Vec::new();
         while let Some(packet) = queue.pop_inbound_public() {
             if let Some(dns_response) = try_handle_dns(&packet, &fake_dns) {
@@ -879,7 +879,7 @@ async fn run_event_loop(
                 continue;
             }
             if let Some(udp) = &udp_relay {
-                if is_ipv4_udp(&packet) {
+                if is_ip_udp(&packet) {
                     let wire = {
                         let mut relay = udp.relay.lock().unwrap();
                         relay.tun_to_wire(&packet, std::time::Instant::now())
@@ -903,25 +903,23 @@ async fn run_event_loop(
             tcp_packets.push(packet);
         }
 
-        // ── 2. Process TCP packets: rewrite dst port for SYNs ───────
+        // -- 2. Process TCP packets: rewrite dst port for SYNs --
         for mut pkt in tcp_packets {
-            if pkt.len() < 20 { queue.push_inbound(pkt); continue; }
-            if pkt[0] >> 4 != 4 { queue.push_inbound(pkt); continue; }
-            let ihl = (pkt[0] & 0x0F) as usize * 4;
-            let protocol = pkt[9];
+            let Some((src_ip, dst_ip, protocol, transport_off)) = parse_ip_header(&pkt) else {
+                queue.push_inbound(pkt);
+                continue;
+            };
 
             // Only rewrite TCP packets.
-            if protocol == 6 && pkt.len() >= ihl + 14 {
-                let src_port = u16::from_be_bytes([pkt[ihl], pkt[ihl+1]]);
-                let dst_port = u16::from_be_bytes([pkt[ihl+2], pkt[ihl+3]]);
-                let flags = pkt[ihl + 13];
+            if protocol == 6 && pkt.len() >= transport_off + 14 {
+                let src_port = u16::from_be_bytes([pkt[transport_off], pkt[transport_off + 1]]);
+                let dst_port = u16::from_be_bytes([pkt[transport_off + 2], pkt[transport_off + 3]]);
+                let flags = pkt[transport_off + 13];
                 let is_syn = flags & 0x02 != 0 && flags & 0x10 == 0;
 
-                let src_ip = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
-                let dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
                 let orig_key = TcpSessionKey {
-                    src_addr: SocketAddr::new(IpAddr::V4(src_ip), src_port),
-                    dst_addr: SocketAddr::new(IpAddr::V4(dst_ip), dst_port),
+                    src_addr: SocketAddr::new(src_ip, src_port),
+                    dst_addr: SocketAddr::new(dst_ip, dst_port),
                 };
 
                 if is_syn && !sessions.contains_key(&orig_key) {
@@ -931,10 +929,8 @@ async fn run_event_loop(
                     let socket = stack.tcp_socket_mut(handle);
 
                     if socket.listen(eph_port).is_ok() {
-                        // Cache domain NOW — FakeDns TTL might expire before Established.
-                        let domain = if let IpAddr::V4(v4) = dst_ip.into() {
-                            fake_dns.lookup(v4)
-                        } else { None };
+                        // Cache domain NOW: FakeDns TTL might expire before Established.
+                        let domain = fake_dns.lookup_ip(dst_ip);
 
                         sessions.insert(orig_key, ActiveSession {
                             smol_handle: handle,
@@ -947,40 +943,16 @@ async fn run_event_loop(
                         ctx.stats.connection_opened();
                         ctx.stats.add_tcp_syn();
 
-                        // Rewrite dst → smoltcp's IP:eph_port.
-                        pkt[ihl+2] = (eph_port >> 8) as u8;
-                        pkt[ihl+3] = eph_port as u8;
-                        let smol_ip = crate::ip_stack::SMOL_IP;
-                        let src_ip_inb = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
-                        pkt[16] = smol_ip.octets()[0];
-                        pkt[17] = smol_ip.octets()[1];
-                        pkt[18] = smol_ip.octets()[2];
-                        pkt[19] = smol_ip.octets()[3];
-                        pkt[10] = 0; pkt[11] = 0;
-                        let ip_cksum = ipv4_checksum(&pkt[..ihl]);
-                        pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
-                        let smol_addr = Ipv4Addr::new(smol_ip.octets()[0], smol_ip.octets()[1], smol_ip.octets()[2], smol_ip.octets()[3]);
-                        tcp_checksum_update(&mut pkt, ihl, &src_ip_inb, &smol_addr);
+                        // Rewrite dst -> smoltcp's IP:eph_port.
+                        rewrite_dst_to_smol(&mut pkt, transport_off, eph_port);
                     } else {
                         stack.remove_socket(handle);
                     }
                 } else if let Some(session) = sessions.get(&orig_key) {
                     // Existing connection (ACK, data, FIN, etc.):
-                    // Rewrite dst → smoltcp's IP:eph_port.
+                    // Rewrite dst -> smoltcp's IP:eph_port.
                     let ep = session.eph_port;
-                    pkt[ihl+2] = (ep >> 8) as u8;
-                    pkt[ihl+3] = ep as u8;
-                    let src_ip_inb = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
-                    let smol_ip = crate::ip_stack::SMOL_IP;
-                    pkt[16] = smol_ip.octets()[0];
-                    pkt[17] = smol_ip.octets()[1];
-                    pkt[18] = smol_ip.octets()[2];
-                    pkt[19] = smol_ip.octets()[3];
-                    pkt[10] = 0; pkt[11] = 0;
-                    let ip_cksum = ipv4_checksum(&pkt[..ihl]);
-                    pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
-                    let smol_addr = Ipv4Addr::new(smol_ip.octets()[0], smol_ip.octets()[1], smol_ip.octets()[2], smol_ip.octets()[3]);
-                    tcp_checksum_update(&mut pkt, ihl, &src_ip_inb, &smol_addr);
+                    rewrite_dst_to_smol(&mut pkt, transport_off, ep);
                 }
             }
 
@@ -1132,29 +1104,33 @@ async fn run_event_loop(
             if !stack.poll() { break; }
         }
 
-        // ── 7. Rewrite outbound packets: restore original dst ───────
-        // smoltcp sends packets with src=SMOL_IP:eph_port.
+        // -- 7. Rewrite outbound packets: restore original dst --
+        // smoltcp sends packets with src=SMOL_IP:eph_port (or SMOL_IPV6).
         // We need to rewrite them to src=original_dst_ip:original_dst_port
         // so the TUN client sees the response from the expected address.
         while let Some(mut pkt) = queue.pop_smol_outbound() {
-            if pkt.len() >= 40 && pkt[0] >> 4 == 4 && pkt[9] == 6 {
-                let ihl = (pkt[0] & 0x0F) as usize * 4;
-                if pkt.len() >= ihl + 4 {
-                    let src_port = u16::from_be_bytes([pkt[ihl], pkt[ihl+1]]);
-                    if let Some(orig_key) = port_to_key.get(&src_port) {
-                        if let IpAddr::V4(orig_dst_ip) = orig_key.dst_addr.ip() {
-                            pkt[12] = orig_dst_ip.octets()[0];
-                            pkt[13] = orig_dst_ip.octets()[1];
-                            pkt[14] = orig_dst_ip.octets()[2];
-                            pkt[15] = orig_dst_ip.octets()[3];
+            if pkt.len() >= 40 {
+                if let Some((_, dst_ip, protocol, transport_off)) = parse_ip_header(&pkt) {
+                    if protocol == 6 && pkt.len() >= transport_off + 4 {
+                        let src_port =
+                            u16::from_be_bytes([pkt[transport_off], pkt[transport_off + 1]]);
+                        if let Some(orig_key) = port_to_key.get(&src_port) {
+                            let orig_ip = orig_key.dst_addr.ip();
                             let orig_port = orig_key.dst_addr.port();
-                            pkt[ihl] = (orig_port >> 8) as u8;
-                            pkt[ihl+1] = orig_port as u8;
-                            pkt[10] = 0; pkt[11] = 0;
-                            let ip_cksum = ipv4_checksum(&pkt[..ihl]);
-                            pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
-                            let dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-                            tcp_checksum_update(&mut pkt, ihl, &orig_dst_ip, &dst_ip);
+                            if pkt[0] >> 4 == 4 {
+                                if let IpAddr::V4(v4) = orig_ip {
+                                    pkt[12..16].copy_from_slice(&v4.octets());
+                                    pkt[10] = 0;
+                                    pkt[11] = 0;
+                                    let ip_cksum = ipv4_checksum(&pkt[..transport_off]);
+                                    pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+                                }
+                            } else if let IpAddr::V6(v6) = orig_ip {
+                                pkt[8..24].copy_from_slice(&v6.octets());
+                            }
+                            pkt[transport_off] = (orig_port >> 8) as u8;
+                            pkt[transport_off + 1] = orig_port as u8;
+                            tcp_checksum_update_ip(&mut pkt, transport_off, &orig_ip, &dst_ip);
                         }
                     }
                 }
@@ -1317,21 +1293,43 @@ fn drain_download_to_tx(
 // ── Packet helpers ──────────────────────────────────────────────────
 
 fn try_handle_dns(packet: &[u8], fake_dns: &FakeDns) -> Option<Vec<u8>> {
-    let (src_ip, dst_ip, protocol, ihl) = parse_ipv4_header(packet)?;
+    let (src_ip, dst_ip, protocol, transport_off) = parse_ip_header(packet)?;
     if protocol != 17 { return None; }
-    let udp = &packet[ihl..];
+    let udp = &packet[transport_off..];
     let (src_port, dst_port, data_offset) = parse_udp_header(udp)?;
     if dst_port != 53 { return None; }
     let (dns_response, _) = fake_dns.handle_query(&udp[data_offset..])?;
-    Some(build_udp_response(dst_ip, src_ip, dst_port, src_port, &dns_response))
+    Some(build_udp_response_ip(
+        dst_ip,
+        src_ip,
+        dst_port,
+        src_port,
+        &dns_response,
+    ))
 }
 
-/// IPv4 UDP. DNS отсекается раньше, его берёт FakeDns; такой пакет уходит в UDP-реле.
-fn is_ipv4_udp(packet: &[u8]) -> bool {
-    let Some((_, _, protocol, _)) = parse_ipv4_header(packet) else {
+/// UDP любого семейства. DNS отсекается раньше, его берёт FakeDns; такой
+/// пакет уходит в UDP-реле.
+fn is_ip_udp(packet: &[u8]) -> bool {
+    let Some((_, _, protocol, _)) = parse_ip_header(packet) else {
         return false;
     };
     protocol == 17
+}
+
+/// Ответ DNS или UDP-реле обратно в TUN: сборка семейства по адресам.
+pub(crate) fn build_udp_response_ip(
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    match (src_ip, dst_ip) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => build_udp_response(s, d, src_port, dst_port, payload),
+        (IpAddr::V6(s), IpAddr::V6(d)) => build_udp_response_v6(s, d, src_port, dst_port, payload),
+        _ => Vec::new(),
+    }
 }
 
 pub fn parse_ipv4_header(p: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, u8, usize)> {
@@ -1339,6 +1337,151 @@ pub fn parse_ipv4_header(p: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, u8, usize)> {
     let ihl = (p[0] & 0x0F) as usize * 4;
     if ihl < 20 || p.len() < ihl { return None; }
     Some((Ipv4Addr::new(p[12],p[13],p[14],p[15]), Ipv4Addr::new(p[16],p[17],p[18],p[19]), p[9], ihl))
+}
+
+/// Разбор IP-пакета любого семейства: адреса, протокол транспорта и смещение
+/// его заголовка. У IPv6 смещение уходит за цепочку расширений.
+pub fn parse_ip_header(p: &[u8]) -> Option<(IpAddr, IpAddr, u8, usize)> {
+    if p.is_empty() {
+        return None;
+    }
+    match p[0] >> 4 {
+        4 => {
+            let (src, dst, proto, ihl) = parse_ipv4_header(p)?;
+            Some((IpAddr::V4(src), IpAddr::V4(dst), proto, ihl))
+        }
+        6 => parse_ipv6_header(p),
+        _ => None,
+    }
+}
+
+/// Разбор IPv6: адреса, next header транспорта, смещение за расширениями.
+///
+/// Цепочка расширений обходится до транспортного заголовка: Hop-by-Hop,
+/// Routing, Dest Options, Fragment и AH. Фрагменты после первого не содержат
+/// транспорта, такой пакет уходит в стек как есть.
+fn parse_ipv6_header(p: &[u8]) -> Option<(IpAddr, IpAddr, u8, usize)> {
+    if p.len() < 40 || p[0] >> 4 != 6 {
+        return None;
+    }
+    let mut next = p[6];
+    let mut off = 40usize;
+    loop {
+        match next {
+            // Hop-by-Hop, Routing, Dest Options.
+            0 | 43 | 60 => {
+                if off + 2 > p.len() {
+                    return None;
+                }
+                let ext_len = (p[off + 1] as usize + 1) * 8;
+                if off + ext_len > p.len() {
+                    return None;
+                }
+                next = p[off];
+                off += ext_len;
+            }
+            // Fragment: первый фрагмент несёт транспорт, дальше усечение.
+            44 => {
+                if off + 8 > p.len() {
+                    return None;
+                }
+                next = p[off];
+                off += 8;
+            }
+            // Authentication Header.
+            51 => {
+                if off + 2 > p.len() {
+                    return None;
+                }
+                let ext_len = (p[off + 1] as usize + 2) * 4;
+                if off + ext_len > p.len() {
+                    return None;
+                }
+                next = p[off];
+                off += ext_len;
+            }
+            _ => break,
+        }
+    }
+    let src = Ipv6Addr::from(<[u8; 16]>::try_from(&p[8..24]).ok()?);
+    let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&p[24..40]).ok()?);
+    Some((IpAddr::V6(src), IpAddr::V6(dst), next, off))
+}
+
+/// IPv6 не несёт контрольной суммы заголовка: после подмены адреса смысла
+/// пересчитывать нечего, правится только TCP.
+fn tcp_checksum_update_ip(pkt: &mut [u8], transport_off: usize, src: &IpAddr, dst: &IpAddr) {
+    match (src, dst) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => tcp_checksum_update(pkt, transport_off, s, d),
+        (IpAddr::V6(s), IpAddr::V6(d)) => {
+            let tcp_len = pkt.len() - transport_off;
+            pkt[transport_off + 16] = 0;
+            pkt[transport_off + 17] = 0;
+
+            let mut sum = 0u32;
+            for part in [s.octets(), d.octets()] {
+                for pair in part.chunks(2) {
+                    sum += u16::from_be_bytes([pair[0], pair[1]]) as u32;
+                }
+            }
+            sum += (tcp_len >> 16) as u32;
+            sum += (tcp_len & 0xFFFF) as u32;
+            sum += 6u32; // next header TCP
+
+            let tcp = &pkt[transport_off..];
+            for i in (0..tcp.len()).step_by(2) {
+                let word = if i + 1 < tcp.len() {
+                    u16::from_be_bytes([tcp[i], tcp[i + 1]])
+                } else {
+                    u16::from_be_bytes([tcp[i], 0])
+                };
+                sum += word as u32;
+            }
+
+            while sum >> 16 != 0 {
+                sum = (sum & 0xFFFF) + (sum >> 16);
+            }
+            let cksum = !(sum as u16);
+            pkt[transport_off + 16] = (cksum >> 8) as u8;
+            pkt[transport_off + 17] = cksum as u8;
+        }
+        _ => {}
+    }
+}
+
+/// Подмена адреса назначения на адрес стека и порта на ephemeral (входящий SYN
+/// и продолжение сессии). IPv4 пересчитывает и заголовок, IPv6 его не имеет.
+fn rewrite_dst_to_smol(pkt: &mut [u8], transport_off: usize, eph_port: u16) {
+    pkt[transport_off + 2] = (eph_port >> 8) as u8;
+    pkt[transport_off + 3] = eph_port as u8;
+    let Some((src, _, _, _)) = parse_ip_header(pkt) else {
+        return;
+    };
+    if pkt[0] >> 4 == 4 {
+        let smol_ip = crate::ip_stack::SMOL_IP;
+        pkt[16] = smol_ip.octets()[0];
+        pkt[17] = smol_ip.octets()[1];
+        pkt[18] = smol_ip.octets()[2];
+        pkt[19] = smol_ip.octets()[3];
+        pkt[10] = 0;
+        pkt[11] = 0;
+        let ip_cksum = ipv4_checksum(&pkt[..transport_off]);
+        pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+    } else {
+        let smol_ip = crate::ip_stack::SMOL_IPV6;
+        pkt[24..40].copy_from_slice(&smol_ip.octets());
+    }
+    let smol_addr = if pkt[0] >> 4 == 4 {
+        IpAddr::V4(Ipv4Addr::new(
+            crate::ip_stack::SMOL_IP.octets()[0],
+            crate::ip_stack::SMOL_IP.octets()[1],
+            crate::ip_stack::SMOL_IP.octets()[2],
+            crate::ip_stack::SMOL_IP.octets()[3],
+        ))
+    } else {
+        IpAddr::V6(Ipv6Addr::from(crate::ip_stack::SMOL_IPV6.octets()))
+    };
+    tcp_checksum_update_ip(pkt, transport_off, &src, &smol_addr);
 }
 
 pub fn parse_udp_header(p: &[u8]) -> Option<(u16, u16, usize)> {
@@ -1361,6 +1504,56 @@ pub fn build_udp_response(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, src_port: u16, dst
     p[20..22].copy_from_slice(&src_port.to_be_bytes()); p[22..24].copy_from_slice(&dst_port.to_be_bytes());
     p[24..26].copy_from_slice(&((8+payload.len()) as u16).to_be_bytes());
     p[28..].copy_from_slice(payload); p
+}
+
+/// UDP-ответ в TUN поверх IPv6. Заголовок 40 байт без своей контрольной суммы,
+/// у UDP своя считается по псевдозаголовку IPv6.
+pub fn build_udp_response_v6(
+    src_ip: Ipv6Addr,
+    dst_ip: Ipv6Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let udp_len = 8 + payload.len();
+    let mut p = vec![0u8; 40 + udp_len];
+    p[0] = 0x60;
+    p[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    p[6] = 17; // next header UDP
+    p[7] = 64; // hop limit
+    p[8..24].copy_from_slice(&src_ip.octets());
+    p[24..40].copy_from_slice(&dst_ip.octets());
+    p[40..42].copy_from_slice(&src_port.to_be_bytes());
+    p[42..44].copy_from_slice(&dst_port.to_be_bytes());
+    p[44..46].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    p[48..].copy_from_slice(payload);
+
+    // Контрольная сумма UDP по псевдозаголовку IPv6.
+    let mut sum = 0u32;
+    for part in [src_ip.octets(), dst_ip.octets()] {
+        for pair in part.chunks(2) {
+            sum += u16::from_be_bytes([pair[0], pair[1]]) as u32;
+        }
+    }
+    sum += (udp_len >> 16) as u32;
+    sum += (udp_len & 0xFFFF) as u32;
+    sum += 17u32;
+    for i in (40..p.len()).step_by(2) {
+        let word = if i + 1 < p.len() {
+            u16::from_be_bytes([p[i], p[i + 1]])
+        } else {
+            u16::from_be_bytes([p[i], 0])
+        };
+        sum += word as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let cksum = !(sum as u16);
+    // Нулевая сумма в IPv6 передаётся как 0xFFFF.
+    let cksum = if cksum == 0 { 0xFFFF } else { cksum };
+    p[46..48].copy_from_slice(&cksum.to_be_bytes());
+    p
 }
 
 /// Recalculate TCP checksum after NAT rewrite.
@@ -1919,5 +2112,369 @@ mod tests {
         assert_eq!(pick_relay_endpoint(&endpoints, 1), Some(backup));
         assert_eq!(pick_relay_endpoint(&endpoints, 2), None);
         assert_eq!(pick_relay_endpoint(&endpoints, 3), None);
+    }
+
+    // -- IPv6 поверх той же обвязки, что и IPv4 (XR-302) --
+
+    const TCP_SYN: u8 = 0x02;
+    const TCP_PSH: u8 = 0x08;
+    const TCP_ACK: u8 = 0x10;
+
+    fn v6_client() -> Ipv6Addr {
+        Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 2)
+    }
+
+    fn v6_target() -> Ipv6Addr {
+        Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1)
+    }
+
+    /// TCP-сегмент поверх IPv6. Контрольные суммы не проставляются: стек
+    /// на приёме их игнорирует, как и в боевом пути NAT.
+    fn tcp_v6(
+        src: Ipv6Addr,
+        dst: Ipv6Addr,
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let tcp_len = 20 + payload.len();
+        let mut p = vec![0u8; 40 + tcp_len];
+        p[0] = 0x60;
+        p[4..6].copy_from_slice(&(tcp_len as u16).to_be_bytes());
+        p[6] = 6;
+        p[7] = 64;
+        p[8..24].copy_from_slice(&src.octets());
+        p[24..40].copy_from_slice(&dst.octets());
+        p[40..42].copy_from_slice(&sport.to_be_bytes());
+        p[42..44].copy_from_slice(&dport.to_be_bytes());
+        p[44..48].copy_from_slice(&seq.to_be_bytes());
+        p[48..52].copy_from_slice(&ack.to_be_bytes());
+        p[52] = 5 << 4;
+        p[53] = flags;
+        p[54..56].copy_from_slice(&8192u16.to_be_bytes());
+        p[60..].copy_from_slice(payload);
+        p
+    }
+
+    fn tcp_v4(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let tcp_len = 20 + payload.len();
+        let mut p = vec![0u8; 20 + tcp_len];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&((20 + tcp_len) as u16).to_be_bytes());
+        p[8] = 64;
+        p[9] = 6;
+        p[12..16].copy_from_slice(&src.octets());
+        p[16..20].copy_from_slice(&dst.octets());
+        p[20..22].copy_from_slice(&sport.to_be_bytes());
+        p[22..24].copy_from_slice(&dport.to_be_bytes());
+        p[24..28].copy_from_slice(&seq.to_be_bytes());
+        p[28..32].copy_from_slice(&ack.to_be_bytes());
+        p[32] = 5 << 4;
+        p[33] = flags;
+        p[34..36].copy_from_slice(&8192u16.to_be_bytes());
+        p[40..].copy_from_slice(payload);
+        p
+    }
+
+    fn udp_v6(src: Ipv6Addr, dst: Ipv6Addr, sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+        build_udp_response_v6(src, dst, sport, dport, payload)
+    }
+
+    /// AAAA-запрос в том виде, в каком его собирает клиент.
+    fn aaaa_query(domain: &str) -> Vec<u8> {
+        let mut buf = vec![0x12, 0x34, 0x01, 0x00];
+        buf.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        for label in domain.split('.') {
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label.as_bytes());
+        }
+        buf.push(0);
+        buf.extend_from_slice(&[0x00, 28, 0x00, 0x01]);
+        buf
+    }
+
+    /// SYN из TUN на глобальный IPv6 попадает в сессию с адресом стека.
+    #[test]
+    fn ipv6_syn_from_tun_rewrites_into_v6_session() {
+        let mut pkt = tcp_v6(v6_client(), v6_target(), 40000, 443, 1000, 0, TCP_SYN, &[]);
+        let (src, dst, proto, off) = parse_ip_header(&pkt).expect("IPv6 SYN обязан разбираться");
+        assert_eq!(src, IpAddr::V6(v6_client()));
+        assert_eq!(dst, IpAddr::V6(v6_target()));
+        assert_eq!(proto, 6);
+        assert_eq!(off, 40);
+
+        let eph = 55555u16;
+        rewrite_dst_to_smol(&mut pkt, off, eph);
+        let (_, dst2, _, off2) = parse_ip_header(&pkt).unwrap();
+        assert_eq!(dst2, IpAddr::V6(Ipv6Addr::from(crate::ip_stack::SMOL_IPV6.octets())));
+        assert_eq!(
+            u16::from_be_bytes([pkt[off2], pkt[off2 + 1]]),
+            40000,
+            "исходный порт клиента не трогается"
+        );
+        assert_eq!(
+            u16::from_be_bytes([pkt[off2 + 2], pkt[off2 + 3]]),
+            eph,
+            "порт назначения уходит в ephemeral сессии"
+        );
+
+        // Ключ сессии того же семейства, что и адреса из TUN.
+        let key = TcpSessionKey {
+            src_addr: SocketAddr::new(src, 40000),
+            dst_addr: SocketAddr::new(dst, 443),
+        };
+        assert!(key.src_addr.is_ipv6() && key.dst_addr.is_ipv6());
+    }
+
+    /// Разбор IPv6 с цепочкой расширений доходит до TCP.
+    #[test]
+    fn parse_ipv6_header_walks_extension_chain() {
+        // Hop-by-Hop (8 байт) перед TCP.
+        let pkt = tcp_v6(v6_client(), v6_target(), 1, 2, 0, 0, TCP_SYN, &[]);
+        let mut with_ext = vec![0u8; 48 + 20];
+        with_ext[..40].copy_from_slice(&pkt[..40]);
+        with_ext[6] = 0; // next = Hop-by-Hop
+        with_ext[40] = 6; // ext next = TCP
+        with_ext[41] = 0; // ext len (8 bytes)
+        with_ext[48..].copy_from_slice(&pkt[40..]);
+        let (src, dst, proto, off) = parse_ip_header(&with_ext).unwrap();
+        assert_eq!(src, IpAddr::V6(v6_client()));
+        assert_eq!(dst, IpAddr::V6(v6_target()));
+        assert_eq!(proto, 6);
+        assert_eq!(off, 48);
+    }
+
+    /// AAAA через FakeDns отвечает в туннель пакетом того же семейства.
+    #[test]
+    fn aaaa_dns_answer_returns_ipv6_packet_to_tun() {
+        let dns = FakeDns::new();
+        let query = aaaa_query("example.com");
+        let pkt = udp_v6(v6_client(), Ipv6Addr::LOCALHOST, 53000, 53, &query);
+
+        let Some(resp) = try_handle_dns(&pkt, &dns) else {
+            panic!("AAAA-запрос обязан получить ответ FakeDns");
+        };
+        let (src, dst, proto, off) = parse_ip_header(&resp).unwrap();
+        assert_eq!(src, IpAddr::V6(Ipv6Addr::LOCALHOST), "ответ идёт с адреса резолвера");
+        assert_eq!(dst, IpAddr::V6(v6_client()), "ответ уходит в TUN клиенту");
+        assert_eq!(proto, 17);
+        assert_eq!(
+            u16::from_be_bytes([resp[off], resp[off + 1]]),
+            53,
+            "источник UDP это порт DNS"
+        );
+        assert_eq!(
+            u16::from_be_bytes([resp[off + 2], resp[off + 3]]),
+            53000
+        );
+        let payload = &resp[off + 8..];
+        assert!(payload.len() > 12);
+        assert_eq!(payload[2] & 0x80, 0x80, "QR=1");
+        assert_eq!(u16::from_be_bytes([payload[6], payload[7]]), 1, "ANCOUNT=1");
+    }
+
+    /// A и AAAA живут на одном интерфейсе и не мешают друг другу.
+    #[test]
+    fn ipv4_and_ipv6_dns_do_not_interfere() {
+        let dns = FakeDns::new();
+        let q6 = aaaa_query("example.com");
+        let pkt6 = udp_v6(v6_client(), Ipv6Addr::LOCALHOST, 53000, 53, &q6);
+        let resp6 = try_handle_dns(&pkt6, &dns).unwrap();
+
+        // A-запрос поверх IPv4 тем же доменом получает свой ответ.
+        let mut q4 = vec![0xAB, 0xCD, 0x01, 0x00];
+        q4.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        for label in "example.com".split('.') {
+            q4.push(label.len() as u8);
+            q4.extend_from_slice(label.as_bytes());
+        }
+        q4.push(0);
+        q4.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        let pkt4 = build_udp_response(
+            Ipv4Addr::new(192, 0, 2, 10),
+            Ipv4Addr::new(192, 0, 2, 53),
+            53000,
+            53,
+            &q4,
+        );
+        let resp4 = try_handle_dns(&pkt4, &dns).unwrap();
+
+        let (_, _, _, off6) = parse_ip_header(&resp6).unwrap();
+        let (_, _, _, off4) = parse_ip_header(&resp4).unwrap();
+        assert!(resp6[0] >> 4 == 6 && resp4[0] >> 4 == 4);
+        assert_eq!(u16::from_be_bytes([resp6[off6 + 2], resp6[off6 + 3]]), 53000);
+        assert_eq!(u16::from_be_bytes([resp4[off4 + 2], resp4[off4 + 3]]), 53000);
+
+        // Оба ответа несут адрес своего семейства из одного пула домена.
+        let (_, ip6) = dns.handle_query(&q6).unwrap();
+        let (_, ip4) = dns.handle_query(&q4).unwrap();
+        let IpAddr::V6(v6) = ip6 else { panic!("AAAA обязан отдать V6") };
+        let IpAddr::V4(v4) = ip4 else { panic!("A обязан отдать V4") };
+        assert_eq!(FakeDns::to_fake_v6(v4), v6);
+    }
+
+    /// TCP до IPv6-цели проходит PacketQueue туда и обратно.
+    #[test]
+    fn tcp_v6_round_trip_via_packet_queue() {
+        use smoltcp::socket::tcp::State as St;
+
+        let queue = PacketQueue::new();
+        let mut stack = IpStack::new(queue.clone());
+        let handle = stack.add_tcp_socket(2048, 2048);
+        stack.tcp_socket_mut(handle).listen(443).unwrap();
+
+        let eph = 443u16;
+        let mut syn = tcp_v6(v6_client(), v6_target(), 40000, 443, 1000, 0, TCP_SYN, &[]);
+        let (_, _, _, off) = parse_ip_header(&syn).unwrap();
+        rewrite_dst_to_smol(&mut syn, off, eph);
+        queue.push_inbound(syn);
+        assert!(stack.poll());
+
+        let syn_ack = queue.pop_smol_outbound().expect("smoltcp обязан ответить SYN-ACK");
+        let (s, d, proto, off) = parse_ip_header(&syn_ack).expect("SYN-ACK это IPv6");
+        assert_eq!(proto, 6);
+        assert_eq!(s, IpAddr::V6(Ipv6Addr::from(crate::ip_stack::SMOL_IPV6.octets())));
+        assert_eq!(d, IpAddr::V6(v6_client()));
+        assert_eq!(syn_ack[off + 13] & 0x12, 0x12, "SYN+ACK");
+
+        let server_seq = u32::from_be_bytes([
+            syn_ack[off + 4],
+            syn_ack[off + 5],
+            syn_ack[off + 6],
+            syn_ack[off + 7],
+        ]);
+
+        let ack = tcp_v6(
+            v6_client(),
+            v6_target(),
+            40000,
+            443,
+            1001,
+            server_seq.wrapping_add(1),
+            TCP_ACK,
+            &[],
+        );
+        let mut ack = ack;
+        let (_, _, _, off) = parse_ip_header(&ack).unwrap();
+        rewrite_dst_to_smol(&mut ack, off, eph);
+        queue.push_inbound(ack);
+        assert!(stack.poll());
+        assert_eq!(stack.tcp_socket(handle).state(), St::Established);
+
+        // Данные вверх: клиент -> сокет.
+        let mut up = tcp_v6(
+            v6_client(),
+            v6_target(),
+            40000,
+            443,
+            1001,
+            server_seq.wrapping_add(1),
+            TCP_PSH | TCP_ACK,
+            b"ping",
+        );
+        let (_, _, _, off) = parse_ip_header(&up).unwrap();
+        rewrite_dst_to_smol(&mut up, off, eph);
+        queue.push_inbound(up);
+        assert!(stack.poll());
+
+        let mut got = [0u8; 16];
+        let n = stack
+            .tcp_socket_mut(handle)
+            .recv(|data| {
+                let n = data.len().min(got.len());
+                got[..n].copy_from_slice(&data[..n]);
+                (n, n)
+            })
+            .expect("данные клиента обязаны дойти до сокета");
+        assert_eq!(&got[..n], b"ping");
+
+        // Данные вниз: сокет -> клиент.
+        stack.tcp_socket_mut(handle).send_slice(b"pong").unwrap();
+        assert!(stack.poll());
+        let down = queue
+            .pop_smol_outbound()
+            .expect("ответ сокета обязан уйти в TUN");
+        let (s, d, proto, off) = parse_ip_header(&down).unwrap();
+        assert_eq!(proto, 6);
+        assert_eq!(s, IpAddr::V6(Ipv6Addr::from(crate::ip_stack::SMOL_IPV6.octets())));
+        assert_eq!(d, IpAddr::V6(v6_client()));
+        let flags = down[off + 13];
+        assert!(flags & TCP_ACK != 0);
+        let payload = &down[off + 20..];
+        // Сегмент может нести данные сразу или следующим кадром.
+        let mut seen = payload.to_vec();
+        if !seen.windows(4).any(|w| w == b"pong") {
+            if let Some(next) = queue.pop_smol_outbound() {
+                let (_, _, _, off) = parse_ip_header(&next).unwrap();
+                seen.extend_from_slice(&next[off + 20..]);
+            }
+        }
+        assert!(seen.windows(4).any(|w| w == b"pong"), "ответ сокета потерян");
+    }
+
+    /// Один интерфейс обслуживает IPv4 и IPv6 одновременно, сессии не смешиваются.
+    #[test]
+    fn ipv4_and_ipv6_sessions_coexist_on_one_stack() {
+        use smoltcp::socket::tcp::State as St;
+
+        let queue = PacketQueue::new();
+        let mut stack = IpStack::new(queue.clone());
+        let h6 = stack.add_tcp_socket(1024, 1024);
+        let h4 = stack.add_tcp_socket(1024, 1024);
+        stack.tcp_socket_mut(h6).listen(443).unwrap();
+        stack.tcp_socket_mut(h4).listen(80).unwrap();
+
+        let mut syn6 = tcp_v6(v6_client(), v6_target(), 40001, 443, 10, 0, TCP_SYN, &[]);
+        let (_, _, _, off) = parse_ip_header(&syn6).unwrap();
+        rewrite_dst_to_smol(&mut syn6, off, 443);
+        queue.push_inbound(syn6);
+
+        let mut syn4 = tcp_v4(
+            Ipv4Addr::new(192, 0, 2, 10),
+            Ipv4Addr::new(192, 0, 2, 20),
+            40002,
+            80,
+            20,
+            0,
+            TCP_SYN,
+            &[],
+        );
+        let (_, _, _, off) = parse_ip_header(&syn4).unwrap();
+        rewrite_dst_to_smol(&mut syn4, off, 80);
+        queue.push_inbound(syn4);
+
+        for _ in 0..8 {
+            stack.poll();
+        }
+
+        let mut saw_v6 = false;
+        let mut saw_v4 = false;
+        while let Some(pkt) = queue.pop_smol_outbound() {
+            match parse_ip_header(&pkt) {
+                Some((s, _, _, _)) if s == IpAddr::V6(Ipv6Addr::from(crate::ip_stack::SMOL_IPV6.octets())) => {
+                    saw_v6 = true;
+                }
+                Some((s, _, _, _)) if s == IpAddr::V4(crate::ip_stack::SMOL_IP) => {
+                    saw_v4 = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_v6, "SYN-ACK по IPv6 потерян");
+        assert!(saw_v4, "SYN-ACK по IPv4 потерян");
+        assert_eq!(stack.tcp_socket(h6).state(), St::SynReceived);
+        assert_eq!(stack.tcp_socket(h4).state(), St::SynReceived);
     }
 }

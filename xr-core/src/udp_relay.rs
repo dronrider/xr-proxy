@@ -13,14 +13,14 @@
 //! ```
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
 use xr_proto::obfuscation::Obfuscator;
 use xr_proto::udp_relay::{self, RelayPacket, RelayType};
 
-use crate::engine::{build_udp_response, parse_ipv4_header, parse_udp_header};
+use crate::engine::{build_udp_response_ip, parse_ip_header, parse_udp_header};
 
 /// Туннельный порт выдаётся на `(адрес, порт)` устройства и держится на всех
 /// его адресатов сразу. Адресата в ключ не брать: иначе NAT на VPS становится
@@ -218,18 +218,18 @@ impl UdpRelay {
     /// Пакет из TUN в провод. Не-UDP, исключённый порт и исчерпанный пул дают
     /// `None`; такой пакет не уезжает в туннель и в smoltcp не возвращается.
     pub fn tun_to_wire(&mut self, packet: &[u8], now: Instant) -> Option<Vec<u8>> {
-        let (src_ip, dst_ip, proto, ihl) = parse_ipv4_header(packet)?;
+        let (src_ip, dst_ip, proto, transport_off) = parse_ip_header(packet)?;
         if proto != 17 {
             return None;
         }
-        let udp = &packet[ihl..];
+        let udp = &packet[transport_off..];
         let (src_port, dst_port, data_offset) = parse_udp_header(udp)?;
         if EXCLUDE_DST_PORTS.contains(&dst_port) {
             return None;
         }
 
-        let src_addr = SocketAddr::new(IpAddr::V4(src_ip), src_port);
-        let dst_addr = SocketAddr::new(IpAddr::V4(dst_ip), dst_port);
+        let src_addr = SocketAddr::new(src_ip, src_port);
+        let dst_addr = SocketAddr::new(dst_ip, dst_port);
         let relay = self
             .flows
             .upstream_packet(src_addr, dst_addr, udp[data_offset..].to_vec(), now)?;
@@ -245,14 +245,9 @@ impl UdpRelay {
         }
 
         let (device, spoof_src) = self.flows.downstream_target(&packet, now)?;
-        let (IpAddr::V4(dst_ip), IpAddr::V4(src_ip)) = (device.ip(), spoof_src.ip()) else {
-            // Стек TUN пока IPv4; дорога IPv6 живёт в XR-302.
-            tracing::debug!("UDP relay: dropping non-IPv4 downstream to {}", device);
-            return None;
-        };
-        Some(build_udp_response(
-            src_ip,
-            dst_ip,
+        Some(build_udp_response_ip(
+            spoof_src.ip(),
+            device.ip(),
             spoof_src.port(),
             device.port(),
             &packet.payload,
@@ -294,8 +289,9 @@ impl UdpRelay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::{build_udp_response, parse_ipv4_header};
     use crate::ip_stack::PacketQueue;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use xr_proto::obfuscation::ModifierStrategy;
 
     fn test_obfuscator() -> Obfuscator {
@@ -334,6 +330,14 @@ mod tests {
             panic!("tun_udp expects IPv4");
         };
         build_udp_response(src_ip, dst_ip, src.port(), dst.port(), payload)
+    }
+
+    /// Собирает IPv6/UDP пакет, какой приходит из TUN.
+    fn tun_udp_v6(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) = (src.ip(), dst.ip()) else {
+            panic!("tun_udp_v6 expects IPv6");
+        };
+        crate::engine::build_udp_response_v6(src_ip, dst_ip, src.port(), dst.port(), payload)
     }
 
     // -- Таблица флоу --
@@ -525,8 +529,30 @@ mod tests {
         assert_eq!(&back[ihl..][off..], b"hello");
     }
 
+    /// Тот же путь пакета для IPv6: адреса и порты переживают round-trip.
+    #[test]
+    fn tun_to_wire_and_back_v6() {
+        let mut r = relay();
+        let now = Instant::now();
+        let device = v6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 2), 57976);
+        let server = v6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1), 443);
+
+        let wire = r
+            .tun_to_wire(&tun_udp_v6(device, server, b"hello6"), now)
+            .expect("UDP из TUN уезжает в провод");
+        let back = r.wire_to_tun(&wire, now).expect("тот же пакет не возвращается в TUN");
+
+        let (src_ip, dst_ip, proto, off) = crate::engine::parse_ip_header(&back).unwrap();
+        assert_eq!(proto, 17);
+        assert_eq!(src_ip, server.ip(), "источник ответа это сервер");
+        assert_eq!(dst_ip, device.ip(), "адресат это устройство");
+        let (src_port, dst_port, udp_off) = parse_udp_header(&back[off..]).unwrap();
+        assert_eq!((src_port, dst_port), (443, 57976));
+        assert_eq!(&back[off..][udp_off..], b"hello6");
+    }
+
     /// Провод умеет адреса обоих семейств; round-trip через обфускатор обязан
-    /// их сохранять. Граница задачи: стек IPv6 живёт в XR-302.
+    /// их сохранять.
     #[test]
     fn relay_packet_roundtrip_v4_and_v6_through_obfuscator() {
         let obfs = test_obfuscator();
