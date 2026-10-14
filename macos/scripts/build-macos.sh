@@ -43,12 +43,7 @@ echo "==> Генерация Xcode-проекта"
 (cd "$MACOS_DIR" && xcodegen generate)
 
 echo "==> xcodebuild ($CONFIG)"
-XCODE_ARGS="-project $MACOS_DIR/XrMac.xcodeproj -scheme XrMac -configuration $(echo "$CONFIG" | sed 's/^./\U&/')"
-if [ "$CONFIG" = "release" ]; then
-    XCODE_ARGS="$XCODE_ARGS -destination 'platform=macOS' build"
-else
-    XCODE_ARGS="$XCODE_ARGS -destination 'platform=macOS' build"
-fi
+XCODE_ARGS="-project $MACOS_DIR/XrMac.xcodeproj -scheme XrMac -configuration $(echo "$CONFIG" | sed 's/^./\U&/') -destination 'platform=macOS' build"
 
 # shellcheck disable=SC2086
 xcodebuild $XCODE_ARGS
