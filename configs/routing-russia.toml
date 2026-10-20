@@ -157,6 +157,21 @@ ip_ranges = [
   "160.79.104.0/21",
 ]
 
+# --- Apple ---
+# Персональные запросы Apple (Apple ID, iCloud, Siri, App Store) обязаны
+# выходить одним резидентским адресом. На серверах у этих доменов правило
+# с outbound = "resident": без живого резидента соединение рвётся, прямого
+# выхода нет. Список собран по доке Apple «Use Apple products on enterprise
+# networks» (support.apple.com/101555); *.aaplimg.com не взят: там громкие
+# загрузки обновлений ОС, а не персонифицированные запросы.
+[[routing.rules]]
+name = "Apple"
+action = "proxy"
+domains = [
+  "*.apple.com", "*.icloud.com", "*.icloud-content.com", "*.me.com",
+  "*.cdn-apple.com", "*.apple-cloudkit.com", "*.mzstatic.com",
+]
+
 # --- Разработка и IT ---
 # Периодически недоступны или отдают частичный контент.
 [[routing.rules]]
