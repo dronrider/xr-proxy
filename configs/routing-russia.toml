@@ -1,6 +1,6 @@
 # ===============================================================
 # XR Proxy: правила маршрутизации для России
-# Актуально на август 2026
+# Актуально на октябрь 2026
 # ===============================================================
 #
 # Всё что не перечислено ниже, идёт напрямую без прокси.
@@ -12,7 +12,7 @@
 # правило без имени работает как раньше.
 #
 # Файл держится в соответствии с боевым пресетом `russia` на хабе
-# (сверен на версии 43): те же группы, те же имена, тот же состав.
+# (сверен на версиях 59 и 47): те же группы, те же имена, тот же состав.
 # Запись `*.example.com` покрывает и поддомены, и сам `example.com`,
 # поэтому голая форма рядом со звёздочной не нужна.
 
@@ -27,11 +27,13 @@ name = "YouTube и личные сервисы"
 action = "proxy"
 domains = [
   "*.coderabbit.ai", "*.zoobr.top", "*.claudelog.com",
+  "*.astroproxy.com", "*.cyberyozh.com", "*.yesim.app",
   "*.grizzlysms.com", "*.smtp2go.com", "*.forklog.com",
   "*.kimi.com", "*.xmpp.org", "*.youtube.ru",
-  "*.youtube.com", "*.youtu.be", "*.googlevideo.com",
+  "*.youtube.com", "*.youtu.be", "*.yt.be", "*.googlevideo.com",
   "*.ytimg.com", "*.youtube-nocookie.com", "*.youtube-ui.l.google.com",
   "*.ggpht.com", "*.daisyui.com", "*.kokonutui.com",
+  "*.filmix.gg", "*.modelyard.dev", "*.proxys.io", "*.starship.rs",
   "*.openrouter.ai",
 ]
 
@@ -95,15 +97,25 @@ domains = [
 ]
 
 # --- Google ---
-# Часть сервисов замедлена, gvt-домены отдают обновления.
+# Весь гугл обязан выходить одним резидентским адресом, на серверах у этого
+# правила стоит outbound = "resident" (XR-307). Antigravity попадает сюда же:
+# antigravity.google и облачные среды агентов на run.app. Суффикс вида
+# *.google парсер домена не принимает (нужна минимум вторая метка), поэтому
+# TLD .google записан явным доменом. YouTube-семейство едет в туннель группой
+# выше, но мимо резидента: видеострим объёмный, и персону он не строит.
 [[routing.rules]]
 name = "Google"
 action = "proxy"
 domains = [
-  "*.google.com", "*.google.ru", "*.googleapis.com",
-  "*.gstatic.com", "*.googleusercontent.com", "*.google-analytics.com",
-  "*.googletagmanager.com", "*.gmail.com", "*.gvt1.com",
-  "*.gvt2.com",
+  "*.google.com", "*.google.ru", "*.antigravity.google", "*.goo.gle",
+  "goo.gl", "*.g.co", "*.gmail.com", "*.googleapis.com", "*.gstatic.com",
+  "*.googleusercontent.com", "*.google-analytics.com", "*.googletagmanager.com",
+  "*.googleadservices.com", "*.googlesyndication.com", "*.doubleclick.net",
+  "*.recaptcha.net", "*.gvt1.com", "*.gvt2.com", "*.android.com",
+  "*.chrome.com", "*.chromium.org", "*.firebaseio.com", "*.firebaseapp.com",
+  "*.cloudfunctions.net", "*.run.app", "*.appspot.com", "*.web.app",
+  "*.blogger.com", "*.blogspot.com", "*.deepmind.com", "*.withgoogle.com",
+  "*.ai.google.dev",
 ]
 
 # --- Discord ---
@@ -130,18 +142,14 @@ domains = [
 
 # --- AI-сервисы ---
 # Отказывают по гео: с российского адреса не пускают ни в чат, ни в API.
+# Гугловы AI-домены живут в группе «Google».
 [[routing.rules]]
 name = "AI-сервисы"
 action = "proxy"
 domains = [
   "*.openai.com", "*.chatgpt.com", "*.claude.ai",
-  "*.anthropic.com", "*.perplexity.ai", "gemini.google.com",
-  "bard.google.com", "stripe.com", "*.z.ai",
-  "aistudio.google.com",
-  "alkalimakersuite-pa.clients6.google.com", "generativelanguage.googleapis.com",
-  "proactivebackend-pa.googleapis.com", "geller-pa.googleapis.com",
-  "cloudcode-pa.googleapis.com", "aiplatform.googleapis.com",
-  "*.ai.google.dev",
+  "*.anthropic.com", "*.perplexity.ai", "*.stripe.com", "*.z.ai",
+  "*.open-design.ai", "*.xiaomimimo.com", "*.stripecdn.com",
 ]
 
 # --- Claude ---
