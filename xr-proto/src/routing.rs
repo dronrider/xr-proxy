@@ -86,6 +86,14 @@ impl CidrRange {
     }
 }
 
+/// Разбирается ли CIDR-диапазон из конфига тем же разбором, который встраивает
+/// его в правило `compile_rule`. Хаб зовёт это для `ip_ranges` пресета на
+/// входе (XR-308): битый диапазон клиент выкидывает с WARN, поэтому хаб
+/// отказывает ему сразу, вместе с доменами.
+pub fn valid_cidr(s: &str) -> bool {
+    CidrRange::parse(s).is_some()
+}
+
 /// Compiled routing rule for fast matching.
 #[derive(Debug)]
 struct CompiledRule {
@@ -826,6 +834,17 @@ mod tests {
         assert_eq!(router.resolve_outbound(Some("claude.ai"), None), None);
         let infer: IpAddr = "192.0.2.5".parse().unwrap();
         assert_eq!(router.resolve_outbound(None, Some(infer)), Some("resident"));
+    }
+
+    #[test]
+    fn test_valid_cidr() {
+        for good in ["192.0.2.0/24", "192.0.2.1/32", "192.0.2.0/0", "2001:db8::/48", "2001:db8::/32"] {
+            assert!(valid_cidr(good), "expected valid: {good}");
+        }
+        // Без префикса, с префиксом за границей семейства и с мусором в адресе.
+        for bad in ["192.0.2.0", "192.0.2.0/33", "2001:db8::/129", "banana/8", "192.0.2.0/8/8"] {
+            assert!(!valid_cidr(bad), "expected invalid: {bad}");
+        }
     }
 
     #[test]
