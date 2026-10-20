@@ -9,6 +9,7 @@ use axum::Json;
 use serde::Deserialize;
 use xr_proto::config::RoutingConfig;
 use xr_proto::preset::{Preset, PresetSummary};
+use xr_proto::routing::valid_cidr;
 use xr_proto::user_rule::{classify_pattern, normalize_pattern, RuleKind};
 
 use crate::state::AppState;
@@ -144,7 +145,7 @@ pub async fn create_preset(
 ) -> Result<(StatusCode, Json<Preset>), (StatusCode, String)> {
     validate_slug(&req.name)?;
     validate_rules_size(&req.rules)?;
-    validate_rules_domains(&req.rules)?;
+    validate_rules_patterns(&req.rules)?;
 
     let mut presets = state.presets.write().await;
     if presets.contains_key(&req.name) {
@@ -180,7 +181,7 @@ pub async fn update_preset(
     Json(req): Json<CreatePresetRequest>,
 ) -> Result<Json<Preset>, (StatusCode, String)> {
     validate_rules_size(&req.rules)?;
-    validate_rules_domains(&req.rules)?;
+    validate_rules_patterns(&req.rules)?;
 
     let mut presets = state.presets.write().await;
     let existing = presets
@@ -250,12 +251,13 @@ fn validate_rules_size(rules: &RoutingConfig) -> Result<(), (StatusCode, String)
     Ok(())
 }
 
-/// Домены правил пресета проходят ту же классификацию из `xr-proto`, по
-/// которой клиент и сервер решают, применять запись (XR-308). Без неё хаб
-/// принимал `*.google`, клиент выкидывал запись с WARN, и домен молча не
-/// маршрутизировался. Битый домен отказывает всему запросу, как серверному
-/// `validate`: частично применённый пресет это та же молчаливая правка.
-fn validate_rules_domains(rules: &RoutingConfig) -> Result<(), (StatusCode, String)> {
+/// Домены и CIDR-диапазоны правил пресета проходят те же проверки из
+/// `xr-proto`, по которым клиент и сервер решают, применять запись (XR-308).
+/// Без них хаб принимал `*.google` и битые диапазоны, клиент выкидывал запись
+/// с WARN, и адресат молча не маршрутизировался. Битая запись отказывает
+/// всему запросу, как серверному `validate`: частично применённый пресет это
+/// та же молчаливая правка.
+fn validate_rules_patterns(rules: &RoutingConfig) -> Result<(), (StatusCode, String)> {
     for rule in &rules.rules {
         for domain in &rule.domains {
             let d = normalize_pattern(domain);
@@ -273,6 +275,11 @@ fn validate_rules_domains(rules: &RoutingConfig) -> Result<(), (StatusCode, Stri
                         format!("domain does not parse: {domain}: {e}"),
                     ));
                 }
+            }
+        }
+        for cidr in &rule.ip_ranges {
+            if !valid_cidr(cidr) {
+                return Err((StatusCode::BAD_REQUEST, format!("broken CIDR range: {cidr}")));
             }
         }
     }
@@ -567,6 +574,55 @@ mod tests {
         assert!(err.1.contains("192.0.2.10"));
 
         assert_eq!(state.presets.read().await.get("russia").unwrap().version, 1);
+    }
+
+    // Битый CIDR в ip_ranges отказывает PUT тем же порядком, что и битый
+    // домен (ревью XR-308): клиент выкидывает такой диапазон с WARN, и адреса
+    // молча не маршрутизируются. Без префикса диапазон тоже битый: одиночный
+    // IP клиент в ip_ranges не разбирает, ему нужна форма a.b.c.d/32.
+    #[tokio::test]
+    async fn update_rejects_broken_cidr_and_keeps_preset() {
+        for broken in ["192.0.2.0/33", "2001:db8::/129", "192.0.2.0"] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = state_with_preset(dir.path());
+
+            let err = update_preset(
+                State(state.clone()),
+                extract::Path("russia".to_string()),
+                Json(CreatePresetRequest {
+                    name: "russia".into(),
+                    description: String::new(),
+                    rules: RoutingConfig {
+                        default_action: "direct".into(),
+                        rules: vec![RoutingRule {
+                            name: Some("Telegram".into()),
+                            action: "proxy".into(),
+                            domains: vec!["*.telegram.org".into()],
+                            ip_ranges: vec![broken.into()],
+                            geoip: vec![],
+                            outbound: None,
+                        }],
+                    },
+                }),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "cidr {broken}");
+            assert!(err.1.contains(broken), "error names the range: {}", err.1);
+            assert!(
+                err.1.contains("broken CIDR range"),
+                "error names the reason: {}",
+                err.1
+            );
+
+            let presets = state.presets.read().await;
+            assert_eq!(
+                presets.get("russia").unwrap().version,
+                1,
+                "version untouched for {broken}"
+            );
+        }
     }
 
     // Годный домен с однобуквенным TLD нового поколения проходит: отказ
