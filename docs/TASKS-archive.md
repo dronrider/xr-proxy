@@ -199,3 +199,4 @@ Append-only журнал закрытых задач, растёт свобод�
 | XR-301 | UDP идёт через туннель ядра: реле живёт в xr-core, а не только в xr-client [долг] | task | P1 | 2026-10-14 | [tasks/archive/2026/XR-301.md](tasks/archive/2026/XR-301.md) |
 | XR-302 | IPv6 идёт через туннель ядра наравне с IPv4 | task | P1 | 2026-10-14 | [tasks/archive/2026/XR-302.md](tasks/archive/2026/XR-302.md) |
 | XR-299 | Чувствительные домены уходят с сервера через резидентский прокси | task | P1 | 2026-10-15 | [tasks/archive/2026/XR-299.md](tasks/archive/2026/XR-299.md) |
+| XR-306 | Apple-домены через резидентский SOCK | task | P2 | 2026-10-20 | [tasks/archive/2026/XR-306.md](tasks/archive/2026/XR-306.md) |
