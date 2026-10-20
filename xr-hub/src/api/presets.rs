@@ -9,6 +9,7 @@ use axum::Json;
 use serde::Deserialize;
 use xr_proto::config::RoutingConfig;
 use xr_proto::preset::{Preset, PresetSummary};
+use xr_proto::user_rule::{classify_pattern, normalize_pattern, RuleKind};
 
 use crate::state::AppState;
 use crate::storage;
@@ -143,6 +144,7 @@ pub async fn create_preset(
 ) -> Result<(StatusCode, Json<Preset>), (StatusCode, String)> {
     validate_slug(&req.name)?;
     validate_rules_size(&req.rules)?;
+    validate_rules_domains(&req.rules)?;
 
     let mut presets = state.presets.write().await;
     if presets.contains_key(&req.name) {
@@ -178,6 +180,7 @@ pub async fn update_preset(
     Json(req): Json<CreatePresetRequest>,
 ) -> Result<Json<Preset>, (StatusCode, String)> {
     validate_rules_size(&req.rules)?;
+    validate_rules_domains(&req.rules)?;
 
     let mut presets = state.presets.write().await;
     let existing = presets
@@ -247,6 +250,35 @@ fn validate_rules_size(rules: &RoutingConfig) -> Result<(), (StatusCode, String)
     Ok(())
 }
 
+/// Домены правил пресета проходят ту же классификацию из `xr-proto`, по
+/// которой клиент и сервер решают, применять запись (XR-308). Без неё хаб
+/// принимал `*.google`, клиент выкидывал запись с WARN, и домен молча не
+/// маршрутизировался. Битый домен отказывает всему запросу, как серверному
+/// `validate`: частично применённый пресет это та же молчаливая правка.
+fn validate_rules_domains(rules: &RoutingConfig) -> Result<(), (StatusCode, String)> {
+    for rule in &rules.rules {
+        for domain in &rule.domains {
+            let d = normalize_pattern(domain);
+            match classify_pattern(&d) {
+                Ok(RuleKind::Domain) | Ok(RuleKind::Wildcard) => {}
+                Ok(RuleKind::CidrV4) | Ok(RuleKind::CidrV6) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("IP range in domains, use ip_ranges: {domain}"),
+                    ));
+                }
+                Err(e) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("domain does not parse: {domain}: {e}"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -255,6 +287,7 @@ mod tests {
     use axum::http::Request;
     use tokio::sync::RwLock;
     use tower::ServiceExt;
+    use xr_proto::config::RoutingRule;
 
     use super::*;
     use crate::api::router;
@@ -459,5 +492,179 @@ mod tests {
         assert_eq!(wait_hold(Some(10)), Duration::from_secs(10));
         assert_eq!(wait_hold(Some(0)), Duration::ZERO);
         assert_eq!(wait_hold(Some(600)), Duration::from_secs(60));
+    }
+
+    fn rules_with_domains(domains: &[&str]) -> RoutingConfig {
+        RoutingConfig {
+            default_action: "direct".into(),
+            rules: vec![RoutingRule {
+                name: Some("Google".into()),
+                action: "proxy".into(),
+                domains: domains.iter().map(|s| s.to_string()).collect(),
+                ip_ranges: vec![],
+                geoip: vec![],
+                outbound: None,
+            }],
+        }
+    }
+
+    // Ради чего задача заведена (XR-308): домен, который клиент выкинет с
+    // WARN, отказывает всему PUT, в тексте названы домен и причина, а пресет
+    // остаётся прежним и версия не поднимается. `*.google` и `*.goog` это
+    // случай с боевого хаба, у суффикса после звёздочки меньше двух меток.
+    #[tokio::test]
+    async fn update_rejects_broken_domain_and_keeps_preset() {
+        for broken in ["*.google", "*.goog", "a..b"] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = state_with_preset(dir.path());
+
+            let err = update_preset(
+                State(state.clone()),
+                extract::Path("russia".to_string()),
+                Json(CreatePresetRequest {
+                    name: "russia".into(),
+                    description: "не должно примениться".into(),
+                    rules: rules_with_domains(&[broken, "*.google.com"]),
+                }),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "domain {broken}");
+            assert!(
+                err.1.contains(broken),
+                "error names the domain: {}",
+                err.1
+            );
+            assert!(!err.1.is_empty() && err.1.len() > broken.len());
+
+            let presets = state.presets.read().await;
+            let preset = presets.get("russia").unwrap();
+            assert_eq!(preset.version, 1, "version untouched for {broken}");
+            assert!(preset.rules.rules.is_empty(), "rules untouched for {broken}");
+        }
+    }
+
+    // IP в списке domains клиент тоже выкидывает с WARN, поэтому отказ тот же.
+    #[tokio::test]
+    async fn update_rejects_ip_in_domains() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_preset(dir.path());
+
+        let err = update_preset(
+            State(state.clone()),
+            extract::Path("russia".to_string()),
+            Json(CreatePresetRequest {
+                name: "russia".into(),
+                description: String::new(),
+                rules: rules_with_domains(&["192.0.2.10"]),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("192.0.2.10"));
+
+        assert_eq!(state.presets.read().await.get("russia").unwrap().version, 1);
+    }
+
+    // Годный домен с однобуквенным TLD нового поколения проходит: отказ
+    // не шире классификации, которой пользуется клиент.
+    #[tokio::test]
+    async fn update_accepts_valid_domains() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_preset(dir.path());
+
+        let updated = update_preset(
+            State(state.clone()),
+            extract::Path("russia".to_string()),
+            Json(CreatePresetRequest {
+                name: "russia".into(),
+                description: "Google через резидента".into(),
+                rules: RoutingConfig {
+                    default_action: "direct".into(),
+                    rules: vec![RoutingRule {
+                        name: Some("Google".into()),
+                        action: "proxy".into(),
+                        domains: vec![
+                            "*.antigravity.google".into(),
+                            "*.google.com".into(),
+                            "youtu.be".into(),
+                        ],
+                        ip_ranges: vec!["192.0.2.0/24".into()],
+                        geoip: vec![],
+                        outbound: None,
+                    }],
+                },
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(updated.version, 2);
+        assert_eq!(
+            state.presets.read().await.get("russia").unwrap().version,
+            2
+        );
+    }
+
+    // Создание пресета проверяет те же домены: дыра на POST закрылась бы
+    // первым же PUT, но битый пресет не должен появляться и на один шаг.
+    #[tokio::test]
+    async fn create_rejects_broken_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_preset(dir.path());
+
+        let err = create_preset(
+            State(state.clone()),
+            Json(CreatePresetRequest {
+                name: "turkey".into(),
+                description: String::new(),
+                rules: rules_with_domains(&["*.goog"]),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("*.goog"));
+        assert!(!state.presets.read().await.contains_key("turkey"));
+    }
+
+    // Живой эталон `configs/routing-russia.toml` принимается хабом без
+    // правок: по нему заводится боевой пресет, и каждое пополнение эталона
+    // обязано проходить валидацию на входе. Проверка идёт самой ручкой,
+    // а не функцией валидации напрямую.
+    #[tokio::test]
+    async fn reference_russia_preset_passes_domain_validation() {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            routing: RoutingConfig,
+        }
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../configs/routing-russia.toml");
+        let content = std::fs::read_to_string(path).unwrap();
+        let cfg: Wrapper = toml::from_str(&content).unwrap();
+        assert!(!cfg.routing.rules.is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_preset(dir.path());
+        let updated = update_preset(
+            State(state.clone()),
+            extract::Path("russia".to_string()),
+            Json(CreatePresetRequest {
+                name: "russia".into(),
+                description: String::new(),
+                rules: cfg.routing,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(updated.version, 2);
+        assert_eq!(
+            state.presets.read().await.get("russia").unwrap().version,
+            2
+        );
     }
 }
