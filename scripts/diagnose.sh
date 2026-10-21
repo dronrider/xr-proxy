@@ -216,6 +216,47 @@ else
 fi
 echo ""
 
+# 10. Каналы и политики устройств (XR-310)
+echo "== 10. Каналы и политики (XR-310) =="
+WAN_N=$(grep -c '^\s*\[\[wan\]\]' "$CONFIG" 2>/dev/null); WAN_N=${WAN_N:-0}
+EXIT_N=$(grep -c '^\s*\[\[exit\]\]' "$CONFIG" 2>/dev/null); EXIT_N=${EXIT_N:-0}
+DEV_N=$(grep -c '^\s*\[\[device\]\]' "$CONFIG" 2>/dev/null); DEV_N=${DEV_N:-0}
+if [ "$WAN_N" -eq 0 ] && [ "$EXIT_N" -eq 0 ] && [ "$DEV_N" -eq 0 ]; then
+    info "Секций [[wan]]/[[exit]]/[[device]] нет: весь LAN идёт прежним путём [routing]"
+else
+    ok "Политики XR-310: каналов $WAN_N, профилей выхода $EXIT_N, устройств $DEV_N"
+    WAN_IFACES=$(awk '/^\[\[wan\]\]/{inwan=1; next} /^\[/{inwan=0} inwan && $1=="interface"{gsub(/"/,"",$3); print $3}' "$CONFIG" 2>/dev/null)
+    WAN2_USED=0
+    for IFACE in $WAN_IFACES; do
+        [ "$IFACE" = "wan2" ] && WAN2_USED=1
+        if ip link show dev "$IFACE" >/dev/null 2>&1; then
+            STATE=$(ip link show dev "$IFACE" | grep -o 'state [A-Z]*' | head -1 | cut -d' ' -f2)
+            ADDR=$(ip -4 addr show dev "$IFACE" 2>/dev/null | grep 'inet ' | awk '{print $2}' | head -1)
+            if [ -n "$ADDR" ]; then
+                ok "Канал $IFACE: ${STATE:-без state}, адрес $ADDR"
+            else
+                warn "Канал $IFACE: ${STATE:-без state}, IPv4-адреса нет"
+                info "Кабель провайдера воткнут и интерфейс поднят?"
+            fi
+        else
+            fail "Канал $IFACE: интерфейса нет в ядре"
+            info "Второй канал заводит 'xr-setup router ... --second-wan-port <порт>'"
+        fi
+    done
+    if [ -n "$(uci -q get network.wan2.proto 2>/dev/null)" ] && [ "$WAN2_USED" -eq 0 ]; then
+        warn "wan2 настроен в uci, но ни один [[wan]] его не называет"
+    fi
+    info "Маршруты по умолчанию: $(ip route show default 2>/dev/null | tr '\n' ' ')"
+    DECISIONS=$(logread 2>/dev/null | grep -E "exit '|exit pool missing" | tail -5)
+    if [ -n "$DECISIONS" ]; then
+        info "Последние решения политик и отказы (журнал xr-client):"
+        echo "$DECISIONS"
+    else
+        info "Решений политик в журнале нет: трафика известных устройств не было"
+    fi
+fi
+echo ""
+
 echo "════════════════════════════════════════════════"
 echo "  Для подробной диагностики остановите сервис и"
 echo "  запустите вручную с debug-логированием:"
