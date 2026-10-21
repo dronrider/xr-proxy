@@ -218,9 +218,9 @@ echo ""
 
 # 10. Каналы и политики устройств (XR-310)
 echo "== 10. Каналы и политики (XR-310) =="
-WAN_N=$(grep -c '^\s*\[\[wan\]\]' "$CONFIG" 2>/dev/null); WAN_N=${WAN_N:-0}
-EXIT_N=$(grep -c '^\s*\[\[exit\]\]' "$CONFIG" 2>/dev/null); EXIT_N=${EXIT_N:-0}
-DEV_N=$(grep -c '^\s*\[\[device\]\]' "$CONFIG" 2>/dev/null); DEV_N=${DEV_N:-0}
+WAN_N=$(grep -Ec '^\s*\[\[wan\]\]' "$CONFIG" 2>/dev/null); WAN_N=${WAN_N:-0}
+EXIT_N=$(grep -Ec '^\s*\[\[exit\]\]' "$CONFIG" 2>/dev/null); EXIT_N=${EXIT_N:-0}
+DEV_N=$(grep -Ec '^\s*\[\[device\]\]' "$CONFIG" 2>/dev/null); DEV_N=${DEV_N:-0}
 if [ "$WAN_N" -eq 0 ] && [ "$EXIT_N" -eq 0 ] && [ "$DEV_N" -eq 0 ]; then
     info "Секций [[wan]]/[[exit]]/[[device]] нет: весь LAN идёт прежним путём [routing]"
 else
