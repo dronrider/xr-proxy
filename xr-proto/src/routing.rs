@@ -40,13 +40,13 @@ impl Action {
 
 /// Parsed CIDR range for fast matching.
 #[derive(Debug)]
-enum CidrRange {
+pub(crate) enum CidrRange {
     V4 { addr: u32, mask: u32 },
     V6 { addr: u128, mask: u128 },
 }
 
 impl CidrRange {
-    fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         let (ip_str, prefix_str) = s.split_once('/')?;
         let prefix_len: u32 = prefix_str.parse().ok()?;
 
@@ -73,7 +73,27 @@ impl CidrRange {
         }
     }
 
-    fn contains(&self, ip: IpAddr) -> bool {
+    /// Адрес без префикса читается как `/32` (или `/128`): в списках
+    /// устройств и правил хочется писать и одиночный адрес, и подсеть одной
+    /// строкой (XR-310).
+    pub(crate) fn parse_ip_or_cidr(s: &str) -> Option<Self> {
+        if let Some(range) = CidrRange::parse(s) {
+            return Some(range);
+        }
+        let ip: IpAddr = s.parse().ok()?;
+        match ip {
+            IpAddr::V4(v4) => Some(CidrRange::V4 {
+                addr: u32::from(v4),
+                mask: !0u32,
+            }),
+            IpAddr::V6(v6) => Some(CidrRange::V6 {
+                addr: u128::from(v6),
+                mask: !0u128,
+            }),
+        }
+    }
+
+    pub(crate) fn contains(&self, ip: IpAddr) -> bool {
         match (self, ip) {
             (CidrRange::V4 { addr, mask }, IpAddr::V4(v4)) => {
                 (u32::from(v4) & mask) == *addr
@@ -94,14 +114,83 @@ pub fn valid_cidr(s: &str) -> bool {
     CidrRange::parse(s).is_some()
 }
 
-/// Compiled routing rule for fast matching.
-#[derive(Debug)]
-struct CompiledRule {
-    action: Action,
+/// Скомпилированный набор доменов правила. Значения приводит та же
+/// проверка, что экран «Правила» (`user_rule`), поэтому пресет, TOML и
+/// политики устройств (XR-310) матчат домены одинаково.
+#[derive(Debug, Default)]
+pub(crate) struct DomainSet {
     /// Exact domain matches (lowercase).
     exact_domains: Vec<String>,
     /// Wildcard suffixes: "*.google.com" stored as ".google.com".
     wildcard_suffixes: Vec<String>,
+}
+
+impl DomainSet {
+    /// Собрать набор из паттернов конфига. Битые записи отбрасываются с
+    /// WARN, как и в `compile_rule`: набор общий на пресеты, и одна опечатка
+    /// не должна лишать маршрутизации весь парк.
+    pub(crate) fn compile(patterns: &[String]) -> Self {
+        let mut set = DomainSet::default();
+        for domain in patterns {
+            let d = normalize_pattern(domain);
+            match classify_pattern(&d) {
+                Ok(RuleKind::Wildcard) => {
+                    // "*.google.com" -> ".google.com", одиночная "*" -> ""
+                    set.wildcard_suffixes
+                        .push(d.strip_prefix('*').unwrap_or_default().to_string());
+                }
+                Ok(RuleKind::Domain) => set.exact_domains.push(d),
+                Ok(RuleKind::CidrV4) | Ok(RuleKind::CidrV6) => {
+                    tracing::warn!("IP range in domains list, use ip_ranges instead: {}", domain)
+                }
+                // Текст ошибки от classify_pattern написан для экрана «Правила» на
+                // Android, в лог клиента его не тащим: соседние записи английские.
+                Err(_) => tracing::warn!("Invalid domain in config: {}", domain),
+            }
+        }
+        set
+    }
+
+    /// Матч по домену. Пустая строка (`sni = None`) ничего не совпадает:
+    /// точный список и суффиксы привязаны к реальному хостнейму, а пустой
+    /// домен не бывает.
+    pub(crate) fn matches(&self, hostname: &str) -> bool {
+        if hostname.is_empty() {
+            return false;
+        }
+        let hostname_lower = hostname.to_lowercase();
+
+        for exact in &self.exact_domains {
+            if hostname_lower == *exact {
+                return true;
+            }
+        }
+
+        for suffix in &self.wildcard_suffixes {
+            // "*.google.com" хранится как ".google.com" и матчит как
+            // "mail.google.com", так и сам "google.com"; одиночная "*" это
+            // пустой суффикс, он матчит любой SNI. Срез по байтам здесь
+            // недопустим: домен приходит из чужого конфига, и на
+            // многобайтовом символе он роняет процесс.
+            if hostname_lower.ends_with(suffix.as_str()) {
+                return true;
+            }
+            if let Some(base) = suffix.strip_prefix('.') {
+                if hostname_lower == base {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+}
+
+/// Compiled routing rule for fast matching.
+#[derive(Debug)]
+struct CompiledRule {
+    action: Action,
+    domains: DomainSet,
     /// IP/CIDR ranges.
     ip_ranges: Vec<CidrRange>,
     /// GeoIP country codes (uppercase).
@@ -216,7 +305,7 @@ impl Router {
             let Some(outbound) = rule.outbound.as_deref() else {
                 continue;
             };
-            let domain_hit = sni.is_some_and(|host| self.matches_domain(rule, host));
+            let domain_hit = sni.is_some_and(|host| rule.domains.matches(host));
             let ip_hit = dest_ip.is_some_and(|ip| self.matches_ip(rule, ip));
             if domain_hit || ip_hit {
                 return Some(outbound);
@@ -226,42 +315,7 @@ impl Router {
     }
 
     fn matches_rule(&self, rule: &CompiledRule, sni: Option<&str>, dest_ip: IpAddr) -> bool {
-        self.matches_domain(rule, sni.unwrap_or(""))
-            || self.matches_ip(rule, dest_ip)
-    }
-
-    /// Матч по домену. Пустая строка (`sni = None`) ничего не совпадает:
-    /// точный список и суффиксы привязаны к реальному хостнейму, а пустой
-    /// домен не бывает.
-    fn matches_domain(&self, rule: &CompiledRule, hostname: &str) -> bool {
-        if hostname.is_empty() {
-            return false;
-        }
-        let hostname_lower = hostname.to_lowercase();
-
-        for exact in &rule.exact_domains {
-            if hostname_lower == *exact {
-                return true;
-            }
-        }
-
-        for suffix in &rule.wildcard_suffixes {
-            // "*.google.com" хранится как ".google.com" и матчит как
-            // "mail.google.com", так и сам "google.com"; одиночная "*" это
-            // пустой суффикс, он матчит любой SNI. Срез по байтам здесь
-            // недопустим: домен приходит из чужого конфига, и на
-            // многобайтовом символе он роняет процесс.
-            if hostname_lower.ends_with(suffix.as_str()) {
-                return true;
-            }
-            if let Some(base) = suffix.strip_prefix('.') {
-                if hostname_lower == base {
-                    return true;
-                }
-            }
-        }
-
-        false
+        rule.domains.matches(sni.unwrap_or("")) || self.matches_ip(rule, dest_ip)
     }
 
     /// Матч по адресу назначения: CIDR-диапазоны и GeoIP.
@@ -315,29 +369,12 @@ impl Router {
 
 fn compile_rule(rule: &RoutingRule) -> CompiledRule {
     let action = Action::from_str(&rule.action);
-    let mut exact_domains = Vec::new();
-    let mut wildcard_suffixes = Vec::new();
 
     // Домены из пресета хаба и из TOML проходят ту же проверку, что и
     // пользовательские правила (`user_rule::classify_pattern`): битое
     // отбраковывается с WARN, как невалидный CIDR ниже. Fail-soft, потому что
     // одна опечатка в общем пресете не должна лишать весь парк маршрутизации.
-    for domain in &rule.domains {
-        let d = normalize_pattern(domain);
-        match classify_pattern(&d) {
-            Ok(RuleKind::Wildcard) => {
-                // "*.google.com" -> ".google.com", одиночная "*" -> ""
-                wildcard_suffixes.push(d.strip_prefix('*').unwrap_or_default().to_string());
-            }
-            Ok(RuleKind::Domain) => exact_domains.push(d),
-            Ok(RuleKind::CidrV4) | Ok(RuleKind::CidrV6) => {
-                tracing::warn!("IP range in domains list, use ip_ranges instead: {}", domain)
-            }
-            // Текст ошибки от classify_pattern написан для экрана «Правила» на
-            // Android, в лог клиента его не тащим: соседние записи английские.
-            Err(_) => tracing::warn!("Invalid domain in config: {}", domain),
-        }
-    }
+    let domains = DomainSet::compile(&rule.domains);
 
     let mut ip_ranges = Vec::new();
     for cidr_str in &rule.ip_ranges {
@@ -351,8 +388,7 @@ fn compile_rule(rule: &RoutingRule) -> CompiledRule {
 
     CompiledRule {
         action,
-        exact_domains,
-        wildcard_suffixes,
+        domains,
         ip_ranges,
         geoip_codes,
         outbound: rule.outbound.clone(),
@@ -471,15 +507,19 @@ mod tests {
         // Регресс XR-206: матчинг резал суффикс по байтам (`suffix[1..]`) в
         // расчёте на ведущую точку, и на кириллице срез попадал внутрь
         // символа, роняя процесс на первом же SNI. Матчинг не должен
-        // полагаться на то, что домены уже отфильтрованы компиляцией.
+        // полагаться на то, что домены уже отфильтрованы компиляцией,
+        // поэтому набор с кириллическим суффиксом строится руками: компиляция
+        // такие отбрасывает (нужен punycode), а защитить надо сам матч.
         let router = Router::new(
             &RoutingConfig { default_action: "direct".into(), rules: vec![] },
             None,
         );
         let rule = CompiledRule {
             action: Action::Proxy,
-            exact_domains: vec![],
-            wildcard_suffixes: vec!["яндекс.рф".into()],
+            domains: DomainSet {
+                exact_domains: vec![],
+                wildcard_suffixes: vec!["яндекс.рф".into()],
+            },
             ip_ranges: vec![],
             geoip_codes: vec![],
             outbound: None,
@@ -500,8 +540,7 @@ mod tests {
         );
         let rule = CompiledRule {
             action: Action::Proxy,
-            exact_domains: vec![],
-            wildcard_suffixes: vec!["".into()],
+            domains: DomainSet::compile(&["*".into()]),
             ip_ranges: vec![],
             geoip_codes: vec![],
             outbound: None,

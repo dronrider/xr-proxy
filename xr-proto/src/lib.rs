@@ -1,6 +1,7 @@
 pub mod accept;
 pub mod app_update;
 pub mod config;
+pub mod device;
 pub mod invite_url;
 pub mod mux;
 pub mod mux_pool;

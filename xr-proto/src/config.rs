@@ -34,6 +34,20 @@ pub struct ClientConfig {
     /// пойдёт ли к нему dnsmasq, решает раскладка `xr-setup`.
     #[serde(default)]
     pub dns: DnsClientConfig,
+    /// Каналы провайдеров (XR-310). Каждый именует интерфейс ядра, через
+    /// который профили выхода пускают исходящие сокеты. Пусто у конфигов с
+    /// одним провайдером.
+    #[serde(default)]
+    pub wan: Vec<WanChannelConfig>,
+    /// Профили выхода (XR-310): сочетание канала, действия и подмножества
+    /// серверов пула, на которое ссылаются политики устройств.
+    #[serde(default)]
+    pub exit: Vec<ExitProfileConfig>,
+    /// Политики устройств (XR-310): маршрут по умолчанию и ресурсные
+    /// исключения для адресов LAN. Неизвестное устройство живёт по
+    /// `[routing]`.
+    #[serde(default)]
+    pub device: Vec<DevicePolicyConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,6 +313,72 @@ impl Default for DnsClientConfig {
 #[derive(Debug, Deserialize)]
 pub struct GeoIpConfig {
     pub database: String,
+}
+
+// -- Каналы и политики устройств (XR-310) -----------------------------
+
+/// Канал провайдера `[[wan]]` (XR-310): имя, на которое ссылаются профили
+/// выхода, и интерфейс ядра для привязки исходящих сокетов
+/// (SO_BINDTODEVICE). Имя `main` зарезервировано за основным маршрутом ОС.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WanChannelConfig {
+    pub name: String,
+    pub interface: String,
+}
+
+/// Профиль выхода `[[exit]]` (XR-310). Определяет, через какой канал и как
+/// выходит соединение: напрямую, через подмножество пула прокси-серверов
+/// или в блэкхол. На профиль ссылаются политики устройств.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExitProfileConfig {
+    pub name: String,
+    /// Имя канала из `[[wan]]`; без поля действует основной маршрут ОС.
+    #[serde(default)]
+    pub wan: Option<String>,
+    /// direct, proxy или block.
+    pub action: String,
+    /// Имена серверов из `[[servers]]` (или адрес безымянного). Без поля
+    /// профиль использует пул целиком.
+    #[serde(default)]
+    pub servers: Vec<String>,
+    /// direct или block. По умолчанию block: отказ прокси не должен молча
+    /// выпускать соединение напрямую с реальным IP.
+    #[serde(default)]
+    pub on_server_down: String,
+    /// Имя резервного канала из `[[wan]]`. После отказа всех серверов
+    /// профиля те же серверы опрашиваются через него. Без поля перехода на
+    /// другой канал нет.
+    #[serde(default)]
+    pub fallback_wan: Option<String>,
+}
+
+/// Политика устройства `[[device]]` (XR-310): адрес LAN получает маршрут по
+/// умолчанию и ресурсные исключения. Устройство ищется по source IP
+/// соединения, побеждает первое совпавшее.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DevicePolicyConfig {
+    pub name: String,
+    /// Адрес или подсеть LAN-устройства.
+    #[serde(default)]
+    pub ips: Vec<String>,
+    pub default_exit: String,
+    #[serde(default, rename = "rule")]
+    pub rules: Vec<DeviceRuleConfig>,
+}
+
+/// Ресурсное исключение `[[device.rule]]`: домен или IP/подсеть, для которой
+/// соединение устройства уходит в другой профиль выхода. Первое совпавшее
+/// правило устройства побеждает.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeviceRuleConfig {
+    /// Название правила для журнала.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub ip_ranges: Vec<String>,
+    pub exit: String,
 }
 
 // ── Server config ────────────────────────────────────────────────────
@@ -607,6 +687,9 @@ pub fn validate_client_config(config: &ClientConfig) -> Result<(), String> {
     if config.dns.enabled {
         dns_reject_reason(&config.dns)?;
     }
+    // Секции XR-310 проверяются тем же разбором, которым старт соберёт
+    // политики: validate не может пропустить то, что уронит старт.
+    crate::device::policy_reject_reason(config)?;
     Ok(())
 }
 
