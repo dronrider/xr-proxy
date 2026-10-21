@@ -2,6 +2,7 @@ mod dns;
 mod proxy;
 mod redirect;
 mod udp_relay;
+mod wan;
 
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
@@ -164,38 +165,64 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // Build the server pool: per-server MuxPool (N parallel mux tunnels each),
     // primary/backup by priority, failover/failback inside the pool (LLD-10).
-    let mut pool_servers = Vec::with_capacity(server_entries.len());
-    for entry in &server_entries {
-        let addr: SocketAddr = format!("{}:{}", entry.address, entry.port)
-            .parse()
-            .map_err(|e| format!("invalid server address {}: {}", entry.address, e))?;
-        let entry_codec = codec_for_entry(entry, &config.obfuscation, &codec)?;
-        let mux_pool = xr_proto::mux_pool::MuxPool::new(
-            Arc::new(move || {
-                Box::pin(async move {
-                    xr_proto::tunnel::connect_to_server(&addr).await
-                })
-            }),
-            entry_codec,
-            config.client.mux_pool_size,
-        );
-        pool_servers.push(PoolServer {
-            name: entry.display_name().to_string(),
-            addr: addr.to_string(),
-            pool: mux_pool,
-        });
-    }
-    let server_pool = ServerPool::new(pool_servers, PoolProfile::router(), None);
+    // Пул по умолчанию ходит основным маршрутом; профили выхода XR-310
+    // добавляют свои пулы на других каналах с раздельным здоровьем.
+    let server_pool = build_server_pool(
+        &server_entries,
+        None,
+        &config.obfuscation,
+        &codec,
+        config.client.mux_pool_size,
+    )?;
 
     // Фоновый пробер: держит mux ко всем серверам тёплым и возвращает трафик
     // на primary после восстановления (failback с hold-down).
     tokio::spawn(server_pool.clone().health_loop());
+
+    // Политики устройств (XR-310) уже прошли validate, здесь они собираются
+    // повторно тем же разбором и превращаются в пулы по ключу канала и
+    // подмножества серверов. Профиль без wan с полным пулом ложится на пул
+    // по умолчанию, отдельного пула для него не строится.
+    let policy = xr_proto::device::DevicePolicySet::compile(&config)?;
+    let mut pools: std::collections::HashMap<String, Arc<ServerPool>> =
+        std::collections::HashMap::new();
+    pools.insert(
+        xr_proto::device::pool_key(None, &server_entries),
+        server_pool.clone(),
+    );
+    for spec in policy.pool_specs(&config)? {
+        if pools.contains_key(&spec.key) {
+            continue;
+        }
+        let pool = build_server_pool(
+            &spec.servers,
+            spec.interface.as_deref(),
+            &config.obfuscation,
+            &codec,
+            config.client.mux_pool_size,
+        )?;
+        tracing::info!(
+            "exit pool '{}' on {} ({} server(s))",
+            spec.key,
+            spec.interface.as_deref().unwrap_or("main"),
+            spec.servers.len()
+        );
+        tokio::spawn(pool.clone().health_loop());
+        pools.insert(spec.key, pool);
+    }
+    if let Some(udp) = config.udp_relay.as_ref().filter(|u| u.enabled) {
+        for warning in policy.udp_relay_overlap_warnings(&udp.source_ips) {
+            tracing::warn!("{warning}");
+        }
+    }
 
     let state = Arc::new(proxy::ProxyState {
         router: std::sync::RwLock::new(Arc::new(router)),
         on_server_down,
         listen_port: config.client.listen_port,
         server_pool,
+        policy,
+        pools,
     });
 
     // Setup firewall redirect
@@ -243,16 +270,30 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // ложится строкой в журнал, иначе снаружи молчание не отличить от работы.
     if config.dns.enabled {
         let dns_config = config.dns.clone();
-        let pool = state.server_pool.clone();
+        // Цепочка пулов для DoT (XR-310): сначала основной маршрут, затем
+        // пулы прочих каналов в порядке имён ключей. Ответ резолвера не
+        // зависит от выхода, но мёртвый основной канал не должен оставлять
+        // LAN без DNS, пока жив второй провайдер.
+        let mut dns_pools = vec![state.server_pool.clone()];
+        let mut extra_keys: Vec<&String> = state.pools.keys().collect();
+        extra_keys.sort();
+        for key in extra_keys {
+            let pool = state.pools.get(key).expect("ключ только что был");
+            if !dns_pools.iter().any(|p| Arc::ptr_eq(p, pool)) {
+                dns_pools.push(pool.clone());
+            }
+        }
         match dns_upstreams(&dns_config) {
             Ok((upstreams, tls_connector, server_name)) => {
                 tokio::spawn(async move {
                     let connect = move || {
-                        let pool = pool.clone();
+                        let dns_pools = dns_pools.clone();
                         let upstreams = upstreams.clone();
                         let tls_connector = tls_connector.clone();
                         let server_name = server_name.clone();
-                        async move { open_dot(pool, tls_connector, upstreams, server_name).await }
+                        async move {
+                            open_dot(dns_pools, tls_connector, upstreams, server_name).await
+                        }
                     };
                     if let Err(e) = dns::run_forwarder(&dns_config, connect).await {
                         tracing::error!(
@@ -403,6 +444,41 @@ fn codec_for_entry(
     Ok(Codec::new(obfuscator, obfuscation.padding_min, obfuscation.padding_max))
 }
 
+/// Собрать пул серверов (LLD-10) на заданном канале. `interface` это имя
+/// интерфейса канала для SO_BINDTODEVICE (XR-310): туннели, переподключения
+/// и пробы здоровья пула ходят только через него. `None` отпускает соединения
+/// на основной маршрут ОС, как было до XR-310.
+fn build_server_pool(
+    entries: &[ServerEntry],
+    interface: Option<&str>,
+    obfuscation: &ObfuscationConfig,
+    shared: &Codec,
+    mux_pool_size: usize,
+) -> Result<Arc<ServerPool>, Box<dyn std::error::Error>> {
+    let mut pool_servers = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let addr: SocketAddr = format!("{}:{}", entry.address, entry.port)
+            .parse()
+            .map_err(|e| format!("invalid server address {}: {}", entry.address, e))?;
+        let entry_codec = codec_for_entry(entry, obfuscation, shared)?;
+        let iface = interface.map(str::to_string);
+        let mux_pool = xr_proto::mux_pool::MuxPool::new(
+            Arc::new(move || {
+                let iface = iface.clone();
+                Box::pin(async move { wan::tunnel_connect(iface.as_deref(), addr).await })
+            }),
+            entry_codec,
+            mux_pool_size,
+        );
+        pool_servers.push(PoolServer {
+            name: entry.display_name().to_string(),
+            addr: addr.to_string(),
+            pool: mux_pool,
+        });
+    }
+    Ok(ServerPool::new(pool_servers, PoolProfile::router(), None))
+}
+
 /// Разобранная секция `[dns]`: адреса апстримов, TLS-коннектор с корнями
 /// webpki и имя, которое обязано стоять в сертификате. Ошибка тут значит, что
 /// форвардер поднимать не из чего.
@@ -446,23 +522,25 @@ fn dns_upstreams(
 /// по порядку: первый ответивший и берётся, а падение всех это причина, с
 /// которой форвардер жалуется в журнал.
 async fn open_dot(
-    pool: Arc<ServerPool>,
+    pools: Vec<Arc<ServerPool>>,
     tls: tokio_rustls::TlsConnector,
     upstreams: Vec<SocketAddr>,
     server_name: rustls::pki_types::ServerName<'static>,
 ) -> std::io::Result<tokio_rustls::client::TlsStream<xr_proto::mux::MuxStreamIo>> {
     let mut last: Option<std::io::Error> = None;
-    for addr in upstreams {
-        let stream = match pool.open_stream(&TargetAddr::Ip(addr)).await {
-            Ok(s) => s,
-            Err(e) => {
-                last = Some(e);
-                continue;
+    for pool in &pools {
+        for addr in &upstreams {
+            let stream = match pool.open_stream(&TargetAddr::Ip(*addr)).await {
+                Ok(s) => s,
+                Err(e) => {
+                    last = Some(e);
+                    continue;
+                }
+            };
+            match tls.connect(server_name.clone(), stream.into_io()).await {
+                Ok(tls_stream) => return Ok(tls_stream),
+                Err(e) => last = Some(e),
             }
-        };
-        match tls.connect(server_name.clone(), stream.into_io()).await {
-            Ok(tls_stream) => return Ok(tls_stream),
-            Err(e) => last = Some(e),
         }
     }
     Err(last.unwrap_or_else(|| {

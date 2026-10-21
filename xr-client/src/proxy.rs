@@ -1,9 +1,12 @@
 /// Transparent proxy core: accept connections, extract SNI, route, tunnel.
+use crate::wan;
 use xr_proto::accept::accept_loop;
+use xr_proto::device::{DevicePolicySet, PolicyDecision};
 use xr_proto::routing::{Action, Router};
 use xr_proto::server_pool::ServerPool;
 use xr_proto::sni;
 use xr_proto::tunnel;
+use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, RwLock};
@@ -65,6 +68,13 @@ pub struct ProxyState {
     /// Пул серверов (LLD-10): primary/backup по приоритету, failover и
     /// failback внутри. `Err` от него означает «весь пул недоступен».
     pub server_pool: Arc<ServerPool>,
+    /// Политики устройств (XR-310). Пустой набор держит весь трафик на
+    /// общих правилах `[routing]`, поэтому старый конфиг ведёт себя прежне.
+    pub policy: DevicePolicySet,
+    /// Пулы профилей выхода по ключу `device::pool_key`: интерфейс канала
+    /// плюс подмножество серверов. Ключ пула по умолчанию здесь тоже,
+    /// профиль без `wan` с полным списком попадает на `server_pool`.
+    pub pools: HashMap<String, Arc<ServerPool>>,
 }
 
 /// Enable TCP keepalive on a stream to detect dead connections.
@@ -175,6 +185,7 @@ const PEEK_WAIT_WEB: Duration = Duration::from_secs(10);
 const PEEK_WAIT_OTHER: Duration = Duration::from_millis(300);
 
 /// Решение по первым байтам клиента: маршрут или разрыв соединения.
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 enum PeekVerdict {
     /// Клиент на web-порту так и не заговорил: соединение мёртвое.
@@ -183,20 +194,52 @@ enum PeekVerdict {
     Route(Action, Option<String>),
 }
 
-/// Подсмотреть первые байты клиента и решить маршрут. Молчание вне web-портов
-/// это штатный случай server-first протокола: баннер обещает сервер, поэтому
-/// по таймауту короткого ожидания подсмотренные байты остаются пустыми и
-/// соединение уходит в Direct, а не рвётся после долгого висения (XR-292).
-/// На web-порту клиент обязан говорить первым, тишина означает мёртвое
-/// соединение.
-async fn decide_route<F>(
-    client: &TcpStream,
-    orig_dst: SocketAddr,
-    resolve: F,
-) -> io::Result<PeekVerdict>
-where
-    F: FnOnce(Option<&str>) -> Action,
-{
+/// Вердикт общих правил `[routing]` по фактам подсмотра (XR-292).
+///
+/// SNI-роутинг доверяем только на стандартных web-портах (80/443). На любом
+/// нестандартном порту SNI скорее всего fake (Telegram MTProto маскирует
+/// обфусцированный поток под TLS-handshake с self.events.data.microsoft.com,
+/// ssl.gstatic.com и подобными доменами для обхода DPI). Решение по такому
+/// SNI = заведомо неправильный routing -> direct -> провайдерский RST.
+///
+/// Для non-80/443 портов смотрим на сам первый байт: 0x16 = TLS handshake
+/// ContentType. Если это TLS, почти наверняка обфусцированный/маскированный
+/// протокол (Telegram MTProto на 5277/5993, DoT на 853 и т.п.) -> Proxy.
+/// Если нет, это сырой TCP-протокол (BitTorrent peer handshake начинается
+/// с 0x13 + "BitTorrent protocol", IRC и т.д.). Проксировать его бессмысленно
+/// (IP клиента всё равно засветится в peer-listing), а вред огромный:
+/// BitTorrent открывает десятки одновременных Connect'ов к мёртвым/firewalled
+/// пирам, забивает mux writer-канал и target-семафор xr-server'а
+/// (max_connections=256), из-за чего ConnectAck для легитимного TLS-трафика
+/// (YouTube, шортсы) timeout'ит и видео фризит.
+fn verdict_action(web_port: bool, tls_first_byte: bool, resolved: Action) -> Action {
+    if web_port {
+        resolved
+    } else if tls_first_byte {
+        Action::Proxy
+    } else {
+        Action::Direct
+    }
+}
+
+/// Факты подсмотра первых байт клиента, без решения о маршруте. Политика
+/// устройств (XR-310) решает по ним раньше общих правил, поэтому подсмотр
+/// отделён от вердикта.
+#[derive(Debug, Default)]
+struct PeekFacts {
+    sni: Option<String>,
+    /// Первый байт 0x16, начало TLS-записи.
+    tls_first_byte: bool,
+    /// Клиент на web-порту промолчал всё окно: соединение мёртвое.
+    dead: bool,
+}
+
+/// Подсмотреть первые байты клиента. Молчание вне web-портов это штатный
+/// случай server-first протокола: баннер обещает сервер, поэтому по таймауту
+/// короткого ожидания факты остаются пустыми и соединение уйдёт в Direct,
+/// а не рвётся после долгого висения (XR-292). На web-порту клиент обязан
+/// говорить первым, тишина означает мёртвое соединение.
+async fn peek_facts(client: &TcpStream, orig_dst: SocketAddr) -> io::Result<PeekFacts> {
     let mut peek_buf = vec![0u8; 4096];
     let wait = if is_web_port(orig_dst.port()) {
         PEEK_WAIT_WEB
@@ -211,38 +254,38 @@ where
         }
         Err(_) => {
             tracing::debug!("Peek timeout -> {}: dropping", orig_dst);
-            return Ok(PeekVerdict::Dead);
+            return Ok(PeekFacts { dead: true, ..Default::default() });
         }
     };
     let n = peek_client_hello(client, &mut peek_buf, n).await?;
-    let sni_name = sni::extract_sni(&peek_buf[..n]);
-    let resolved = resolve(sni_name.as_deref());
+    let sni = sni::extract_sni(&peek_buf[..n]);
+    Ok(PeekFacts {
+        sni,
+        tls_first_byte: n > 0 && peek_buf[0] == 0x16,
+        dead: false,
+    })
+}
 
-    // SNI-роутинг доверяем только на стандартных web-портах (80/443). На любом
-    // нестандартном порту SNI скорее всего fake (Telegram MTProto маскирует
-    // обфусцированный поток под TLS-handshake с self.events.data.microsoft.com,
-    // ssl.gstatic.com и подобными доменами для обхода DPI). Решение по такому
-    // SNI = заведомо неправильный routing -> direct -> провайдерский RST.
-    //
-    // Для non-80/443 портов смотрим на сам первый байт: 0x16 = TLS handshake
-    // ContentType. Если это TLS, почти наверняка обфусцированный/маскированный
-    // протокол (Telegram MTProto на 5277/5993, DoT на 853 и т.п.) -> Proxy.
-    // Если нет, это сырой TCP-протокол (BitTorrent peer handshake начинается
-    // с 0x13 + "BitTorrent protocol", IRC и т.д.). Проксировать его бессмысленно
-    // (IP клиента всё равно засветится в peer-listing), а вред огромный:
-    // BitTorrent открывает десятки одновременных Connect'ов к мёртвым/firewalled
-    // пирам, забивает mux writer-канал и target-семафор xr-server'а
-    // (max_connections=256), из-за чего ConnectAck для легитимного TLS-трафика
-    // (YouTube, шортсы) timeout'ит и видео фризит.
-    let looks_like_tls = n > 0 && peek_buf[0] == 0x16;
-    let action = if is_web_port(orig_dst.port()) {
-        resolved
-    } else if looks_like_tls {
-        Action::Proxy
-    } else {
-        Action::Direct
-    };
-    Ok(PeekVerdict::Route(action, sni_name))
+/// Подсмотреть первые байты клиента и решить маршрут по общим правилам
+/// `[routing]` (XR-292). Политика устройств сюда не входит: у неё свой
+/// судья над теми же фактами в `handle_connection`. Живёт для тестов
+/// подсмотра: продакшн-путь собирает те же части по ходу `handle_connection`.
+#[cfg(test)]
+async fn decide_route<F>(
+    client: &TcpStream,
+    orig_dst: SocketAddr,
+    resolve: F,
+) -> io::Result<PeekVerdict>
+where
+    F: FnOnce(Option<&str>) -> Action,
+{
+    let facts = peek_facts(client, orig_dst).await?;
+    if facts.dead {
+        return Ok(PeekVerdict::Dead);
+    }
+    let resolved = resolve(facts.sni.as_deref());
+    let action = verdict_action(is_web_port(orig_dst.port()), facts.tls_first_byte, resolved);
+    Ok(PeekVerdict::Route(action, facts.sni))
 }
 
 async fn handle_connection(
@@ -266,28 +309,54 @@ async fn handle_connection(
     set_keepalive(&client);
 
     // Read-lock роутера живёт ровно длину вызова resolve(): guard не Send,
-    // и держать его через await-точки decide_route не выйдет.
-    let verdict = decide_route(&client, orig_dst, |sni| {
-        state.router.read().unwrap().resolve(sni, dest_ip)
-    })
-    .await?;
-    let (action, sni_name) = match verdict {
-        PeekVerdict::Dead => return Ok(()),
-        PeekVerdict::Route(action, sni_name) => (action, sni_name),
+    // и держать его через await-точки подсмотра не выйдет. Сначала решает
+    // политика устройств (XR-310): известное устройство получает профиль
+    // выхода без эвристики первого байта, неизвестное живёт прежним путём
+    // `[routing]` с теми же фактами подсмотра.
+    let facts = peek_facts(&client, orig_dst).await?;
+    if facts.dead {
+        return Ok(());
+    }
+    let decision = state
+        .policy
+        .decide(client_addr.ip(), facts.sni.as_deref(), dest_ip);
+    let (action, sni_name, exit) = match decision {
+        PolicyDecision::Exit { exit, device, rule } => {
+            tracing::info!(
+                "{} -> {} [SNI: {}] device '{}' rule {} exit '{}' wan {} => {:?}",
+                client_addr,
+                orig_dst,
+                facts.sni.as_deref().unwrap_or("-"),
+                device,
+                rule.as_deref().unwrap_or("default"),
+                exit.name,
+                exit.interface.as_deref().unwrap_or("main"),
+                exit.action
+            );
+            (exit.action, facts.sni.clone(), Some(exit))
+        }
+        PolicyDecision::Global => {
+            let resolved = state.router.read().unwrap().resolve(facts.sni.as_deref(), dest_ip);
+            let action =
+                verdict_action(is_web_port(orig_dst.port()), facts.tls_first_byte, resolved);
+            (action, facts.sni.clone(), None)
+        }
     };
 
-    tracing::info!(
-        "{} -> {} [SNI: {}] => {:?}",
-        client_addr,
-        orig_dst,
-        sni_name.as_deref().unwrap_or("-"),
-        action
-    );
+    if exit.is_none() {
+        tracing::info!(
+            "{} -> {} [SNI: {}] => {:?}",
+            client_addr,
+            orig_dst,
+            sni_name.as_deref().unwrap_or("-"),
+            action
+        );
+    }
 
     let idle_timeout = Duration::from_secs(300);
     let max_lifetime = Duration::from_secs(3600);
 
-    // Hard cap on Direct TCP connect — без него default Linux SYN retry
+    // Hard cap на прямой TCP connect. Без него default Linux SYN retry
     // выкручивает на ~130 секунд, и при BitTorrent-нагрузке (десятки
     // dial/сек к мёртвым/firewalled пирам) сокеты накапливаются: видели
     // 845 open fd при единственном активном LAN-стриме, что топит tokio
@@ -298,62 +367,147 @@ async fn handle_connection(
         Action::Block => {
             // Правило маршрутизации явно блокирует: рвём соединение, наружу не
             // выпускаем. Для проксируемого трафика это fail-closed, IP не течёт.
-            tracing::debug!("Blocked {} -> {} (routing action=block)", client_addr, orig_dst);
+            tracing::debug!("Blocked {} -> {} (action=block)", client_addr, orig_dst);
             Ok(())
         }
         Action::Direct => {
-            // Connect directly to the original destination
-            let mut target = match tokio::time::timeout(
-                direct_connect_timeout,
-                TcpStream::connect(orig_dst),
-            ).await {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    tracing::debug!("direct connect to {} timed out", orig_dst);
+            // Напрямую к цели через канал профиля: у устройства без профиля
+            // это основной маршрут ОС, как и до XR-310.
+            let iface = exit.as_ref().and_then(|e| e.interface.as_deref());
+            direct_relay(&mut client, orig_dst, iface, direct_connect_timeout, max_lifetime).await
+        }
+        Action::Proxy => {
+            // Туннель через пул профиля. Для устройства без профиля это пул
+            // по умолчанию с прежним поведением on_server_down (XR-292).
+            let (primary, fallback, on_down, iface) = match exit.as_ref() {
+                Some(e) => (
+                    state.pools.get(&e.pool_key).cloned(),
+                    e.fallback_pool_key
+                        .as_ref()
+                        .and_then(|k| state.pools.get(k).cloned()),
+                    e.on_server_down,
+                    e.interface.as_deref(),
+                ),
+                None => (
+                    Some(state.server_pool.clone()),
+                    None,
+                    state.on_server_down,
+                    None,
+                ),
+            };
+            let primary = match primary {
+                Some(pool) => pool,
+                None => {
+                    // Профилю нужен пул, которого нет в реестре. Это ошибка
+                    // сборки, но соединение обязано закрыться, а не уйти
+                    // незаданным путём (XR-310, fail-closed).
+                    tracing::error!(
+                        "exit pool missing, dropping {} -> {}",
+                        client_addr,
+                        orig_dst
+                    );
                     return Ok(());
                 }
             };
-            set_keepalive(&target);
-            tunnel::relay_bidirectional(&mut client, &mut target, max_lifetime).await
-        }
-        Action::Proxy => {
-            // Connect through the obfuscated tunnel.
-            //
-            // We distinguish errors by side: if the LAN client closed first
-            // (RST/EPIPE on read/write), there is nothing to fall back to —
-            // the local socket is dead. Only tunnel-side failures justify the
-            // direct fallback.
-            match tunnel_connection(&mut client, orig_dst, sni_name.as_deref(), &state, idle_timeout, max_lifetime).await {
+            let target_addr = target_addr_for(orig_dst, sni_name.as_deref());
+
+            // Резерв канала пробуется только на отказе открытия стрима: как
+            // только релей тронул байты клиента, повторная отправка через
+            // другой пул дублировала бы поток.
+            let mux_stream = match primary.open_stream(&target_addr).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    let mut retry = None;
+                    if let Some(fb_pool) = &fallback {
+                        tracing::warn!(
+                            "pool exhausted for {} ({}), retrying via fallback wan",
+                            orig_dst,
+                            e
+                        );
+                        retry = fb_pool.open_stream(&target_addr).await.ok();
+                    }
+                    match retry {
+                        Some(stream) => stream,
+                        None => {
+                            tracing::warn!(
+                                "Tunnel to {} failed: {}, fallback={:?}",
+                                orig_dst,
+                                e,
+                                on_down
+                            );
+                            if on_down == Action::Direct {
+                                return direct_relay(
+                                    &mut client,
+                                    orig_dst,
+                                    iface,
+                                    direct_connect_timeout,
+                                    max_lifetime,
+                                )
+                                .await;
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+            };
+            match relay_mux(&mut client, mux_stream, idle_timeout, max_lifetime).await {
                 Ok(()) => Ok(()),
                 Err(RelayError::LocalClient(e)) => {
-                    tracing::debug!("LAN client closed early ({} -> {}): {}", client_addr, orig_dst, e);
+                    tracing::debug!(
+                        "LAN client closed early ({} -> {}): {}",
+                        client_addr,
+                        orig_dst,
+                        e
+                    );
                     Ok(())
                 }
                 Err(RelayError::Tunnel(e)) => {
-                    tracing::warn!("Tunnel to {} failed: {}, fallback={:?}",
-                        orig_dst, e, state.on_server_down);
-                    if state.on_server_down == Action::Direct {
-                        // Fallback: try direct connection.
-                        let mut target = match tokio::time::timeout(
-                            direct_connect_timeout,
-                            TcpStream::connect(orig_dst),
-                        ).await {
-                            Ok(Ok(s)) => s,
-                            Ok(Err(e)) => return Err(e),
-                            Err(_) => {
-                                tracing::debug!("direct fallback to {} timed out", orig_dst);
-                                return Ok(());
-                            }
-                        };
-                        set_keepalive(&target);
-                        tunnel::relay_bidirectional(&mut client, &mut target, max_lifetime).await
+                    tracing::warn!(
+                        "Tunnel to {} failed: {}, fallback={:?}",
+                        orig_dst,
+                        e,
+                        on_down
+                    );
+                    if on_down == Action::Direct {
+                        direct_relay(&mut client, orig_dst, iface, direct_connect_timeout, max_lifetime).await
                     } else {
                         Err(e)
                     }
                 }
             }
         }
+    }
+}
+
+/// Прямое соединение с целью через выбранный канал и релей без туннеля.
+/// Таймаут соединения здесь не ошибка: молчащее соединение закрывается
+/// тихо, как и до XR-292.
+async fn direct_relay(
+    client: &mut TcpStream,
+    orig_dst: SocketAddr,
+    iface: Option<&str>,
+    connect_timeout: Duration,
+    max_lifetime: Duration,
+) -> io::Result<()> {
+    let mut target = match wan::connect_via(iface, orig_dst, connect_timeout).await {
+        Ok(stream) => stream,
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+            tracing::debug!("direct connect to {} timed out", orig_dst);
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    set_keepalive(&target);
+    tunnel::relay_bidirectional(client, &mut target, max_lifetime).await
+}
+
+/// Адрес цели для туннеля: подсмотренное доменное имя экономит серверу
+/// резолв, без имени уходит оригинальный адрес.
+fn target_addr_for(orig_dst: SocketAddr, sni_name: Option<&str>) -> TargetAddr {
+    if let Some(domain) = sni_name {
+        TargetAddr::Domain(domain.to_string(), orig_dst.port())
+    } else {
+        TargetAddr::Ip(orig_dst)
     }
 }
 
@@ -375,32 +529,9 @@ impl From<RelayError> for io::Error {
     }
 }
 
-// ── Tunnel through server ────────────────────────────────────────────
-
-async fn tunnel_connection(
-    client: &mut TcpStream,
-    orig_dst: SocketAddr,
-    sni_name: Option<&str>,
-    state: &ProxyState,
-    idle_timeout: Duration,
-    max_lifetime: Duration,
-) -> Result<(), RelayError> {
-    let target_addr = if let Some(domain) = sni_name {
-        TargetAddr::Domain(domain.to_string(), orig_dst.port())
-    } else {
-        TargetAddr::Ip(orig_dst)
-    };
-
-    // Failure to open a mux stream is a tunnel-side problem (mux dead,
-    // ConnectAck timeout, etc.), so the direct fallback is appropriate. Err
-    // от server_pool означает, что исчерпан весь пул серверов, не один VPS.
-    let mux_stream = state
-        .server_pool
-        .open_stream(&target_addr)
-        .await
-        .map_err(RelayError::Tunnel)?;
-    relay_mux(client, mux_stream, idle_timeout, max_lifetime).await
-}
+// Открытие стрима живёт в handle_connection: выбор пула, резерв канала и
+// прямой запасной ход переплетены с решением политики (XR-310), а сам релей
+// ниже устроен одинаково для любого пула.
 
 /// Relay data between a local client and a MuxStream.
 ///
@@ -466,6 +597,26 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
     use xr_proto::config::{RoutingConfig, RoutingRule};
+
+    #[test]
+    fn web_port_trusts_routing_rules() {
+        assert_eq!(verdict_action(true, false, Action::Proxy), Action::Proxy);
+        assert_eq!(verdict_action(true, false, Action::Direct), Action::Direct);
+        assert_eq!(verdict_action(true, false, Action::Block), Action::Block);
+    }
+
+    #[test]
+    fn off_web_port_tls_first_byte_wins_over_rules() {
+        // Эвристика XR-292: вне web-портов первый байт 0x16 это Proxy, даже
+        // если правила по SNI сказали Direct.
+        assert_eq!(verdict_action(false, true, Action::Direct), Action::Proxy);
+    }
+
+    #[test]
+    fn off_web_port_silence_and_plain_bytes_go_direct() {
+        assert_eq!(verdict_action(false, false, Action::Proxy), Action::Direct);
+        assert_eq!(verdict_action(false, false, Action::Block), Action::Direct);
+    }
 
     /// ClientHello с SNI и расширением перед ним: имя лежит дальше первого
     /// сегмента, ровно как у браузера с постквантовым key_share.
