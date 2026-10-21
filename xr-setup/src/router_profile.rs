@@ -6,7 +6,7 @@
 use crate::actions::{InstallBinary, InstallScript, Restart, Sysctl, WriteConfig};
 use crate::arch::Arch;
 use crate::fetch::BinSource;
-use crate::openwrt::{DnsmasqForwarder, ProcdService, WifiSsid};
+use crate::openwrt::{DnsmasqForwarder, ProcdService, SecondWan, WifiSsid};
 use crate::render::{
     render_control_section, render_router_toml, RouterTomlParams, KILLSWITCH_CLEANUP,
     KILLSWITCH_SETUP, ROUTER_INIT, ROUTER_SYSCTL_CONF, ROUTER_WATCHDOG, UDP_TPROXY_CLEANUP,
@@ -38,8 +38,18 @@ pub struct RouterOpts {
     pub name: Option<String>,
     pub ssid: Option<String>,
     pub wifi_pass: Option<String>,
+    /// Второй WAN (XR-310): порт уходит из br-lan под интерфейс wan2.
+    pub second_wan: Option<SecondWanOpts>,
     pub source: Option<BinSource>,
     pub force: bool,
+}
+
+/// Настройка второго канала из флагов установщика.
+pub struct SecondWanOpts {
+    pub port: String,
+    pub metric: u32,
+    /// Режим отката: снять wan2 и вернуть порт в мост.
+    pub remove: bool,
 }
 
 pub struct Resolved {
@@ -49,6 +59,7 @@ pub struct Resolved {
     pub config: String,
     pub enroll: Option<EnrollParams>,
     pub ssid: Option<(String, Option<String>)>,
+    pub second_wan: Option<SecondWanOpts>,
 }
 
 pub struct EnrollParams {
@@ -90,9 +101,14 @@ pub fn resolve(opts: RouterOpts) -> Result<Resolved> {
         }
         // Перегенерация под --force не должна стирать выданную реестром
         // идентичность: повторный enroll одноразовым токеном невозможен.
+        // Политики устройств (XR-310) переносятся тем же правилом, что и
+        // машинные исключения: они описывают конкретную LAN этой машины.
         Ok(old) => {
             if let Some(control) = carry_control(&old) {
                 config.push_str(&control);
+            }
+            if let Some(policy) = carry_device_policy(&old) {
+                config.push_str(&policy);
             }
         }
         Err(_) => {}
@@ -118,7 +134,31 @@ pub fn resolve(opts: RouterOpts) -> Result<Resolved> {
         config,
         enroll,
         ssid: opts.ssid.map(|s| (s, opts.wifi_pass)),
+        second_wan: opts.second_wan,
     })
+}
+
+/// Перенести `[[wan]]`, `[[exit]]` и `[[device]]` из старого конфига в новый
+/// (XR-310). Секции описывают конкретную LAN и каналы этой машины, из флагов
+/// установщика их не восстановить, поэтому перегенерация под --force несёт
+/// их за собой, как несёт `bypass_rules`.
+pub fn carry_device_policy(old_config: &str) -> Option<String> {
+    let v: toml::Value = old_config.parse().ok()?;
+    let mut carried = String::new();
+    for key in ["wan", "exit", "device"] {
+        let Some(list) = v.get(key).and_then(|x| x.as_array()) else {
+            continue;
+        };
+        if list.is_empty() {
+            continue;
+        }
+        let mut table = toml::map::Map::new();
+        table.insert(key.to_string(), toml::Value::Array(list.clone()));
+        let chunk = toml::to_string(&toml::Value::Table(table)).ok()?;
+        carried.push_str(&chunk);
+        carried.push('\n');
+    }
+    (!carried.is_empty()).then_some(carried)
 }
 
 /// Перенести исключения перехвата из старого конфига машины (XR-248).
@@ -213,6 +253,17 @@ pub fn plan(r: &Resolved) -> Vec<Box<dyn Step>> {
             rc_link: PathBuf::from(RC_LINK),
         }),
     ];
+
+    // Второй WAN (XR-310) до enroll и SSID: раскладка порта не зависит от
+    // хаба, а применить её надо до того, как в порт воткнут кабель второго
+    // провайдера.
+    if let Some(w) = &r.second_wan {
+        steps.push(Box::new(SecondWan {
+            port: w.port.clone(),
+            metric: w.metric,
+            remove: w.remove,
+        }));
+    }
 
     // Enroll после старта клиента (LLD-13 п. 2.1) и после dnsmasq: имя
     // хаба резолвится уже форвардером через туннель, а не резолверами
@@ -396,6 +447,7 @@ mod tests {
                 name: "router-de".into(),
             }),
             ssid: ssid.then(|| ("HomeNet".to_string(), None)),
+            second_wan: None,
         }
     }
 
@@ -432,6 +484,56 @@ mod tests {
             "имя хаба резолвится уже форвардером через туннель"
         );
         assert_eq!(names.last().unwrap(), "wifi:ssid", "смена SSID строго последняя");
+    }
+
+    /// Второй WAN стоит до dnsmasq и enroll (XR-310): порт должен освободиться
+    /// из моста до подключения второго провайдера, а последующие шаги не
+    /// зависят от того, живёт ли уже второй канал.
+    #[test]
+    fn second_wan_step_sits_before_dns_and_enroll() {
+        let mut r = resolved(true, false);
+        r.second_wan = Some(SecondWanOpts {
+            port: "lan4".into(),
+            metric: 40,
+            remove: false,
+        });
+        let plan_names = names(&r);
+        let pos = |n: &str| plan_names.iter().position(|x| x == n).unwrap();
+        assert!(pos("wan:second") < pos("dnsmasq:tunnel"));
+        assert!(pos("wan:second") < pos("hub:enroll"));
+
+        r.second_wan = Some(SecondWanOpts {
+            port: "lan4".into(),
+            metric: 40,
+            remove: true,
+        });
+        let removal_names = names(&r);
+        assert!(removal_names.contains(&"wan:second-remove".to_string()));
+    }
+
+    /// Перегенерация под --force переносит политики устройств (XR-310) как
+    /// машинные исключения: они описывают конкретную LAN, из флагов их
+    /// не восстановить.
+    #[test]
+    fn force_carries_device_policy_sections() {
+        let old = "[obfuscation]\nkey = \"QUJD\"\n\
+[[wan]]\nname = \"fast\"\ninterface = \"eth1\"\n\
+[[exit]]\nname = \"fast-direct\"\nwan = \"fast\"\naction = \"direct\"\n\
+[[device]]\nname = \"pc\"\nips = [\"192.0.2.10\"]\ndefault_exit = \"fast-direct\"\n";
+        let carried = carry_device_policy(old).expect("секции должны переехать");
+        assert!(carried.contains("[[wan]]"));
+        assert!(carried.contains("interface = \"eth1\""));
+        assert!(carried.contains("[[exit]]"));
+        assert!(carried.contains("[[device]]"));
+        assert!(carried.contains("default_exit = \"fast-direct\""));
+        // Перенесённое собирается в конфиг клиента и проходит его разбор.
+        let merged = format!("[obfuscation]\nkey = \"QUJD\"\n[routing]\ndefault_action = \"direct\"\n{carried}");
+        let parsed: xr_proto::config::ClientConfig = toml::from_str(&merged).unwrap();
+        assert_eq!(parsed.wan.len(), 1);
+        assert_eq!(parsed.exit.len(), 1);
+        assert_eq!(parsed.device.len(), 1);
+
+        assert!(carry_device_policy("[client]\nlisten_port = 1080\n").is_none());
     }
 
     /// Порт в секции `[dns]` конфига и порт, на который шаг переводит dnsmasq,

@@ -105,6 +105,16 @@ struct RouterArgs {
     /// Пароль Wi-Fi (psk2); без флага шифрование не трогается
     #[arg(long, requires = "ssid")]
     wifi_pass: Option<String>,
+    /// Порт роутера под второй WAN (XR-310): уходит из br-lan, под ним
+    /// поднимается интерфейс wan2 с proto dhcp
+    #[arg(long)]
+    second_wan_port: Option<String>,
+    /// Метрика интерфейса wan2: выше основной, маршрут по умолчанию не меняется
+    #[arg(long, default_value_t = 40, requires = "second_wan_port")]
+    second_wan_metric: u32,
+    /// Снять второй WAN и вернуть порт в br-lan (XR-310)
+    #[arg(long, requires = "second_wan_port")]
+    second_wan_remove: bool,
     /// База раздачи бинарей (как у server)
     #[arg(long, conflicts_with = "from_dir")]
     dist_url: Option<String>,
@@ -141,6 +151,11 @@ fn run_router(args: RouterArgs) -> Result<()> {
         name: args.name,
         ssid: args.ssid,
         wifi_pass: args.wifi_pass,
+        second_wan: args.second_wan_port.map(|port| router_profile::SecondWanOpts {
+            port,
+            metric: args.second_wan_metric,
+            remove: args.second_wan_remove,
+        }),
         source,
         force: args.force,
     };
