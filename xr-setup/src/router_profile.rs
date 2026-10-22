@@ -94,16 +94,18 @@ pub fn resolve(opts: RouterOpts) -> Result<Resolved> {
     };
     let mut config = render_router_toml(&params);
     match old_config {
-        Ok(_) if !opts.force => {
+        Ok(old) if !opts.force => {
             println!(
                 "  внимание: {CLIENT_CONF} уже существует и останется как есть (нужен --force)"
             );
+            config = old;
         }
         // Перегенерация под --force не должна стирать выданную реестром
         // идентичность: повторный enroll одноразовым токеном невозможен.
         // Политики устройств (XR-310) переносятся тем же правилом, что и
         // машинные исключения: они описывают конкретную LAN этой машины.
         Ok(old) => {
+            config = crate::wan_pool_setup::carry(&config, &old)?;
             if let Some(control) = carry_control(&old) {
                 config.push_str(&control);
             }
@@ -113,6 +115,7 @@ pub fn resolve(opts: RouterOpts) -> Result<Resolved> {
         }
         Err(_) => {}
     }
+    crate::wan_pool_setup::parse(&config)?;
 
     let enroll = match (&opts.enroll_token, &opts.hub_url) {
         (Some(token), Some(url)) => Some(EnrollParams {
@@ -247,11 +250,6 @@ pub fn plan(r: &Resolved) -> Vec<Box<dyn Step>> {
             path: PathBuf::from(SYSCTL_FILE),
             content: ROUTER_SYSCTL_CONF.into(),
         }),
-        Box::new(ProcdService {
-            init_path: PathBuf::from(INIT_PATH),
-            content: ROUTER_INIT.into(),
-            rc_link: PathBuf::from(RC_LINK),
-        }),
     ];
 
     // Второй WAN (XR-310) до enroll и SSID: раскладка порта не зависит от
@@ -264,6 +262,16 @@ pub fn plan(r: &Resolved) -> Vec<Box<dyn Step>> {
             remove: w.remove,
         }));
     }
+    if let Ok(Some(pool)) = crate::wan_pool_setup::parse(&r.config) {
+        steps.push(Box::new(crate::wan_pool_setup::WanPool { pool }));
+    } else if crate::wan_pool_setup::WanPoolDisabled::needed() {
+        steps.push(Box::new(crate::wan_pool_setup::WanPoolDisabled));
+    }
+    steps.push(Box::new(ProcdService {
+        init_path: PathBuf::from(INIT_PATH),
+        content: ROUTER_INIT.into(),
+        rc_link: PathBuf::from(RC_LINK),
+    }));
 
     // Enroll после старта клиента (LLD-13 п. 2.1) и после dnsmasq: имя
     // хаба резолвится уже форвардером через туннель, а не резолверами
@@ -509,6 +517,19 @@ mod tests {
         });
         let removal_names = names(&r);
         assert!(removal_names.contains(&"wan:second-remove".to_string()));
+    }
+
+    #[test]
+    fn pool_is_installed_after_second_wan_before_client_service() {
+        let mut r = resolved(false, false);
+        r.second_wan = Some(SecondWanOpts { port: "lan1".into(), metric: 40, remove: false });
+        r.config = crate::wan_pool_setup::carry(&r.config, "[client]\nwan_pool=[{interface='wan',weight=1},{interface='lan1',weight=3}]\nwan_pool_bypass_ips=['192.168.1.42']\n").unwrap();
+        let names = names(&r);
+        let pos = |n: &str| names.iter().position(|x| x == n).unwrap();
+        assert!(pos("wan:second") < pos("wan:pool"));
+        assert!(pos("wan:pool") < pos("service:xr-proxy"));
+        assert!(pos("wan:pool") < pos("dnsmasq:tunnel"));
+        assert!(!super::tests::names(&resolved(false, false)).contains(&"wan:pool".to_string()));
     }
 
     /// Перегенерация под --force переносит политики устройств (XR-310) как

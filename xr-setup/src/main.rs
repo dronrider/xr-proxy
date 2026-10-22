@@ -13,6 +13,7 @@ mod router_profile;
 mod secrets;
 mod server_profile;
 mod steps;
+mod wan_pool_setup;
 
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};

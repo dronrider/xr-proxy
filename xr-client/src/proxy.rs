@@ -75,6 +75,9 @@ pub struct ProxyState {
     /// плюс подмножество серверов. Ключ пула по умолчанию здесь тоже,
     /// профиль без `wan` с полным списком попадает на `server_pool`.
     pub pools: HashMap<String, Arc<ServerPool>>,
+    pub wan_pool: Option<Arc<wan::WanPool>>,
+    pub wan_pool_bypass_ips: Vec<String>,
+    pub default_pool_key: String,
 }
 
 /// Enable TCP keepalive on a stream to detect dead connections.
@@ -376,6 +379,10 @@ async fn handle_connection(
     // runtime и тормозит легитимный YouTube-трафик.
     let direct_connect_timeout = Duration::from_secs(5);
 
+    let balanced = if exit.as_ref().is_none_or(|e| e.use_wan_pool)
+        && !xr_proto::config::wan_pool_bypasses(&state.wan_pool_bypass_ips, client_addr.ip())
+    { state.wan_pool.as_deref() } else { None };
+
     match action {
         Action::Block => {
             // Правило маршрутизации явно блокирует: рвём соединение, наружу не
@@ -387,7 +394,7 @@ async fn handle_connection(
             // Напрямую к цели через канал профиля: у устройства без профиля
             // это основной маршрут ОС, как и до XR-310.
             let iface = exit.as_ref().and_then(|e| e.interface.as_deref());
-            direct_relay(&mut client, orig_dst, iface, direct_connect_timeout, max_lifetime).await
+            direct_relay(&mut client, orig_dst, iface, balanced, direct_connect_timeout, max_lifetime).await
         }
         Action::Proxy => {
             // Туннель через пул профиля. Для устройства без профиля это пул
@@ -427,7 +434,14 @@ async fn handle_connection(
             // Резерв канала пробуется только на отказе открытия стрима: как
             // только релей тронул байты клиента, повторная отправка через
             // другой пул дублировала бы поток.
-            let mux_stream = match primary.open_stream(&target_addr).await {
+            let opened = if let Some(wan_pool) = balanced {
+                let key = exit.as_ref().map(|e| e.pool_key.as_str())
+                    .unwrap_or(&state.default_pool_key);
+                wan_pool.open_stream(key, &target_addr).await
+            } else {
+                primary.open_stream(&target_addr).await
+            };
+            let mux_stream = match opened {
                 Ok(stream) => stream,
                 Err(e) => {
                     let mut retry = None;
@@ -453,6 +467,7 @@ async fn handle_connection(
                                     &mut client,
                                     orig_dst,
                                     iface,
+                                    balanced,
                                     direct_connect_timeout,
                                     max_lifetime,
                                 )
@@ -482,7 +497,7 @@ async fn handle_connection(
                         on_down
                     );
                     if on_down == Action::Direct {
-                        direct_relay(&mut client, orig_dst, iface, direct_connect_timeout, max_lifetime).await
+                        direct_relay(&mut client, orig_dst, iface, balanced, direct_connect_timeout, max_lifetime).await
                     } else {
                         Err(e)
                     }
@@ -499,10 +514,15 @@ async fn direct_relay(
     client: &mut TcpStream,
     orig_dst: SocketAddr,
     iface: Option<&str>,
+    balanced: Option<&wan::WanPool>,
     connect_timeout: Duration,
     max_lifetime: Duration,
 ) -> io::Result<()> {
-    let mut target = match wan::connect_via(iface, orig_dst, connect_timeout).await {
+    let connection = match balanced {
+        Some(pool) => pool.connect(orig_dst, connect_timeout).await,
+        None => wan::connect_via(iface, orig_dst, connect_timeout).await,
+    };
+    let mut target = match connection {
         Ok(stream) => stream,
         Err(e) if e.kind() == io::ErrorKind::TimedOut => {
             tracing::debug!("direct connect to {} timed out", orig_dst);

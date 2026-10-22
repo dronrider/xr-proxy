@@ -24,6 +24,7 @@ pub struct ExitProfile {
     /// Интерфейс канала для SO_BINDTODEVICE. `None` означает основной
     /// маршрут ОС.
     pub interface: Option<String>,
+    pub use_wan_pool: bool,
     /// Ключ пула серверов профиля, см. [`pool_key`].
     pub pool_key: String,
     /// Ключ резервного пула, если задан `fallback_wan`.
@@ -329,7 +330,7 @@ impl DevicePolicySet {
             // совпадает с общим только при полном списке.
             for name in [exit.wan.as_deref(), exit.fallback_wan.as_deref()] {
                 let interface = match name {
-                    None | Some("") => None,
+                    None | Some("") | Some(MAIN_WAN) => None,
                     Some(n) => Some(
                         by_name
                             .get(n)
@@ -397,7 +398,7 @@ fn compile_exit(
     let interface_of = |wan: &Option<String>, field: &str| -> Result<Option<String>, String> {
         match wan.as_deref() {
             None | Some("") => Ok(None),
-            Some(MAIN_WAN) => Err(format!("{section}: {field} 'main' зарезервирован")),
+            Some(MAIN_WAN) => Ok(None),
             Some(name) => Ok(Some(
                 channels
                     .get(name)
@@ -416,13 +417,14 @@ fn compile_exit(
     }
     let owned: Vec<ServerEntry> = servers.iter().map(|s| (*s).clone()).collect();
     let key = pool_key(interface.as_deref(), &owned);
-    let fallback_pool_key = fallback_interface
-        .as_deref()
-        .map(|iface| pool_key(Some(iface), &owned));
+    let fallback_pool_key = exit.fallback_wan.as_ref()
+        .filter(|name| !name.is_empty())
+        .map(|_| pool_key(fallback_interface.as_deref(), &owned));
     Ok(ExitProfile {
         name: exit.name.clone(),
         action,
         interface,
+        use_wan_pool: exit.wan.as_deref().is_none_or(str::is_empty),
         pool_key: key,
         fallback_pool_key,
         on_server_down,
@@ -503,6 +505,29 @@ mod tests {
         port = 8443
         priority = 1
     "#;
+
+    #[test]
+    fn explicit_main_exit_stays_pinned_when_wan_pool_is_enabled() {
+        let cfg = config(&format!(r#"{BASE}
+[client]
+wan_pool = [{{ interface="wan", weight=1 }}, {{ interface="lan1", weight=3 }}]
+[[exit]]
+name = "fixed"
+wan = "main"
+action = "proxy"
+[[device]]
+name = "admin"
+ips = ["192.168.1.20"]
+default_exit = "fixed"
+"#));
+        let set = DevicePolicySet::compile(&cfg).unwrap();
+        let PolicyDecision::Exit { exit, .. } = set.decide(
+            "192.168.1.20".parse().unwrap(), None, "1.1.1.1".parse().unwrap()
+        ) else { panic!("explicit exit must match") };
+        assert!(!exit.use_wan_pool);
+        assert!(exit.interface.is_none());
+        assert!(set.pool_specs(&cfg).unwrap().iter().all(|spec| spec.interface.is_none()));
+    }
 
     #[test]
     fn empty_policy_decides_global() {
