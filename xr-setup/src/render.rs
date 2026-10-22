@@ -17,6 +17,10 @@ pub const KILLSWITCH_SETUP: &str = include_str!("../../scripts/killswitch-setup.
 pub const KILLSWITCH_CLEANUP: &str = include_str!("../../scripts/killswitch-cleanup.sh");
 pub const UDP_TPROXY_SETUP: &str = include_str!("../../scripts/udp-tproxy-setup.sh");
 pub const UDP_TPROXY_CLEANUP: &str = include_str!("../../scripts/udp-tproxy-cleanup.sh");
+pub const WAN_POOL_SETUP: &str = include_str!("../../scripts/wan-pool-setup.sh");
+pub const WAN_POOL_CLEANUP: &str = include_str!("../../scripts/wan-pool-cleanup.sh");
+pub const WAN_POOL_WATCH: &str = include_str!("../../scripts/wan-pool-watch.sh");
+pub const WAN_POOL_INIT: &str = include_str!("../../deploy/xr-wan-pool.init");
 
 /// Бэкап состояния хаба (XR-224): тот же скрипт, что кладут руками.
 pub const HUB_BACKUP: &str = include_str!("../../deploy/xr-hub-backup.sh");

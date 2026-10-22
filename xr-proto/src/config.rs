@@ -164,8 +164,18 @@ pub struct RoutingRule {
     pub geoip: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct WanPoolMember {
+    pub interface: String,
+    pub weight: u32,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ClientSettings {
+    #[serde(default)]
+    pub wan_pool: Vec<WanPoolMember>,
+    #[serde(default)]
+    pub wan_pool_bypass_ips: Vec<String>,
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
     #[serde(default = "default_true")]
@@ -201,6 +211,8 @@ pub struct ClientSettings {
 impl Default for ClientSettings {
     fn default() -> Self {
         Self {
+            wan_pool: vec![],
+            wan_pool_bypass_ips: vec![],
             listen_port: default_listen_port(),
             auto_redirect: true,
             on_server_down: default_on_server_down(),
@@ -690,6 +702,42 @@ pub fn validate_client_config(config: &ClientConfig) -> Result<(), String> {
     // Секции XR-310 проверяются тем же разбором, которым старт соберёт
     // политики: validate не может пропустить то, что уронит старт.
     crate::device::policy_reject_reason(config)?;
+    validate_wan_pool(&config.client.wan_pool)?;
+    for range in &config.client.wan_pool_bypass_ips {
+        if crate::routing::CidrRange::parse_ip_or_cidr(range).is_none() {
+            return Err(format!("client.wan_pool_bypass_ips: invalid IP/CIDR '{range}'"));
+        }
+    }
+    Ok(())
+}
+
+pub fn wan_pool_bypasses(ranges: &[String], source: std::net::IpAddr) -> bool {
+    ranges.iter().any(|range| crate::routing::CidrRange::parse_ip_or_cidr(range)
+        .is_some_and(|range| range.contains(source)))
+}
+
+pub fn validate_wan_pool(members: &[WanPoolMember]) -> Result<(), String> {
+    if members.len() > 8 {
+        return Err("client.wan_pool: at most 8 members are supported".into());
+    }
+    let mut interfaces = std::collections::HashSet::new();
+    let mut total = 0u32;
+    for member in members {
+        let name = &member.interface;
+        if name.is_empty() || name.len() > 15
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b))
+        {
+            return Err(format!("client.wan_pool: invalid interface '{name}'"));
+        }
+        if !interfaces.insert(name) {
+            return Err(format!("client.wan_pool: duplicate interface '{name}'"));
+        }
+        if member.weight == 0 {
+            return Err(format!("client.wan_pool: zero weight for '{name}'"));
+        }
+        total = total.checked_add(member.weight)
+            .ok_or("client.wan_pool: total weight overflow")?;
+    }
     Ok(())
 }
 
@@ -1472,4 +1520,111 @@ pub fn decode_key(key_str: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> 
         return Err("key must not be empty".into());
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod wan_pool_tests {
+    use super::*;
+
+    #[test]
+    fn pool_keeps_local_and_hub_routing_for_all_sources() {
+        let cfg: ClientConfig = toml::from_str(r#"
+[client]
+wan_pool = [{ interface="wan", weight=1 }, { interface="lan1", weight=3 }]
+wan_pool_bypass_ips = ["192.168.1.20"]
+[server]
+address = "192.0.2.1"
+port = 8443
+[obfuscation]
+key = "dGVzdA=="
+[routing]
+default_action = "direct"
+[[routing.rules]]
+action = "block"
+domains = ["blocked.example"]
+"#).unwrap();
+        validate_client_config(&cfg).unwrap();
+        let preset: RoutingConfig = toml::from_str(r#"
+default_action = "direct"
+[[rules]]
+action = "proxy"
+domains = ["private.example"]
+"#).unwrap();
+        let router = crate::routing::Router::from_merged(&cfg.routing, &preset, None);
+        let policies = crate::device::DevicePolicySet::compile(&cfg).unwrap();
+        for source in ["192.168.1.20", "192.168.1.50"] {
+            assert!(matches!(policies.decide(source.parse().unwrap(), Some("private.example"),
+                "1.1.1.1".parse().unwrap()), crate::device::PolicyDecision::Global));
+        }
+        for (domain, expected) in [("private.example", crate::routing::Action::Proxy),
+            ("blocked.example", crate::routing::Action::Block), ("public.example", crate::routing::Action::Direct)] {
+            assert_eq!(router.resolve(Some(domain), "1.1.1.1".parse().unwrap()), expected);
+        }
+    }
+
+    #[test]
+    fn invalid_source_bypass_is_rejected_before_startup() {
+        let cfg: ClientConfig = toml::from_str(r#"
+[client]
+wan_pool = [{ interface="wan", weight=1 }]
+wan_pool_bypass_ips = ["192.168.1.300"]
+[server]
+address = "192.0.2.1"
+port = 8443
+[obfuscation]
+key = "dGVzdA=="
+[routing]
+default_action = "direct"
+"#).unwrap();
+        let err = validate_client_config(&cfg).unwrap_err();
+        assert!(err.contains("wan_pool_bypass_ips"), "{err}");
+    }
+
+    #[test]
+    fn legacy_client_settings_have_no_pool() {
+        let settings: ClientSettings = toml::from_str("").unwrap();
+        assert!(settings.wan_pool.is_empty());
+        assert!(settings.wan_pool_bypass_ips.is_empty());
+    }
+
+    #[test]
+    fn pool_weights_and_interfaces_are_validated() {
+        let settings: ClientSettings = toml::from_str(r#"
+wan_pool = [{ interface = "wan", weight = 1 }, { interface = "lan1", weight = 3 }]
+"#).unwrap();
+        validate_wan_pool(&settings.wan_pool).unwrap();
+        let mut members = settings.wan_pool;
+        members[0].weight = 0;
+        assert!(validate_wan_pool(&members).is_err());
+        members[0].weight = 1;
+        members[1].interface = "wan".into();
+        assert!(validate_wan_pool(&members).is_err());
+        members[1].interface = "bad iface".into();
+        assert!(validate_wan_pool(&members).is_err());
+        members[1].interface = "lan1".into();
+        members[0].weight = u32::MAX;
+        assert!(validate_wan_pool(&members).is_err());
+    }
+
+    #[test]
+    fn pool_accepts_eight_members_and_rejects_nine() {
+        let mut members: Vec<WanPoolMember> = (0..8)
+            .map(|i| WanPoolMember { interface: format!("wan{i}"), weight: 1 })
+            .collect();
+        validate_wan_pool(&members).unwrap();
+        members.push(WanPoolMember { interface: "wan8".into(), weight: 1 });
+        let error = validate_wan_pool(&members).unwrap_err();
+        assert!(error.contains("at most 8"), "{error}");
+    }
+
+    #[test]
+    fn administrator_pool_bypass_matches_only_configured_sources() {
+        let ranges = vec!["192.168.1.20".into(), "192.168.5.0/24".into(), "fd00::/64".into()];
+        for ip in ["192.168.1.20", "192.168.5.17", "fd00::42"] {
+            assert!(wan_pool_bypasses(&ranges, ip.parse().unwrap()));
+        }
+        for ip in ["192.168.1.21", "192.168.6.17", "fd01::42"] {
+            assert!(!wan_pool_bypasses(&ranges, ip.parse().unwrap()));
+        }
+    }
 }

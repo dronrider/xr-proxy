@@ -210,6 +210,34 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(pool.clone().health_loop());
         pools.insert(spec.key, pool);
     }
+    let wan_pool = if config.client.wan_pool.is_empty() {
+        None
+    } else {
+        let mut specs = policy.pool_specs(&config)?;
+        let default_key = xr_proto::device::pool_key(None, &server_entries);
+        let mut balanced = std::collections::HashMap::new();
+        let mut entries_by_key = vec![(default_key, server_entries.clone())];
+        for spec in specs.drain(..).filter(|spec| spec.interface.is_none()) {
+            if !entries_by_key.iter().any(|(key, _)| key == &spec.key) {
+                entries_by_key.push((spec.key, spec.servers));
+            }
+        }
+        for (key, entries) in entries_by_key {
+            let mut member_pools = Vec::new();
+            for member in &config.client.wan_pool {
+                let pool = build_server_pool(
+                    &entries, Some(&member.interface), &config.obfuscation,
+                    &codec, config.client.mux_pool_size,
+                )?;
+                tokio::spawn(pool.clone().health_loop());
+                member_pools.push(pool);
+                tracing::info!("WAN pool '{}' via {} weight {}", key, member.interface, member.weight);
+            }
+            balanced.insert(key, member_pools);
+        }
+        Some(Arc::new(wan::WanPool::new(config.client.wan_pool.clone(), balanced)))
+    };
+
     if let Some(udp) = config.udp_relay.as_ref().filter(|u| u.enabled) {
         for warning in policy.udp_relay_overlap_warnings(&udp.source_ips) {
             tracing::warn!("{warning}");
@@ -223,6 +251,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         server_pool,
         policy,
         pools,
+        wan_pool,
+        wan_pool_bypass_ips: config.client.wan_pool_bypass_ips.clone(),
+        default_pool_key: xr_proto::device::pool_key(None, &server_entries),
     });
 
     // Setup firewall redirect
@@ -281,6 +312,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let pool = state.pools.get(key).expect("ключ только что был");
             if !dns_pools.iter().any(|p| Arc::ptr_eq(p, pool)) {
                 dns_pools.push(pool.clone());
+            }
+        }
+        if let Some(wan_pool) = &state.wan_pool {
+            if let Some(pools) = wan_pool.pools.get(&state.default_pool_key) {
+                dns_pools.extend(pools.iter().cloned());
             }
         }
         match dns_upstreams(&dns_config) {
