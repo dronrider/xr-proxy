@@ -174,6 +174,17 @@ fn is_web_port(port: u16) -> bool {
     matches!(port, 80 | 443)
 }
 
+/// SNI, который политика устройств вправе читать как имя ресурса (XR-310).
+/// Вне web-портов имя недостоверно: маскарад под TLS шлёт ClientHello с
+/// чужими доменами (разбор у `verdict_action`), и доменное правило на
+/// таком имени отправило бы маскирующийся поток не в его профиль, реальный
+/// IP утёк бы там, где профиль обещает прокси. Вне 80/443 политика
+/// получает `None`, у правил устройств остаются совпадения `ip_ranges`;
+/// общий путь `[routing]` поступает так же через `verdict_action`.
+fn policy_sni(web_port: bool, sni: Option<&str>) -> Option<&str> {
+    if web_port { sni } else { None }
+}
+
 /// Сколько peek ждёт первые байты клиента. На web-портах SNI решает маршрут,
 /// и ClientHello с постквантовым key_share приезжает медленно и кусками,
 /// поэтому ожидание длинное. Вне web-портов подсмотренные байты нужны ровно
@@ -317,9 +328,11 @@ async fn handle_connection(
     if facts.dead {
         return Ok(());
     }
-    let decision = state
-        .policy
-        .decide(client_addr.ip(), facts.sni.as_deref(), dest_ip);
+    let decision = state.policy.decide(
+        client_addr.ip(),
+        policy_sni(is_web_port(orig_dst.port()), facts.sni.as_deref()),
+        dest_ip,
+    );
     let (action, sni_name, exit) = match decision {
         PolicyDecision::Exit { exit, device, rule } => {
             tracing::info!(
@@ -616,6 +629,16 @@ mod tests {
     fn off_web_port_silence_and_plain_bytes_go_direct() {
         assert_eq!(verdict_action(false, false, Action::Proxy), Action::Direct);
         assert_eq!(verdict_action(false, false, Action::Block), Action::Direct);
+    }
+
+    #[test]
+    fn device_policy_sees_sni_only_on_web_ports() {
+        // XR-310: вне web-портов SNI это чужое имя из маскарада под TLS,
+        // доменное правило устройства на нём совпадать не обязано. Решение
+        // остаётся за default_exit и ip_ranges.
+        assert_eq!(policy_sni(true, Some("ssl.gstatic.com")), Some("ssl.gstatic.com"));
+        assert_eq!(policy_sni(false, Some("ssl.gstatic.com")), None);
+        assert_eq!(policy_sni(true, None), None);
     }
 
     /// ClientHello с SNI и расширением перед ним: имя лежит дальше первого
