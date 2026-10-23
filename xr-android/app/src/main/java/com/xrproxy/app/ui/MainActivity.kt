@@ -192,7 +192,10 @@ fun MainScreen(
     }
     val ssidPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissionEpoch++ }
+    ) {
+        permissionEpoch++
+        viewModel.onSsidPermissionChanged()
+    }
 
     // SAF document picker for downloading the log (LLD-03 §3.5). Writes the
     // full log to the user-chosen location; no storage permission needed.

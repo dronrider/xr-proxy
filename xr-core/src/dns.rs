@@ -452,6 +452,18 @@ fn build_dns_response_aaaa(id: u16, question_section: &[u8], ip: Ipv6Addr) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn android_virtual_endpoints_are_never_allocated() {
+        let dns = FakeDns::new();
+        let tun = Ipv4Addr::new(198, 18, 0, 0);
+        let resolver = Ipv4Addr::new(198, 19, 255, 255);
+        for index in 0..=131_072 {
+            let ip = dns.allocate(&format!("{index}.example.test"));
+            assert_ne!(ip, tun, "Android TUN address allocated at {index}");
+            assert_ne!(ip, resolver, "Android DNS address allocated at {index}");
+        }
+    }
     use std::collections::HashSet;
 
     #[test]

@@ -17,6 +17,7 @@ android {
         applicationId = "com.xrproxy.app"
         minSdk = 29
         targetSdk = 34
+        testInstrumentationRunner = "com.xrproxy.app.service.TrustedNetworkInstrumentation"
         // versionCode гейтит самообновление (LLD-12): приложение предлагает
         // апдейт только если version_code манифеста строго больше
         // установленного. Бампать на каждый релиз; переопределяется проперти

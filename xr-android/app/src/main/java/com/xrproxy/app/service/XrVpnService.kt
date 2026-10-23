@@ -284,6 +284,7 @@ class XrVpnService : VpnService() {
     // RestorePolicy.foregroundLocationTypeAllowed: поле пишет main до
     // запуска корутины старта.
     @Volatile private var sessionFromUi = false
+    @Volatile private var lastTrustVisibilityWarning: String? = null
 
     // Speed tracking: previous snapshot for delta computation
     private var prevBytesUp: Long = 0
@@ -518,6 +519,36 @@ class XrVpnService : VpnService() {
      *  to pre-fill "add current network". Null when unknown / non-Wi-Fi. */
     fun currentRawSsidOrNull(): String? = currentRawSsid
 
+    fun onAppForeground() {
+        val phase = _stateFlow.value.phase
+        if (foregroundServiceType and android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION == 0 &&
+            phase != Phase.Idle && phase != Phase.Error && phase != Phase.Stopping &&
+            checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            // Фоновое восстановление не могло запросить location. Видимый UI
+            // позволяет добавить тип к уже работающему сервису без нового TUN.
+            val wasFromUi = sessionFromUi
+            sessionFromUi = true
+            try {
+                startForegroundWithLocationType()
+                NativeBridge.nativeJournalLog("INFO", "net", "чтение SSID на фоне включено после открытия приложения")
+            } catch (e: RuntimeException) {
+                sessionFromUi = wasFromUi
+                NativeBridge.nativeJournalLog("WARN", "net", "не удалось включить чтение SSID на фоне: ${e.javaClass.simpleName}")
+            }
+        }
+        reevaluateTrustedNetwork()
+    }
+
+    fun onTrustedNetworksChanged() {
+        if (_stateFlow.value.phase == Phase.Paused && !isTrusted(_stateFlow.value.pausedSsid)) {
+            scope.launch { requestResume("изменились настройки доверенных сетей") }
+        } else {
+            reevaluateTrustedNetwork()
+        }
+    }
+
     /** "Включить здесь" (paused card / notification action): bring the tunnel
      *  up on the current trusted network and keep it up until the uplink leaves
      *  that network. Not just a resume from Paused: the tap can land on an
@@ -625,9 +656,8 @@ class XrVpnService : VpnService() {
 
         val builder = Builder()
             .setSession("XR Proxy")
-            .addAddress("10.0.0.2", 32)
-            .addRoute("0.0.0.0", 0)
-            .addDnsServer("10.0.0.1")
+            .addAddress(VpnIpv4Routes.TUN_ADDRESS, 32)
+            .addDnsServer(VpnIpv4Routes.DNS_ADDRESS)
             // 1280 = IPv6 minimum MTU. Mobile IPv6/NAT64 uplinks run MTU ~1300
             // and tunnel stacking (VPN over a router that itself proxies) shrinks
             // it further; a 1500 TUN advertised an MSS the underlay couldn't carry,
@@ -635,6 +665,7 @@ class XrVpnService : VpnService() {
             // on outbound sockets in xr-core session.rs.
             .setMtu(1280)
             .setBlocking(true)
+        VpnIpv4Routes.routes().forEach { builder.addRoute(it.address, it.prefix) }
         excludeAndroidAuto(builder)
         // Слот подготовленного VPN-пакета живёт в системе только до
         // перезагрузки: согласие пользователя (appop ACTIVATE_VPN) переживает
@@ -791,6 +822,7 @@ class XrVpnService : VpnService() {
             // Wi-Fi so a stale association can't pause us on cellular.
             if (_stateFlow.value.phase == Phase.Connected && currentDefaultIsWifi) {
                 val wifiSsid = usableSsid(currentWifiSsidRaw())
+                reportTrustVisibility(wifiSsid ?: currentRawSsid, wifiUplink = true)
                 maybeDisarmOverride(wifiSsid, wifiUplink = true)
                 if (shouldAutoPause(wifiSsid)) {
                     requestPause(wifiSsid)
@@ -1119,6 +1151,24 @@ class XrVpnService : VpnService() {
     private fun usableSsid(raw: String?): String? =
         raw?.takeIf { NativeBridge.nativeNormalizeSsid(it) != null }
 
+    private fun reportTrustVisibility(raw: String?, wifiUplink: Boolean) {
+        if (!wifiUplink || raw != null || trustedRepo.activeTrustedSsids().isEmpty()) {
+            lastTrustVisibilityWarning = null
+            return
+        }
+        val reason = when {
+            checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED -> "не выдано точное местоположение"
+            getSystemService(android.location.LocationManager::class.java)?.isLocationEnabled == false ->
+                "геолокация выключена в настройках Android"
+            !sessionFromUi -> "после фонового восстановления нужно открыть приложение"
+            else -> "Android не передал имя Wi-Fi"
+        }
+        if (reason == lastTrustVisibilityWarning) return
+        lastTrustVisibilityWarning = reason
+        NativeBridge.nativeJournalLog("WARN", "net", "авто-пауза не может проверить доверенную сеть: $reason; туннель остаётся включён")
+    }
+
     /**
      * Raw SSID of the currently associated Wi-Fi via WifiManager. Unlike the
      * NetworkCapabilities path, this is independent of our own VPN being up —
@@ -1159,6 +1209,7 @@ class XrVpnService : VpnService() {
         }
         currentDefaultIsWifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
         currentRawSsid = raw
+        reportTrustVisibility(raw, currentDefaultIsWifi)
         // Unblock startVpn's initial-trust wait now that we have an SSID verdict.
         firstCapsSignal?.complete(Unit)
 
@@ -1632,9 +1683,8 @@ class XrVpnService : VpnService() {
      * The manifest pairs the type with the FOREGROUND_SERVICE_SPECIAL_USE
      * permission and the subtype property.
      *
-     * The price of the location omission: a restored session reads SSID only
-     * after the app is opened again, so trusted-network auto-pause on a
-     * restored session waits for that; the tunnel itself stays up.
+     * A restored session can add location when the app is opened; until then
+     * trusted-network auto-pause may have to wait for a readable SSID.
      */
     private fun startForegroundWithLocationType() {
         val notif = buildNotification(_stateFlow.value)

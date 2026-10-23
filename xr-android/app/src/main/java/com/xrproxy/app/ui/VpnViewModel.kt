@@ -282,7 +282,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             // the service poll-loop frozen with the CPU asleep), so the tunnel
             // can sit up on a trusted Wi-Fi until the app is opened. Doing it
             // here makes opening the app deterministically land the pause.
-            boundService?.reevaluateTrustedNetwork()
+            boundService?.onAppForeground()
             startLogPolling()
         }
 
@@ -360,6 +360,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             val svc = (binder as XrVpnService.LocalBinder).service()
             boundService = svc
+            // onStart может пройти раньше асинхронного bind.
+            if (appForeground) svc.onAppForeground()
             serviceObserverJob?.cancel()
             serviceObserverJob = viewModelScope.launch {
                 svc.stateFlow.collect { applyServiceState(it) }
@@ -617,6 +619,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     // ── Trusted networks / auto-pause (task 3b-2) ───────────────────
 
+    fun onSsidPermissionChanged() {
+        if (appForeground) boundService?.onAppForeground()
+    }
+
     fun addTrustedNetwork(ssid: String) {
         val clean = ssid.trim()
         if (clean.isBlank()) {
@@ -624,11 +630,18 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         trustedRepo.add(clean)
+        boundService?.onTrustedNetworksChanged()
     }
 
-    fun removeTrustedNetwork(ssid: String) = trustedRepo.remove(ssid)
+    fun removeTrustedNetwork(ssid: String) {
+        trustedRepo.remove(ssid)
+        boundService?.onTrustedNetworksChanged()
+    }
 
-    fun setTrustedAutoPauseEnabled(enabled: Boolean) = trustedRepo.setEnabled(enabled)
+    fun setTrustedAutoPauseEnabled(enabled: Boolean) {
+        trustedRepo.setEnabled(enabled)
+        boundService?.onTrustedNetworksChanged()
+    }
 
     /**
      * Best-effort current Wi-Fi SSID for the "add current network" shortcut.
