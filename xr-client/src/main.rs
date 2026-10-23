@@ -747,8 +747,15 @@ mod tests {
                     } else if let Ok(mut tls) = acceptor.accept(stream.into_io()).await {
                         // Настоящие данные поверх TLS подтверждают не только
                         // создание mux-стрима, но и готовность DoT-транспорта.
-                        let mut byte = [0];
-                        let _ = tls.read(&mut byte).await;
+                        use tokio::io::AsyncWriteExt;
+                        loop {
+                            let mut len = [0; 2];
+                            if tls.read_exact(&mut len).await.is_err() { break; }
+                            let mut msg = vec![0; u16::from_be_bytes(len) as usize];
+                            if tls.read_exact(&mut msg).await.is_err() { break; }
+                            if tls.write_all(&len).await.is_err() { break; }
+                            if tls.write_all(&msg).await.is_err() { break; }
+                        }
                     }
                 });
             }
@@ -875,4 +882,27 @@ mod tests {
             "после deadline не должно остаться фонового подключения"
         );
     }
+    #[tokio::test]
+    async fn dns_racing_two_healthy_pools_keeps_winner_stream_alive() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (tls, acceptor) = dns_test_tls();
+        let first = dns_test_serving_pool(acceptor.clone(), false).await;
+        let second = dns_test_serving_pool(acceptor, false).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for round in 0..16u8 {
+                let mut stream = open_dot(vec![first.clone(), second.clone()], tls.clone(),
+                    vec!["9.9.9.9:853".parse().unwrap()], "localhost".try_into().unwrap())
+                    .await.unwrap();
+                for n in 0..8u8 {
+                    let request = [0, 4, round, n, 42, 7];
+                    stream.write_all(&request).await.unwrap();
+                    let mut reply = [0; 6];
+                    stream.read_exact(&mut reply).await
+                        .expect("отмена второго рабочего пула закрыла победивший DoT");
+                    assert_eq!(reply, request);
+                }
+            }
+        }).await.expect("гонка двух рабочих пулов не должна вызвать DNS churn");
+    }
+
 }

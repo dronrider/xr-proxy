@@ -190,9 +190,10 @@ if [ "$TOTAL" -gt 0 ]; then
 else
     echo 'add rule ip xr_wan_pool select drop' >> "$NFT"
 fi
+# Bypass forwarding has no pool mark, and member zones need not enable fw4 NAT.
 for MEMBER in $MEMBERS; do
     DEV=${MEMBER%:*}
-    echo "add rule ip xr_wan_pool nat iifname \"$LAN\" oifname \"$DEV\" meta mark & 0x0f000000 != 0 masquerade" >> "$NFT"
+    echo "add rule ip xr_wan_pool nat iifname \"$LAN\" oifname \"$DEV\" masquerade" >> "$NFT"
 done
 nft -c -f "$NFT"
 nft -f "$NFT"

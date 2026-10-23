@@ -339,11 +339,20 @@ async fn read_answers<R: AsyncRead + Unpin>(mut reader: R, tx: mpsc::Sender<Vec<
     loop {
         let read = async {
             let mut len = [0u8; 2];
-            reader.read_exact(&mut len).await.ok()?;
+            if let Err(error) = reader.read_exact(&mut len).await {
+                tracing::warn!("dns: upstream read length failed ({:?}): {error}", error.kind());
+                return None;
+            }
             let n = u16::from_be_bytes(len) as usize;
-            if n == 0 { return None; }
+            if n == 0 {
+                tracing::warn!("dns: upstream sent a zero-length DNS frame");
+                return None;
+            }
             let mut msg = vec![0u8; n];
-            reader.read_exact(&mut msg).await.ok()?;
+            if let Err(error) = reader.read_exact(&mut msg).await {
+                tracing::warn!("dns: upstream read payload failed ({:?}): {error}", error.kind());
+                return None;
+            }
             Some(msg)
         };
         let msg = tokio::select! {
