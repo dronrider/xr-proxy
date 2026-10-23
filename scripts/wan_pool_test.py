@@ -3,6 +3,7 @@
 import ipaddress
 import json
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import tempfile
@@ -159,6 +160,56 @@ class PoolScripts(unittest.TestCase):
         self.assertIn(["ip", "-4", "rule", "add", "priority", "11100", "oif", "wan", "lookup", "210"], calls)
         self.assertIn(["ip", "-4", "route", "replace", "unreachable", "default", "metric", "32767", "table", "210"], calls)
         self.assertEqual((self.base / "state/fallback-selected").read_text(), "lan1\n")
+
+    def test_raw_forward_bypass_is_masqueraded_without_pool_mark(self):
+        self.cfg["routes"] = "default via 192.0.2.1 dev lan1 table 202\n"
+        self.cfg["main"] = "203.0.113.0/24 dev wg0\n"
+        self.cfg["no_address"] = ["wan"]
+        self.assertEqual(self.run_script().returncode, 0)
+        nft = (self.base / "applied.nft").read_text()
+        bypass = "add rule ip xr_wan_pool select ip saddr 192.168.1.42 return"
+        self.assertIn(bypass, nft)
+        self.assertLess(nft.index(bypass), nft.index("ct mark set"))
+        fallback = self.fallback_routes()[-1]
+        egress = fallback[fallback.index("dev") + 1]
+        nat = [shlex.split(line) for line in nft.splitlines()
+               if line.startswith("add rule ip xr_wan_pool nat ")]
+
+        def forwarded_source(source, ingress, output, mark=0, earlier_binding=None, protocol="tcp", port=22):
+            if earlier_binding is not None:
+                return earlier_binding
+            for rule in nat:
+                if rule[rule.index("iifname") + 1] != ingress or rule[rule.index("oifname") + 1] != output:
+                    continue
+                if "l4proto" in rule and rule[rule.index("l4proto") + 1] != protocol:
+                    continue
+                if ("tcp" in rule and protocol != "tcp") or ("udp" in rule and protocol != "udp"):
+                    continue
+                if "dport" in rule and int(rule[rule.index("dport") + 1]) != port:
+                    continue
+                if "mark" in rule:
+                    start = rule.index("mark")
+                    mask = int(rule[start + 2], 0)
+                    expected = int(rule[start + 4], 0)
+                    actual = mark & mask
+                    comparison = rule[start + 3]
+                    if (comparison == "!=" and actual == expected) or (comparison == "==" and actual != expected):
+                        continue
+                if rule[-1] == "masquerade":
+                    return {"wan": "198.51.100.4", "lan1": "192.0.2.4"}[output]
+            return source
+
+        # Raw forwarding enters here after redirect bypass; no xr-client socket or
+        # outer TLS tunnel supplies a WAN source address on its behalf.
+        for protocol, port in (("tcp", 22), ("tcp", 8443), ("udp", 53)):
+            with self.subTest(protocol=protocol, port=port):
+                self.assertEqual(forwarded_source("192.168.1.42", "br-lan", egress, mark=0, protocol=protocol, port=port), "192.0.2.4")
+        self.assertEqual(forwarded_source("192.168.1.43", "br-lan", egress, mark=0x2000000), "192.0.2.4")
+        self.assertEqual(forwarded_source("192.168.1.42", None, egress), "192.168.1.42")
+        self.assertEqual(forwarded_source("192.168.1.42", "br-lan", "wg0"), "192.168.1.42")
+        self.assertEqual(forwarded_source("203.0.113.8", "lan1", "br-lan"), "203.0.113.8")
+        self.assertEqual(forwarded_source("192.168.1.42", "br-lan", "br-lan"), "192.168.1.42")
+        self.assertEqual(forwarded_source("192.168.1.42", "br-lan", "wan", earlier_binding="198.51.100.4"), "198.51.100.4")
 
     def test_late_tproxy_and_destination_policy_survive_router_fallback(self):
         # The router can install TPROXY at 32765 after reboot, rather than 9999.
