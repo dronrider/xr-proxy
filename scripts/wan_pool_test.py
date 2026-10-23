@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Run the pool scripts against a stateful, isolated ip/nft command fixture."""
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -30,7 +31,7 @@ if name == 'nft':
         (base / 'nft-owned').unlink(missing_ok=True)
 elif args[:4] == ['-4', 'route', 'show', 'table']:
     table = args[4]
-    print(cfg.get('routes' if table == 'all' else 'main' if table == 'main' else 'occupied', ''), end='')
+    print(cfg.get('routes' if table == 'all' else 'main' if table == 'main' else 'occupied_' + table, cfg.get('occupied', '')), end='')
 elif args[:3] == ['-4', 'rule', 'show']:
     print((base / 'rules').read_text() if (base / 'rules').exists() else '', end='')
 elif args[:3] == ['-4', 'rule', 'add']:
@@ -134,10 +135,106 @@ class PoolScripts(unittest.TestCase):
         calls = self.calls()[before:]
         flushes = [call for call in calls if "flush" in call]
         self.assertEqual(flushes, [["ip", "-4", "route", "flush", "table", "210"],
-                                  ["ip", "-4", "route", "flush", "table", "211"]])
+                                  ["ip", "-4", "route", "flush", "table", "211"],
+                                  ["ip", "-4", "route", "flush", "table", "218"]])
         before = len(self.calls())
         self.assertEqual(self.run_script(cleanup=True).returncode, 0)
         self.assertEqual(len(self.calls()), before)
+
+    def fallback_routes(self, calls=None):
+        return [call for call in (self.calls() if calls is None else calls)
+                if call[:5] == ["ip", "-4", "route", "replace", "default"] and call[-2:] == ["table", "218"]]
+
+    def test_dhcp_loss_keeps_router_and_bypass_default_on_second_wan(self):
+        self.cfg["routes"] = "default via 192.0.2.1 dev lan1 table 202\n"
+        self.cfg["main"] = "10.10.10.0/24 dev wg0\n"
+        self.cfg["no_address"] = ["wan"]
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fallback_routes(), [["ip", "-4", "route", "replace", "default",
+                         "via", "192.0.2.1", "dev", "lan1", "onlink", "metric", "10", "table", "218"]])
+        calls = self.calls()
+        self.assertIn(["ip", "-4", "rule", "add", "priority", "32763", "not", "fwmark", "0x200/0x200", "lookup", "main", "suppress_prefixlength", "0"], calls)
+        self.assertIn(["ip", "-4", "rule", "add", "priority", "32764", "not", "fwmark", "0x200/0x200", "lookup", "218"], calls)
+        self.assertIn(["ip", "-4", "rule", "add", "priority", "11100", "oif", "wan", "lookup", "210"], calls)
+        self.assertIn(["ip", "-4", "route", "replace", "unreachable", "default", "metric", "32767", "table", "210"], calls)
+        self.assertEqual((self.base / "state/fallback-selected").read_text(), "lan1\n")
+
+    def test_late_tproxy_and_destination_policy_survive_router_fallback(self):
+        # The router can install TPROXY at 32765 after reboot, rather than 9999.
+        (self.base / "rules").write_text(
+            "10000: from 192.0.2.4 lookup 202\n"
+            "20000: from all to 192.0.2.4/24 lookup 202\n"
+            "32765: from all fwmark 0x200 lookup 201\n"
+            "32766: from all lookup main\n")
+        self.assertEqual(self.run_script(["--down", "wan"]).returncode, 0)
+        rules = sorted((line.split() for line in (self.base / "rules").read_text().splitlines()),
+                       key=lambda fields: int(fields[0][:-1]))
+
+        def lookup(mark, destination, source="198.51.100.20"):
+            for rule in rules:
+                if "fwmark" in rule:
+                    value = rule[rule.index("fwmark") + 1].split("/")
+                    mask = int(value[1], 0) if len(value) == 2 else 0xffffffff
+                    matches = mark & mask == int(value[0], 0)
+                    if "not" in rule:
+                        matches = not matches
+                    if not matches:
+                        continue
+                if "from" in rule:
+                    src = rule[rule.index("from") + 1]
+                    if src != "all" and ipaddress.ip_address(source) not in ipaddress.ip_network(src, strict=False):
+                        continue
+                if "to" in rule and ipaddress.ip_address(destination) not in ipaddress.ip_network(rule[rule.index("to") + 1], strict=False):
+                    continue
+                if "oif" in rule:
+                    continue
+                table = rule[rule.index("lookup") + 1]
+                if table == "main" and "suppress_prefixlength" in rule:
+                    if ipaddress.ip_address(destination) not in ipaddress.ip_network("203.0.113.0/24"):
+                        continue
+                return table
+            return None
+
+        self.assertEqual(lookup(0x200, "198.51.100.80"), "201")
+        self.assertEqual(lookup(0x200, "203.0.113.80"), "201")
+        self.assertEqual(lookup(0, "198.51.100.80"), "218")
+        self.assertEqual(lookup(0, "203.0.113.80"), "main")
+        self.assertEqual(lookup(0, "192.0.2.80"), "202")
+        self.assertEqual(lookup(0, "198.51.100.80", source="192.0.2.4"), "202")
+        self.assertIn("32765: from all fwmark 0x200 lookup 201", (self.base / "rules").read_text())
+
+    def test_health_failure_overrides_stale_primary_default_and_recovers(self):
+        self.assertEqual(self.run_script().returncode, 0)
+        self.assertEqual(self.fallback_routes()[-1][8], "wan")
+        before = len(self.calls())
+        self.assertEqual(self.run_script(["--down", "wan"]).returncode, 0)
+        self.assertEqual(self.fallback_routes(self.calls()[before:])[-1][8], "lan1")
+        self.assertEqual(self.run_script().returncode, 0)
+        self.assertEqual(self.fallback_routes()[-1][8], "wan")
+        self.assertEqual(sum(call[:6] == ["ip", "-4", "rule", "add", "priority", "32764"] for call in self.calls()), 1)
+        self.assertFalse(any("main" in call and ("replace" in call or "flush" in call or "del" in call) for call in self.calls()))
+
+    def test_all_down_closes_unbound_default_and_does_not_reuse_owned_route(self):
+        self.cfg["routes"] += "default via 192.0.2.99 dev wan table 218\n"
+        self.assertEqual(self.run_script(["--down", "wan", "--down", "lan1"]).returncode, 0)
+        self.assertFalse(self.fallback_routes())
+        self.assertIn(["ip", "-4", "route", "del", "default", "metric", "10", "table", "218"], self.calls())
+        self.assertIn(["ip", "-4", "route", "replace", "unreachable", "default", "metric", "32767", "table", "218"], self.calls())
+        self.assertEqual((self.base / "state/fallback-selected").read_text(), "none\n")
+        self.cfg["routes"] = "default via 192.0.2.99 dev wan table 218\n"
+        self.assertEqual(self.run_script().returncode, 0)
+        self.assertFalse(self.fallback_routes())
+
+    def test_foreign_fallback_table_and_rules_are_not_claimed(self):
+        self.cfg["occupied_218"] = "default via 192.0.2.99 dev other\n"
+        self.assertNotEqual(self.run_script().returncode, 0)
+        self.assertFalse(any("add" in call or "replace" in call or "flush" in call for call in self.calls()))
+        self.assertFalse((self.base / "state/fallback-owned").exists())
+        self.cfg.pop("occupied_218")
+        (self.base / "rules").write_text("32763: from all lookup custom\n")
+        self.assertNotEqual(self.run_script().returncode, 0)
+        self.assertFalse((self.base / "state/fallback-owned").exists())
 
     def test_invalid_input_and_foreign_state_fail_without_mutation(self):
         self.assertNotEqual(self.run_script(["--member", "bad;name:1"]).returncode, 0)

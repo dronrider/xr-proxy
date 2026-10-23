@@ -64,6 +64,20 @@ pub async fn connect_via(
 /// `xr_proto::tunnel::connect_to_server`, плюс привязка к интерфейсу и
 /// nodelay на mux-сокете.
 pub async fn tunnel_connect(interface: Option<&str>, addr: SocketAddr) -> io::Result<TcpStream> {
+    tunnel_connect_checked(interface, addr, interface_available).await
+}
+
+async fn tunnel_connect_checked(
+    interface: Option<&str>,
+    addr: SocketAddr,
+    available: fn(&str) -> bool,
+) -> io::Result<TcpStream> {
+    if interface.is_some_and(|name| !available(name)) {
+        return Err(io::Error::new(
+            io::ErrorKind::NetworkUnreachable,
+            "tunnel WAN has no usable IPv4 uplink",
+        ));
+    }
     let stream = connect_via(interface, addr, Duration::from_secs(2)).await?;
     // Nagle off на mux-сокете: контрольные кадры (Connect) крошечные и должны
     // уходить сразу, а не коалесцироваться за неотправленной upload-Data.
@@ -75,6 +89,25 @@ pub async fn tunnel_connect(interface: Option<&str>, addr: SocketAddr) -> io::Re
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn tunnel_rejects_unavailable_ipv4_before_binding_socket() {
+        // carrier=1 не означает доступность IPv4: getifaddrs может уже не
+        // вернуть адрес. На macOS подставляем такой ответ проверки, чтобы
+        // результат не зависел от интерфейсов машины и SO_BINDTODEVICE.
+        let err = tunnel_connect_checked(
+            Some("wan-without-ipv4"),
+            "127.0.0.1:1".parse().unwrap(),
+            |_| false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::NetworkUnreachable,
+            "без IPv4 нельзя запускать bind/connect или уходить основным маршрутом"
+        );
+    }
 
     #[tokio::test]
     async fn connect_without_interface_uses_default_route() {

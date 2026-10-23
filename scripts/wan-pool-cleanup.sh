@@ -14,5 +14,11 @@ while read -r DEV; do
     ip -4 route flush table "$TABLE"
     SLOT=$((SLOT + 1))
 done < "$STATE/owned"
+if [ -f "$STATE/fallback-owned" ]; then
+    ip -4 rule del priority 32763 2>/dev/null || true
+    ip -4 rule del priority 32764 2>/dev/null || true
+    ip -4 route flush table 218
+    rm -f "$STATE/fallback-owned" "$STATE/fallback-selected"
+fi
 rm -f "$STATE/owned"
 echo 'wan-pool: removed; main route unchanged' >&2 || true

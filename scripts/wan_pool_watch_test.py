@@ -68,6 +68,21 @@ class WatchTests(unittest.TestCase):
         self.run_once()
         self.assertIn("--down lan1", self.last_apply())
 
+    def test_owned_router_fallback_route_does_not_trigger_refresh_loop(self):
+        self.script("ip", """if test "$2" = route; then
+    n=$(cat "$TEST_ROOT/route-counter" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "$n" > "$TEST_ROOT/route-counter"
+    echo "default via 192.0.2.1 dev wan"
+    echo "default via 192.0.2.$n dev wan table 218"
+else
+    echo "2: wan inet 192.0.2.2/24 scope global"
+fi
+""")
+        self.run_once()
+        self.run_once()
+        self.assertEqual(len((self.root / "applies").read_text().splitlines()), 1)
+
     def test_failed_apply_is_retried(self):
         self.script("setup", "exit 1\n")
         self.run_once()

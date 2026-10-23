@@ -301,10 +301,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // ложится строкой в журнал, иначе снаружи молчание не отличить от работы.
     if config.dns.enabled {
         let dns_config = config.dns.clone();
-        // Цепочка пулов для DoT (XR-310): сначала основной маршрут, затем
-        // пулы прочих каналов в порядке имён ключей. Ответ резолвера не
-        // зависит от выхода, но мёртвый основной канал не должен оставлять
-        // LAN без DNS, пока жив второй провайдер.
+        // Пулы DoT независимы от политик устройств. Гонка до завершения TLS
+        // не даёт мёртвому каналу съесть общий срок DNS-запроса.
         let mut dns_pools = vec![state.server_pool.clone()];
         let mut extra_keys: Vec<&String> = state.pools.keys().collect();
         extra_keys.sort();
@@ -554,33 +552,56 @@ fn dns_upstreams(
     Ok((upstreams, tokio_rustls::TlsConnector::from(Arc::new(tls)), server_name))
 }
 
-/// Соединение до DoT-резолвера поверх туннельного стрима. Апстримы обходятся
-/// по порядку: первый ответивший и берётся, а падение всех это причина, с
-/// которой форвардер жалуется в журнал.
+/// Первый готовый DoT через любой настроенный туннель. Последовательный
+/// обход пулов тратил весь DNS timeout на blackhole первого WAN, хотя
+/// второй WAN отвечал. На пул приходится одна попытка; апстримы внутри
+/// него сохраняют порядок. Общий срок ограничивает DNS-форвардер.
 async fn open_dot(
     pools: Vec<Arc<ServerPool>>,
     tls: tokio_rustls::TlsConnector,
     upstreams: Vec<SocketAddr>,
     server_name: rustls::pki_types::ServerName<'static>,
 ) -> std::io::Result<tokio_rustls::client::TlsStream<xr_proto::mux::MuxStreamIo>> {
-    let mut last: Option<std::io::Error> = None;
-    for pool in &pools {
-        for addr in &upstreams {
-            let stream = match pool.open_stream(&TargetAddr::Ip(*addr)).await {
-                Ok(s) => s,
-                Err(e) => {
-                    last = Some(e);
-                    continue;
+    let mut attempts = tokio::task::JoinSet::new();
+    for (index, pool) in pools.into_iter().enumerate() {
+        let tls = tls.clone();
+        let upstreams = upstreams.clone();
+        let server_name = server_name.clone();
+        attempts.spawn(async move {
+            let mut last = None;
+            for addr in upstreams {
+                let result = async {
+                    let stream = pool.open_stream(&TargetAddr::Ip(addr)).await?;
+                    tls.connect(server_name.clone(), stream.into_io()).await
                 }
-            };
-            match tls.connect(server_name.clone(), stream.into_io()).await {
-                Ok(tls_stream) => return Ok(tls_stream),
-                Err(e) => last = Some(e),
+                .await;
+                match result {
+                    Ok(stream) => return Ok((index, stream)),
+                    Err(e) => last = Some(e),
+                }
             }
+            Err(last.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "no dns upstreams configured")
+            }))
+        });
+    }
+    let mut last = None;
+    while let Some(result) = attempts.join_next().await {
+        match result {
+            Ok(Ok((index, stream))) => {
+                tracing::info!("dns: DoT connected through tunnel pool {}", index);
+                // Drop JoinSet отменяет проигравшие попытки, в том числе TLS.
+                return Ok(stream);
+            }
+            Ok(Err(e)) => last = Some(e),
+            Err(e) => last = Some(std::io::Error::other(e)),
         }
     }
     Err(last.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "no dns upstreams configured")
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no dns tunnel pools configured",
+        )
     }))
 }
 
@@ -635,5 +656,223 @@ mod tests {
     fn clean_stop_is_not_a_failure() {
         let clean: Result<std::io::Result<()>, String> = Ok(Ok(()));
         assert_eq!(proxy_failure(clean), None);
+    }
+    fn dns_test_codec() -> Codec {
+        Codec::new(
+            Obfuscator::new(vec![42; 32], 12, ModifierStrategy::PositionalXorRotate),
+            0,
+            0,
+        )
+    }
+
+    fn dns_test_tls() -> (tokio_rustls::TlsConnector, tokio_rustls::TlsAcceptor) {
+        // Одноразовый ключ и самоподписанный localhost-сертификат только
+        // для стенда. В боевом dns_upstreams остаются корни webpki.
+        let cert = rustls::pki_types::CertificateDer::from(
+            include_bytes!("../tests/fixtures/dns-localhost.der").to_vec(),
+        );
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(
+            include_bytes!("../tests/fixtures/dns-localhost-key.der").to_vec(),
+        );
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.clone()).unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key.into())
+            .unwrap();
+        (
+            tokio_rustls::TlsConnector::from(Arc::new(client)),
+            tokio_rustls::TlsAcceptor::from(Arc::new(server)),
+        )
+    }
+
+    fn dns_test_pool(connect: xr_proto::mux_pool::ConnectFn) -> Arc<ServerPool> {
+        ServerPool::new(
+            vec![PoolServer {
+                name: "dns-test".into(),
+                addr: "127.0.0.1:1".into(),
+                pool: xr_proto::mux_pool::MuxPool::new(connect, dns_test_codec(), 1),
+            }],
+            PoolProfile::mobile(),
+            None,
+        )
+    }
+
+    async fn dns_test_serving_pool(
+        acceptor: tokio_rustls::TlsAcceptor,
+        stall_tls: bool,
+    ) -> Arc<ServerPool> {
+        use tokio::io::AsyncReadExt;
+        use xr_proto::mux::{mux_handshake_server, Multiplexer};
+        use xr_proto::protocol::Command;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let codec = dns_test_codec();
+            let mut bytes = Vec::new();
+            let init = loop {
+                let mut chunk = [0; 4096];
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(n, 0);
+                bytes.extend_from_slice(&chunk[..n]);
+                if let Some((frame, _)) = codec.decode_frame(&bytes).unwrap() {
+                    break frame;
+                }
+            };
+            let caps = mux_handshake_server(&mut stream, &codec, &init)
+                .await
+                .unwrap()
+                .unwrap();
+            let mux = Multiplexer::new_server(stream, codec, caps);
+            let mut incoming = mux.take_new_stream_rx().await.unwrap();
+            while let Some(ns) = incoming.recv().await {
+                let stream = mux.register_stream(ns.stream_id).await;
+                mux.send_frame(ns.stream_id, Command::ConnectAck, vec![0])
+                    .await
+                    .unwrap();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    if stall_tls {
+                        let _stream = stream;
+                        std::future::pending::<()>().await;
+                    } else if let Ok(mut tls) = acceptor.accept(stream.into_io()).await {
+                        // Настоящие данные поверх TLS подтверждают не только
+                        // создание mux-стрима, но и готовность DoT-транспорта.
+                        let mut byte = [0];
+                        let _ = tls.read(&mut byte).await;
+                    }
+                });
+            }
+        });
+        dns_test_pool(Arc::new(move || {
+            Box::pin(tokio::net::TcpStream::connect(addr))
+        }))
+    }
+
+    struct DnsActiveConnect(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for DnsActiveConnect {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    // Последовательный open_dot проводит весь срок на первом пуле.
+    // Живой пул стоит после пяти мёртвых, чтобы очередь с лимитом 4 тоже
+    // не могла скрыть регрессию. Проверяется TLS, а не один ConnectAck.
+    #[tokio::test]
+    async fn dns_live_wan_wins_over_first_blackhole_pool() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (tls, acceptor) = dns_test_tls();
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut pools: Vec<_> = (0..5).map(|_| {
+            let active = active.clone();
+            dns_test_pool(Arc::new(move || {
+                let active = active.clone();
+                Box::pin(async move {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _guard = DnsActiveConnect(active);
+                    std::future::pending().await
+                })
+            }))
+        }).collect();
+        pools.push(dns_test_serving_pool(acceptor, false).await);
+        let stream = tokio::time::timeout(std::time::Duration::from_secs(5), open_dot(
+            pools, tls, vec!["9.9.9.9:853".parse().unwrap()],
+            "localhost".try_into().unwrap(),
+        )).await.expect("рабочий WAN не должен ждать blackhole другого канала")
+            .expect("стенд должен завершить настоящий TLS через mux");
+        drop(stream);
+        tokio::task::yield_now().await;
+        assert_eq!(active.load(Ordering::SeqCst), 0,
+            "готовый DoT должен отменить все проигравшие подключения");
+    }
+
+    #[tokio::test]
+    async fn dns_live_wan_wins_over_first_stalled_tls() {
+        let (tls, acceptor) = dns_test_tls();
+        let stalled = dns_test_serving_pool(acceptor.clone(), true).await;
+        let alive = dns_test_serving_pool(acceptor, false).await;
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            open_dot(
+                vec![stalled, alive],
+                tls,
+                vec!["9.9.9.9:853".parse().unwrap()],
+                "localhost".try_into().unwrap(),
+            ),
+        )
+        .await
+        .expect("готовый mux с зависшим TLS не должен блокировать другой WAN")
+        .expect("живой WAN должен завершить TLS");
+        drop(stream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dns_all_failed_pools_return_error_without_direct_fallback() {
+        let (tls, _) = dns_test_tls();
+        let failed = dns_test_pool(Arc::new(|| {
+            Box::pin(async {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NetworkUnreachable,
+                    "WAN down",
+                ))
+            })
+        }));
+        let result = open_dot(
+            vec![failed],
+            tls,
+            vec!["9.9.9.9:853".parse().unwrap()],
+            "localhost".try_into().unwrap(),
+        )
+        .await;
+        assert!(result.is_err(), "в обход туннеля DNS уходить не должен");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dns_blackhole_deadline_cancels_connector() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Active(Arc<AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let active = Arc::new(AtomicUsize::new(0));
+        let connect_count = active.clone();
+        let stalled = dns_test_pool(Arc::new(move || {
+            let active = connect_count.clone();
+            Box::pin(async move {
+                active.fetch_add(1, Ordering::SeqCst);
+                let _guard = Active(active);
+                std::future::pending().await
+            })
+        }));
+        let (tls, _) = dns_test_tls();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            open_dot(
+                vec![stalled],
+                tls,
+                vec!["9.9.9.9:853".parse().unwrap()],
+                "localhost".try_into().unwrap(),
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "blackhole должен закончиться DNS deadline");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            0,
+            "после deadline не должно остаться фонового подключения"
+        );
     }
 }
