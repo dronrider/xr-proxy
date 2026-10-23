@@ -71,7 +71,7 @@ while :; do
             dev=${member%:*}
             ip -4 -o addr show dev "$dev" 2>/dev/null || true
             ip -4 route show table all default dev "$dev" 2>/dev/null |
-                awk '{own=0; for(i=1;i<=NF;i++) if($i=="table" && $(i+1)>=210 && $(i+1)<=217) own=1; if(!own) print}'
+                awk '{own=0; for(i=1;i<=NF;i++) if($i=="table" && $(i+1)>=210 && $(i+1)<=218) own=1; if(!own) print}'
             if test -f "$STATE/down.$dev"; then echo "down $dev"; fi
         done
     } > "$STATE/current"

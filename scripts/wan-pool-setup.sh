@@ -1,10 +1,10 @@
 #!/bin/sh
-# IPv4 pool for LAN forwarding and SO_BINDTODEVICE sockets. Main routes stay intact.
+# IPv4 pool and ordered failover for unbound router/bypass traffic.
 # Usage: wan-pool-setup.sh --member wan:1 --member lan1:3 --bypass 192.168.1.10
 # Reapply with the SAME member order after DHCP/interface changes. Weights may change.
 # Requires existing firewall permissions LAN -> each WAN, without changing input rules.
 # --down DEV excludes new flows after a failed health check but keeps probe routes.
-# IPv6, routed point-to-point WANs, and provider health probes are outside this script.
+# IPv6 and routed point-to-point WANs are outside this script.
 set -eu
 trap '' PIPE
 STATE=${XR_WAN_POOL_STATE_DIR:-/var/run/xr-wan-pool}
@@ -77,10 +77,19 @@ else
     done
     printf '%s\n' "$DEVICES" > "$STATE/owned"
 fi
+# A separate lookup after bound-WAN rules preserves netifd-owned routes. Look
+# through main's specific prefixes first, but select default only from healthy WANs.
+if [ ! -f "$STATE/fallback-owned" ]; then
+    [ -z "$(ip -4 route show table 218 2>/dev/null)" ] || fail 'route table 218 is occupied'
+    ip -4 rule show | awk '$1=="32763:" || $1=="32764:" {f=1} END {exit !f}' && fail 'fallback rule priority is occupied'
+    : > "$STATE/fallback-owned"
+fi
 # Reserved tables terminate failed lookups: a dead bound/marked WAN must not fall
 # through to the main table and leak traffic through another provider.
 SLOT=0
 TOTAL=0
+FALLBACK_DEV=
+FALLBACK_GATEWAY=
 : > "$STATE/active"
 ip -4 route show table all > "$STATE/routes"
 for MEMBER in $MEMBERS; do
@@ -93,19 +102,40 @@ for MEMBER in $MEMBERS; do
     if ! ip -4 rule show | awk -v p="$OIF_PRIORITY:" '$1==p {f=1} END {exit !f}'; then
         ip -4 rule add priority "$OIF_PRIORITY" oif "$DEV" lookup "$TABLE"
     fi
-    GATEWAY=$(awk -v dev="$DEV" '$1=="default" {d="";g="";own=0;for(i=1;i<=NF;i++){if($i=="dev")d=$(i+1);if($i=="via")g=$(i+1);if($i=="table" && $(i+1)>=210 && $(i+1)<=217)own=1}if(d==dev && !own && g!=""){print g;exit}}' "$STATE/routes")
+    GATEWAY=$(awk -v dev="$DEV" '$1=="default" {d="";g="";own=0;for(i=1;i<=NF;i++){if($i=="dev")d=$(i+1);if($i=="via")g=$(i+1);if($i=="table" && $(i+1)>=210 && $(i+1)<=218)own=1}if(d==dev && !own && g!=""){print g;exit}}' "$STATE/routes")
     if ip link show dev "$DEV" 2>/dev/null | grep -q 'LOWER_UP' && [ -n "$GATEWAY" ] && ip -o -4 addr show dev "$DEV" | grep -q ' inet '; then
         ip_ok "$GATEWAY" || fail 'invalid gateway from kernel'
         ip -4 route replace default via "$GATEWAY" dev "$DEV" onlink metric 10 table "$TABLE"
         case " $DOWN " in
             *" $DEV "*) ;;
-            *) printf '%s %s %s\n' "$DEV" "$MARK" "$WEIGHT" >> "$STATE/active"; TOTAL=$((TOTAL + WEIGHT));;
+            *)
+                printf '%s %s %s\n' "$DEV" "$MARK" "$WEIGHT" >> "$STATE/active"
+                TOTAL=$((TOTAL + WEIGHT))
+                if [ -z "$FALLBACK_DEV" ]; then FALLBACK_DEV=$DEV; FALLBACK_GATEWAY=$GATEWAY; fi
+                ;;
         esac
     else
         ip -4 route del default metric 10 table "$TABLE" 2>/dev/null || true
     fi
     SLOT=$((SLOT + 1))
 done
+ip -4 route replace unreachable default metric 32767 table 218
+if [ -n "$FALLBACK_DEV" ]; then
+    ip -4 route replace default via "$FALLBACK_GATEWAY" dev "$FALLBACK_DEV" onlink metric 10 table 218
+else
+    ip -4 route del default metric 10 table 218 2>/dev/null || true
+fi
+if ! ip -4 rule show | awk '$1=="32763:" {f=1} END {exit !f}'; then
+    ip -4 rule add priority 32763 not fwmark 0x200/0x200 lookup main suppress_prefixlength 0
+fi
+if ! ip -4 rule show | awk '$1=="32764:" {f=1} END {exit !f}'; then
+    ip -4 rule add priority 32764 not fwmark 0x200/0x200 lookup 218
+fi
+SELECTED=${FALLBACK_DEV:-none}
+if [ "$(cat "$STATE/fallback-selected" 2>/dev/null || true)" != "$SELECTED" ]; then
+    echo "wan-pool: router/bypass default WAN $SELECTED" >&2 || true
+    printf '%s\n' "$SELECTED" > "$STATE/fallback-selected"
+fi
 NFT="$STATE/nft"
 : > "$NFT"
 if nft list table ip xr_wan_pool >/dev/null 2>&1; then echo 'delete table ip xr_wan_pool' >> "$NFT"; fi
@@ -166,4 +196,4 @@ for MEMBER in $MEMBERS; do
 done
 nft -c -f "$NFT"
 nft -f "$NFT"
-echo "wan-pool: applied, active weight $TOTAL; main route unchanged" >&2 || true
+echo "wan-pool: applied, active weight $TOTAL; router/bypass WAN $SELECTED" >&2 || true

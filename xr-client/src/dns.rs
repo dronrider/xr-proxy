@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -42,6 +43,8 @@ const UPSTREAM_RETRY_PAUSE: Duration = Duration::from_secs(1);
 struct Job {
     query: Vec<u8>,
     reply: oneshot::Sender<Vec<u8>>,
+    timed_out: Arc<AtomicBool>,
+    deadline: tokio::time::Instant,
 }
 
 struct Pending {
@@ -50,6 +53,8 @@ struct Pending {
     /// разные спрашивающие.
     client_id: [u8; 2],
     reply: oneshot::Sender<Vec<u8>>,
+    timed_out: Arc<AtomicBool>,
+    sent_at: tokio::time::Instant,
 }
 
 struct Conn<W> {
@@ -85,16 +90,28 @@ impl Forwarder {
     /// ждёт своим таймаутом, а SERVFAIL видит сразу. Отката на провайдерский
     /// резолвер тут нет и быть не может, ради этого всё и затевалось.
     pub async fn resolve(&self, query: &[u8]) -> Vec<u8> {
-        let (tx, rx) = oneshot::channel();
-        let job = Job { query: query.to_vec(), reply: tx };
+        let (tx, mut rx) = oneshot::channel();
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let job = Job {
+            query: query.to_vec(),
+            reply: tx,
+            timed_out: timed_out.clone(),
+            deadline,
+        };
         // Очередь забита значит апстрим не отвечает, и ждать в ней места это
         // то самое молчание, вместо которого спрашивающему нужен отказ.
         if self.jobs.try_send(job).is_err() {
             return servfail(query);
         }
-        match tokio::time::timeout(self.timeout, rx).await {
-            Ok(Ok(answer)) => answer,
-            _ => servfail(query),
+        tokio::select! {
+            result = &mut rx => result.unwrap_or_else(|_| servfail(query)),
+            _ = tokio::time::sleep_until(deadline) => {
+                // Метка ставится до закрытия rx. Простая отмена resolve
+                // метку не ставит и живое соединение не перезапускает.
+                timed_out.store(true, Ordering::SeqCst);
+                servfail(query)
+            }
         }
     }
 }
@@ -192,6 +209,16 @@ where
             _ = sweep.tick() => Event::Sweep,
         };
 
+        if conn.as_ref().is_some_and(|c| c.pending.values().any(|p| {
+            p.timed_out.load(Ordering::SeqCst)
+                || (!p.reply.is_closed() && p.sent_at.elapsed() >= timeout)
+        })) {
+            complain(&mut last_complaint, "upstream response timed out; reconnecting".into());
+            conn = None;
+            answers = None;
+            next_attempt = None;
+        }
+
         match event {
             Event::Stop => break,
             Event::Sweep => {
@@ -199,7 +226,7 @@ where
                 // и ушёл SERVFAIL), держать незачем: без чистки таблица растёт
                 // на каждом молчании апстрима.
                 if let Some(c) = conn.as_mut() {
-                    c.pending.retain(|_, p| !p.reply.is_closed());
+                    c.pending.retain(|_, p| !p.reply.is_closed() || p.timed_out.load(Ordering::SeqCst));
                 }
             }
             Event::Answer(Some(msg)) => {
@@ -236,7 +263,7 @@ where
                     if next_attempt.is_some_and(|t| Instant::now() < t) {
                         continue;
                     }
-                    match tokio::time::timeout(timeout, connect()).await {
+                    match tokio::time::timeout_at(job.deadline, connect()).await {
                         Ok(Ok(stream)) => {
                             let (reader, writer) = tokio::io::split(stream);
                             let (atx, arx) = mpsc::channel(64);
@@ -270,13 +297,24 @@ where
                 let mut framed = Vec::with_capacity(msg.len() + 2);
                 framed.extend_from_slice(&(msg.len() as u16).to_be_bytes());
                 framed.extend_from_slice(&msg);
-                if let Err(e) = c.writer.write_all(&framed).await {
-                    tracing::warn!("dns: write to upstream failed: {e}");
-                    conn = None;
-                    answers = None;
-                    continue;
+                match tokio::time::timeout_at(job.deadline, c.writer.write_all(&framed)).await {
+                    Ok(Ok(())) => {}
+                    failure => {
+                        tracing::warn!("dns: write to upstream failed or timed out: {failure:?}");
+                        conn = None;
+                        answers = None;
+                        continue;
+                    }
                 }
-                c.pending.insert(wire_id, Pending { client_id, reply: job.reply });
+                c.pending.insert(
+                    wire_id,
+                    Pending {
+                        client_id,
+                        reply: job.reply,
+                        timed_out: job.timed_out,
+                        sent_at: tokio::time::Instant::now(),
+                    },
+                );
             }
         }
     }
@@ -299,24 +337,22 @@ fn complain(last: &mut Option<Instant>, reason: String) {
 
 async fn read_answers<R: AsyncRead + Unpin>(mut reader: R, tx: mpsc::Sender<Vec<u8>>) {
     loop {
-        let mut len = [0u8; 2];
-        if reader.read_exact(&mut len).await.is_err() {
-            break;
-        }
-        // Длинный ответ дочитывается целиком, а не рвёт разговор: обрыв снёс
-        // бы таблицу ожидающих, и SERVFAIL получили бы все, кто спрашивал
-        // параллельно про другие имена, а само имя не резолвилось бы никогда.
-        let n = u16::from_be_bytes(len) as usize;
-        if n == 0 {
-            break;
-        }
-        let mut msg = vec![0u8; n];
-        if reader.read_exact(&mut msg).await.is_err() {
-            break;
-        }
-        if tx.send(msg).await.is_err() {
-            break;
-        }
+        let read = async {
+            let mut len = [0u8; 2];
+            reader.read_exact(&mut len).await.ok()?;
+            let n = u16::from_be_bytes(len) as usize;
+            if n == 0 { return None; }
+            let mut msg = vec![0u8; n];
+            reader.read_exact(&mut msg).await.ok()?;
+            Some(msg)
+        };
+        let msg = tokio::select! {
+            // При замене апстрима reader должен отпустить старый поток,
+            // даже если от него больше никогда не придёт ни байта.
+            _ = tx.closed() => break,
+            msg = read => match msg { Some(msg) => msg, None => break },
+        };
+        if tx.send(msg).await.is_err() { break; }
     }
 }
 
@@ -539,7 +575,10 @@ mod tests {
 
     /// Честный резолвер за туннелем: говорит DNS-over-TCP и на всё отвечает
     /// одним адресом. В бою на его месте стоит Quad9 за TLS.
-    async fn spawn_upstream(ip: Ipv4Addr, answers_per_conn: usize) -> (SocketAddr, Arc<AtomicUsize>) {
+    async fn spawn_upstream(
+        ip: Ipv4Addr,
+        answers_per_conn: usize,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let conns = Arc::new(AtomicUsize::new(0));
@@ -856,4 +895,95 @@ mod tests {
         assert_eq!(&short[6..12], &[0u8; 6]);
         assert_eq!(short.len(), question_end(&q).unwrap());
     }
+    async fn memory_forwarder(block_first_write: bool) -> (Forwarder, Arc<AtomicUsize>) {
+        let (tx, rx) = mpsc::channel(16);
+        let count = Arc::new(AtomicUsize::new(0));
+        let connects = count.clone();
+        let connect = move || {
+            let n = connects.fetch_add(1, Ordering::SeqCst);
+            let (client, mut server) = tokio::io::duplex(if block_first_write { 16 } else { 4096 });
+            tokio::spawn(async move {
+                if block_first_write && n == 0 {
+                    let _server = server;
+                    std::future::pending::<()>().await;
+                    return;
+                }
+                let mut answered = false;
+                loop {
+                    let mut len = [0; 2];
+                    if server.read_exact(&mut len).await.is_err() { return; }
+                    let mut q = vec![0; u16::from_be_bytes(len) as usize];
+                    if server.read_exact(&mut q).await.is_err() { return; }
+                    if n == 0 && answered {
+                        // Первый туннель после успешного ответа замирает,
+                        // но поток остаётся открытым, как при blackhole WAN.
+                        std::future::pending::<()>().await;
+                    }
+                    let answer = answer_a(&q, Ipv4Addr::new(1, 2, 3, 4));
+                    server.write_all(&(answer.len() as u16).to_be_bytes()).await.unwrap();
+                    server.write_all(&answer).await.unwrap();
+                    answered = true;
+                }
+            });
+            async move { Ok(client) }
+        };
+        let timeout = Duration::from_secs(5);
+        tokio::spawn(upstream_loop(rx, connect, timeout));
+        (Forwarder { jobs: tx, timeout }, count)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_established_upstream_is_reconnected_after_query_deadline() {
+        let (forwarder, connects) = memory_forwarder(false).await;
+        assert_eq!(rcode(&forwarder.resolve(&query(1, "first.test", None)).await), 0);
+        assert_eq!(rcode(&forwarder.resolve(&query(2, "blackhole.test", None)).await), 2);
+        let answer = forwarder.resolve(&query(3, "recovered.test", None)).await;
+        assert_eq!(rcode(&answer), 0,
+            "после истечения запроса нужна новая гонка туннелей вместо вечного SERVFAIL");
+        assert_eq!(connects.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_query_does_not_reconnect_open_upstream() {
+        let (forwarder, connects) = memory_forwarder(false).await;
+        assert_eq!(rcode(&forwarder.resolve(&query(1, "first.test", None)).await), 0);
+        let second = forwarder.clone();
+        let task = tokio::spawn(async move { second.resolve(&query(2, "cancelled.test", None)).await });
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        // Sweep удаляет отменённый запрос; его deadline не должен потом
+        // выглядеть как недоступность апстрима.
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+        let answer = forwarder.resolve(&query(3, "still-on-same.test", None)).await;
+        assert_eq!(rcode(&answer), 2,
+            "отмена не должна сама переключать ещё открытый апстрим");
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_answer_receiver_stops_stalled_reader() {
+        let (reader, mut server) = tokio::io::duplex(1024);
+        let (tx, rx) = mpsc::channel(1);
+        let task = tokio::spawn(read_answers(reader, tx));
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(1), task).await
+            .expect("reader не завершился после отключения receiver").unwrap();
+        let mut byte = [0];
+        assert_eq!(server.read(&mut byte).await.unwrap(), 0,
+            "отменённый reader обязан закрыть старый туннельный поток");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_upstream_write_expires_and_next_query_reconnects() {
+        let (forwarder, connects) = memory_forwarder(true).await;
+        let first = forwarder.resolve(&query(1, "blocked-write.test", None)).await;
+        assert_eq!(rcode(&first), 2);
+        let next = forwarder.resolve(&query(2, "recovered.test", None)).await;
+        assert_eq!(rcode(&next), 0,
+            "зависшая запись не должна навсегда остановить цикл DNS");
+        assert_eq!(connects.load(Ordering::SeqCst), 2);
+    }
+
 }
