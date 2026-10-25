@@ -14,9 +14,11 @@ test -r "$CONFIG" || exit 0
 case "$INTERVAL" in ''|*[!0-9]*) exit 2 ;; esac
 test "$INTERVAL" -ge 1 || exit 2
 mkdir -p "$STATE"
+SLOTS=0
+for member in $MEMBERS; do SLOTS=$((SLOTS + 1)); done
 
 apply_pool() (
-    if ! mkdir "$STATE/lock" 2>/dev/null; then exit 0; fi
+    if ! mkdir "$STATE/lock" 2>/dev/null; then exit 1; fi
     trap 'rmdir "$STATE/lock" 2>/dev/null || true' EXIT HUP INT TERM
     set -- --lan "$LAN"
     for member in $MEMBERS; do
@@ -29,7 +31,87 @@ apply_pool() (
     "$SETUP" "$@"
 )
 
+kernel_snapshot() {
+    ip -4 route show table all > "$STATE/kernel.routes" || return 1
+    ip -4 rule show > "$STATE/kernel.rules" || return 1
+    awk -v slots="$SLOTS" '
+        {for(i=1;i<NF;i++) if($i=="table" && (($(i+1)>=210 && $(i+1)<210+slots) || $(i+1)==218)) {print;break}}
+    ' "$STATE/kernel.routes" | LC_ALL=C sort
+    awk -v slots="$SLOTS" '
+        {p=$1;sub(/:$/, "", p)}
+        (p>=11000 && p<11000+slots) || (p>=11100 && p<11100+slots) || p==32763 || p==32764
+    ' "$STATE/kernel.rules" | LC_ALL=C sort
+}
+
+route_present() {
+    awk -v table="$1" -v kind="$2" -v dev="${3:-}" -v gateway="${4:-}" '
+        {t="";d="";g="";m="";for(i=1;i<NF;i++) {
+            if($i=="table")t=$(i+1);if($i=="dev")d=$(i+1);
+            if($i=="via")g=$(i+1);if($i=="metric")m=$(i+1)
+        }}
+        t==table && ((kind=="unreachable" && $1=="unreachable" && $2=="default" && m==32767) ||
+            (kind=="probe" && $1=="default" && d==dev && g==gateway && m==10)) {found=1}
+        END {exit !found}
+    ' "$STATE/kernel.candidate"
+}
+
+rule_present() {
+    awk -v priority="$1:" -v selector="$2" -v table="$3" -v extra="${4:-}" '
+        {$1=$1}
+        $1==priority && index(" "$0" ", " "selector" ") &&
+            (extra=="" || index(" "$0" ", " "extra" ")) {
+            for(i=1;i<NF;i++) if($i=="lookup" && $(i+1)==table) found=1
+        }
+        END {exit !found}
+    ' "$STATE/kernel.candidate"
+}
+
+kernel_valid() {
+    slot=0
+    fallback_dev=
+    fallback_gateway=
+    for member in $MEMBERS; do
+        dev=${member%:*}
+        table=$((210 + slot))
+        mark=$(printf '0x%x/0xf000000' "$(((slot + 1) * 16777216))")
+        route_present "$table" unreachable || return 1
+        rule_present "$((11000 + slot))" "fwmark $mark" "$table" || return 1
+        rule_present "$((11100 + slot))" "oif $dev" "$table" || return 1
+        gateway=$(awk -v dev="$dev" '$1=="default" {d="";g="";own=0;for(i=1;i<=NF;i++){if($i=="dev")d=$(i+1);if($i=="via")g=$(i+1);if($i=="table" && $(i+1)>=210 && $(i+1)<=218)own=1}if(d==dev && !own && g!=""){print g;exit}}' "$STATE/kernel.routes")
+        if ip link show dev "$dev" 2>/dev/null | grep -q LOWER_UP &&
+           test -n "$gateway" && ip -o -4 addr show dev "$dev" | grep -q ' inet '; then
+            route_present "$table" probe "$dev" "$gateway" || return 1
+            if test -z "$fallback_dev" && ! test -f "$STATE/down.$dev"; then
+                fallback_dev=$dev
+                fallback_gateway=$gateway
+            fi
+        fi
+        slot=$((slot + 1))
+    done
+    if test -n "$fallback_dev"; then
+        route_present 218 probe "$fallback_dev" "$fallback_gateway" || return 1
+    fi
+    route_present 218 unreachable &&
+        rule_present 32763 'not from all fwmark 0x200/0x200' main 'suppress_prefixlength 0' &&
+        rule_present 32764 'not from all fwmark 0x200/0x200' 218
+}
+
+refresh_pool() {
+    if apply_pool && kernel_snapshot > "$STATE/kernel.candidate" && kernel_valid; then
+        mv "$STATE/kernel.candidate" "$STATE/kernel.applied"
+    else
+        logger -t xr-wan-pool "Failed to refresh WAN pool; retry on next check"
+        return 1
+    fi
+}
+
 while :; do
+    kernel_snapshot > "$STATE/kernel.current"
+    # netifd can flush our probe routes without changing the provider snapshot.
+    # Repair them before probing, including routes of members already marked down.
+    if test -f "$STATE/kernel.applied" && ! cmp -s "$STATE/kernel.current" "$STATE/kernel.applied"; then
+        refresh_pool || true
+    fi
     for member in $MEMBERS; do
         dev=${member%:*}
         case "$dev" in ''|*[!a-zA-Z0-9_.:-]*) exit 2 ;; esac
@@ -75,11 +157,9 @@ while :; do
             if test -f "$STATE/down.$dev"; then echo "down $dev"; fi
         done
     } > "$STATE/current"
-    if ! cmp -s "$STATE/current" "$STATE/applied" || ! nft list table ip xr_wan_pool >/dev/null 2>&1; then
-        if apply_pool; then
+    if ! cmp -s "$STATE/current" "$STATE/applied" || ! test -f "$STATE/kernel.applied" || ! nft list table ip xr_wan_pool >/dev/null 2>&1; then
+        if refresh_pool; then
             cp "$STATE/current" "$STATE/applied"
-        else
-            logger -t xr-wan-pool "Failed to refresh WAN pool; retry on next check"
         fi
     fi
     test "$ONCE" = 0 || exit 0
