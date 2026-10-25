@@ -269,6 +269,14 @@ impl WanPool {
             .collect()
     }
 
+    fn ordered_at(&self, now: Instant) -> Vec<usize> {
+        let selection = self.selection.lock().unwrap();
+        let healthy: Vec<_> = (0..self.members.len())
+            .filter(|&i| selection.failed_until[i].is_none_or(|until| now >= until))
+            .collect();
+        if healthy.is_empty() { (0..self.members.len()).collect() } else { healthy }
+    }
+
     fn failed(&self, index: usize) {
         self.selection.lock().unwrap().failed_until[index] =
             Some(Instant::now() + Duration::from_secs(5));
@@ -307,12 +315,22 @@ impl WanPool {
     }
 
     pub async fn open_stream(&self, key: &str, target: &TargetAddr) -> io::Result<MuxStream> {
+        self.open_stream_using(key, target, false).await
+    }
+
+    pub async fn open_stream_ordered(&self, key: &str, target: &TargetAddr) -> io::Result<MuxStream> {
+        self.open_stream_using(key, target, true).await
+    }
+
+    async fn open_stream_using(&self, key: &str, target: &TargetAddr, ordered: bool) -> io::Result<MuxStream> {
         let pools = self
             .pools
             .get(key)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "WAN proxy pool missing"))?;
         let mut error = io::Error::new(io::ErrorKind::NotConnected, "WAN proxy pool exhausted");
-        for i in self.order_at(Instant::now()) {
+        let now = Instant::now();
+        let order = if ordered { self.ordered_at(now) } else { self.order_at(now) };
+        for i in order {
             if !(self.available)(&self.members[i].interface) {
                 continue;
             }
@@ -337,6 +355,7 @@ impl WanPool {
     }
 }
 
+// regcheck:test-begin
 #[cfg(test)]
 mod pool_tests {
     use super::*;
@@ -405,6 +424,12 @@ mod pool_tests {
     }
 
     async fn serving_pool(counter: Arc<AtomicUsize>, failed: bool) -> Arc<ServerPool> {
+        serving_pool_observed(counter, failed, None).await
+    }
+
+    async fn serving_pool_observed(counter: Arc<AtomicUsize>, failed: bool,
+        observed: Option<Arc<Mutex<Vec<Vec<u8>>>>>) -> Arc<ServerPool>
+    {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let served = counter.clone();
@@ -414,6 +439,7 @@ mod pool_tests {
                     return;
                 };
                 let served = served.clone();
+                let observed = observed.clone();
                 tokio::spawn(async move {
                     let codec = codec();
                     let mut bytes = vec![0; 4096];
@@ -442,10 +468,16 @@ mod pool_tests {
                     };
                     while let Some(ns) = rx.recv().await {
                         served.fetch_add(1, Ordering::Relaxed);
-                        let _ = mux
-                            .send_frame(ns.stream_id, Command::ConnectAck, vec![0])
-                            .await;
-                        let _ = mux.register_stream(ns.stream_id).await;
+                        let mut stream = mux.register_stream(ns.stream_id).await;
+                        let _ = mux.send_frame(ns.stream_id, Command::ConnectAck, vec![0]).await;
+                        if let Some(observed) = observed.clone() {
+                            tokio::spawn(async move {
+                                if let Some(data) = stream.recv().await {
+                                    observed.lock().unwrap().push(data);
+                                    let _ = stream.close().await;
+                                }
+                            });
+                        }
                     }
                 });
             }
@@ -593,4 +625,171 @@ mod pool_tests {
                 .is_err()
         );
     }
+    fn proxy_state(unbound: Arc<ServerPool>, wan_pool: WanPool) -> crate::proxy::ProxyState {
+        crate::proxy::ProxyState {
+            router: std::sync::RwLock::new(Arc::new(xr_proto::routing::Router::new(
+                &xr_proto::config::RoutingConfig::default(), None))),
+            on_server_down: xr_proto::routing::Action::Block,
+            listen_port: 1080,
+            server_pool: unbound,
+            policy: xr_proto::device::DevicePolicySet::default(),
+            pools: HashMap::new(),
+            wan_pool: Some(Arc::new(wan_pool)),
+            wan_pool_bypass_ips: vec!["192.168.1.181".into()],
+            default_pool_key: "global".into(),
+        }
+    }
+
+    fn exit_profile(key: &str, use_wan_pool: bool, interface: Option<&str>)
+        -> xr_proto::device::ExitProfile
+    {
+        xr_proto::device::ExitProfile {
+            name: "test".into(), action: xr_proto::routing::Action::Proxy,
+            interface: interface.map(str::to_owned), use_wan_pool,
+            pool_key: key.into(), fallback_pool_key: Some("explicit-fallback".into()),
+            on_server_down: xr_proto::routing::Action::Block,
+        }
+    }
+
+    async fn open_for(state: &crate::proxy::ProxyState,
+        exit: Option<&xr_proto::device::ExitProfile>, source: &str)
+        -> io::Result<MuxStream>
+    {
+        crate::proxy::open_proxy_stream(state, exit, source.parse().unwrap(),
+            &state.server_pool, &TargetAddr::Domain("proxy.test".into(), 443)).await
+    }
+
+    #[tokio::test]
+    async fn bypass_proxy_uses_primary_order_while_other_clients_keep_weights() {
+        let unbound = Arc::new(AtomicUsize::new(0));
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let primary = serving_pool(unbound.clone(), false).await;
+        let a = serving_pool(first.clone(), false).await;
+        let b = serving_pool(second.clone(), false).await;
+        let state = proxy_state(primary, test_pool(members(), HashMap::from([("global".into(), vec![a,b])])));
+        for _ in 0..8 { open_for(&state, None, "192.168.1.181").await.unwrap(); }
+        assert_eq!(first.load(Ordering::Relaxed), 9,
+            "bypass Proxy должен выбирать первый WAN вместо старого unbound mux");
+        assert_eq!(second.load(Ordering::Relaxed), 0, "bypass не должен балансироваться весами 1:3");
+        assert_eq!(unbound.load(Ordering::Relaxed), 0);
+        assert_eq!(state.wan_pool.as_ref().unwrap().selection.lock().unwrap().next, 0,
+            "bypass изменил weighted counter других устройств");
+        for _ in 0..8 { open_for(&state, None, "192.168.1.139").await.unwrap(); }
+        assert_eq!(first.load(Ordering::Relaxed), 11);
+        assert_eq!(second.load(Ordering::Relaxed), 7);
+    }
+
+    #[tokio::test]
+    async fn bypass_proxy_skips_down_primary_without_touching_unbound_or_server_health() {
+        let unbound = Arc::new(AtomicUsize::new(0));
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let primary = serving_pool(unbound.clone(), true).await;
+        let a = serving_pool(first.clone(), false).await;
+        let b = serving_pool(second.clone(), false).await;
+        let mut pool = test_pool(members(), HashMap::from([("global".into(), vec![a,b])]));
+        pool.available = |interface| interface != "wan";
+        let state = proxy_state(primary, pool);
+        let opened = open_for(&state, None, "192.168.1.181").await;
+        assert!(opened.is_ok(), "рабочий резерв не должен зависеть от мёртвого unbound: {opened:?}");
+        assert_eq!(first.load(Ordering::Relaxed), 0);
+        assert_eq!(second.load(Ordering::Relaxed), 2);
+        assert_eq!(unbound.load(Ordering::Relaxed), 0);
+        assert!(state.wan_pool.as_ref().unwrap().selection.lock().unwrap().failed_until[0].is_none(),
+            "известный down не должен штрафовать VPS");
+    }
+
+    #[tokio::test]
+    async fn bypass_proxy_respects_cooldown_and_retries_primary_after_it_expires() {
+        let first = Arc::new(AtomicUsize::new(0));
+        let recovered = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let primary = serving_pool(Arc::new(AtomicUsize::new(0)), true).await;
+        let a = serving_pool(first.clone(), true).await;
+        let b = serving_pool(second.clone(), false).await;
+        let mut state = proxy_state(primary, test_pool(members(), HashMap::from([("global".into(), vec![a,b])])));
+        open_for(&state, None, "192.168.1.181").await.unwrap();
+        assert_eq!(first.load(Ordering::Relaxed), 1);
+        let replacement = serving_pool(recovered.clone(), false).await;
+        let pool = Arc::get_mut(state.wan_pool.as_mut().unwrap()).unwrap();
+        pool.pools.get_mut("global").unwrap()[0] = replacement;
+        for _ in 0..4 { open_for(&state, None, "192.168.1.181").await.unwrap(); }
+        assert_eq!(recovered.load(Ordering::Relaxed), 0, "cooldown первого WAN был проигнорирован");
+        assert_eq!(second.load(Ordering::Relaxed), 6);
+        state.wan_pool.as_ref().unwrap().selection.lock().unwrap().failed_until[0] =
+            Some(Instant::now() - Duration::from_secs(1));
+        open_for(&state, None, "192.168.1.181").await.unwrap();
+        assert_eq!(recovered.load(Ordering::Relaxed), 2, "после cooldown не вернулись на первый WAN");
+        assert_eq!(second.load(Ordering::Relaxed), 6);
+    }
+
+    #[tokio::test]
+    async fn bypass_proxy_preserves_exit_server_subset_and_missing_key_is_fail_closed() {
+        let primary = serving_pool(Arc::new(AtomicUsize::new(0)), true).await;
+        let default_count = Arc::new(AtomicUsize::new(0));
+        let subset_count = Arc::new(AtomicUsize::new(0));
+        let default_a = serving_pool(default_count.clone(), false).await;
+        let default_b = serving_pool(default_count.clone(), false).await;
+        let subset_a = serving_pool(subset_count.clone(), false).await;
+        let subset_b = serving_pool(Arc::new(AtomicUsize::new(0)), false).await;
+        let pool = test_pool(members(), HashMap::from([
+            ("global".into(), vec![default_a, default_b]),
+            ("subset".into(), vec![subset_a, subset_b]),
+        ]));
+        let state = proxy_state(primary, pool);
+        let profile = exit_profile("subset", true, None);
+        open_for(&state, Some(&profile), "192.168.1.181").await.unwrap();
+        assert_eq!(subset_count.load(Ordering::Relaxed), 2);
+        assert_eq!(default_count.load(Ordering::Relaxed), 0, "профиль вышел через полный global список VPS");
+        let missing = exit_profile("absent", true, None);
+        assert_eq!(open_for(&state, Some(&missing), "192.168.1.181").await.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(default_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn bypass_proxy_keeps_explicit_wan_and_main_on_selected_primary_pool() {
+        let unbound = Arc::new(AtomicUsize::new(0));
+        let balanced = Arc::new(AtomicUsize::new(0));
+        let primary = serving_pool(unbound.clone(), false).await;
+        let a = serving_pool(balanced.clone(), false).await;
+        let b = serving_pool(balanced.clone(), false).await;
+        let state = proxy_state(primary, test_pool(members(), HashMap::from([("global".into(), vec![a,b])])));
+        for interface in [None, Some("pinned-wan")] {
+            let profile = exit_profile("explicit", false, interface);
+            open_for(&state, Some(&profile), "192.168.1.181").await.unwrap();
+        }
+        assert_eq!(unbound.load(Ordering::Relaxed), 3);
+        assert_eq!(balanced.load(Ordering::Relaxed), 0, "явный wan/main был подменён общим WAN пулом");
+        assert_eq!(state.wan_pool.as_ref().unwrap().selection.lock().unwrap().next, 0);
+    }
+
+    #[tokio::test]
+    async fn bypass_proxy_without_wan_pool_keeps_old_unbound_path() {
+        let unbound = Arc::new(AtomicUsize::new(0));
+        let primary = serving_pool(unbound.clone(), false).await;
+        let mut state = proxy_state(primary, test_pool(members(), HashMap::new()));
+        state.wan_pool = None;
+        open_for(&state, None, "192.168.1.181").await.unwrap();
+        assert_eq!(unbound.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn bypass_proxy_does_not_replay_data_after_peer_closes_stream() {
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let primary = serving_pool(Arc::new(AtomicUsize::new(0)), true).await;
+        let a = serving_pool_observed(first.clone(), false, Some(observed.clone())).await;
+        let b = serving_pool_observed(second.clone(), false, Some(observed.clone())).await;
+        let state = proxy_state(primary, test_pool(members(), HashMap::from([("global".into(), vec![a,b])])));
+        let mut stream = open_for(&state, None, "192.168.1.181").await.unwrap();
+        stream.send(b"request already sent").await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), stream.recv()).await.unwrap().is_none());
+        assert_eq!(&*observed.lock().unwrap(), &[b"request already sent".to_vec()]);
+        assert_eq!(first.load(Ordering::Relaxed), 2);
+        assert_eq!(second.load(Ordering::Relaxed), 0, "после передачи данных открыли второй WAN");
+    }
+
 }
+// regcheck:test-end
