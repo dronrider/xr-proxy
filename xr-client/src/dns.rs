@@ -296,7 +296,7 @@ where
                 retry_pending(conn.take(), &mut retries, retryable, &mut next_attempt);
                 answers = None;
             }
-            Event::Job(job) => {
+            Event::Job(mut job) => {
                 prefer_retry = !prefer_retry;
                 if job.query.len() < 12 {
                     continue;
@@ -307,7 +307,16 @@ where
                     continue;
                 }
                 if conn.is_none() {
-                    if next_attempt.is_some_and(|t| tokio::time::Instant::now() < t) {
+                    if let Some(retry_at) = next_attempt.filter(|t| tokio::time::Instant::now() < *t) {
+                        // При conn=None полезных ответов ждать неоткуда, а
+                        // connect до retry_at запрещён всем jobs. Ожидание
+                        // не продлевает срок ни текущего запроса, ни очереди.
+                        tokio::select! {
+                            _ = job.reply.closed() => continue,
+                            _ = tokio::time::sleep_until(retry_at.min(job.deadline)) => {}
+                        }
+                    }
+                    if job.reply.is_closed() || tokio::time::Instant::now() >= job.deadline {
                         continue;
                     }
                     match tokio::time::timeout_at(job.deadline, connect()).await {
@@ -832,13 +841,18 @@ mod tests {
             };
             let _ = serve_forwarder(udp, tcp, Duration::from_millis(300), connect).await;
         });
-        // Запросов заведомо больше, чем помещается в очередь форвардера.
+        // Одновременных запросов больше, чем помещается в очередь. Каждый
+        // ждёт в пределах своего срока, а не 300 раз подряд за соседями.
+        let mut requests = tokio::task::JoinSet::new();
         for i in 0..300u16 {
-            let q = query(i, "rutracker.org", None);
-            let answer = ask_udp(addr, &q).await;
-            assert_eq!(rcode(&answer), 2, "запрос {i} остался без отказа");
-            assert_eq!(&answer[0..2], &q[0..2]);
+            requests.spawn(async move {
+                let q = query(i, "rutracker.org", None);
+                let answer = ask_udp(addr, &q).await;
+                assert_eq!(rcode(&answer), 2, "запрос {i} остался без отказа");
+                assert_eq!(&answer[0..2], &q[0..2]);
+            });
         }
+        while let Some(result) = requests.join_next().await { result.unwrap(); }
     }
 
     /// Ответ длиннее датаграммы не рвёт разговор с апстримом: он доезжает по
@@ -1406,6 +1420,89 @@ mod tests {
         let mut byte = [0];
         assert!(tokio::time::timeout(Duration::from_secs(1), second.read(&mut byte)).await.is_err(),
             "после отмены клиента отправили повторный запрос");
+    }
+
+    async fn exhausted_dns_retry() ->
+        (Forwarder, mpsc::UnboundedReceiver<tokio::io::DuplexStream>, Arc<AtomicUsize>)
+    {
+        let (forwarder, mut connections, count) = controlled_retry_forwarder(Duration::from_secs(5));
+        let client = forwarder.clone();
+        let request = tokio::spawn(async move { client.resolve(&query(1, "exhaust.test", None)).await });
+        for _ in 0..2 {
+            let mut server = retry_connection(&mut connections).await;
+            read_retry_query(&mut server).await;
+            drop(server);
+        }
+        assert_eq!(rcode(&request.await.unwrap()), 2);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        (forwarder, connections, count)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_query_waits_out_disconnect_backoff_and_succeeds() {
+        let (forwarder, mut connections, count) = exhausted_dns_retry().await;
+        let failed_at = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let client = forwarder.clone();
+        let request = tokio::spawn(async move { client.resolve(&query(2, "after-backoff.test", None)).await });
+        let mut server = tokio::time::timeout(Duration::from_secs(2), connections.recv()).await
+            .expect("новый запрос потерялся в паузе после двух EOF").unwrap();
+        assert_eq!(tokio::time::Instant::now() - failed_at, Duration::from_secs(1),
+            "общая пауза должна закончиться в прежний момент, не начинаться заново");
+        let q = read_retry_query(&mut server).await;
+        reply_retry_query(&mut server, &q, Ipv4Addr::new(1, 2, 3, 4)).await;
+        assert_eq!(rcode(&request.await.unwrap()), 0);
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn query_deadline_shorter_than_backoff_fails_without_connect() {
+        let (mut forwarder, mut connections, count) = exhausted_dns_retry().await;
+        forwarder.timeout = Duration::from_millis(250);
+        let started = tokio::time::Instant::now();
+        let answer = forwarder.resolve(&query(2, "short-budget.test", None)).await;
+        assert_eq!(rcode(&answer), 2);
+        assert_eq!(tokio::time::Instant::now() - started, Duration::from_millis(250),
+            "ожидание паузы обязано соблюдать исходный deadline, а не ронять запрос сразу");
+        assert!(tokio::time::timeout(Duration::from_secs(2), connections.recv()).await.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_query_during_backoff_does_not_connect_or_write() {
+        let (forwarder, mut connections, count) = exhausted_dns_retry().await;
+        let client = forwarder.clone();
+        let request = tokio::spawn(async move { client.resolve(&query(2, "cancel-backoff.test", None)).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(250)).await;
+        assert!(!request.is_finished(), "запрос сразу получил SERVFAIL вместо ожидания паузы");
+        request.abort();
+        let _ = request.await;
+        assert!(tokio::time::timeout(Duration::from_secs(2), connections.recv()).await.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_short_deadline_stays_bounded_while_first_job_waits_for_backoff() {
+        let (forwarder, mut connections, count) = exhausted_dns_retry().await;
+        let client = forwarder.clone();
+        let long = tokio::spawn(async move { client.resolve(&query(2, "long-backoff.test", None)).await });
+        tokio::task::yield_now().await;
+        let mut short = forwarder.clone();
+        short.timeout = Duration::from_millis(250);
+        let started = tokio::time::Instant::now();
+        let answer = short.resolve(&query(3, "short-queued.test", None)).await;
+        assert_eq!(rcode(&answer), 2);
+        assert_eq!(tokio::time::Instant::now() - started, Duration::from_millis(250));
+        let mut server = tokio::time::timeout(Duration::from_secs(2), connections.recv()).await
+            .expect("длинный запрос не пережил общую паузу").unwrap();
+        let q = read_retry_query(&mut server).await;
+        reply_retry_query(&mut server, &q, Ipv4Addr::new(1, 2, 3, 4)).await;
+        assert_eq!(rcode(&long.await.unwrap()), 0);
+        let mut extra = [0];
+        assert!(tokio::time::timeout(Duration::from_secs(1), server.read(&mut extra)).await.is_err(),
+            "истёкший запрос из очереди отправился после паузы");
+        assert_eq!(count.load(Ordering::SeqCst), 3);
     }
 
 }
