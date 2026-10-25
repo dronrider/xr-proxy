@@ -10,7 +10,7 @@
 //! Транспорт до апстрима задаётся вызывающим: в бою это TLS поверх
 //! туннельного стрима, в тестах голый TCP до заглушки резолвера.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -39,22 +39,67 @@ const UPSTREAM_ERROR_QUIET: Duration = Duration::from_secs(60);
 /// ждёт свой полный таймаут подключения, очередь копится, и спрашивающий
 /// перестаёт получать даже отказ.
 const UPSTREAM_RETRY_PAUSE: Duration = Duration::from_secs(1);
+const MAX_RETRIES: usize = 256;
 
 struct Job {
     query: Vec<u8>,
     reply: oneshot::Sender<Vec<u8>>,
     timed_out: Arc<AtomicBool>,
     deadline: tokio::time::Instant,
+    attempt: u8,
 }
 
 struct Pending {
-    /// Идентификатор, с которым запрос пришёл от dnsmasq: на проводе к
-    /// апстриму у него свой, потому что в одно соединение мультиплексируются
-    /// разные спрашивающие.
-    client_id: [u8; 2],
-    reply: oneshot::Sender<Vec<u8>>,
-    timed_out: Arc<AtomicBool>,
+    job: Job,
     sent_at: tokio::time::Instant,
+}
+
+fn retryable_disconnect(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::NotConnected | io::ErrorKind::WriteZero)
+}
+
+fn queue_retry(retries: &mut VecDeque<Job>, mut job: Job) -> bool {
+    if job.attempt != 0 || retries.len() >= MAX_RETRIES
+        || job.query.len() < 12 || job.query[2] & 0xf8 != 0
+        || job.reply.is_closed() || job.timed_out.load(Ordering::SeqCst)
+        || tokio::time::Instant::now() >= job.deadline
+    {
+        return false;
+    }
+    job.attempt = 1;
+    retries.push_back(job);
+    true
+}
+
+async fn next_job(jobs: &mut mpsc::Receiver<Job>, retries: &mut VecDeque<Job>,
+    prefer_retry: bool) -> Option<Job>
+{
+    if !prefer_retry {
+        if let Ok(job) = jobs.try_recv() { return Some(job); }
+    }
+    if let Some(job) = retries.pop_front() { return Some(job); }
+    jobs.recv().await
+}
+
+fn retry_pending<W>(conn: Option<Conn<W>>, retries: &mut VecDeque<Job>, retryable: bool,
+    next_attempt: &mut Option<tokio::time::Instant>)
+{
+    let Some(conn) = conn else { return; };
+    let mut queued = 0;
+    let mut exhausted = false;
+    for pending in conn.pending.into_values() {
+        exhausted |= pending.job.attempt != 0 && !pending.job.reply.is_closed()
+            && !pending.job.timed_out.load(Ordering::SeqCst)
+            && tokio::time::Instant::now() < pending.job.deadline;
+        if retryable && queue_retry(retries, pending.job) { queued += 1; }
+    }
+    if queued > 0 {
+        tracing::info!("dns: retrying {queued} outstanding queries after upstream disconnect");
+    } else if exhausted {
+        *next_attempt = Some(tokio::time::Instant::now() + UPSTREAM_RETRY_PAUSE);
+    }
 }
 
 struct Conn<W> {
@@ -98,6 +143,7 @@ impl Forwarder {
             reply: tx,
             timed_out: timed_out.clone(),
             deadline,
+            attempt: 0,
         };
         // Очередь забита значит апстрим не отвечает, и ждать в ней места это
         // то самое молчание, вместо которого спрашивающему нужен отказ.
@@ -172,12 +218,12 @@ where
 enum Event {
     Job(Job),
     /// Ответ апстрима, либо `None`, когда его соединение кончилось.
-    Answer(Option<Vec<u8>>),
+    Answer(Option<io::Result<Vec<u8>>>),
     Sweep,
     Stop,
 }
 
-async fn recv_answer(answers: &mut Option<mpsc::Receiver<Vec<u8>>>) -> Option<Vec<u8>> {
+async fn recv_answer(answers: &mut Option<mpsc::Receiver<io::Result<Vec<u8>>>>) -> Option<io::Result<Vec<u8>>> {
     match answers {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
@@ -194,14 +240,16 @@ where
     Fut: Future<Output = io::Result<S>>,
 {
     let mut conn: Option<Conn<tokio::io::WriteHalf<S>>> = None;
-    let mut answers: Option<mpsc::Receiver<Vec<u8>>> = None;
+    let mut answers: Option<mpsc::Receiver<io::Result<Vec<u8>>>> = None;
     let mut last_complaint: Option<Instant> = None;
-    let mut next_attempt: Option<Instant> = None;
+    let mut next_attempt: Option<tokio::time::Instant> = None;
+    let mut retries = VecDeque::new();
+    let mut prefer_retry = true;
     let mut sweep = tokio::time::interval(Duration::from_secs(1));
 
     loop {
         let event = tokio::select! {
-            job = jobs.recv() => match job {
+            job = next_job(&mut jobs, &mut retries, prefer_retry) => match job {
                 Some(job) => Event::Job(job),
                 None => Event::Stop,
             },
@@ -210,8 +258,8 @@ where
         };
 
         if conn.as_ref().is_some_and(|c| c.pending.values().any(|p| {
-            p.timed_out.load(Ordering::SeqCst)
-                || (!p.reply.is_closed() && p.sent_at.elapsed() >= timeout)
+            p.job.timed_out.load(Ordering::SeqCst)
+                || (!p.job.reply.is_closed() && p.sent_at.elapsed() >= timeout)
         })) {
             complain(&mut last_complaint, "upstream response timed out; reconnecting".into());
             conn = None;
@@ -226,10 +274,10 @@ where
                 // и ушёл SERVFAIL), держать незачем: без чистки таблица растёт
                 // на каждом молчании апстрима.
                 if let Some(c) = conn.as_mut() {
-                    c.pending.retain(|_, p| !p.reply.is_closed() || p.timed_out.load(Ordering::SeqCst));
+                    c.pending.retain(|_, p| !p.job.reply.is_closed() || p.job.timed_out.load(Ordering::SeqCst));
                 }
             }
-            Event::Answer(Some(msg)) => {
+            Event::Answer(Some(Ok(msg))) => {
                 if msg.len() < 12 {
                     continue;
                 }
@@ -237,30 +285,29 @@ where
                 if let Some(c) = conn.as_mut() {
                     if let Some(p) = c.pending.remove(&wire_id) {
                         let mut msg = msg;
-                        msg[0] = p.client_id[0];
-                        msg[1] = p.client_id[1];
-                        let _ = p.reply.send(msg);
+                        msg[0..2].copy_from_slice(&p.job.query[0..2]);
+                        let _ = p.job.reply.send(msg);
                     }
                 }
             }
-            Event::Answer(None) => {
+            Event::Answer(failure) => {
+                let retryable = matches!(failure, Some(Err(ref error)) if retryable_disconnect(error));
                 tracing::warn!("dns: upstream closed the connection, will reconnect on next query");
-                // Ожидающие уходят вместе с таблицей: их oneshot закрывается,
-                // и спрашивающий получает SERVFAIL, а не виснет до таймаута.
-                conn = None;
+                retry_pending(conn.take(), &mut retries, retryable, &mut next_attempt);
                 answers = None;
             }
             Event::Job(job) => {
+                prefer_retry = !prefer_retry;
                 if job.query.len() < 12 {
                     continue;
                 }
                 // Спрашивающий уже ушёл по своему таймауту: тратить на него
                 // попытку подключения значит задерживать тех, кто ещё ждёт.
-                if job.reply.is_closed() {
+                if job.reply.is_closed() || tokio::time::Instant::now() >= job.deadline {
                     continue;
                 }
                 if conn.is_none() {
-                    if next_attempt.is_some_and(|t| Instant::now() < t) {
+                    if next_attempt.is_some_and(|t| tokio::time::Instant::now() < t) {
                         continue;
                     }
                     match tokio::time::timeout_at(job.deadline, connect()).await {
@@ -277,21 +324,23 @@ where
                         }
                         Ok(Err(e)) => {
                             complain(&mut last_complaint, format!("{e}"));
-                            next_attempt = Some(Instant::now() + UPSTREAM_RETRY_PAUSE);
+                            next_attempt = Some(tokio::time::Instant::now() + UPSTREAM_RETRY_PAUSE);
                             continue;
                         }
                         Err(_) => {
                             complain(&mut last_complaint, "connect timed out".to_string());
-                            next_attempt = Some(Instant::now() + UPSTREAM_RETRY_PAUSE);
+                            next_attempt = Some(tokio::time::Instant::now() + UPSTREAM_RETRY_PAUSE);
                             continue;
                         }
                     }
                 }
 
+                if job.reply.is_closed() || tokio::time::Instant::now() >= job.deadline {
+                    continue;
+                }
                 let c = conn.as_mut().expect("connection built above");
                 let wire_id = c.next_free_id();
-                let mut msg = job.query;
-                let client_id = [msg[0], msg[1]];
+                let mut msg = job.query.clone();
                 msg[0..2].copy_from_slice(&wire_id.to_be_bytes());
 
                 let mut framed = Vec::with_capacity(msg.len() + 2);
@@ -300,21 +349,17 @@ where
                 match tokio::time::timeout_at(job.deadline, c.writer.write_all(&framed)).await {
                     Ok(Ok(())) => {}
                     failure => {
+                        let retryable = matches!(failure, Ok(Err(ref error)) if retryable_disconnect(error));
                         tracing::warn!("dns: write to upstream failed or timed out: {failure:?}");
-                        conn = None;
+                        // При частичной записи QUERY допустимо повторить один
+                        // раз: opcode с побочным эффектом сюда не попадает.
+                        c.pending.insert(wire_id, Pending { job, sent_at: tokio::time::Instant::now() });
+                        retry_pending(conn.take(), &mut retries, retryable, &mut next_attempt);
                         answers = None;
                         continue;
                     }
                 }
-                c.pending.insert(
-                    wire_id,
-                    Pending {
-                        client_id,
-                        reply: job.reply,
-                        timed_out: job.timed_out,
-                        sent_at: tokio::time::Instant::now(),
-                    },
-                );
+                c.pending.insert(wire_id, Pending { job, sent_at: tokio::time::Instant::now() });
             }
         }
     }
@@ -335,33 +380,34 @@ fn complain(last: &mut Option<Instant>, reason: String) {
     }
 }
 
-async fn read_answers<R: AsyncRead + Unpin>(mut reader: R, tx: mpsc::Sender<Vec<u8>>) {
+async fn read_answers<R: AsyncRead + Unpin>(mut reader: R, tx: mpsc::Sender<io::Result<Vec<u8>>>) {
     loop {
         let read = async {
             let mut len = [0u8; 2];
             if let Err(error) = reader.read_exact(&mut len).await {
                 tracing::warn!("dns: upstream read length failed ({:?}): {error}", error.kind());
-                return None;
+                return Err(error);
             }
             let n = u16::from_be_bytes(len) as usize;
             if n == 0 {
                 tracing::warn!("dns: upstream sent a zero-length DNS frame");
-                return None;
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "zero-length DNS frame"));
             }
             let mut msg = vec![0u8; n];
             if let Err(error) = reader.read_exact(&mut msg).await {
                 tracing::warn!("dns: upstream read payload failed ({:?}): {error}", error.kind());
-                return None;
+                return Err(error);
             }
-            Some(msg)
+            Ok(msg)
         };
         let msg = tokio::select! {
             // При замене апстрима reader должен отпустить старый поток,
             // даже если от него больше никогда не придёт ни байта.
             _ = tx.closed() => break,
-            msg = read => match msg { Some(msg) => msg, None => break },
+            msg = read => msg,
         };
-        if tx.send(msg).await.is_err() { break; }
+        let disconnected = msg.is_err();
+        if tx.send(msg).await.is_err() || disconnected { break; }
     }
 }
 
@@ -993,6 +1039,373 @@ mod tests {
         assert_eq!(rcode(&next), 0,
             "зависшая запись не должна навсегда остановить цикл DNS");
         assert_eq!(connects.load(Ordering::SeqCst), 2);
+    }
+
+    fn controlled_retry_forwarder(timeout: Duration) ->
+        (Forwarder, mpsc::UnboundedReceiver<tokio::io::DuplexStream>, Arc<AtomicUsize>)
+    {
+        let (jobs, rx) = mpsc::channel(1024);
+        let (servers, connections) = mpsc::unbounded_channel();
+        let count = Arc::new(AtomicUsize::new(0));
+        let connects = count.clone();
+        tokio::spawn(upstream_loop(rx, move || {
+            connects.fetch_add(1, Ordering::SeqCst);
+            let (client, server) = tokio::io::duplex(4096);
+            servers.send(server).unwrap();
+            async move { Ok(client) }
+        }, timeout));
+        (Forwarder { jobs, timeout }, connections, count)
+    }
+
+    async fn retry_connection(connections: &mut mpsc::UnboundedReceiver<tokio::io::DuplexStream>)
+        -> tokio::io::DuplexStream
+    {
+        tokio::time::timeout(Duration::from_secs(1), connections.recv()).await
+            .expect("после раннего EOF не было повторного подключения").unwrap()
+    }
+
+    async fn read_retry_query(server: &mut tokio::io::DuplexStream) -> Vec<u8> {
+        let mut len = [0; 2];
+        server.read_exact(&mut len).await.unwrap();
+        let mut query = vec![0; u16::from_be_bytes(len) as usize];
+        server.read_exact(&mut query).await.unwrap();
+        query
+    }
+
+    async fn reply_retry_query(server: &mut tokio::io::DuplexStream, q: &[u8], ip: Ipv4Addr) {
+        let answer = answer_a(q, ip);
+        server.write_all(&(answer.len() as u16).to_be_bytes()).await.unwrap();
+        server.write_all(&answer).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn early_eof_retries_original_query_once_and_preserves_edns_client_id() {
+        let (forwarder, mut connections, count) = controlled_retry_forwarder(Duration::from_secs(5));
+        let original = query(0xbeef, "retry.test", Some(1232));
+        let q = original.clone();
+        let request = tokio::spawn(async move { forwarder.resolve(&q).await });
+        let mut first = retry_connection(&mut connections).await;
+        let accepted = read_retry_query(&mut first).await;
+        assert_eq!(&accepted[2..], &original[2..]);
+        drop(first);
+        let mut second = retry_connection(&mut connections).await;
+        let retried = read_retry_query(&mut second).await;
+        assert_eq!(&retried[2..], &original[2..], "повтор потерял DNS flags/question/EDNS");
+        reply_retry_query(&mut second, &retried, Ipv4Addr::new(1, 2, 3, 4)).await;
+        let answer = request.await.unwrap();
+        assert_eq!(rcode(&answer), 0);
+        assert_eq!(&answer[0..2], &[0xbe, 0xef]);
+        assert_eq!(first_a(&answer), Some(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_early_eofs_stop_after_exactly_two_attempts() {
+        let (forwarder, mut connections, count) = controlled_retry_forwarder(Duration::from_secs(5));
+        let client = forwarder.clone();
+        let request = tokio::spawn(async move { client.resolve(&query(1, "twice.test", None)).await });
+        for _ in 0..2 {
+            let mut server = retry_connection(&mut connections).await;
+            read_retry_query(&mut server).await;
+            drop(server);
+        }
+        assert_eq!(rcode(&request.await.unwrap()), 2);
+        assert!(tokio::time::timeout(Duration::from_secs(1), connections.recv()).await.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 2, "повтор зациклился при общем отказе апстрима");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_connect_uses_original_deadline_and_is_cancelled_at_it() {
+        struct Active(Arc<AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) { self.0.fetch_sub(1, Ordering::SeqCst); }
+        }
+        let (jobs, rx) = mpsc::channel(16);
+        let (servers, mut connections) = mpsc::unbounded_channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let connecting = active.clone();
+        tokio::spawn(upstream_loop(rx, move || {
+            let first = counter.fetch_add(1, Ordering::SeqCst) == 0;
+            let active = connecting.clone();
+            let servers = servers.clone();
+            async move {
+                if first {
+                    let (client, server) = tokio::io::duplex(4096);
+                    servers.send(server).unwrap();
+                    Ok(client)
+                } else {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _guard = Active(active);
+                    std::future::pending().await
+                }
+            }
+        }, Duration::from_secs(5)));
+        let forwarder = Forwarder { jobs, timeout: Duration::from_secs(5) };
+        let started = tokio::time::Instant::now();
+        let request = tokio::spawn(async move { forwarder.resolve(&query(1, "deadline.test", None)).await });
+        let mut first = retry_connection(&mut connections).await;
+        read_retry_query(&mut first).await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        drop(first);
+        assert_eq!(rcode(&request.await.unwrap()), 2);
+        tokio::task::yield_now().await;
+        assert_eq!(tokio::time::Instant::now() - started, Duration::from_secs(5));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0, "повтор продлил срок подключения");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_query_is_not_retried_after_eof() {
+        let (forwarder, mut connections, count) = controlled_retry_forwarder(Duration::from_secs(5));
+        let client = forwarder.clone();
+        let request = tokio::spawn(async move { client.resolve(&query(1, "cancel.test", None)).await });
+        let mut first = retry_connection(&mut connections).await;
+        read_retry_query(&mut first).await;
+        request.abort();
+        let _ = request.await;
+        drop(first);
+        assert!(tokio::time::timeout(Duration::from_secs(1), connections.recv()).await.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn update_notify_and_response_are_not_retried_after_eof() {
+        for flags in [5 << 3, 4 << 3, 0x80] {
+            let (forwarder, mut connections, count) = controlled_retry_forwarder(Duration::from_secs(5));
+            let mut q = query(1, "non-query.test", None);
+            q[2] = flags;
+            let client = forwarder.clone();
+        let request = tokio::spawn(async move { client.resolve(&q).await });
+            let mut first = retry_connection(&mut connections).await;
+            read_retry_query(&mut first).await;
+            drop(first);
+            assert_eq!(rcode(&request.await.unwrap()), 2);
+            assert!(tokio::time::timeout(Duration::from_secs(1), connections.recv()).await.is_err());
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn multiple_pending_retries_keep_distinct_wire_ids_and_out_of_order_answers() {
+        let (forwarder, mut connections, count) = controlled_retry_forwarder(Duration::from_secs(5));
+        let originals: Vec<_> = (0..3).map(|n| query(0xbeef, &format!("{n}.retry.test"), Some(1232))).collect();
+        let mut requests = Vec::new();
+        for q in &originals {
+            let q = q.clone();
+            let forwarder = forwarder.clone();
+            requests.push(tokio::spawn(async move { forwarder.resolve(&q).await }));
+        }
+        let mut first = retry_connection(&mut connections).await;
+        for _ in 0..3 { read_retry_query(&mut first).await; }
+        tokio::time::advance(Duration::from_secs(2)).await;
+        drop(first);
+        let mut second = retry_connection(&mut connections).await;
+        let mut retried = Vec::new();
+        for _ in 0..3 { retried.push(read_retry_query(&mut second).await); }
+        let ids: std::collections::HashSet<_> = retried.iter().map(|q| &q[0..2]).collect();
+        assert_eq!(ids.len(), 3, "одинаковые client ID столкнулись после повтора");
+        for q in retried.iter().rev() {
+            let index = originals.iter().position(|original| original[2..] == q[2..]).unwrap();
+            reply_retry_query(&mut second, q, Ipv4Addr::new(1, 2, 3, index as u8)).await;
+        }
+        for (index, request) in requests.into_iter().enumerate() {
+            let answer = request.await.unwrap();
+            assert_eq!(rcode(&answer), 0);
+            assert_eq!(&answer[0..2], &[0xbe, 0xef]);
+            assert_eq!(first_a(&answer), Some(Ipv4Addr::new(1, 2, 3, index as u8)));
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 2, "повторы открыли отдельное соединение на каждый запрос");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eof_retry_queue_never_replays_more_than_256_outstanding_queries() {
+        let (forwarder, mut connections, count) = controlled_retry_forwarder(Duration::from_secs(5));
+        let mut requests = Vec::new();
+        for n in 0..300 {
+            let forwarder = forwarder.clone();
+            requests.push(tokio::spawn(async move { forwarder.resolve(&query(n, "bound.test", None)).await }));
+        }
+        let mut first = retry_connection(&mut connections).await;
+        for _ in 0..300 { read_retry_query(&mut first).await; }
+        drop(first);
+        let mut second = retry_connection(&mut connections).await;
+        for _ in 0..256 {
+            let q = read_retry_query(&mut second).await;
+            reply_retry_query(&mut second, &q, Ipv4Addr::new(1, 2, 3, 4)).await;
+        }
+        let mut success = 0;
+        for request in requests { success += usize::from(rcode(&request.await.unwrap()) == 0); }
+        assert_eq!(success, 256);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        let mut extra = [0];
+        assert!(tokio::time::timeout(Duration::from_secs(1), second.read(&mut extra)).await.is_err(),
+            "повторили запрос сверх предела очереди");
+    }
+
+    struct FaultyDnsStream {
+        inner: tokio::io::DuplexStream,
+        read_error: Option<io::ErrorKind>,
+        write_error: Option<io::ErrorKind>,
+    }
+
+    impl AsyncRead for FaultyDnsStream {
+        fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<io::Result<()>>
+        {
+            if let Some(kind) = self.read_error.take() {
+                return std::task::Poll::Ready(Err(io::Error::new(kind, "synthetic read fault")));
+            }
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for FaultyDnsStream {
+        fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+            buf: &[u8]) -> std::task::Poll<io::Result<usize>>
+        {
+            if let Some(kind) = self.write_error.take() {
+                return std::task::Poll::Ready(Err(io::Error::new(kind, "synthetic write fault")));
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>)
+            -> std::task::Poll<io::Result<()>>
+        { std::pin::Pin::new(&mut self.inner).poll_flush(cx) }
+        fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>)
+            -> std::task::Poll<io::Result<()>>
+        { std::pin::Pin::new(&mut self.inner).poll_shutdown(cx) }
+    }
+
+    fn faulty_retry_forwarder(read_error: Option<io::ErrorKind>, write_error: Option<io::ErrorKind>)
+        -> (Forwarder, mpsc::UnboundedReceiver<tokio::io::DuplexStream>, Arc<AtomicUsize>)
+    {
+        let (jobs, rx) = mpsc::channel(16);
+        let (servers, connections) = mpsc::unbounded_channel();
+        let count = Arc::new(AtomicUsize::new(0));
+        let connects = count.clone();
+        tokio::spawn(upstream_loop(rx, move || {
+            let first = connects.fetch_add(1, Ordering::SeqCst) == 0;
+            let (inner, server) = tokio::io::duplex(4096);
+            servers.send(server).unwrap();
+            async move { Ok(FaultyDnsStream { inner,
+                read_error: if first { read_error } else { None },
+                write_error: if first { write_error } else { None },
+            }) }
+        }, Duration::from_secs(5)));
+        (Forwarder { jobs, timeout: Duration::from_secs(5) }, connections, count)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn early_broken_pipe_write_retries_query_on_new_connection() {
+        let (forwarder, mut connections, count) = faulty_retry_forwarder(None, Some(io::ErrorKind::BrokenPipe));
+        let client = forwarder.clone();
+        let request = tokio::spawn(async move { client.resolve(&query(0xcafe, "write-retry.test", None)).await });
+        let _broken = retry_connection(&mut connections).await;
+        let mut second = retry_connection(&mut connections).await;
+        let q = read_retry_query(&mut second).await;
+        reply_retry_query(&mut second, &q, Ipv4Addr::new(1, 2, 3, 4)).await;
+        let answer = request.await.unwrap();
+        assert_eq!(rcode(&answer), 0);
+        assert_eq!(&answer[0..2], &[0xca, 0xfe]);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalid_tls_data_is_not_retried() {
+        let (forwarder, mut connections, count) = faulty_retry_forwarder(Some(io::ErrorKind::InvalidData), None);
+        let client = forwarder.clone();
+        let request = tokio::spawn(async move { client.resolve(&query(1, "invalid.test", None)).await });
+        let _broken = retry_connection(&mut connections).await;
+        assert_eq!(rcode(&request.await.unwrap()), 2);
+        assert!(tokio::time::timeout(Duration::from_secs(1), connections.recv()).await.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_query_is_not_retried_after_late_eof() {
+        let (forwarder, mut connections, count) = controlled_retry_forwarder(Duration::from_secs(5));
+        let client = forwarder.clone();
+        let request = tokio::spawn(async move { client.resolve(&query(1, "expired.test", None)).await });
+        let mut first = retry_connection(&mut connections).await;
+        read_retry_query(&mut first).await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(rcode(&request.await.unwrap()), 2);
+        drop(first);
+        assert!(tokio::time::timeout(Duration::from_secs(1), connections.recv()).await.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_retries_do_not_starve_new_queries() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (forwarder, mut connections, _) = controlled_retry_forwarder(Duration::from_secs(5));
+            let mut requests = Vec::new();
+            for n in 0..8 {
+                let client = forwarder.clone();
+                requests.push(tokio::spawn(async move { client.resolve(&query(n, "old.test", None)).await }));
+            }
+            let mut first = retry_connection(&mut connections).await;
+            for _ in 0..8 { read_retry_query(&mut first).await; }
+            // Ставим новые запросы в канал до обработки обрыва, не давая
+            // планировщику спрятать голодание за разным порядком spawn.
+            let mut fresh = Vec::new();
+            for n in 8..10 {
+                let client = forwarder.clone();
+                fresh.push(Box::pin(async move { client.resolve(&query(n, &format!("fresh{}.test", n - 8), None)).await }));
+            }
+            std::future::poll_fn(|cx| {
+                for future in &mut fresh { assert!(future.as_mut().poll(cx).is_pending()); }
+                std::task::Poll::Ready(())
+            }).await;
+            requests.extend(fresh.into_iter().map(tokio::spawn));
+            drop(first);
+            let mut second = retry_connection(&mut connections).await;
+            let mut last_fresh = None;
+            for index in 0..10 {
+                let q = read_retry_query(&mut second).await;
+                if q.windows(6).any(|bytes| bytes == b"fresh1") {
+                    last_fresh = Some(index);
+                }
+                reply_retry_query(&mut second, &q, Ipv4Addr::new(1, 2, 3, 4)).await;
+            }
+            assert!(last_fresh.is_some_and(|index| index <= 3),
+                "новые запросы ждали полного обхода очереди повторов: {last_fresh:?}");
+            for request in requests { assert_eq!(rcode(&request.await.unwrap()), 0); }
+        }).await.expect("новые запросы потерялись при разборе очереди повторов");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_during_retry_connect_does_not_send_query_after_connect() {
+        let (jobs, rx) = mpsc::channel(16);
+        let (servers, mut connections) = mpsc::unbounded_channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let reconnect = gate.clone();
+        tokio::spawn(upstream_loop(rx, move || {
+            let first = attempts.fetch_add(1, Ordering::SeqCst) == 0;
+            let (client, server) = tokio::io::duplex(4096);
+            servers.send(server).unwrap();
+            let gate = reconnect.clone();
+            async move {
+                if !first { gate.notified().await; }
+                Ok(client)
+            }
+        }, Duration::from_secs(5)));
+        let forwarder = Forwarder { jobs, timeout: Duration::from_secs(5) };
+        let client = forwarder.clone();
+        let request = tokio::spawn(async move { client.resolve(&query(1, "connect-cancel.test", None)).await });
+        let mut first = retry_connection(&mut connections).await;
+        read_retry_query(&mut first).await;
+        drop(first);
+        let mut second = retry_connection(&mut connections).await;
+        request.abort();
+        let _ = request.await;
+        gate.notify_one();
+        let mut byte = [0];
+        assert!(tokio::time::timeout(Duration::from_secs(1), second.read(&mut byte)).await.is_err(),
+            "после отмены клиента отправили повторный запрос");
     }
 
 }
