@@ -434,13 +434,9 @@ async fn handle_connection(
             // Резерв канала пробуется только на отказе открытия стрима: как
             // только релей тронул байты клиента, повторная отправка через
             // другой пул дублировала бы поток.
-            let opened = if let Some(wan_pool) = balanced {
-                let key = exit.as_ref().map(|e| e.pool_key.as_str())
-                    .unwrap_or(&state.default_pool_key);
-                wan_pool.open_stream(key, &target_addr).await
-            } else {
-                primary.open_stream(&target_addr).await
-            };
+            let opened = open_proxy_stream(
+                &state, exit.as_deref(), client_addr.ip(), &primary, &target_addr,
+            ).await;
             let mux_stream = match opened {
                 Ok(stream) => stream,
                 Err(e) => {
@@ -505,6 +501,28 @@ async fn handle_connection(
             }
         }
     }
+}
+
+/// Bypass исключает распределение по весам, но не резервирование Proxy.
+/// Direct и явно закреплённые выходы сохраняют прежний путь.
+pub(crate) async fn open_proxy_stream(
+    state: &ProxyState,
+    exit: Option<&xr_proto::device::ExitProfile>,
+    client_ip: std::net::IpAddr,
+    primary: &ServerPool,
+    target: &TargetAddr,
+) -> io::Result<xr_proto::mux::MuxStream> {
+    if exit.is_none_or(|profile| profile.use_wan_pool) {
+        if let Some(wan_pool) = state.wan_pool.as_deref() {
+            let key = exit.map(|profile| profile.pool_key.as_str())
+                .unwrap_or(&state.default_pool_key);
+            if xr_proto::config::wan_pool_bypasses(&state.wan_pool_bypass_ips, client_ip) {
+                return wan_pool.open_stream_ordered(key, target).await;
+            }
+            return wan_pool.open_stream(key, target).await;
+        }
+    }
+    primary.open_stream(target).await
 }
 
 /// Прямое соединение с целью через выбранный канал и релей без туннеля.
