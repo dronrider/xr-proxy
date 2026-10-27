@@ -3770,6 +3770,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "xr-macos"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "xr-core",
+ "xr-proto",
+]
+
+[[package]]
 name = "xr-proto"
 version = "0.1.0"
 dependencies = [
