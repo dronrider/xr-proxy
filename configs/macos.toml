@@ -1,7 +1,7 @@
 # Конфиг сервиса macOS (xr-macos, XR-309).
 #
 # Держит только обвязку Mac. Серверы, ключ обфускации и правила маршрутизации
-# берёт JSON-профиль приложения (profile_path), тот же, что уезжает в Android
+# даёт JSON-профиль приложения (profile_path), тот же, что уезжает в Android
 # по QR или с хаба. Файл ставится командой `xr-macos install --profile ...` в
 # /etc/xr-proxy/macos.toml. Изменения живой копии подхватываются после
 # перезапуска сервиса (`sudo xr-macos stop && sudo xr-macos start`).
