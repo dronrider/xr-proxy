@@ -67,9 +67,7 @@ impl Obfuscator {
             ModifierStrategy::PositionalXorRotate => {
                 ((i as u32).wrapping_mul(self.salt) & 0xFF) as u8
             }
-            ModifierStrategy::RotatingSalt => {
-                (self.salt.rotate_left((i % 32) as u32) & 0xFF) as u8
-            }
+            ModifierStrategy::RotatingSalt => (self.salt.rotate_left((i % 32) as u32) & 0xFF) as u8,
             ModifierStrategy::SubstitutionTable => {
                 self.sub_table[(i.wrapping_add(self.salt as usize)) % 256]
             }
@@ -84,6 +82,16 @@ impl Obfuscator {
     pub fn apply(&self, data: &mut [u8], offset: u32) {
         let key_len = self.key.len();
         let offset = offset as usize;
+
+        if key_len.is_power_of_two() {
+            let mask = key_len - 1;
+            for (i, byte) in data.iter_mut().enumerate() {
+                let key_byte = self.key[(i + offset) & mask];
+                let mod_byte = self.modifier(i + offset);
+                *byte ^= key_byte ^ mod_byte;
+            }
+            return;
+        }
 
         for (i, byte) in data.iter_mut().enumerate() {
             let key_byte = self.key[(i + offset) % key_len];
@@ -127,7 +135,10 @@ mod tests {
         let mut data2 = original.clone();
         obfs.apply(&mut data2, 2);
 
-        assert_ne!(data1, data2, "different nonces should produce different output");
+        assert_ne!(
+            data1, data2,
+            "different nonces should produce different output"
+        );
     }
 
     #[test]
@@ -146,6 +157,93 @@ mod tests {
             assert_ne!(data, original);
             obfs.apply(&mut data, 100);
             assert_eq!(data, original, "roundtrip failed for {:?}", strategy);
+        }
+    }
+
+    fn reference_apply(
+        key: &[u8],
+        salt: u32,
+        strategy: ModifierStrategy,
+        data: &mut [u8],
+        offset: u32,
+    ) {
+        let mut table = [0u8; 256];
+        let mut state = salt;
+        for (i, entry) in table.iter_mut().enumerate() {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            state ^= key[i % key.len()] as u32;
+            *entry = (state >> 16) as u8;
+        }
+        for (i, byte) in data.iter_mut().enumerate() {
+            let position = i as u64 + u64::from(offset);
+            let modifier = match strategy {
+                ModifierStrategy::PositionalXorRotate => (position as u32).wrapping_mul(salt) as u8,
+                ModifierStrategy::RotatingSalt => salt.rotate_left((position % 32) as u32) as u8,
+                ModifierStrategy::SubstitutionTable => {
+                    table[((position + u64::from(salt)) % 256) as usize]
+                }
+            };
+            *byte ^= key[(position % key.len() as u64) as usize] ^ modifier;
+        }
+    }
+
+    #[test]
+    fn wire_bytes_match_reference_at_key_and_offset_boundaries() {
+        let lengths: [usize; 12] = [0, 1, 7, 8, 15, 16, 31, 32, 33, 255, 256, 257];
+        for key_len in [1, 2, 3, 7, 8, 15, 16, 31, 32, 33, 63, 64, 65, 128, 256, 257] {
+            let key: Vec<u8> = (0..key_len).map(|i| (i * 37 + 11) as u8).collect();
+            for strategy in [
+                ModifierStrategy::PositionalXorRotate,
+                ModifierStrategy::RotatingSalt,
+                ModifierStrategy::SubstitutionTable,
+            ] {
+                for salt in [0, 1, 0xDEADBEEF, u32::MAX] {
+                    let obfs = Obfuscator::new(key.clone(), salt, strategy);
+                    for offset in [0, 1, 31, 32, 255, 256, u32::MAX - 7, u32::MAX] {
+                        for len in lengths {
+                            if (offset as usize)
+                                .checked_add(len.saturating_sub(1))
+                                .is_none()
+                            {
+                                continue;
+                            }
+                            let mut actual: Vec<u8> =
+                                (0..len).map(|i| (i * 29 + 7) as u8).collect();
+                            let mut expected = actual.clone();
+                            reference_apply(&key, salt, strategy, &mut expected, offset);
+                            obfs.apply(&mut actual, offset);
+                            assert_eq!(actual, expected, "key_len={key_len}, strategy={strategy:?}, salt={salt}, offset={offset}, len={len}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn maximum_frame_payload_matches_reference_for_all_strategies() {
+        for key_len in [31, 32, 33, 64] {
+            let key: Vec<u8> = (0..key_len).map(|i| (i * 37 + 11) as u8).collect();
+            for strategy in [
+                ModifierStrategy::PositionalXorRotate,
+                ModifierStrategy::RotatingSalt,
+                ModifierStrategy::SubstitutionTable,
+            ] {
+                for offset in [0, 255, u32::MAX - 7, u32::MAX] {
+                    if (offset as usize).checked_add(65534).is_none() {
+                        continue;
+                    }
+                    let mut actual: Vec<u8> = (0..65535).map(|i| (i * 29 + 7) as u8).collect();
+                    let original = actual.clone();
+                    let mut expected = actual.clone();
+                    reference_apply(&key, 0xDEADBEEF, strategy, &mut expected, offset);
+                    let obfs = Obfuscator::new(key.clone(), 0xDEADBEEF, strategy);
+                    obfs.apply(&mut actual, offset);
+                    assert_eq!(actual, expected);
+                    obfs.apply(&mut actual, offset);
+                    assert_eq!(actual, original);
+                }
+            }
         }
     }
 }
