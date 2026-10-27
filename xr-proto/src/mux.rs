@@ -1286,15 +1286,21 @@ async fn reader_task<R: AsyncReadExt + Unpin>(
                 filled += n;
 
                 // Decode all complete frames.
+                let mut consumed_total = 0;
                 loop {
-                    match codec.decode_frame(&buf[..filled])? {
+                    match codec.decode_frame(&buf[consumed_total..filled])? {
                         Some((frame, consumed)) => {
                             dispatch_frame(&frame, &streams, &ctrl_tx, &new_stream_tx, &relay_health).await;
-                            buf.copy_within(consumed..filled, 0);
-                            filled -= consumed;
+                            consumed_total += consumed;
                         }
                         None => break,
                     }
+                }
+                if consumed_total > 0 {
+                    if consumed_total < filled {
+                        buf.copy_within(consumed_total..filled, 0);
+                    }
+                    filled -= consumed_total;
                 }
             }
             _ = keepalive_interval.tick() => {
@@ -1752,6 +1758,182 @@ mod tests {
         let key = b"test-key-32-bytes-long-enough!!!".to_vec();
         let obfs = Obfuscator::new(key, 0xDEADBEEF, ModifierStrategy::PositionalXorRotate);
         Codec::new(obfs, 0, 0) // no padding for simpler testing
+    }
+
+    struct ReaderChunks {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        offset: usize,
+    }
+
+    impl AsyncRead for ReaderChunks {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(chunk) = self.chunks.front() {
+                let count = (chunk.len() - self.offset).min(output.remaining());
+                output.put_slice(&chunk[self.offset..self.offset + count]);
+                self.offset += count;
+                if self.offset == self.chunks.front().unwrap().len() {
+                    self.chunks.pop_front();
+                    self.offset = 0;
+                }
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct ReaderOutput {
+        first: Vec<Vec<u8>>,
+        third: Vec<Vec<u8>>,
+        incoming: Vec<(u32, Vec<u8>)>,
+        controls: Vec<(Command, Vec<u8>)>,
+        first_closed: bool,
+        third_credit: i64,
+    }
+
+    async fn read_batches(codec: Codec, chunks: Vec<Vec<u8>>) -> ReaderOutput {
+        let mut entries = HashMap::new();
+        let mut receivers = Vec::new();
+        let mut windows = Vec::new();
+        for stream_id in [1, 3] {
+            let (tx, rx) = mpsc::channel(16);
+            let window = SendWindow::new(0);
+            entries.insert(
+                stream_id,
+                StreamEntry {
+                    tx,
+                    got_data: false,
+                    domain: false,
+                    window: window.clone(),
+                    close_reason: Arc::new(AtomicU8::new(0)),
+                },
+            );
+            receivers.push(rx);
+            windows.push(window);
+        }
+        let streams = Arc::new(Mutex::new(entries));
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel(16);
+        let (new_tx, mut new_rx) = mpsc::channel(16);
+        let reader = ReaderChunks {
+            chunks: chunks.into(),
+            offset: 0,
+        };
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            reader_task(reader, codec, streams.clone(), ctrl_tx, new_tx, None),
+        )
+        .await
+        .expect("reader must finish at scripted EOF")
+        .unwrap();
+        let mut data = Vec::new();
+        for mut rx in receivers {
+            let mut frames = Vec::new();
+            while let Ok(frame) = rx.try_recv() {
+                frames.push(frame);
+            }
+            data.push(frames);
+        }
+        let mut incoming = Vec::new();
+        while let Ok(frame) = new_rx.try_recv() {
+            incoming.push((frame.stream_id, frame.payload));
+        }
+        let mut controls = Vec::new();
+        while let Ok(frame) = ctrl_rx.try_recv() {
+            controls.push((frame.command, frame.payload));
+        }
+        ReaderOutput {
+            first: data.remove(0),
+            third: data.remove(0),
+            incoming,
+            controls,
+            first_closed: windows[0].closed.load(Ordering::Relaxed),
+            third_credit: windows[1].credit.load(Ordering::Relaxed),
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_batch_preserves_coalesced_data_control_and_eof_tail() {
+        let codec = test_codec();
+        let mut wire = Vec::new();
+        for (command, payload) in [
+            (Command::Data, encode_mux_payload(1, b"first")),
+            (Command::Ping, b"ping".to_vec()),
+            (Command::Data, encode_mux_payload(3, b"third")),
+            (
+                Command::WindowUpdate,
+                encode_mux_payload(3, &4096u32.to_be_bytes()),
+            ),
+            (Command::Connect, encode_mux_payload(5, b"five")),
+            (Command::Data, encode_mux_payload(1, b"second")),
+            (Command::Connect, encode_mux_payload(7, b"seven")),
+            (Command::Close, encode_mux_payload(1, &[])),
+            (
+                Command::Data,
+                encode_mux_payload(1, b"must be ignored after Close"),
+            ),
+        ] {
+            wire.extend(codec.encode_frame(command, &payload).unwrap());
+        }
+        let unfinished = codec
+            .encode_frame(Command::Data, &encode_mux_payload(3, b"tail"))
+            .unwrap();
+        wire.extend_from_slice(&unfinished[..NONCE_LEN + HEADER_LEN - 1]);
+        let got = read_batches(codec, vec![wire]).await;
+        assert_eq!(got.first, [b"first".to_vec(), b"second".to_vec()]);
+        assert_eq!(got.third, [b"third".to_vec()]);
+        assert_eq!(
+            got.incoming,
+            [(5, b"five".to_vec()), (7, b"seven".to_vec())]
+        );
+        assert_eq!(got.controls, [(Command::Pong, b"ping".to_vec())]);
+        assert!(got.first_closed);
+        assert_eq!(got.third_credit, 4096);
+    }
+
+    #[tokio::test]
+    async fn reader_batch_keeps_fragmented_maximum_frame_and_following_frames() {
+        let obfs = Obfuscator::new(
+            vec![7; 32],
+            0xDEADBEEF,
+            ModifierStrategy::PositionalXorRotate,
+        );
+        let codec = Codec::new(obfs, MAX_PADDING_LEN as u8, MAX_PADDING_LEN as u8);
+        let payload: Vec<_> = (0..MAX_PAYLOAD_LEN - 4).map(|i| (i % 251) as u8).collect();
+        let large = codec
+            .encode_frame(Command::Data, &encode_mux_payload(3, &payload))
+            .unwrap();
+        assert_eq!(
+            large.len(),
+            NONCE_LEN + HEADER_LEN + MAX_PADDING_LEN + MAX_PAYLOAD_LEN
+        );
+        let mut prefix = codec
+            .encode_frame(Command::Data, &encode_mux_payload(1, b"before"))
+            .unwrap();
+        prefix.extend_from_slice(&large[..5]);
+        let cut = NONCE_LEN + HEADER_LEN + MAX_PADDING_LEN + 17;
+        let mut suffix = large[large.len() - 3..].to_vec();
+        suffix.extend(
+            codec
+                .encode_frame(Command::Data, &encode_mux_payload(1, b"after"))
+                .unwrap(),
+        );
+        suffix.extend(codec.encode_frame(Command::Ping, b"done").unwrap());
+        let got = read_batches(
+            codec,
+            vec![
+                prefix,
+                large[5..cut].to_vec(),
+                large[cut..large.len() - 3].to_vec(),
+                suffix,
+            ],
+        )
+        .await;
+        assert_eq!(got.first, [b"before".to_vec(), b"after".to_vec()]);
+        assert_eq!(got.third, [payload]);
+        assert_eq!(got.controls, [(Command::Pong, b"done".to_vec())]);
+        assert!(got.incoming.is_empty());
     }
 
     #[tokio::test]
