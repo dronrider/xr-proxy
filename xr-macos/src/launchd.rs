@@ -109,7 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn plist_escapes_spaces_in_paths() {
+    fn plist_keeps_spaces_in_paths() {
         let paths = ServicePaths {
             binary: "/usr/local/bin/xr macos".into(),
             config: "/etc/xr-proxy/macos.toml".into(),
