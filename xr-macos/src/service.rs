@@ -252,13 +252,23 @@ impl Daemon {
         if !self.cfg.dns_apply || self.dns_applied {
             return;
         }
+        let ours = self.cfg.dns_server.to_string();
         let snapshot = match self.state.load_dns() {
             Some(saved) => {
                 tracing::info!("исходный DNS взят из сохранённого снимка");
                 saved
             }
             None => match snapshot_dns() {
-                Ok(snap) => {
+                Ok(mut snap) => {
+                    // Сервис, чей DNS до старта уже стоял в туннель, не даёт
+                    // исходного значения: в снимок идёт «от DHCP», и откат
+                    // вернёт его, а не мёртвый адрес туннеля.
+                    if dnsconf::strip_stale_tunnel_dns(&mut snap, &ours) {
+                        tracing::warn!(
+                            "у некоторых сервисов DNS уже указывал в туннель до старта: \
+                             исходные значения неизвестны, восстановление вернёт DHCP"
+                        );
+                    }
                     if let Err(e) = self.state.save_dns(&snap) {
                         self.fail(&format!("снимок DNS не сохранён: {e}"));
                     }
@@ -270,23 +280,11 @@ impl Daemon {
                 }
             },
         };
-        let ours = self.cfg.dns_server.to_string();
-        let mut stale_dns = false;
         for svc in &snapshot {
             let cmd = dnsconf::set_dns_cmd(&svc.service, &[ours.clone()]);
             if let Err(e) = cmd.run_checked() {
                 self.fail(&format!("DNS сервиса {}: {e}", svc.service));
-                continue;
             }
-            if svc.servers == [ours.clone()] {
-                stale_dns = true;
-            }
-        }
-        if stale_dns {
-            tracing::warn!(
-                "у некоторых сервисов DNS уже указывал в туннель до старта: \
-                 исходные значения неизвестны, восстановление вернёт DHCP"
-            );
         }
         self.dns_applied = true;
     }
@@ -396,8 +394,9 @@ impl Daemon {
     /// Одна итерация сторожа. Правила PF переустанавливаются целиком:
     /// внешний перегруз PF сносит динамические анкоры. Сеть сверяется на
     /// смену шлюза, движок перезапускается после отказа. Пропажа utun
-    /// возвращает управление: полный повторный подъём делает свежий
-    /// процесс launchd.
+    /// возвращает управление без отката сети: kill-switch остаётся
+    /// взведённым и закрывает прямой выход на окно перезапуска, полный
+    /// повторный подъём делает свежий процесс launchd.
     pub fn tick(&mut self) -> TickOutcome {
         self.resolve_servers();
         let Some(tun) = self.tun.as_ref() else {
@@ -405,8 +404,13 @@ impl Daemon {
         };
         let ifname = tun.ifname.clone();
         if !self.tun_still_alive() {
-            tracing::error!("интерфейс {} исчез", ifname);
-            self.teardown_network();
+            // Отката сети нет: анкор держит прямой выход закрытым, пока
+            // launchd ждёт ThrottleInterval и поднимает свежий процесс.
+            // Маршруты на сгинувший интерфейс ядро снимает само, снимки
+            // состояния переживут аварию, а откат при неудачном подъёме
+            // выполнит сам свежий процесс.
+            self.fail(&format!("интерфейс {ifname} исчез"));
+            self.write_status();
             return TickOutcome::TunGone;
         }
         let before = self.phys.lock().unwrap().clone();
@@ -519,6 +523,29 @@ impl Daemon {
 pub enum TickOutcome {
     Alive,
     TunGone,
+}
+
+/// Откат правок сети на выходе демона: только штатная остановка. Потеря
+/// туннеля уходит с взведённым kill-switch, иначе на окно ThrottleInterval
+/// launchd и подъём свежего процесса прямой выход был бы открыт. Откат на
+/// пути потери сделает сам свежий процесс, если его сеть не поднимется,
+/// либо команда recover.
+pub fn rollback_on_exit(exit_code: i32) -> bool {
+    exit_code == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tunnel_loss_exits_with_armed_killswitch() {
+        // Штатная остановка откатывает правки сети.
+        assert!(rollback_on_exit(0));
+        // Потеря туннеля уходит без отката: окно перезапуска launchd
+        // закрыто взведённым kill-switch.
+        assert!(!rollback_on_exit(1));
+    }
 }
 
 /// Петля пакетов: отдельная от `Daemon`, чтобы сторож мог править сеть,

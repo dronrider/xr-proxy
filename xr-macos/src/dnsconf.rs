@@ -90,6 +90,22 @@ pub fn usable_for_engine(snapshot: &[ServiceDns]) -> Vec<String> {
     out
 }
 
+/// Выбросить из снимка DNS туннеля: сервис, чей единственный резолвер до
+/// старта уже указывал в туннель (прошлый прогон не оставил снимка),
+/// исходного значения не имеет, и восстановление вернёт ему DNS от DHCP.
+/// Смешанные списки не трогаются: у них есть живые адреса. Возврат говорит,
+/// нашлись ли такие записи.
+pub fn strip_stale_tunnel_dns(snapshot: &mut [ServiceDns], tunnel_dns: &str) -> bool {
+    let mut stale = false;
+    for svc in snapshot {
+        if svc.servers.len() == 1 && svc.servers[0] == tunnel_dns {
+            svc.servers.clear();
+            stale = true;
+        }
+    }
+    stale
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +182,48 @@ Wi-Fi
             usable_for_engine(&snapshot),
             vec!["192.0.2.1".to_string(), "198.51.100.53".to_string()]
         );
+    }
+
+    #[test]
+    fn stale_tunnel_dns_in_snapshot_becomes_dhcp() {
+        let tunnel_dns = format!("{TUNNEL_PREFIX}1");
+        let mut snapshot = vec![
+            ServiceDns {
+                service: "Wi-Fi".into(),
+                // Единственный адрес равен DNS туннеля: исходное неизвестно.
+                servers: vec![tunnel_dns.clone()],
+            },
+            ServiceDns {
+                service: "Thunderbolt Bridge".into(),
+                servers: vec!["192.0.2.1".into(), "192.0.2.2".into()],
+            },
+            ServiceDns {
+                service: "Сервер Outline".into(),
+                servers: Vec::new(),
+            },
+        ];
+        assert!(strip_stale_tunnel_dns(&mut snapshot, &tunnel_dns));
+        // Мёртвый адрес туннеля превращается в «от DHCP» ...
+        assert_eq!(snapshot[0].servers, Vec::<String>::new());
+        // ... посторонние списки не трогаются.
+        assert_eq!(
+            snapshot[1].servers,
+            vec!["192.0.2.1".to_string(), "192.0.2.2".to_string()]
+        );
+        assert_eq!(snapshot[2].servers, Vec::<String>::new());
+        // Смешанный список с адресом туннеля остаётся как есть.
+        let mut mixed = vec![ServiceDns {
+            service: "Wi-Fi".into(),
+            servers: vec![tunnel_dns.clone(), "192.0.2.1".into()],
+        }];
+        assert!(!strip_stale_tunnel_dns(&mut mixed, &tunnel_dns));
+        assert_eq!(mixed[0].servers.len(), 2);
+        // Сценарий ревью: снимок с DNS туннеля, затем остановка. Откат
+        // рендерит команду из сохранённого снимка, ей достаётся Empty.
+        let cmd = set_dns_cmd(&snapshot[0].service, &snapshot[0].servers);
+        assert_eq!(cmd.args, vec!["-setdnsservers", "Wi-Fi", "Empty"]);
+        // Чистый снимок повторной правки не требует.
+        assert!(!strip_stale_tunnel_dns(&mut snapshot, &tunnel_dns));
     }
 
     #[test]

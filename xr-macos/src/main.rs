@@ -31,7 +31,7 @@ use tokio::sync::watch;
 use crate::config::ServiceConfig;
 use crate::dnsconf::ServiceDns;
 use crate::launchd::ServicePaths;
-use crate::service::{packet_loops, Daemon, TickOutcome};
+use crate::service::{packet_loops, rollback_on_exit, Daemon, TickOutcome};
 use crate::vpncheck::VpnConflict;
 
 const PROFILE_PATH: &str = "/etc/xr-proxy/profile.json";
@@ -237,8 +237,9 @@ fn cmd_run(config_path: &str) -> i32 {
 }
 
 /// Главный цикл демона: сигналы, пакетные петли и сторож по интервалу.
-/// Возврат это код выхода процесса: ноль для штатной остановки, единица
-/// для потери туннеля, launchd поднимет демон заново.
+/// Возврат это код выхода процесса: ноль для штатной остановки с откатом
+/// правок сети, единица для потери туннеля, тогда выход идёт с взведённым
+/// kill-switch и launchd поднимет демон заново.
 async fn run_supervisor(
     mut daemon: Daemon,
     shutdown_tx: watch::Sender<bool>,
@@ -307,12 +308,14 @@ async fn run_supervisor(
     }
 
     let _ = shutdown_tx.send(true);
-    if code == 0 {
+    if rollback_on_exit(code) {
         tracing::info!("остановка по сигналу, откатываю правки сети");
+        daemon.teardown_network();
     } else {
-        tracing::error!("туннель потерян, откатываю правки сети и выхожу; launchd поднимет заново");
+        tracing::error!(
+            "туннель потерян, выхожу с взведённым kill-switch; launchd поднимет заново"
+        );
     }
-    daemon.teardown_network();
     code
 }
 
