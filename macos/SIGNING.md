@@ -1,8 +1,9 @@
 # Подпись и нотаризация NE-приложения macOS
 
-Системное расширение (Network Extension) ставится на чужую машину только
-подписанным и нотаризованным. Без учётки Apple Developer Program приложение
-работает только на той машине, где собрано.
+Для запуска Network Extension нужна подпись и профиль с соответствующим
+разрешением. Это относится и к машине сборки. Бесплатная Personal Team
+не поддерживает Network Extension. См.
+[ответ Apple DTS](https://developer.apple.com/forums/thread/128767).
 
 ## Что нужно
 
@@ -29,23 +30,23 @@ App Groups и Network Extension.
 
 ## Сборка
 
-Скрипт `scripts/build-macos.sh` собирает staticlib ядра, генерирует
+Скрипт `macos/scripts/build-macos.sh` собирает staticlib ядра, генерирует
 Xcode-проект и гоняет xcodebuild.
 
 ```sh
 # Debug без подписи, для локальной проверки
-scripts/build-macos.sh
+macos/scripts/build-macos.sh
 
 # Release с Developer ID подписью
 DEVELOPER_ID="Developer ID Application: Имя (TEAMID)" \
-  scripts/build-macos.sh --release --sign
+  macos/scripts/build-macos.sh --release --sign
 
 # Полный цикл с нотаризацией
 DEVELOPER_ID="Developer ID Application: Имя (TEAMID)" \
 APPLE_ID="you@example.com" \
 APPLE_TEAM_ID="TEAMID" \
 APPLE_APP_PASSWORD="xxxx-xxxx-xxxx-xxxx" \
-  scripts/build-macos.sh --release --sign --notarize
+  macos/scripts/build-macos.sh --release --sign --notarize
 ```
 
 Секреты уезжают в переменные окружения. Без этого они оседают в истории
