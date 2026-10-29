@@ -1,7 +1,7 @@
 //! Управление NE-туннелем из приложения.
 
 import Foundation
-import NetworkExtension
+@preconcurrency import NetworkExtension
 import XrCore
 import Combine
 import os.log
@@ -70,7 +70,10 @@ final class TunnelController: ObservableObject {
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = tunnelProviderBundleId
         proto.serverAddress = profile.serverAddress
+        proto.includeAllNetworks = true
+        proto.enforceRoutes = true
         manager.protocolConfiguration = proto
+        manager.isEnabled = true
         manager.localizedDescription = "XR Proxy"
         manager.isOnDemandEnabled = alwaysOnDemandEnabled
         if alwaysOnDemandEnabled {

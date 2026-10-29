@@ -11,6 +11,7 @@ let package = Package(
     platforms: [.macOS(.v13)],
     products: [
         .library(name: "XrCore", targets: ["XrCore"]),
+        .library(name: "XrCoreBridge", targets: ["XrCoreBridge"]),
         .executable(name: "xrcore-tests", targets: ["XrCoreTests"])
     ],
     targets: [

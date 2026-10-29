@@ -8,6 +8,10 @@ options:
     macOS: "13.0"
   xcodeVersion: "15.0"
 
+packages:
+  XrCore:
+    path: ../XrCore
+
 settings:
   base:
     SWIFT_VERSION: "5.9"
@@ -28,14 +32,14 @@ targets:
     platform: macOS
     sources:
       - path: XrMac
-      - path: ../XrCore/Sources/XrCore
-        group: XrCore
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.xr.macos
         INFOPLIST_FILE: XrMac/Info.plist
         CODE_SIGN_ENTITLEMENTS: XrMac/XrMac.entitlements
     dependencies:
+      - package: XrCore
+        product: XrCore
       - target: XrMacTunnel
         embed: true
     info:
@@ -54,16 +58,14 @@ targets:
     platform: macOS
     sources:
       - path: XrMacTunnel
-      - path: ../XrCore/Sources/XrCore
-        group: XrCore
-      - path: ../XrCore/Sources/XrCoreBridge
-        group: XrCoreBridge
+    dependencies:
+      - package: XrCore
+        product: XrCoreBridge
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.xr.macos.tunnel
         INFOPLIST_FILE: XrMacTunnel/Info.plist
         CODE_SIGN_ENTITLEMENTS: XrMacTunnel/XrMacTunnel.entitlements
-        SWIFT_OBJC_BRIDGING_HEADER: XrMacTunnel-Bridging-Header.h
     info:
       path: XrMacTunnel/Info.plist
       properties:

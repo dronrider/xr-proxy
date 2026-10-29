@@ -14,6 +14,7 @@ TARGET_DIR="$ROOT/target"
 CONFIG="${CONFIG:-debug}"
 SIGN=0
 NOTARIZE=0
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
 
 for arg in "$@"; do
     case "$arg" in
@@ -43,20 +44,22 @@ echo "==> Генерация Xcode-проекта"
 (cd "$MACOS_DIR" && xcodegen generate)
 
 echo "==> xcodebuild ($CONFIG)"
-XCODE_ARGS="-project $MACOS_DIR/XrMac.xcodeproj -scheme XrMac -configuration $(echo "$CONFIG" | sed 's/^./\U&/') -destination 'platform=macOS' build"
+case "$CONFIG" in
+    debug) XCODE_CONFIG=Debug ;;
+    release) XCODE_CONFIG=Release ;;
+    *) echo "неизвестная конфигурация: $CONFIG" >&2; exit 2 ;;
+esac
+xcodebuild -project "$MACOS_DIR/XrMac.xcodeproj" -scheme XrMac \
+    -configuration "$XCODE_CONFIG" -destination "platform=macOS" \
+    -derivedDataPath "$TARGET_DIR/macos" \
+    "LIBRARY_SEARCH_PATHS=$TARGET_DIR/$CONFIG" CODE_SIGNING_ALLOWED=NO build
 
-# shellcheck disable=SC2086
-xcodebuild $XCODE_ARGS
-
-APP_PATH=$(find "$MACOS_DIR/build" -name "XR Proxy.app" -maxdepth 5 | head -1)
-if [ -z "$APP_PATH" ]; then
-    # Xcode кладёт в DerivedData; ищем оттуда.
-    APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -name "XR Proxy.app" -path "*XrMac*" | head -1)
-fi
+APP_PATH="$TARGET_DIR/macos/Build/Products/$XCODE_CONFIG/XrMac.app"
+test -d "$APP_PATH"
 echo "==> Сборка: $APP_PATH"
 
 if [ "$SIGN" -eq 0 ]; then
-    echo "==> Подпись пропущена (без --sign). Приложение локально, для чужих машин нужна подпись."
+    echo "==> Подпись пропущена (без --sign). Для запуска VPN нужна подпись Network Extension."
     exit 0
 fi
 
@@ -70,7 +73,7 @@ echo "==> Подпись Developer ID: $DEVELOPER_ID"
 codesign --force --options runtime --timestamp \
     --sign "$DEVELOPER_ID" \
     --entitlements "$MACOS_DIR/XrMacTunnel/XrMacTunnel.entitlements" \
-    "$APP_PATH/Contents/PlugIns/XR Tunnel.appex"
+    "$APP_PATH/Contents/PlugIns/XrMacTunnel.appex"
 codesign --force --options runtime --timestamp \
     --sign "$DEVELOPER_ID" \
     --entitlements "$MACOS_DIR/XrMac/XrMac.entitlements" \

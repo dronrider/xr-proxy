@@ -182,9 +182,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         // Весь IP-трафик уходит в туннель, включая QUIC: срез udp/443
         // делает ядро (block_quic), а не файрвол.
-        settings.includeAllNetworks = true
-        settings.enforceRoutes = true
-
         return settings
     }
 
@@ -198,14 +195,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             addresses.append(contentsOf: resolveIPv4(host: serverAddress))
         }
         return addresses.map {
-            NEIPv4Route(destinationAddress: $0, subnetMasks: ["255.255.255.255"])
+            NEIPv4Route(destinationAddress: $0, subnetMask: "255.255.255.255")
         }
     }
 
     private static func resolveIPv4(host: String) -> [String] {
         let name = host as CFString
-        guard let lookup = CFHostCreateWithName(nil, name)?.takeRetainedValue(),
-              CFHostStartInfoResolution(lookup, .addresses, nil)
+        let lookup = CFHostCreateWithName(nil, name).takeRetainedValue()
+        guard CFHostStartInfoResolution(lookup, .addresses, nil)
         else { return [] }
         guard let data = CFHostGetAddressing(lookup, nil)?.takeUnretainedValue() as? [Data] else {
             return []

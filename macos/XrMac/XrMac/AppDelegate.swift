@@ -1,9 +1,11 @@
 //! Точка входа приложения macOS: запуск и остановка туннеля.
 
 import Cocoa
+import SwiftUI
 import NetworkExtension
 
 @main
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let controller = TunnelController()
     private var window: NSWindow!

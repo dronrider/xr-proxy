@@ -1,5 +1,7 @@
 .DS_Store
 target
+macos/XrMac/XrMac.xcodeproj/
+macos/XrCore/.build/
 # Кросс-сборка под windows (xr-share.d) отдельным CARGO_TARGET_DIR.
 target-win
 xr-server/.vscode/launch.json
@@ -22,5 +24,6 @@ __pycache__/
 
 # Журналы запусков инструментов devkit и лок выката, живут только на машине.
 .devkit/log
+.devkit/cmdout/
 .devkit/goal-*.log
 .devkit/ship.lock

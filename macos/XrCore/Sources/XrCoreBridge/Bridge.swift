@@ -33,7 +33,7 @@ public enum XrBridge {
 
     /// Проверить конфиг. `"ok"` или JSON `{"error":...}`.
     public static func validateConfig(_ config: String) -> String {
-        config.withCString { take(xr_validate_config($0)) } ?? #""{"error":"нет ответа"}"#
+        config.withCString { take(xr_validate_config($0)) } ?? #"{"error":"нет ответа"}"#
     }
 
     /// Запустить движок. `nil` = успех, иначе текст ошибки.
