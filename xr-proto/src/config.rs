@@ -1139,6 +1139,32 @@ port = 8443
         toml::from_str(&toml_str).unwrap()
     }
 
+    #[test]
+    fn unsupported_policy_is_rejected_by_client_validation() {
+        let policy = r#"
+[[wan]]
+name = "two"
+interface = "lan4"
+[[exit]]
+name = "foreign"
+wan = "two"
+action = "proxy"
+[[device]]
+name = "console"
+ips = ["192.0.2.30"]
+default_exit = "foreign"
+"#;
+        validate_client_config(&client_with(policy)).unwrap();
+        for (text, expected) in [
+            (policy.replace("ips = [\"192.0.2.30\"]", "ips = [\"2001:db8::1\"]"), "IPv6"),
+            (format!("{policy}\n[[device.rule]]\nip_ranges = [\"2001:db8::/64\"]\nexit = \"foreign\"\n"), "IPv6"),
+            (format!("{policy}\n[udp_relay]\nsource_ips = [\"192.0.2.30\"]\n"), "udp_relay"),
+        ] {
+            let err = validate_client_config(&client_with(&text)).unwrap_err();
+            assert!(err.contains("console") && err.contains(expected), "{err}");
+        }
+    }
+
     fn server_with(extra: &str) -> ServerConfig {
         let toml_str = format!(
             r#"[server]

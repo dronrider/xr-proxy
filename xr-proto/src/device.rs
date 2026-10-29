@@ -71,32 +71,32 @@ impl DevicePolicy {
         self.ips.iter().any(|r| r.contains(src))
     }
 
-    fn single_ips(&self) -> Vec<IpAddr> {
-        self.ips
+    fn has_unmatched_ipv4(&self, earlier: &[DevicePolicy]) -> bool {
+        let bounds = |range: &CidrRange| match range {
+            CidrRange::V4 { addr, mask } => {
+                Some((u64::from(*addr), u64::from(*addr | !*mask)))
+            }
+            CidrRange::V6 { .. } => None,
+        };
+        let mut covered: Vec<_> = earlier
             .iter()
-            .filter_map(|r| match r {
-                // Хостовая маска означает запись одиночным адресом.
-                CidrRange::V4 { addr, mask } if *mask == !0u32 => {
-                    Some(IpAddr::V4((*addr).into()))
+            .flat_map(|device| device.ips.iter())
+            .filter_map(bounds)
+            .collect();
+        covered.sort_unstable();
+        self.ips.iter().filter_map(bounds).any(|(start, end)| {
+            let mut next = start;
+            for &(low, high) in &covered {
+                if low > next {
+                    break;
                 }
-                CidrRange::V6 { addr, mask } if *mask == !0u128 => {
-                    Some(IpAddr::V6((*addr).into()))
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn exits_on_foreign_channel(&self) -> Vec<&str> {
-        let mut found: Vec<&str> = Vec::new();
-        for exit in std::iter::once(&self.default_exit).chain(self.rules.iter().map(|r| &r.exit)) {
-            if let Some(iface) = exit.interface.as_deref() {
-                if !found.contains(&iface) {
-                    found.push(iface);
+                next = next.max(high + 1);
+                if next > end {
+                    return false;
                 }
             }
-        }
-        found
+            next <= end
+        })
     }
 }
 
@@ -189,8 +189,12 @@ fn compile_ips(section: &str, values: &[String]) -> Result<Vec<CidrRange>, Strin
     values
         .iter()
         .map(|v| {
-            CidrRange::parse_ip_or_cidr(v)
-                .ok_or_else(|| format!("{section}: '{v}' не адрес и не CIDR"))
+            let range = CidrRange::parse_ip_or_cidr(v)
+                .ok_or_else(|| format!("{section}: '{v}' не адрес и не CIDR"))?;
+            if matches!(range, CidrRange::V6 { .. }) {
+                return Err(format!("{section}: IPv6 '{v}' не поддерживается политиками устройств; перехват работает только с IPv4 TCP"));
+            }
+            Ok(range)
         })
         .collect()
 }
@@ -277,7 +281,9 @@ impl DevicePolicySet {
                 rules,
             });
         }
-        Ok(Self { devices })
+        let set = Self { devices };
+        set.validate_udp_relay(config)?;
+        Ok(set)
     }
 
     /// Политики пусты, весь трафик идёт прежним путём `[routing]`.
@@ -353,24 +359,44 @@ impl DevicePolicySet {
         Ok(specs)
     }
 
-    /// Предупреждения о пересечении политик с UDP relay (XR-310): relay
-    /// ходит с основного маршрута, поэтому устройство на другом канале
-    /// получает UDP не через свой канал.
-    pub fn udp_relay_overlap_warnings(&self, udp_source_ips: &[String]) -> Vec<String> {
-        let mut warnings = Vec::new();
-        for device in &self.devices {
-            for iface in device.exits_on_foreign_channel() {
-                for ip in device.single_ips() {
-                    if udp_source_ips.contains(&ip.to_string()) {
-                        warnings.push(format!(
-                            "device '{}' уходит через канал {}, но его UDP ловит relay с основного маршрута",
-                            device.name, iface
+    fn validate_udp_relay(&self, config: &ClientConfig) -> Result<(), String> {
+        let Some(udp) = config.udp_relay.as_ref().filter(|udp| udp.enabled) else {
+            return Ok(());
+        };
+        let sources: Vec<IpAddr> = udp
+            .source_ips
+            .iter()
+            .filter_map(|ip| ip.parse::<std::net::Ipv4Addr>().ok().map(IpAddr::V4))
+            .collect();
+        for (index, device) in self.devices.iter().enumerate() {
+            // Как и relay, пустой список разобранных адресов считаем всей LAN.
+            let reachable = if sources.is_empty() {
+                device.has_unmatched_ipv4(&self.devices[..index])
+            } else {
+                sources.iter().any(|src| {
+                    self.devices.iter().position(|device| device.matches_ip(*src)) == Some(index)
+                })
+            };
+            if !reachable {
+                continue;
+            }
+            for exit in std::iter::once(&device.default_exit).chain(device.rules.iter().map(|r| &r.exit)) {
+                let spec = config
+                    .exit
+                    .iter()
+                    .find(|spec| spec.name == exit.name)
+                    .expect("профиль уже проверен при сборке устройства");
+                for (field, wan) in [("wan", &spec.wan), ("fallback_wan", &spec.fallback_wan)] {
+                    if let Some(wan) = wan.as_deref().filter(|wan| !wan.is_empty() && *wan != MAIN_WAN) {
+                        return Err(format!(
+                            "device '{}': exit '{}' задаёт {field} '{wan}', но udp_relay этого устройства использует основной маршрут; уберите устройство из relay или привязку WAN из его TCP-политики",
+                            device.name, exit.name
                         ));
                     }
                 }
             }
         }
-        warnings
+        Ok(())
     }
 }
 
@@ -904,32 +930,6 @@ default_exit = "fixed"
     }
 
     #[test]
-    fn udp_overlap_warning_fires_for_off_channel_device() {
-        let cfg = config(&format!(
-            r#"{BASE}
-            [[wan]]
-            name = "two"
-            interface = "lan4"
-            [[exit]]
-            name = "two-direct"
-            wan = "two"
-            action = "direct"
-            [[device]]
-            name = "console"
-            ips = ["192.0.2.30"]
-            default_exit = "two-direct"
-            "#
-        ));
-        let set = DevicePolicySet::compile(&cfg).expect("политики собираются");
-        let warnings = set.udp_relay_overlap_warnings(&["192.0.2.30".to_string()]);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("console"), "{warnings:?}");
-        // Устройство вне relay не предупреждает.
-        let quiet = set.udp_relay_overlap_warnings(&["192.0.2.99".to_string()]);
-        assert!(quiet.is_empty(), "{quiet:?}");
-    }
-
-    #[test]
     fn policy_reject_reason_covers_compile() {
         assert!(policy_reject_reason(&config(BASE)).is_ok());
         assert!(policy_reject_reason(&config(&format!(
@@ -943,5 +943,175 @@ default_exit = "fixed"
             "#
         )))
         .is_err());
+    }
+
+    #[test]
+    fn unsupported_policy_ipv6_sources_and_destinations_are_rejected() {
+        for address in ["2001:db8::1", "2001:db8::/64", "::/0", "::ffff:192.0.2.30"] {
+            let text = format!(r#"{BASE}
+[[exit]]
+name = "plain"
+action = "direct"
+[[device]]
+name = "console"
+ips = ["192.0.2.30", "{address}"]
+default_exit = "plain"
+"#);
+            let err = policy_reject_reason(&config(&text)).unwrap_err();
+            assert!(err.contains("device 'console'") && err.contains("IPv6"), "{err}");
+
+            let text = text.replace(&format!(", \"{address}\""), "") + &format!(r#"
+[[device.rule]]
+name = "resource"
+ip_ranges = ["192.0.2.0/24", "{address}"]
+exit = "plain"
+"#);
+            let err = policy_reject_reason(&config(&text)).unwrap_err();
+            assert!(err.contains("rule 'resource'") && err.contains("IPv6"), "{err}");
+        }
+    }
+
+    const UDP_POLICY: &str = r#"
+[[wan]]
+name = "two"
+interface = "lan4"
+[[exit]]
+name = "plain"
+wan = "main"
+action = "proxy"
+[[exit]]
+name = "off-channel"
+wan = "two"
+action = "proxy"
+[[exit]]
+name = "reserve"
+fallback_wan = "two"
+action = "proxy"
+"#;
+
+    fn udp_policy(ips: &str, exit: &str, enabled: bool, source_ips: &str) -> ClientConfig {
+        config(&format!(r#"{BASE}{UDP_POLICY}
+[udp_relay]
+enabled = {enabled}
+source_ips = [{source_ips}]
+[[device]]
+name = "console"
+ips = ["{ips}"]
+default_exit = "{exit}"
+"#))
+    }
+
+    #[test]
+    fn unsupported_policy_udp_relay_rejects_host_and_cidr_with_primary_or_fallback_wan() {
+        for source in ["192.0.2.30", "192.0.2.30/32", "192.0.2.0/24", "0.0.0.0/0"] {
+            for exit in ["off-channel", "reserve"] {
+                let cfg = udp_policy(source, exit, true, "\"192.0.2.30\"");
+                let err = policy_reject_reason(&cfg).unwrap_err();
+                assert!(err.contains("console") && err.contains("udp_relay") && err.contains(exit), "{err}");
+            }
+        }
+        let cfg = udp_policy("192.0.2.30", "off-channel", true, "");
+        assert!(policy_reject_reason(&cfg).is_err(), "relay без source_ips принимает все устройства");
+    }
+
+    #[test]
+    fn unsupported_policy_udp_relay_checks_resource_exits_too() {
+        let mut cfg = udp_policy("192.0.2.0/24", "plain", true, "\"192.0.2.30\"");
+        cfg.device[0].rules.push(toml::from_str(r#"
+name = "resource"
+domains = ["example.com"]
+exit = "reserve"
+"#).unwrap());
+        let err = policy_reject_reason(&cfg).unwrap_err();
+        assert!(err.contains("console") && err.contains("reserve") && err.contains("udp_relay"), "{err}");
+    }
+
+    #[test]
+    fn unsupported_policy_udp_relay_preserves_disabled_unrelated_and_main_exits() {
+        for cfg in [
+            udp_policy("192.0.2.0/24", "off-channel", false, "\"192.0.2.30\""),
+            udp_policy("198.51.100.0/24", "off-channel", true, "\"192.0.2.30\""),
+            udp_policy("192.0.2.0/24", "plain", true, "\"192.0.2.30\""),
+        ] {
+            policy_reject_reason(&cfg).unwrap();
+        }
+        let mut cfg = udp_policy("192.0.2.0/24", "off-channel", true, "\"192.0.2.30\"");
+        cfg.udp_relay = None;
+        policy_reject_reason(&cfg).unwrap();
+        let mut legacy = config(BASE);
+        legacy.udp_relay = udp_policy("192.0.2.30", "plain", true, "").udp_relay;
+        legacy.routing.rules.push(toml::from_str(r#"
+action = "proxy"
+ip_ranges = ["2001:db8::/32"]
+"#).unwrap());
+        policy_reject_reason(&legacy).unwrap();
+        let mut cfg = udp_policy("192.0.2.0/24", "plain", true, "\"192.0.2.30\"");
+        cfg.exit[0].fallback_wan = Some("main".into());
+        policy_reject_reason(&cfg).unwrap();
+        let cfg = udp_policy("192.0.2.30/32", "off-channel", true, "\"192.0.2.31\"");
+        policy_reject_reason(&cfg).unwrap();
+        let cfg = udp_policy("192.0.2.30/32", "off-channel", true, "\"192.0.2.31\", \"192.0.2.30\"");
+        assert!(policy_reject_reason(&cfg).is_err());
+    }
+
+    #[test]
+    fn unsupported_policy_udp_relay_uses_first_matching_device() {
+        let mut cfg = udp_policy("192.0.2.0/24", "plain", true, "\"192.0.2.30\"");
+        cfg.device.push(toml::from_str(r#"
+name = "shadowed"
+ips = ["192.0.2.30"]
+default_exit = "off-channel"
+"#).unwrap());
+        policy_reject_reason(&cfg).unwrap();
+        cfg.device.swap(0, 1);
+        let err = policy_reject_reason(&cfg).unwrap_err();
+        assert!(err.contains("shadowed"), "{err}");
+    }
+
+    #[test]
+    fn unsupported_policy_udp_relay_empty_sources_preserves_shadowed_devices() {
+        for (earlier, later) in [
+            (vec!["0.0.0.0/0"], "192.0.2.30"),
+            (vec!["192.0.2.0/25", "192.0.2.128/25"], "192.0.2.0/24"),
+            (vec!["192.0.2.128/25", "192.0.2.0/25"], "192.0.2.0/24"),
+            (vec!["0.0.0.0/1", "128.0.0.0/1"], "0.0.0.0/0"),
+            (vec!["255.255.255.255"], "255.255.255.255/32"),
+            (vec!["0.0.0.0"], "0.0.0.0/32"),
+        ] {
+            let mut cfg = udp_policy(later, "off-channel", true, "");
+            for (index, range) in earlier.iter().enumerate() {
+                let device = toml::from_str(&format!(r#"
+name = "earlier-{index}"
+ips = ["{range}"]
+default_exit = "plain"
+"#)).unwrap();
+                cfg.device.insert(index, device);
+            }
+            policy_reject_reason(&cfg)
+                .unwrap_or_else(|err| panic!("{earlier:?} полностью закрывает {later}: {err}"));
+        }
+    }
+
+    #[test]
+    fn unsupported_policy_udp_relay_empty_sources_rejects_partial_shadow() {
+        for (earlier, later) in [
+            (vec!["192.0.2.0/25"], "192.0.2.0/24"),
+            (vec!["192.0.2.0/26", "192.0.2.128/25"], "192.0.2.0/24"),
+            (vec!["192.0.2.0/25", "192.0.2.0/26"], "192.0.2.0/24"),
+            (vec!["0.0.0.0/1", "128.0.0.0/2"], "0.0.0.0/0"),
+            (vec!["255.255.255.254"], "255.255.255.254/31"),
+        ] {
+            let mut cfg = udp_policy(later, "reserve", true, "");
+            for (index, range) in earlier.iter().enumerate() {
+                let device = toml::from_str(&format!(r#"
+name = "earlier-{index}"
+ips = ["{range}"]
+default_exit = "plain"
+"#)).unwrap();
+                cfg.device.insert(index, device);
+            }
+            let err = policy_reject_reason(&cfg).unwrap_err();
+            assert!(err.contains("console") && err.contains("reserve"), "{earlier:?} не закрывает {later}: {err}");
+        }
     }
 }

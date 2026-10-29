@@ -238,12 +238,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Arc::new(wan::WanPool::new(config.client.wan_pool.clone(), balanced)))
     };
 
-    if let Some(udp) = config.udp_relay.as_ref().filter(|u| u.enabled) {
-        for warning in policy.udp_relay_overlap_warnings(&udp.source_ips) {
-            tracing::warn!("{warning}");
-        }
-    }
-
     let state = Arc::new(proxy::ProxyState {
         router: std::sync::RwLock::new(Arc::new(router)),
         on_server_down,
